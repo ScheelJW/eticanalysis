@@ -186,9 +186,16 @@ function pickWorkbookAttachment(
 function normalizeAttachmentBinary(content: Attachment["content"]): ArrayBuffer {
   if (content instanceof ArrayBuffer) return content;
   if (content instanceof Uint8Array) {
-    return content.buffer.slice(content.byteOffset, content.byteOffset + content.byteLength);
+    return cloneToArrayBuffer(content);
   }
-  return new TextEncoder().encode(content).buffer;
+  const encoded = new TextEncoder().encode(content);
+  return cloneToArrayBuffer(encoded);
+}
+
+function cloneToArrayBuffer(view: ArrayBufferView): ArrayBuffer {
+  const clone = new Uint8Array(view.byteLength);
+  clone.set(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
+  return clone.buffer;
 }
 
 function sanitizeFileName(fileName: string): string {
