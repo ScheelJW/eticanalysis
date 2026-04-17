@@ -1,0 +1,30 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "etic-email-automation",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-04-17",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "r2_buckets": [
+    {
+      "binding": "ETIC_BUCKET",
+      "bucket_name": "eticanalysis"
+    }
+  ],
+  "send_email": [
+    {
+      "name": "REPORT_EMAIL"
+    }
+  ],
+  "vars": {
+    "REPORT_TO": "",
+    "REPORT_FROM": "",
+    "EXPECTED_ATTACHMENT_NAME": "Vehicle ETIC.xlsx",
+    "ALLOWED_SENDERS": "",
+    "MAX_ATTACHMENT_BYTES": "20000000"
+  }
+}
