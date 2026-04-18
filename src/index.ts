@@ -1,6 +1,10 @@
 import PostalMime from "postal-mime";
 import type { Attachment } from "postal-mime";
 import ExcelJS from "exceljs";
+import {
+  extractWorkOrderRows,
+  generateYardCheckWorkbookBuffer,
+} from "./yardCheck";
 
 const DEFAULT_MAX_ATTACHMENT_BYTES = 30 * 1024 * 1024;
 const SITE_TITLE = "Minot Vehicle ETIC";
@@ -170,6 +174,10 @@ export default {
       return Response.json(analysis, { headers: cacheHeaders() });
     }
 
+    if (url.pathname === "/api/yard-check.xlsx") {
+      return handleYardCheckDownload(env);
+    }
+
     if (url.pathname === "/" || url.pathname === "/index.html") {
       return new Response(renderDashboardHtml(), {
         headers: {
@@ -182,6 +190,67 @@ export default {
     return new Response("Not Found", { status: 404 });
   },
 } satisfies ExportedHandler<Env>;
+
+async function handleYardCheckDownload(env: Env): Promise<Response> {
+  const history = await loadHistory(env);
+  const latestEntry = history.entries.length
+    ? [...history.entries].sort((a, b) => a.dateKey.localeCompare(b.dateKey)).pop() ?? null
+    : null;
+
+  const latest = await readJson<AnalysisResult>(env, "analyses/latest.json");
+
+  const workbookKey = latestEntry?.workbookKey ?? null;
+  const sourceFileName = latestEntry?.workbookFileName ?? latest?.workbookFileName ?? "vehicle-etic.xlsx";
+  const sourceDateKey = latestEntry?.dateKey ?? latest?.dateKey ?? "latest";
+
+  if (!workbookKey) {
+    return Response.json(
+      { ok: false, error: "No source workbook found yet. Send the ETIC email to ingest first." },
+      { status: 404 },
+    );
+  }
+
+  const object = await env.ETIC_BUCKET.get(workbookKey);
+  if (!object) {
+    return Response.json(
+      { ok: false, error: `Source workbook not found in R2: ${workbookKey}` },
+      { status: 404 },
+    );
+  }
+
+  const workbookBytes = await object.arrayBuffer();
+  const extraction = await extractWorkOrderRows(workbookBytes);
+  if (!extraction) {
+    return Response.json(
+      {
+        ok: false,
+        error: "Could not locate a Work Orders sheet in the latest workbook.",
+      },
+      { status: 422 },
+    );
+  }
+
+  const generatedAtIso = new Date().toISOString();
+  const buffer = await generateYardCheckWorkbookBuffer(extraction, {
+    sourceWorkbookFileName: sourceFileName,
+    sourceDateKey,
+    generatedAtIso,
+  });
+
+  const downloadName = `yard-check_${sourceDateKey}_${generatedAtIso.replace(/[:.]/g, "-")}.xlsx`;
+  return new Response(buffer, {
+    headers: {
+      "Content-Type":
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "Content-Disposition": `attachment; filename="${downloadName}"`,
+      "Cache-Control": "no-store",
+      "X-Source-Workbook": workbookKey,
+      "X-Source-Date": sourceDateKey,
+      "X-Total-Rows": String(extraction.totalDataRows),
+      "X-Unmatched-Headers": String(extraction.unmatchedHeaders.length),
+    },
+  });
+}
 
 function cacheHeaders(): HeadersInit {
   return {
@@ -533,15 +602,46 @@ function renderDashboardHtml(): string {
     a:hover { text-decoration: underline; }
     .empty { background: var(--panel); border: 1px dashed var(--border); border-radius: 12px; padding: 24px; color: var(--muted); text-align: center; }
     code { background: #0e1729; padding: 2px 6px; border-radius: 6px; border: 1px solid var(--border); }
+    .btn {
+      background: linear-gradient(180deg, #2a4d8f, #1c3971);
+      color: #e7efff;
+      border: 1px solid #3a5da5;
+      padding: 8px 14px;
+      border-radius: 10px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.05s ease, filter 0.15s ease;
+    }
+    .btn:hover { filter: brightness(1.1); }
+    .btn:active { transform: translateY(1px); }
+    .btn:disabled { opacity: 0.6; cursor: progress; }
   </style>
 </head>
 <body>
   <header>
     <h1>${escapedTitle}</h1>
     <span class="sub" id="updated">Loading…</span>
+    <span class="spacer" style="flex:1"></span>
+    <button id="download-yard-check" class="btn">Download Yard Check (.xlsx)</button>
   </header>
   <main>
+    <div id="yard-check-status" class="muted" style="margin-bottom:16px; min-height: 18px;"></div>
     <div class="cards" id="summary-cards"></div>
+    <section>
+      <h2>Tools</h2>
+      <div class="card">
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:16px; flex-wrap:wrap;">
+          <div>
+            <div style="font-size:15px; font-weight:600;">Yard Check Generator</div>
+            <div class="muted" style="font-size:12px; max-width:640px;">
+              Produces a landscape, print-ready Excel with every work order (Asset ID, Work Order ID, VIN/Serial, Make, Model, Previous Location) plus blank columns for new location and discrepancies. Use it to walk the compound and record current vehicle positions.
+            </div>
+          </div>
+          <button id="download-yard-check-2" class="btn">Download .xlsx</button>
+        </div>
+      </div>
+    </section>
     <section>
       <h2>History</h2>
       <div id="history-wrap"><div class="empty">Loading history…</div></div>
@@ -672,6 +772,53 @@ function renderDashboardHtml(): string {
         '</table>'
       ].join("");
     }
+
+    async function downloadYardCheck(btn) {
+      const statusEl = document.getElementById("yard-check-status");
+      const prevLabel = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "Preparing…";
+      statusEl.textContent = "Generating yard check from latest workbook…";
+      try {
+        const res = await fetch("/api/yard-check.xlsx");
+        if (!res.ok) {
+          let message = "Failed to generate (" + res.status + ")";
+          try {
+            const body = await res.json();
+            if (body && body.error) message = body.error;
+          } catch (_) {}
+          statusEl.textContent = message;
+          return;
+        }
+        const disposition = res.headers.get("Content-Disposition") || "";
+        const nameMatch = /filename=\"?([^\";]+)\"?/i.exec(disposition);
+        const fileName = nameMatch ? nameMatch[1] : "yard-check.xlsx";
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = fileName;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+        const rowCount = res.headers.get("X-Total-Rows") || "0";
+        statusEl.textContent = "Downloaded " + fileName + " (" + rowCount + " rows).";
+      } catch (err) {
+        statusEl.textContent = "Error: " + (err && err.message ? err.message : String(err));
+      } finally {
+        btn.disabled = false;
+        btn.textContent = prevLabel;
+      }
+    }
+
+    document.addEventListener("click", (ev) => {
+      const target = ev.target;
+      if (target && target instanceof HTMLElement && (target.id === "download-yard-check" || target.id === "download-yard-check-2")) {
+        ev.preventDefault();
+        downloadYardCheck(target);
+      }
+    });
 
     loadAll().catch((err) => {
       document.getElementById("updated").textContent = "Failed to load: " + (err && err.message ? err.message : String(err));
