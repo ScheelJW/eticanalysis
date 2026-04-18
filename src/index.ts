@@ -40,6 +40,8 @@ const DEFAULT_MAX_ATTACHMENT_BYTES = 30 * 1024 * 1024;
 
 export default {
   async email(message: ForwardableEmailMessage, env: Env, ctx: ExecutionContext): Promise<void> {
+    const replyRecipient = resolveReportRecipient(message.from, env.REPORT_TO);
+
     try {
       if (!isAuthorizedSender(message.from, env)) {
         message.setReject("Unauthorized sender");
@@ -61,6 +63,7 @@ export default {
             `To: ${message.to}`,
             `Subject: ${parsed.subject ?? "(no subject)"}`,
           ].join("\n"),
+          replyRecipient,
         );
         return;
       }
@@ -130,6 +133,7 @@ export default {
             "",
             reportText,
           ].join("\n"),
+          replyRecipient,
         ),
       );
     } catch (error) {
@@ -139,6 +143,7 @@ export default {
           env,
           `[Vehicle ETIC] Analysis failure`,
           `The ETIC analysis worker failed.\n\nError: ${messageText}`,
+          replyRecipient,
         ),
       );
       throw error;
@@ -205,6 +210,12 @@ function sanitizeFileName(fileName: string): string {
 
 function normalizeEmailAddress(email: string): string {
   return email.replace(/[<>]/g, "").trim().toLowerCase();
+}
+
+function resolveReportRecipient(sender: string, fallback: string): string {
+  const normalizedSender = normalizeEmailAddress(sender);
+  if (normalizedSender) return normalizedSender;
+  return normalizeEmailAddress(fallback);
 }
 
 function parseMaxAttachmentBytes(raw: string | undefined): number {
@@ -360,12 +371,12 @@ function renderReportText(result: AnalysisResult): string {
   return lines.join("\n");
 }
 
-async function sendTextEmail(env: Env, subject: string, text: string): Promise<void> {
-  if (!env.REPORT_FROM || !env.REPORT_TO) {
+async function sendTextEmail(env: Env, subject: string, text: string, to: string): Promise<void> {
+  if (!env.REPORT_FROM || !to) {
     console.error(
       JSON.stringify({
         level: "warn",
-        message: "Report email skipped due to missing REPORT_FROM or REPORT_TO",
+        message: "Report email skipped due to missing REPORT_FROM or recipient",
         subject,
       }),
     );
@@ -374,7 +385,7 @@ async function sendTextEmail(env: Env, subject: string, text: string): Promise<v
 
   await env.REPORT_EMAIL.send({
     from: env.REPORT_FROM,
-    to: env.REPORT_TO,
+    to,
     subject,
     text,
   });
@@ -386,6 +397,7 @@ export {
   countMelMentions,
   parseMaxAttachmentBytes,
   pickWorkbookAttachment,
+  resolveReportRecipient,
   renderReportText,
   sanitizeFileName,
 };
