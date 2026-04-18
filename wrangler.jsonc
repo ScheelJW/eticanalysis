@@ -1,6 +1,7 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "etic-email-automation",
+  "account_id": "b549ea6423fc2b6ea1bb920e1f248d94",
   "main": "src/index.ts",
   "compatibility_date": "2026-04-17",
   "compatibility_flags": ["nodejs_compat"],
