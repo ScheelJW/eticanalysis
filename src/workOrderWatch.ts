@@ -253,6 +253,79 @@ export type WatchRow = {
   lastSnapshotDate: string;
 };
 
+function rowToWatchRow(
+  row: {
+    work_order_id: string;
+    asset_id: string;
+    mel_tier: string;
+    parts_status: string;
+    etic_raw: string;
+    etic_date: string | null;
+    remarks: string;
+    last_remark_change_date: string;
+    etic_push_count: number;
+    cumulative_etic_slip_days: number;
+    first_etic_date: string | null;
+    last_etic_date: string | null;
+    last_snapshot_date: string;
+  },
+  asOfDateKey: string,
+): WatchRow {
+  const tier = (row.mel_tier as MelTier) || "unknown";
+  const interval = REMARK_INTERVAL[tier];
+  const daysSince = calendarDaysBetween(row.last_remark_change_date, asOfDateKey);
+  const stale = interval !== null && daysSince > interval;
+  return {
+    workOrderId: row.work_order_id,
+    assetId: row.asset_id,
+    melTier: tier,
+    partsStatus: row.parts_status,
+    eticRaw: row.etic_raw,
+    eticDate: row.etic_date,
+    remarks: row.remarks,
+    lastRemarkChangeDate: row.last_remark_change_date,
+    daysSinceRemarkChange: daysSince,
+    requiredIntervalDays: interval,
+    remarkStale: stale,
+    eticPushCount: row.etic_push_count,
+    cumulativeEticSlipDays: row.cumulative_etic_slip_days,
+    firstEticDate: row.first_etic_date,
+    lastEticDate: row.last_etic_date,
+    lastSnapshotDate: row.last_snapshot_date,
+  };
+}
+
+/** One work order’s latest state; staleness vs asOfDateKey. Returns null if not in index. */
+export async function getWatchRowById(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  workOrderId: string,
+  asOfDateKey: string,
+): Promise<WatchRow | null> {
+  const row = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT work_order_id, asset_id, mel_tier, parts_status, etic_raw, etic_date, remarks,
+            last_remark_change_date, etic_push_count, cumulative_etic_slip_days, first_etic_date, last_etic_date, last_snapshot_date
+     FROM work_order_state WHERE work_order_id = ?`,
+  )
+    .bind(workOrderId)
+    .first<{
+      work_order_id: string;
+      asset_id: string;
+      mel_tier: string;
+      parts_status: string;
+      etic_raw: string;
+      etic_date: string | null;
+      remarks: string;
+      last_remark_change_date: string;
+      etic_push_count: number;
+      cumulative_etic_slip_days: number;
+      first_etic_date: string | null;
+      last_etic_date: string | null;
+      last_snapshot_date: string;
+    }>();
+  if (!row) return null;
+  return rowToWatchRow(row, asOfDateKey);
+}
+
 /** Latest state per WO; remark staleness computed vs asOfDateKey (report date). */
 export async function getWatchRowsLatest(env: { ETIC_SNAPSHOTS: D1Database }, asOfDateKey: string): Promise<WatchRow[]> {
   const r = await env.ETIC_SNAPSHOTS.prepare(
@@ -278,28 +351,7 @@ export async function getWatchRowsLatest(env: { ETIC_SNAPSHOTS: D1Database }, as
 
   const out: WatchRow[] = [];
   for (const row of r.results ?? []) {
-    const tier = (row.mel_tier as MelTier) || "unknown";
-    const interval = REMARK_INTERVAL[tier];
-    const daysSince = calendarDaysBetween(row.last_remark_change_date, asOfDateKey);
-    const stale = interval !== null && daysSince > interval;
-    out.push({
-      workOrderId: row.work_order_id,
-      assetId: row.asset_id,
-      melTier: tier,
-      partsStatus: row.parts_status,
-      eticRaw: row.etic_raw,
-      eticDate: row.etic_date,
-      remarks: row.remarks,
-      lastRemarkChangeDate: row.last_remark_change_date,
-      daysSinceRemarkChange: daysSince,
-      requiredIntervalDays: interval,
-      remarkStale: stale,
-      eticPushCount: row.etic_push_count,
-      cumulativeEticSlipDays: row.cumulative_etic_slip_days,
-      firstEticDate: row.first_etic_date,
-      lastEticDate: row.last_etic_date,
-      lastSnapshotDate: row.last_snapshot_date,
-    });
+    out.push(rowToWatchRow(row, asOfDateKey));
   }
   return out;
 }

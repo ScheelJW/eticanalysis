@@ -6,7 +6,7 @@ import {
   extractYardCheckSource,
   generateYardCheckWorkbookBuffer,
 } from "./yardCheck";
-import { getChangelog, getWatchRowsLatest, ingestWorkOrderSnapshot } from "./workOrderWatch";
+import { getChangelog, getWatchRowById, getWatchRowsLatest, ingestWorkOrderSnapshot } from "./workOrderWatch";
 
 const DEFAULT_MAX_ATTACHMENT_BYTES = 30 * 1024 * 1024;
 const SITE_TITLE = "Minot Vehicle ETIC";
@@ -609,6 +609,7 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
   }
 
   const url = new URL(request.url);
+  const woLookup = url.searchParams.get("workOrderId")?.trim();
   let asOf = url.searchParams.get("date");
   if (asOf && !/^\d{4}-\d{2}-\d{2}$/.test(asOf)) {
     return new Response("Invalid date", { status: 400 });
@@ -621,7 +622,23 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
     asOf = latest?.dateKey ?? null;
   }
   if (!asOf) {
-    return Response.json({ asOfDateKey: null, rows: [], staleCount: 0 }, { headers: cacheHeaders() });
+    return Response.json(
+      { asOfDateKey: null, rows: [], staleCount: 0, row: null, found: false },
+      { headers: cacheHeaders() },
+    );
+  }
+
+  if (woLookup) {
+    const row = await getWatchRowById(env, woLookup, asOf);
+    return Response.json(
+      {
+        asOfDateKey: asOf,
+        workOrderId: woLookup,
+        found: row !== null,
+        row: row ?? null,
+      },
+      { headers: cacheHeaders() },
+    );
   }
 
   const rows = await getWatchRowsLatest(env, asOf);
@@ -1061,7 +1078,7 @@ function renderDashboardHtml(): string {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="color-scheme" content="dark light" />
-  <meta name="etic-ui" content="work-order-watch-v1" />
+  <meta name="etic-ui" content="tabs-snapshot-wo-v2" />
   <title>${escapedTitle}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -1099,6 +1116,98 @@ function renderDashboardHtml(): string {
       max-width: 1040px;
       margin: 0 auto;
       padding: 28px 22px 56px;
+    }
+    .main-nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 22px;
+    }
+    .main-nav button {
+      font-family: var(--font);
+      font-size: 0.9rem;
+      font-weight: 600;
+      padding: 12px 20px;
+      border-radius: 12px;
+      border: 1px solid var(--border-strong);
+      background: rgba(12, 18, 32, 0.75);
+      color: var(--muted);
+      cursor: pointer;
+      transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+    }
+    .main-nav button:hover {
+      border-color: rgba(106, 169, 255, 0.35);
+      color: var(--text);
+    }
+    .main-nav button.active {
+      border-color: rgba(106, 169, 255, 0.55);
+      background: rgba(18, 28, 48, 0.95);
+      color: var(--text);
+      box-shadow: 0 0 0 1px rgba(106, 169, 255, 0.12);
+    }
+    .wo-lookup-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: flex-end;
+      margin-bottom: 16px;
+    }
+    .wo-lookup-row label { font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); display: block; margin-bottom: 6px; }
+    .wo-field-grow { flex: 1; min-width: 200px; }
+    .wo-field-grow input {
+      width: 100%;
+      padding: 14px 16px;
+      font-family: var(--font);
+      font-size: 1rem;
+      font-weight: 600;
+      color: var(--text);
+      background: var(--surface-solid);
+      border: 1px solid var(--border-strong);
+      border-radius: 12px;
+    }
+    .wo-field-grow input:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--glow);
+    }
+    .btn-primary {
+      font-family: var(--font);
+      font-weight: 600;
+      font-size: 0.9rem;
+      padding: 14px 22px;
+      border-radius: 12px;
+      border: 1px solid rgba(106, 169, 255, 0.45);
+      background: rgba(106, 169, 255, 0.18);
+      color: var(--text);
+      cursor: pointer;
+    }
+    .btn-primary:hover { background: rgba(106, 169, 255, 0.28); }
+    .wo-detail-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 12px 18px;
+      margin-bottom: 18px;
+    }
+    .wo-detail-grid dt { font-size: 0.68rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 4px; }
+    .wo-detail-grid dd { margin: 0; font-size: 0.9rem; line-height: 1.4; word-break: break-word; }
+    .wo-remarks {
+      margin-top: 8px;
+      padding: 14px 16px;
+      border-radius: 12px;
+      background: rgba(0,0,0,0.25);
+      border: 1px solid var(--border);
+      font-size: 0.88rem;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .wo-stale-banner {
+      margin-bottom: 14px;
+      padding: 12px 16px;
+      border-radius: 10px;
+      background: rgba(255, 100, 100, 0.12);
+      border: 1px solid rgba(255, 138, 138, 0.35);
+      font-size: 0.88rem;
     }
     .top {
       display: flex;
@@ -1484,19 +1593,25 @@ function renderDashboardHtml(): string {
     <header class="top">
       <div class="brand">
         <h1>${escapedTitle}</h1>
-        <p>Pick a report date, compare KPIs across days, download the raw ETIC or yard check.</p>
+        <p id="brand-sub">Snapshots, downloads, and work order tracking.</p>
       </div>
-      <div class="picker-wrap">
+      <div class="picker-wrap hidden" id="snapshot-picker-wrap">
         <label for="etic-date">ETIC report date</label>
         <select id="etic-date" aria-label="Select ETIC report date"></select>
       </div>
     </header>
+
+    <nav class="main-nav" id="main-nav" aria-label="Main sections">
+      <button type="button" id="tab-snapshot" class="active">Snapshot</button>
+      <button type="button" id="tab-work-orders">Work orders</button>
+    </nav>
 
     <div id="view-empty" class="empty-state hidden">
       <p><strong>No ETIC files yet.</strong><br />Email the Vehicle ETIC workbook to your ingest address to get dates here.</p>
     </div>
 
     <div id="view-main" class="hidden">
+      <div id="panel-snapshot">
       <section class="hero">
         <div class="hero-inner">
           <div class="hero-date"><span class="dot" aria-hidden="true"></span> Selected snapshot</div>
@@ -1528,38 +1643,6 @@ function renderDashboardHtml(): string {
         </div>
       </div>
 
-      <div class="card watch-card">
-        <h3>Work order watch</h3>
-        <p class="yard-lead" style="margin-bottom:12px">
-          Remark update expectations by MEL: below = 3 days, at = 5 days, above = 10 days. ETIC “pushes” count when the parsed ETIC date moves later. Use changelog for full history per WO.
-        </p>
-        <div class="watch-toolbar">
-          <label><input type="checkbox" id="watch-stale-only" /> Stale remarks only</label>
-          <button type="button" class="linkish" id="watch-rebuild">Rebuild history from all ETICs (chronological)</button>
-        </div>
-        <p class="status" id="watch-status"></p>
-        <div class="table-wrap">
-          <table class="compare-table watch-table" id="watch-table">
-            <thead>
-              <tr>
-                <th>WO ID</th><th>Asset</th><th>MEL</th><th>Parts</th><th>ETIC</th><th>Remark Δ</th><th>Stale</th><th>Pushes</th><th>Slip days</th><th></th>
-              </tr>
-            </thead>
-            <tbody id="watch-body"><tr><td colspan="10" style="text-align:center;color:var(--muted)">Loading…</td></tr></tbody>
-          </table>
-        </div>
-      </div>
-
-      <div id="changelog-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="changelog-title">
-        <div class="modal">
-          <header>
-            <h4 id="changelog-title">Changelog</h4>
-            <button type="button" class="modal-close" id="changelog-close" aria-label="Close">×</button>
-          </header>
-          <div class="body" id="changelog-body"></div>
-        </div>
-      </div>
-
       <div class="card yard-card">
         <h3>Downloads</h3>
         <p class="yard-lead">Get the raw Vehicle ETIC file for this date, or the yard check export for walkarounds.</p>
@@ -1581,6 +1664,53 @@ function renderDashboardHtml(): string {
         </button>
         <div class="yard-status-wrap">
           <p class="status" id="yard-status" role="status"></p>
+        </div>
+      </div>
+
+      </div>
+
+      <div id="panel-work-orders" class="hidden">
+        <div class="card">
+          <h3>Look up a work order</h3>
+          <p class="yard-lead" style="margin-bottom:14px">
+            Enter a work order ID to see current remarks, parts status, ETIC, MEL tier, remark staleness (by MEL: below 3d · at 5d · above 10d), and ETIC push history. Use “As of” to score staleness against any report date in your history.
+          </p>
+          <div class="wo-lookup-row">
+            <div class="wo-field-grow">
+              <label for="wo-id-input">Work order ID</label>
+              <input type="text" id="wo-id-input" placeholder="e.g. WO12345" autocomplete="off" />
+            </div>
+            <div class="picker-wrap" style="min-width:200px">
+              <label for="wo-asof-date">As of (report date)</label>
+              <select id="wo-asof-date" aria-label="Staleness as of report date"></select>
+            </div>
+            <button type="button" class="btn-primary" id="wo-lookup-btn">Look up</button>
+          </div>
+          <p class="status" id="wo-lookup-status"></p>
+          <div id="wo-detail-empty" class="yard-lead" style="margin-top:8px;color:var(--muted)">Search to load details.</div>
+          <div id="wo-detail" class="hidden">
+            <div id="wo-stale-banner" class="wo-stale-banner hidden"></div>
+            <dl class="wo-detail-grid" id="wo-detail-grid"></dl>
+            <div>
+              <dt style="font-size:0.68rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:var(--muted);margin:0 0 8px">Remarks</dt>
+              <div class="wo-remarks" id="wo-remarks-text"></div>
+            </div>
+            <div style="margin-top:18px;display:flex;flex-wrap:wrap;gap:12px;align-items:center">
+              <button type="button" class="btn-primary" id="wo-open-changelog" style="background:rgba(12,18,32,0.85);border-color:var(--border-strong)">View full changelog</button>
+              <button type="button" class="linkish" id="watch-rebuild" style="font-size:0.85rem">Rebuild history from all ETICs</button>
+            </div>
+            <p class="status" id="watch-rebuild-status" style="margin-top:10px"></p>
+          </div>
+        </div>
+      </div>
+
+      <div id="changelog-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="changelog-title">
+        <div class="modal">
+          <header>
+            <h4 id="changelog-title">Changelog</h4>
+            <button type="button" class="modal-close" id="changelog-close" aria-label="Close">×</button>
+          </header>
+          <div class="body" id="changelog-body"></div>
         </div>
       </div>
     </div>
@@ -1609,18 +1739,34 @@ function renderDashboardHtml(): string {
       return [...entries].sort((a, b) => b.dateKey.localeCompare(a.dateKey));
     }
 
-    function readHashDate() {
-      const h = (location.hash || "").replace(/^#/, "");
-      return /^\\d{4}-\\d{2}-\\d{2}$/.test(h) ? h : null;
+    function readHashRoute() {
+      const raw = (location.hash || "").replace(/^#/, "");
+      if (!raw) return { tab: "snapshot", dateKey: null, workOrderId: null };
+      if (raw.indexOf("wo=") === 0) {
+        const id = decodeURIComponent(raw.slice(3).trim());
+        return { tab: "wo", dateKey: null, workOrderId: id || null };
+      }
+      if (/^\\d{4}-\\d{2}-\\d{2}$/.test(raw)) {
+        return { tab: "snapshot", dateKey: raw, workOrderId: null };
+      }
+      return { tab: "snapshot", dateKey: null, workOrderId: null };
     }
 
     let historyEntries = [];
     let selectedDate = null;
     let snapshotRows = [];
-
-    function setHash(dateKey) {
+    function setHashSnapshot(dateKey) {
       if (dateKey) location.hash = "#" + dateKey;
       else location.hash = "";
+    }
+
+    function setHashWorkOrder(woId) {
+      const t = (woId || "").trim();
+      if (!t) {
+        location.hash = "";
+        return;
+      }
+      location.hash = "#wo=" + encodeURIComponent(t);
     }
 
     async function loadHistory() {
@@ -1718,15 +1864,6 @@ function renderDashboardHtml(): string {
       }).join("");
     }
 
-    async function loadWatch() {
-      if (!selectedDate) return;
-      const stale = document.getElementById("watch-stale-only").checked ? "&stale=1" : "";
-      const res = await fetch("/api/watch?date=" + encodeURIComponent(selectedDate) + stale);
-      if (!res.ok) return [];
-      const data = await res.json();
-      return data.rows || [];
-    }
-
     function tierClass(t) {
       if (t === "below") return "tier-below";
       if (t === "at") return "tier-at";
@@ -1734,39 +1871,140 @@ function renderDashboardHtml(): string {
       return "tier-unknown";
     }
 
-    async function renderWatchTable() {
-      const body = document.getElementById("watch-body");
-      const st = document.getElementById("watch-status");
-      if (!selectedDate) return;
-      body.innerHTML = "<tr><td colspan='10' style='text-align:center;color:var(--muted)'>Loading…</td></tr>";
+    function fillWoAsOfSelect() {
+      const sel = document.getElementById("wo-asof-date");
+      sel.innerHTML = "";
+      const sorted = sortDesc(historyEntries);
+      for (const e of sorted) {
+        const opt = document.createElement("option");
+        opt.value = e.dateKey;
+        opt.textContent = e.dateKey;
+        sel.appendChild(opt);
+      }
+    }
+
+    function syncWoAsOfFromSnapshot() {
+      const woSel = document.getElementById("wo-asof-date");
+      if (!woSel.options.length || !selectedDate) return;
+      const ok = Array.prototype.some.call(woSel.options, function (o) { return o.value === selectedDate; });
+      if (ok) woSel.value = selectedDate;
+    }
+
+    function setMainTab(which) {
+      const snapBtn = document.getElementById("tab-snapshot");
+      const woBtn = document.getElementById("tab-work-orders");
+      const panelSnap = document.getElementById("panel-snapshot");
+      const panelWo = document.getElementById("panel-work-orders");
+      const pickerWrap = document.getElementById("snapshot-picker-wrap");
+      const brandSub = document.getElementById("brand-sub");
+      const isWo = which === "wo";
+      snapBtn.classList.toggle("active", !isWo);
+      woBtn.classList.toggle("active", isWo);
+      panelSnap.classList.toggle("hidden", isWo);
+      panelWo.classList.toggle("hidden", !isWo);
+      pickerWrap.classList.toggle("hidden", isWo);
+      brandSub.textContent = isWo
+        ? "Look up any work order ID — staleness uses the “as of” report date."
+        : "Pick a report date, compare KPIs, download the raw ETIC or yard check.";
+    }
+
+    async function fetchWoById(woId, asOfDate) {
+      const res = await fetch(
+        "/api/watch?workOrderId=" + encodeURIComponent(woId) + "&date=" + encodeURIComponent(asOfDate),
+      );
+      if (!res.ok) throw new Error("Lookup failed");
+      return res.json();
+    }
+
+    function renderWoDetail(data) {
+      const empty = document.getElementById("wo-detail-empty");
+      const wrap = document.getElementById("wo-detail");
+      const st = document.getElementById("wo-lookup-status");
+      const ban = document.getElementById("wo-stale-banner");
+      const grid = document.getElementById("wo-detail-grid");
+      const remarksEl = document.getElementById("wo-remarks-text");
+      if (!data.found || !data.row) {
+        empty.classList.remove("hidden");
+        wrap.classList.add("hidden");
+        st.className = "status err";
+        st.textContent = "No work order \"" + esc(data.workOrderId || "") + "\" in the index yet. Check the ID or run Rebuild history.";
+        return;
+      }
+      const r = data.row;
+      empty.classList.add("hidden");
+      wrap.classList.remove("hidden");
+      st.className = "status ok";
+      st.textContent = "As of " + esc(data.asOfDateKey || "") + " · last seen on snapshot " + esc(r.lastSnapshotDate || "—");
+      if (r.remarkStale) {
+        ban.classList.remove("hidden");
+        const intv = r.requiredIntervalDays != null ? r.requiredIntervalDays + " days" : "—";
+        ban.textContent =
+          "Stale remarks: no update in " +
+          esc(String(r.daysSinceRemarkChange)) +
+          " days (MEL tier " +
+          esc(r.melTier) +
+          " expects at least every " +
+          intv +
+          ").";
+      } else {
+        ban.classList.add("hidden");
+        ban.textContent = "";
+      }
+      const eticDisp = (r.eticRaw && String(r.eticRaw).trim()) ? r.eticRaw : (r.eticDate || "—");
+      const firstLast =
+        esc(r.firstEticDate || "—") + " → " + esc(r.lastEticDate || "—");
+      grid.innerHTML = [
+        { dt: "Work order", dd: esc(r.workOrderId) },
+        { dt: "Asset", dd: esc(r.assetId || "—") },
+        { dt: "MEL tier", dd: "<span class='badge-tier " + tierClass(r.melTier) + "'>" + esc(r.melTier) + "</span>" },
+        { dt: "Parts status", dd: esc(r.partsStatus || "—") },
+        { dt: "ETIC (cell)", dd: esc(String(eticDisp)) },
+        { dt: "ETIC (parsed date)", dd: esc(r.eticDate || "—") },
+        { dt: "Remark last changed", dd: esc(r.lastRemarkChangeDate || "—") },
+        {
+          dt: "Days since remark change",
+          dd:
+            esc(String(r.daysSinceRemarkChange)) +
+            (r.requiredIntervalDays != null ? " (expect ≤ " + esc(String(r.requiredIntervalDays)) + "d)" : ""),
+        },
+        { dt: "ETIC pushes", dd: esc(String(r.eticPushCount ?? 0)) },
+        { dt: "Cumulative slip (calendar days)", dd: esc(String(r.cumulativeEticSlipDays ?? 0)) },
+        { dt: "First → last ETIC date", dd: firstLast },
+      ]
+        .map(function (x) {
+          return "<div><dt>" + esc(x.dt) + "</dt><dd>" + x.dd + "</dd></div>";
+        })
+        .join("");
+      remarksEl.textContent = (r.remarks && String(r.remarks).trim()) ? r.remarks : "—";
+    }
+
+    async function runWoLookup(pushHash) {
+      const input = document.getElementById("wo-id-input");
+      const woSel = document.getElementById("wo-asof-date");
+      const st = document.getElementById("wo-lookup-status");
+      const id = (input.value || "").trim();
+      if (!id) {
+        st.className = "status err";
+        st.textContent = "Enter a work order ID.";
+        return;
+      }
+      const asOf = woSel.value || selectedDate;
+      if (!asOf) {
+        st.className = "status err";
+        st.textContent = "No report dates loaded.";
+        return;
+      }
+      st.className = "status";
+      st.textContent = "Loading…";
+      document.getElementById("wo-detail-empty").classList.remove("hidden");
+      document.getElementById("wo-detail").classList.add("hidden");
       try {
-        const rows = await loadWatch();
-        if (!rows.length) {
-          body.innerHTML = "<tr><td colspan='10' style='text-align:center;color:var(--muted)'>No work orders in index yet. Ingest an ETIC or run Rebuild history.</td></tr>";
-          st.textContent = "";
-          return;
-        }
-        st.textContent = rows.length + " row(s) · toggle stale filter as needed";
-        body.innerHTML = rows.map(function (r) {
-          const staleRow = r.remarkStale ? " stale" : "";
-          const intv = r.requiredIntervalDays != null ? "/" + r.requiredIntervalDays + "d" : "";
-          return (
-            "<tr class='" + staleRow.trim() + "'>" +
-            "<td><strong>" + esc(r.workOrderId) + "</strong></td>" +
-            "<td>" + esc(r.assetId || "—") + "</td>" +
-            "<td><span class='badge-tier " + tierClass(r.melTier) + "'>" + esc(r.melTier) + "</span></td>" +
-            "<td style='max-width:140px;white-space:normal'>" + esc((r.partsStatus || "").slice(0, 80)) + "</td>" +
-            "<td>" + esc(r.eticRaw || r.eticDate || "—") + "</td>" +
-            "<td>" + esc(String(r.daysSinceRemarkChange)) + intv + "</td>" +
-            "<td>" + (r.remarkStale ? "<strong style='color:#ff9a9a'>Yes</strong>" : "—") + "</td>" +
-            "<td>" + esc(String(r.eticPushCount ?? 0)) + "</td>" +
-            "<td>" + esc(String(r.cumulativeEticSlipDays ?? 0)) + "</td>" +
-            "<td><button type='button' class='linkish watch-log-btn' data-wo='" + esc(r.workOrderId) + "'>Log</button></td>" +
-            "</tr>"
-          );
-        }).join("");
+        const data = await fetchWoById(id, asOf);
+        renderWoDetail(data);
+        if (pushHash) setHashWorkOrder(id);
       } catch (e) {
-        body.innerHTML = "<tr><td colspan='10' style='text-align:center;color:#ff9a9a'>" + esc(String(e.message || e)) + "</td></tr>";
+        st.className = "status err";
+        st.textContent = String(e && e.message ? e.message : e);
       }
     }
 
@@ -1805,7 +2043,8 @@ function renderDashboardHtml(): string {
 
       renderKpis(analysis.assetManager);
       renderCompareTable();
-      renderWatchTable();
+      fillWoAsOfSelect();
+      syncWoAsOfFromSnapshot();
 
       const ing = document.getElementById("ingest-details");
       const recv = analysis.receivedAtIso
@@ -1828,7 +2067,7 @@ function renderDashboardHtml(): string {
 
     async function selectDate(dateKey, pushHash) {
       selectedDate = dateKey;
-      if (pushHash && dateKey) setHash(dateKey);
+      if (pushHash && dateKey) setHashSnapshot(dateKey);
       document.getElementById("yard-status").textContent = "";
       document.getElementById("yard-status").className = "status";
 
@@ -1840,6 +2079,26 @@ function renderDashboardHtml(): string {
       } catch (e) {
         document.getElementById("ingest-details").innerHTML =
           "<div class='detail-row'><dt>Error</dt><dd>" + esc(e.message || String(e)) + "</dd></div>";
+      }
+    }
+
+    async function applyHashRoute() {
+      const r = readHashRoute();
+      if (r.tab === "wo" && r.workOrderId) {
+        setMainTab("wo");
+        document.getElementById("wo-id-input").value = r.workOrderId;
+        fillWoAsOfSelect();
+        syncWoAsOfFromSnapshot();
+        await runWoLookup(false);
+        return;
+      }
+      setMainTab("snapshot");
+      const sel = document.getElementById("etic-date");
+      if (r.dateKey && historyEntries.some((e) => e.dateKey === r.dateKey)) {
+        if (sel.value !== r.dateKey) sel.value = r.dateKey;
+        await selectDate(r.dateKey, false);
+      } else {
+        await selectDate(sel.value, false);
       }
     }
 
@@ -1954,49 +2213,62 @@ function renderDashboardHtml(): string {
       }, 3000);
 
       const sorted = sortDesc(historyEntries);
-      const hashDate = readHashDate();
+      const route = readHashRoute();
       const start =
-        hashDate && sorted.some((e) => e.dateKey === hashDate)
-          ? hashDate
+        route.tab === "snapshot" && route.dateKey && sorted.some((e) => e.dateKey === route.dateKey)
+          ? route.dateKey
           : sorted[0].dateKey;
       const sel = document.getElementById("etic-date");
       sel.value = start;
-      await selectDate(start, true);
+      selectedDate = start;
+      await applyHashRoute();
 
       sel.addEventListener("change", async () => {
         await selectDate(sel.value, true);
       });
 
       window.addEventListener("hashchange", async () => {
-        const d = readHashDate();
-        if (d && historyEntries.some((e) => e.dateKey === d) && d !== selectedDate) {
-          sel.value = d;
-          await selectDate(d, false);
-        }
+        await applyHashRoute();
+      });
+
+      document.getElementById("tab-snapshot").addEventListener("click", function () {
+        setHashSnapshot(selectedDate || sortDesc(historyEntries)[0].dateKey);
+      });
+      document.getElementById("tab-work-orders").addEventListener("click", function () {
+        const cur = (document.getElementById("wo-id-input").value || "").trim();
+        if (cur) setHashWorkOrder(cur);
+        else setMainTab("wo");
       });
 
       document.getElementById("btn-yard-check").addEventListener("click", downloadYardCheck);
       document.getElementById("btn-download-etic").addEventListener("click", downloadEticWorkbook);
 
-      document.getElementById("watch-stale-only").addEventListener("change", renderWatchTable);
+      document.getElementById("wo-lookup-btn").addEventListener("click", function () {
+        runWoLookup(true);
+      });
+      document.getElementById("wo-id-input").addEventListener("keydown", function (ev) {
+        if (ev.key === "Enter") runWoLookup(true);
+      });
+      document.getElementById("wo-asof-date").addEventListener("change", function () {
+        const id = (document.getElementById("wo-id-input").value || "").trim();
+        if (id) runWoLookup(true);
+      });
+      document.getElementById("wo-open-changelog").addEventListener("click", function () {
+        const id = (document.getElementById("wo-id-input").value || "").trim();
+        if (id) openChangelog(id);
+      });
       document.getElementById("watch-rebuild").addEventListener("click", async function () {
-        const st = document.getElementById("watch-status");
+        const st = document.getElementById("watch-rebuild-status");
         if (!confirm("Rebuild clears work order changelog and replays every ETIC in date order. Continue?")) return;
         st.textContent = "Starting rebuild…";
         try {
           const res = await fetch("/api/watch?rebuild=1", { method: "POST" });
           const j = await res.json();
           st.textContent = (j && j.message) ? j.message : "Rebuild started.";
-          setTimeout(renderWatchTable, 5000);
+          const id = (document.getElementById("wo-id-input").value || "").trim();
+          if (id) setTimeout(function () { runWoLookup(false); }, 5000);
         } catch (e) {
           st.textContent = String(e && e.message ? e.message : e);
-        }
-      });
-      document.getElementById("watch-table").addEventListener("click", function (ev) {
-        const t = ev.target;
-        if (t && t.classList && t.classList.contains("watch-log-btn")) {
-          const wo = t.getAttribute("data-wo");
-          if (wo) openChangelog(wo);
         }
       });
       document.getElementById("changelog-close").addEventListener("click", function () {
