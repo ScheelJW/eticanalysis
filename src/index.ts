@@ -19,6 +19,16 @@ type SheetSummary = {
   melMentions: number;
 };
 
+/** KPIs from worksheet "Asset Manager" row 2: F2–J2 (MC rate, fleet total, FMC, NMC, surplus). */
+type AssetManagerKpis = {
+  sheetFound: boolean;
+  mcRatePercent: number | null;
+  fleetTotal: number | null;
+  fmc: number | null;
+  nmc: number | null;
+  surplus: number | null;
+};
+
 type AnalysisResult = {
   workbookFileName: string;
   receivedAtIso: string;
@@ -27,6 +37,7 @@ type AnalysisResult = {
   to: string;
   subject: string;
   workbookBytes: number;
+  assetManager: AssetManagerKpis;
   sheetSummaries: SheetSummary[];
   totalVisibleSheets: number;
   totalHiddenSheets: number;
@@ -546,6 +557,7 @@ async function analyzeWorkbook(input: {
   const totalRowsAcrossSheets = sheetSummaries.reduce((sum, s) => sum + s.rowCount, 0);
   const melMentionsBySheet = Object.fromEntries(sheetSummaries.map((s) => [s.name, s.melMentions]));
   const melMentionsTotal = sheetSummaries.reduce((sum, s) => sum + s.melMentions, 0);
+  const assetManager = extractAssetManagerKpis(workbook);
 
   return {
     workbookFileName: input.fileName,
@@ -555,12 +567,84 @@ async function analyzeWorkbook(input: {
     to: input.to,
     subject: input.subject,
     workbookBytes: input.binary.byteLength,
+    assetManager,
     sheetSummaries,
     totalVisibleSheets,
     totalHiddenSheets,
     totalRowsAcrossSheets,
     melMentionsBySheet,
     melMentionsTotal,
+  };
+}
+
+function normalizeWorkbookSheetName(name: string): string {
+  return name.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function findAssetManagerSheet(workbook: ExcelJS.Workbook): ExcelJS.Worksheet | undefined {
+  const target = "asset manager";
+  return workbook.worksheets.find((ws) => normalizeWorkbookSheetName(ws.name) === target);
+}
+
+function parseCellNumber(cell: ExcelJS.Cell): number | null {
+  const raw = readCellText(cell).trim();
+  if (!raw) return null;
+  const cleaned = raw.replace(/,/g, "").replace(/%/g, "").trim();
+  const n = Number.parseFloat(cleaned);
+  if (!Number.isFinite(n)) return null;
+  return n;
+}
+
+function parseMcRatePercent(cell: ExcelJS.Cell): number | null {
+  const raw = readCellText(cell).trim();
+  if (!raw) return null;
+  const hasPercent = raw.includes("%");
+  const n = parseCellNumber(cell);
+  if (n === null) return null;
+  if (hasPercent) return n;
+  if (n > 0 && n <= 1) return n * 100;
+  return n;
+}
+
+function parseIntegerCell(cell: ExcelJS.Cell): number | null {
+  const n = parseCellNumber(cell);
+  if (n === null) return null;
+  return Math.round(n);
+}
+
+function extractAssetManagerKpis(workbook: ExcelJS.Workbook): AssetManagerKpis {
+  const empty: AssetManagerKpis = {
+    sheetFound: false,
+    mcRatePercent: null,
+    fleetTotal: null,
+    fmc: null,
+    nmc: null,
+    surplus: null,
+  };
+  const sheet = findAssetManagerSheet(workbook);
+  if (!sheet) return empty;
+
+  const row = sheet.getRow(2);
+  const mcRatePercent = parseMcRatePercent(row.getCell(6));
+  const fleetTotal = parseIntegerCell(row.getCell(7));
+  const fmc = parseIntegerCell(row.getCell(8));
+  const nmc = parseIntegerCell(row.getCell(9));
+  const surplus = parseIntegerCell(row.getCell(10));
+
+  const any =
+    mcRatePercent !== null ||
+    fleetTotal !== null ||
+    fmc !== null ||
+    nmc !== null ||
+    surplus !== null;
+
+  return {
+    sheetFound: any,
+    mcRatePercent,
+    fleetTotal,
+    fmc,
+    nmc,
+    surplus,
   };
 }
 
@@ -659,7 +743,7 @@ function renderDashboardHtml(): string {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="color-scheme" content="dark light" />
-  <meta name="etic-ui" content="yard-export-v2" />
+  <meta name="etic-ui" content="asset-manager-kpis-v1" />
   <title>${escapedTitle}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -802,6 +886,63 @@ function renderDashboardHtml(): string {
       font-size: 0.95rem;
     }
     .hero-file strong { color: #c5d4eb; font-weight: 500; }
+    .kpi-strip {
+      margin-bottom: 22px;
+      padding: 22px 20px 20px;
+      border-radius: var(--radius);
+      background: #000;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
+    }
+    .kpi-strip .kpi-head {
+      font-size: 0.65rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.14em;
+      color: rgba(255, 255, 255, 0.45);
+      margin-bottom: 14px;
+    }
+    .kpi-row {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 8px 12px;
+      align-items: end;
+    }
+    @media (max-width: 900px) {
+      .kpi-row { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    }
+    @media (max-width: 520px) {
+      .kpi-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    .kpi-cell { text-align: center; padding: 6px 4px; }
+    .kpi-cell .lbl {
+      font-size: 0.68rem;
+      font-weight: 600;
+      color: rgba(255, 255, 255, 0.88);
+      line-height: 1.25;
+      margin-bottom: 10px;
+      letter-spacing: 0.02em;
+    }
+    .kpi-cell .lbl small { display: block; font-size: 0.62rem; font-weight: 600; opacity: 0.9; }
+    .kpi-cell .val {
+      font-size: clamp(1.35rem, 3.5vw, 1.85rem);
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      line-height: 1.1;
+    }
+    .kpi-cell .val.em { font-size: clamp(1.55rem, 4vw, 2.1rem); }
+    .kpi-val-mc {
+      background: linear-gradient(180deg, #ffffff 0%, #7eb8ff 45%, #4a9fff 100%);
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+      filter: drop-shadow(0 0 20px rgba(106, 169, 255, 0.45));
+    }
+    .kpi-val-fleet { color: #7ec8ff; }
+    .kpi-val-fmc { color: #5ee397; }
+    .kpi-val-nmc { color: #ff8a8a; }
+    .kpi-val-surplus { color: #f5d547; }
+    .kpi-missing .val { color: rgba(255, 255, 255, 0.25); font-weight: 600; font-size: 1.1rem; }
     .card {
       border-radius: var(--radius);
       background: var(--surface);
@@ -943,6 +1084,11 @@ function renderDashboardHtml(): string {
         </div>
       </section>
 
+      <div class="kpi-strip" id="kpi-strip" style="display:none" aria-label="Asset Manager summary">
+        <div class="kpi-head">Asset Manager</div>
+        <div class="kpi-row" id="kpi-row"></div>
+      </div>
+
       <div class="card ingest-card">
         <h3>This snapshot</h3>
         <dl class="detail-rows" id="ingest-details"></dl>
@@ -1021,10 +1167,48 @@ function renderDashboardHtml(): string {
       return res.json();
     }
 
+    function fmtKpi(n) {
+      if (n === null || n === undefined || typeof n !== "number") return "—";
+      return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
+    }
+
+    function fmtMc(n) {
+      if (n === null || n === undefined || typeof n !== "number") return "—";
+      return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + "%";
+    }
+
+    function renderKpis(am) {
+      const row = document.getElementById("kpi-row");
+      const strip = document.getElementById("kpi-strip");
+      if (!am || !am.sheetFound) {
+        strip.style.display = "none";
+        row.innerHTML = "";
+        return;
+      }
+      strip.style.display = "block";
+      const cells = [
+        { lbl: "MC Rate", sub: "", val: fmtMc(am.mcRatePercent), cls: "kpi-val-mc em", miss: am.mcRatePercent == null },
+        { lbl: "Fleet Total", sub: "", val: fmtKpi(am.fleetTotal), cls: "kpi-val-fleet", miss: am.fleetTotal == null },
+        { lbl: "No. Vehs", sub: "FMC", val: fmtKpi(am.fmc), cls: "kpi-val-fmc", miss: am.fmc == null },
+        { lbl: "No. Vehs", sub: "NMC", val: fmtKpi(am.nmc), cls: "kpi-val-nmc", miss: am.nmc == null },
+        { lbl: "No. Vehs", sub: "Surplus", val: fmtKpi(am.surplus), cls: "kpi-val-surplus", miss: am.surplus == null },
+      ];
+      row.innerHTML = cells.map(function (c) {
+        const miss = c.miss ? " kpi-missing" : "";
+        const sub = c.sub ? "<small>" + esc(c.sub) + "</small>" : "";
+        return (
+          "<div class='kpi-cell" + miss + "'><div class='lbl'>" + esc(c.lbl) + sub + "</div>" +
+          "<div class='val " + c.cls + "'>" + esc(c.val) + "</div></div>"
+        );
+      }).join("");
+    }
+
     function renderDetails(analysis) {
       document.getElementById("hero-title").textContent = analysis.dateKey;
       document.getElementById("hero-file").innerHTML =
         "File <strong>" + esc(analysis.workbookFileName) + "</strong>";
+
+      renderKpis(analysis.assetManager);
 
       const ing = document.getElementById("ingest-details");
       const recv = analysis.receivedAtIso
@@ -1165,6 +1349,7 @@ function escapeHtml(input: string): string {
 export {
   analyzeWorkbook,
   countMelMentions,
+  extractAssetManagerKpis,
   isoDateKey,
   parseMaxAttachmentBytes,
   parseReportDateKeyFromSubject,

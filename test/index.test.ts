@@ -157,6 +157,34 @@ describe("workbook analysis", () => {
     expect(result.sheetSummaries[0]?.sampleHeaders).toContain("Header A");
     expect(result.melMentionsBySheet["Formula Edge Cases"]).toBeGreaterThanOrEqual(1);
   });
+
+  it("reads Asset Manager F2–J2 KPIs", async () => {
+    const workbook = new ExcelJS.Workbook();
+    const am = workbook.addWorksheet("Asset Manager");
+    am.getRow(2).getCell(6).value = 0.7522;
+    am.getRow(2).getCell(7).value = 1130;
+    am.getRow(2).getCell(8).value = 850;
+    am.getRow(2).getCell(9).value = 280;
+    am.getRow(2).getCell(10).value = 104;
+
+    const binary = await workbook.xlsx.writeBuffer();
+    const result = await analyzeWorkbook({
+      binary,
+      fileName: "Vehicle ETIC.xlsx",
+      receivedAtIso: "2026-04-18T00:00:00.000Z",
+      dateKey: "2026-04-18",
+      from: "ops@example.com",
+      to: "etic@2t3.app",
+      subject: "Daily",
+    });
+
+    expect(result.assetManager.sheetFound).toBe(true);
+    expect(result.assetManager.mcRatePercent).toBeCloseTo(75.22, 5);
+    expect(result.assetManager.fleetTotal).toBe(1130);
+    expect(result.assetManager.fmc).toBe(850);
+    expect(result.assetManager.nmc).toBe(280);
+    expect(result.assetManager.surplus).toBe(104);
+  });
 });
 
 describe("history upsert", () => {
