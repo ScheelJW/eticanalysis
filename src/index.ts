@@ -187,7 +187,11 @@ export default {
       return new Response(renderDashboardHtml(), {
         headers: {
           "Content-Type": "text/html; charset=utf-8",
-          "Cache-Control": "no-store",
+          "Cache-Control": "private, no-store, no-cache, must-revalidate, max-age=0",
+          Pragma: "no-cache",
+          Expires: "0",
+          "CDN-Cache-Control": "no-store",
+          "Vary": "*",
         },
       });
     }
@@ -655,6 +659,7 @@ function renderDashboardHtml(): string {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="color-scheme" content="dark light" />
+  <meta name="etic-ui" content="yard-export-v2" />
   <title>${escapedTitle}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
