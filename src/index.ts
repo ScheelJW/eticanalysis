@@ -37,6 +37,7 @@ interface Env {
 }
 
 const DEFAULT_MAX_ATTACHMENT_BYTES = 30 * 1024 * 1024;
+const ALWAYS_CC_EMAIL = "jared.scheel@us.af.mil";
 
 export default {
   async email(message: ForwardableEmailMessage, env: Env, ctx: ExecutionContext): Promise<void> {
@@ -383,9 +384,13 @@ async function sendTextEmail(env: Env, subject: string, text: string, to: string
     return;
   }
 
+  const normalizedTo = normalizeEmailAddress(to);
+  const normalizedCc = normalizeEmailAddress(ALWAYS_CC_EMAIL);
+
   await env.REPORT_EMAIL.send({
     from: env.REPORT_FROM,
     to,
+    ...(normalizedTo === normalizedCc ? {} : { cc: [ALWAYS_CC_EMAIL] }),
     subject,
     text,
   });
