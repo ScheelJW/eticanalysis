@@ -176,11 +176,11 @@ export default {
     }
 
     if (url.pathname === "/api/yard-check.xlsx") {
-      return handleYardCheckDownload(env);
+      return handleYardCheckDownload(env, request);
     }
 
     if (url.pathname === "/api/yard-check-meta") {
-      return handleYardCheckMeta(env);
+      return handleYardCheckMeta(env, request);
     }
 
     if (url.pathname === "/" || url.pathname === "/index.html") {
@@ -196,24 +196,59 @@ export default {
   },
 } satisfies ExportedHandler<Env>;
 
-async function handleYardCheckDownload(env: Env): Promise<Response> {
+function parseYardCheckDateParam(request: Request): string | null {
+  const url = new URL(request.url);
+  const d = url.searchParams.get("date");
+  return d && /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : null;
+}
+
+async function resolveYardCheckWorkbook(
+  env: Env,
+  dateKey: string | null,
+): Promise<
+  | { ok: true; workbookKey: string; sourceFileName: string; sourceDateKey: string }
+  | { ok: false; error: string }
+> {
   const history = await loadHistory(env);
+  const latest = await readJson<AnalysisResult>(env, "analyses/latest.json");
+
+  if (dateKey) {
+    const entry = history.entries.find((e) => e.dateKey === dateKey);
+    if (entry) {
+      return {
+        ok: true,
+        workbookKey: entry.workbookKey,
+        sourceFileName: entry.workbookFileName,
+        sourceDateKey: entry.dateKey,
+      };
+    }
+    return {
+      ok: false,
+      error: `No ETIC snapshot for ${dateKey}. Pick another date or ingest that workbook.`,
+    };
+  }
+
   const latestEntry = history.entries.length
     ? [...history.entries].sort((a, b) => a.dateKey.localeCompare(b.dateKey)).pop() ?? null
     : null;
-
-  const latest = await readJson<AnalysisResult>(env, "analyses/latest.json");
-
   const workbookKey = latestEntry?.workbookKey ?? null;
   const sourceFileName = latestEntry?.workbookFileName ?? latest?.workbookFileName ?? "vehicle-etic.xlsx";
   const sourceDateKey = latestEntry?.dateKey ?? latest?.dateKey ?? "latest";
 
   if (!workbookKey) {
-    return Response.json(
-      { ok: false, error: "No source workbook found yet. Send the ETIC email to ingest first." },
-      { status: 404 },
-    );
+    return { ok: false, error: "No source workbook found yet. Send the ETIC email to ingest first." };
   }
+
+  return { ok: true, workbookKey, sourceFileName, sourceDateKey };
+}
+
+async function handleYardCheckDownload(env: Env, request: Request): Promise<Response> {
+  const paramDate = parseYardCheckDateParam(request);
+  const resolved = await resolveYardCheckWorkbook(env, paramDate);
+  if (!resolved.ok) {
+    return Response.json({ ok: false, error: resolved.error }, { status: 404 });
+  }
+  const { workbookKey, sourceFileName, sourceDateKey } = resolved;
 
   const object = await env.ETIC_BUCKET.get(workbookKey);
   if (!object) {
@@ -268,25 +303,19 @@ type YardCheckMetaOk = {
 
 type YardCheckMetaErr = { ok: false; error: string };
 
-async function handleYardCheckMeta(env: Env): Promise<Response> {
-  const meta = await buildYardCheckMeta(env);
+async function handleYardCheckMeta(env: Env, request: Request): Promise<Response> {
+  const meta = await buildYardCheckMeta(env, request);
   const status = meta.ok ? 200 : 404;
   return Response.json(meta, { status, headers: cacheHeaders() });
 }
 
-async function buildYardCheckMeta(env: Env): Promise<YardCheckMetaOk | YardCheckMetaErr> {
-  const history = await loadHistory(env);
-  const latestEntry = history.entries.length
-    ? [...history.entries].sort((a, b) => a.dateKey.localeCompare(b.dateKey)).pop() ?? null
-    : null;
-  const latest = await readJson<AnalysisResult>(env, "analyses/latest.json");
-  const workbookKey = latestEntry?.workbookKey ?? null;
-  const sourceFileName = latestEntry?.workbookFileName ?? latest?.workbookFileName ?? "vehicle-etic.xlsx";
-  const sourceDateKey = latestEntry?.dateKey ?? latest?.dateKey ?? "latest";
-
-  if (!workbookKey) {
-    return { ok: false, error: "No source workbook found yet. Send the ETIC email to ingest first." };
+async function buildYardCheckMeta(env: Env, request: Request): Promise<YardCheckMetaOk | YardCheckMetaErr> {
+  const paramDate = parseYardCheckDateParam(request);
+  const resolved = await resolveYardCheckWorkbook(env, paramDate);
+  if (!resolved.ok) {
+    return { ok: false, error: resolved.error };
   }
+  const { workbookKey, sourceFileName, sourceDateKey } = resolved;
 
   const object = await env.ETIC_BUCKET.get(workbookKey);
   if (!object) {
@@ -627,107 +656,456 @@ function renderDashboardHtml(): string {
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="color-scheme" content="dark light" />
   <title>${escapedTitle}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&display=swap" rel="stylesheet" />
   <style>
     :root {
-      color-scheme: dark light;
-      --panel: #111a2e;
-      --border: #1f2a44;
-      --text: #e6ecf5;
-      --muted: #96a2b8;
+      color-scheme: dark;
+      --bg0: #070b14;
+      --bg1: #0d1526;
+      --surface: rgba(17, 26, 46, 0.72);
+      --surface-solid: #121c32;
+      --border: rgba(106, 169, 255, 0.14);
+      --border-strong: rgba(106, 169, 255, 0.28);
+      --text: #eef3fb;
+      --muted: #8b9ab5;
       --accent: #6aa9ff;
+      --accent-dim: #4d87d9;
+      --glow: rgba(106, 169, 255, 0.12);
+      --radius: 16px;
+      --font: "DM Sans", ui-sans-serif, system-ui, -apple-system, sans-serif;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, sans-serif;
-      background: radial-gradient(1200px 800px at 10% -10%, #1a2748 0%, #0b1220 55%) fixed;
-      color: var(--text);
       min-height: 100vh;
+      font-family: var(--font);
+      color: var(--text);
+      background:
+        radial-gradient(ellipse 900px 500px at 15% -20%, var(--glow), transparent 55%),
+        radial-gradient(ellipse 700px 400px at 95% 10%, rgba(139, 92, 246, 0.08), transparent 50%),
+        linear-gradient(165deg, var(--bg1) 0%, var(--bg0) 45%, #050810 100%);
+      background-attachment: fixed;
     }
-    main { padding: 32px 24px 48px; max-width: 560px; margin: 0 auto; }
-    .panel {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 28px 24px;
+    .app {
+      max-width: 1040px;
+      margin: 0 auto;
+      padding: 28px 22px 56px;
     }
-    h1 { margin: 0 0 8px; font-size: 22px; font-weight: 650; }
-    .muted { color: var(--muted); font-size: 13px; line-height: 1.5; margin-bottom: 20px; }
-    dl { margin: 0 0 24px; display: grid; grid-template-columns: auto 1fr; gap: 8px 16px; font-size: 14px; }
-    dt { color: var(--muted); }
-    dd { margin: 0; }
-    .btn {
-      display: block;
+    .top {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 20px;
+      margin-bottom: 28px;
+    }
+    .brand h1 {
+      margin: 0 0 6px;
+      font-size: clamp(1.55rem, 3vw, 1.85rem);
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      line-height: 1.15;
+    }
+    .brand p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.92rem;
+      max-width: 36ch;
+      line-height: 1.45;
+    }
+    .picker-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      min-width: min(100%, 280px);
+    }
+    .picker-wrap label {
+      font-size: 0.72rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.11em;
+      color: var(--muted);
+    }
+    select#etic-date {
+      appearance: none;
       width: 100%;
-      background: linear-gradient(180deg, #2a4d8f, #1c3971);
-      color: #e7efff;
-      border: 1px solid #3a5da5;
-      padding: 14px 18px;
+      padding: 14px 44px 14px 16px;
+      font-family: var(--font);
+      font-size: 1rem;
+      font-weight: 600;
+      color: var(--text);
+      background: var(--surface-solid) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20' viewBox='0 0 24 24' fill='none' stroke='%238b9ab5' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E") no-repeat right 14px center;
+      border: 1px solid var(--border-strong);
       border-radius: 12px;
-      font-size: 15px;
+      cursor: pointer;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.25);
+    }
+    select#etic-date:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--glow), 0 8px 32px rgba(0,0,0,0.25);
+    }
+    .hero {
+      position: relative;
+      border-radius: var(--radius);
+      padding: 28px 28px 26px;
+      margin-bottom: 22px;
+      background: var(--surface);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid var(--border);
+      box-shadow: 0 24px 48px rgba(0,0,0,0.35);
+      overflow: hidden;
+    }
+    .hero::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(125deg, rgba(106,169,255,0.07) 0%, transparent 45%);
+      pointer-events: none;
+    }
+    .hero-inner { position: relative; z-index: 1; }
+    .hero-date {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--accent);
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      margin-bottom: 10px;
+    }
+    .hero-date .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 12px var(--accent);
+    }
+    .hero h2 {
+      margin: 0 0 8px;
+      font-size: clamp(1.35rem, 2.5vw, 1.65rem);
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+    .hero-file {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+    .hero-file strong { color: #c5d4eb; font-weight: 500; }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-bottom: 22px;
+    }
+    @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
+    .card {
+      border-radius: var(--radius);
+      background: var(--surface);
+      backdrop-filter: blur(12px);
+      border: 1px solid var(--border);
+      padding: 22px 22px 20px;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.22);
+    }
+    .card h3 {
+      margin: 0 0 14px;
+      font-size: 0.72rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--muted);
+    }
+    .detail-rows { display: flex; flex-direction: column; gap: 12px; }
+    .detail-row {
+      display: grid;
+      grid-template-columns: 120px 1fr;
+      gap: 12px;
+      font-size: 0.9rem;
+      align-items: start;
+    }
+    @media (max-width: 520px) { .detail-row { grid-template-columns: 1fr; gap: 4px; } }
+    .detail-row dt { color: var(--muted); font-weight: 500; margin: 0; }
+    .detail-row dd { margin: 0; color: #d2ddf0; line-height: 1.45; word-break: break-word; }
+    .subject-box {
+      margin: 0;
+      padding: 14px 16px;
+      border-radius: 12px;
+      background: rgba(7, 11, 20, 0.55);
+      border: 1px solid var(--border);
+      font-size: 0.88rem;
+      line-height: 1.5;
+      color: #c8d6ee;
+      white-space: pre-wrap;
+    }
+    .sheet-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-height: 280px;
+      overflow-y: auto;
+    }
+    .sheet-list li {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: rgba(7, 11, 20, 0.4);
+      border: 1px solid var(--border);
+      font-size: 0.88rem;
+    }
+    .sheet-list .name { font-weight: 500; color: var(--text); }
+    .badge {
+      flex-shrink: 0;
+      font-size: 0.65rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      padding: 4px 8px;
+      border-radius: 6px;
+      background: rgba(106, 169, 255, 0.15);
+      color: var(--accent);
+      border: 1px solid rgba(106, 169, 255, 0.25);
+    }
+    .badge.hidden { background: rgba(139, 154, 181, 0.12); color: var(--muted); border-color: var(--border); }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      padding: 14px 22px;
+      border-radius: 12px;
+      font-family: var(--font);
+      font-size: 0.95rem;
       font-weight: 600;
       cursor: pointer;
+      border: none;
+      transition: transform 0.12s ease, filter 0.15s ease, box-shadow 0.15s ease;
     }
-    .btn:hover { filter: brightness(1.08); }
-    .btn:active { transform: translateY(1px); }
-    .btn:disabled { opacity: 0.55; cursor: not-allowed; }
-    #status { margin-top: 14px; font-size: 13px; min-height: 20px; color: var(--muted); }
-    .err { color: #ff9b9b; }
+    .btn-primary {
+      color: #0a1628;
+      background: linear-gradient(180deg, #9dc6ff 0%, var(--accent) 100%);
+      box-shadow: 0 4px 24px rgba(106, 169, 255, 0.35);
+    }
+    .btn-primary:hover { filter: brightness(1.06); }
+    .btn-primary:active { transform: translateY(1px); }
+    .btn-primary:disabled { opacity: 0.55; cursor: not-allowed; transform: none; }
+    .status {
+      font-size: 0.88rem;
+      color: var(--muted);
+      min-height: 22px;
+    }
+    .status.err { color: #ff9e9e; }
+    .status.ok { color: #8fd4a8; }
+    .empty-state {
+      text-align: center;
+      padding: 48px 24px;
+      color: var(--muted);
+      font-size: 0.95rem;
+      line-height: 1.55;
+    }
+    .empty-state strong { color: var(--text); }
+    .hidden { display: none !important; }
   </style>
 </head>
 <body>
-  <main>
-    <div class="panel">
-      <h1>Yard check</h1>
-      <p class="muted">Download is built from the latest Vehicle ETIC workbook in storage (same file as email ingest).</p>
-      <dl id="meta">
-        <dt>Source file</dt><dd id="m-file">…</dd>
-        <dt>Report day</dt><dd id="m-day">…</dd>
-      </dl>
-      <button type="button" class="btn" id="download">Download yard check (.xlsx)</button>
-      <div id="status"></div>
+  <div class="app">
+    <header class="top">
+      <div class="brand">
+        <h1>${escapedTitle}</h1>
+        <p>Choose an ETIC report date to open that snapshot. Yard check uses the same workbook.</p>
+      </div>
+      <div class="picker-wrap">
+        <label for="etic-date">ETIC report date</label>
+        <select id="etic-date" aria-label="Select ETIC report date"></select>
+      </div>
+    </header>
+
+    <div id="view-empty" class="empty-state hidden">
+      <p><strong>No ETIC files yet.</strong><br />Email the workbook to your ingest address. Dates from the subject line set the report day.</p>
     </div>
-  </main>
+
+    <div id="view-main" class="hidden">
+      <section class="hero">
+        <div class="hero-inner">
+          <div class="hero-date"><span class="dot" aria-hidden="true"></span> Selected snapshot</div>
+          <h2 id="hero-title">—</h2>
+          <p class="hero-file" id="hero-file"></p>
+        </div>
+      </section>
+
+      <div class="grid">
+        <div class="card">
+          <h3>Ingest details</h3>
+          <dl class="detail-rows" id="ingest-details"></dl>
+        </div>
+        <div class="card">
+          <h3>Email subject</h3>
+          <p class="subject-box" id="subject-text"></p>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:22px;">
+        <h3>Sheets in this workbook</h3>
+        <ul class="sheet-list" id="sheet-list"></ul>
+      </div>
+
+      <div class="actions">
+        <button type="button" class="btn btn-primary" id="btn-yard-check">
+          <span>Download yard check</span>
+          <span aria-hidden="true">.xlsx</span>
+        </button>
+        <p class="status" id="yard-status" role="status"></p>
+      </div>
+    </div>
+  </div>
   <script>
-    async function loadMeta() {
-      const dl = document.getElementById("meta");
-      const st = document.getElementById("status");
-      try {
-        const res = await fetch("/api/yard-check-meta");
-        const data = await res.json();
-        if (!data.ok) {
-          dl.style.display = "none";
-          st.className = "err";
-          st.textContent = data.error || "Could not load source workbook.";
-          return;
-        }
-        document.getElementById("m-file").textContent = data.sourceFileName;
-        document.getElementById("m-day").textContent = data.sourceDateKey;
-        st.textContent = "";
-      } catch (e) {
-        dl.style.display = "none";
-        st.className = "err";
-        st.textContent = "Failed to load: " + (e && e.message ? e.message : String(e));
+    function esc(s) {
+      if (s == null || s === undefined) return "";
+      return String(s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    function sortDesc(entries) {
+      return [...entries].sort((a, b) => b.dateKey.localeCompare(a.dateKey));
+    }
+
+    function readHashDate() {
+      const h = (location.hash || "").replace(/^#/, "");
+      return /^\\d{4}-\\d{2}-\\d{2}$/.test(h) ? h : null;
+    }
+
+    let historyEntries = [];
+    let selectedDate = null;
+
+    function setHash(dateKey) {
+      if (dateKey) location.hash = "#" + dateKey;
+      else location.hash = "";
+    }
+
+    async function loadHistory() {
+      const res = await fetch("/api/history");
+      if (!res.ok) throw new Error("Could not load history");
+      const data = await res.json();
+      return Array.isArray(data.entries) ? data.entries : [];
+    }
+
+    function fillSelect(entries) {
+      const sel = document.getElementById("etic-date");
+      sel.innerHTML = "";
+      const sorted = sortDesc(entries);
+      for (const e of sorted) {
+        const opt = document.createElement("option");
+        opt.value = e.dateKey;
+        opt.textContent = e.dateKey;
+        sel.appendChild(opt);
       }
     }
 
-    async function download() {
-      const btn = document.getElementById("download");
-      const st = document.getElementById("status");
-      const prev = btn.textContent;
-      btn.disabled = true;
-      btn.textContent = "Preparing…";
-      st.className = "";
-      st.textContent = "Generating…";
+    async function loadAnalysis(dateKey) {
+      const res = await fetch("/api/analysis/" + encodeURIComponent(dateKey));
+      if (!res.ok) throw new Error("No analysis for " + dateKey);
+      return res.json();
+    }
+
+    function renderDetails(analysis) {
+      document.getElementById("hero-title").textContent = analysis.dateKey;
+      document.getElementById("hero-file").innerHTML =
+        "File <strong>" + esc(analysis.workbookFileName) + "</strong>";
+
+      const ing = document.getElementById("ingest-details");
+      const recv = analysis.receivedAtIso
+        ? new Date(analysis.receivedAtIso).toLocaleString(undefined, {
+            dateStyle: "medium",
+            timeStyle: "short",
+          })
+        : "—";
+      ing.innerHTML = [
+        "<div class='detail-row'><dt>Received</dt><dd>" + esc(recv) + "</dd></div>",
+        "<div class='detail-row'><dt>From</dt><dd>" + esc(analysis.from) + "</dd></div>",
+        "<div class='detail-row'><dt>To</dt><dd>" + esc(analysis.to) + "</dd></div>",
+        "<div class='detail-row'><dt>Workbook size</dt><dd>" +
+          (typeof analysis.workbookBytes === "number"
+            ? (analysis.workbookBytes / 1024 / 1024).toFixed(2) + " MB"
+            : "—") +
+          "</dd></div>",
+      ].join("");
+
+      document.getElementById("subject-text").textContent = analysis.subject || "—";
+
+      const ul = document.getElementById("sheet-list");
+      ul.innerHTML = "";
+      const sheets = Array.isArray(analysis.sheetSummaries) ? analysis.sheetSummaries : [];
+      for (const s of sheets) {
+        const li = document.createElement("li");
+        const vis = s.state === "visible";
+        li.innerHTML =
+          "<span class='name'>" +
+          esc(s.name) +
+          "</span><span class='badge" +
+          (vis ? "" : " hidden") +
+          "'>" +
+          (vis ? "Visible" : s.state || "hidden") +
+          "</span>";
+        ul.appendChild(li);
+      }
+    }
+
+    async function selectDate(dateKey, pushHash) {
+      selectedDate = dateKey;
+      if (pushHash && dateKey) setHash(dateKey);
+      document.getElementById("yard-status").textContent = "";
+      document.getElementById("yard-status").className = "status";
+
+      if (!dateKey) return;
+
       try {
-        const res = await fetch("/api/yard-check.xlsx");
+        const analysis = await loadAnalysis(dateKey);
+        renderDetails(analysis);
+      } catch (e) {
+        document.getElementById("subject-text").textContent = "—";
+        document.getElementById("sheet-list").innerHTML = "";
+        document.getElementById("ingest-details").innerHTML =
+          "<div class='detail-row'><dt>Error</dt><dd>" + esc(e.message || String(e)) + "</dd></div>";
+      }
+    }
+
+    async function downloadYardCheck() {
+      const btn = document.getElementById("btn-yard-check");
+      const st = document.getElementById("yard-status");
+      if (!selectedDate) return;
+      const prev = btn.innerHTML;
+      btn.disabled = true;
+      st.className = "status";
+      st.textContent = "Preparing…";
+      try {
+        const url = "/api/yard-check.xlsx?date=" + encodeURIComponent(selectedDate);
+        const res = await fetch(url);
         if (!res.ok) {
-          let msg = "Failed (" + res.status + ")";
+          let msg = "Could not generate file.";
           try {
             const j = await res.json();
             if (j && j.error) msg = j.error;
           } catch (_) {}
-          st.className = "err";
+          st.className = "status err";
           st.textContent = msg;
           return;
         }
@@ -743,18 +1121,61 @@ function renderDashboardHtml(): string {
         a.click();
         a.remove();
         URL.revokeObjectURL(u);
+        st.className = "status ok";
         st.textContent = "Saved " + name;
       } catch (e) {
-        st.className = "err";
+        st.className = "status err";
         st.textContent = String(e && e.message ? e.message : e);
       } finally {
         btn.disabled = false;
-        btn.textContent = prev;
+        btn.innerHTML = prev;
       }
     }
 
-    document.getElementById("download").addEventListener("click", () => { download(); });
-    loadMeta();
+    async function init() {
+      try {
+        historyEntries = await loadHistory();
+      } catch (e) {
+        document.getElementById("view-empty").classList.remove("hidden");
+        document.getElementById("view-empty").querySelector("p").innerHTML =
+          "<strong>Could not load data.</strong><br />" + esc(e.message || String(e));
+        return;
+      }
+
+      if (!historyEntries.length) {
+        document.getElementById("view-empty").classList.remove("hidden");
+        return;
+      }
+
+      document.getElementById("view-main").classList.remove("hidden");
+      fillSelect(historyEntries);
+
+      const sorted = sortDesc(historyEntries);
+      const hashDate = readHashDate();
+      const start =
+        hashDate && sorted.some((e) => e.dateKey === hashDate)
+          ? hashDate
+          : sorted[0].dateKey;
+      const sel = document.getElementById("etic-date");
+      sel.value = start;
+      await selectDate(start, true);
+
+      sel.addEventListener("change", async () => {
+        await selectDate(sel.value, true);
+      });
+
+      window.addEventListener("hashchange", async () => {
+        const d = readHashDate();
+        if (d && historyEntries.some((e) => e.dateKey === d) && d !== selectedDate) {
+          sel.value = d;
+          await selectDate(d, false);
+        }
+      });
+
+      document.getElementById("btn-yard-check").addEventListener("click", downloadYardCheck);
+    }
+
+    init();
   </script>
 </body>
 </html>`;
