@@ -264,19 +264,13 @@ type YardCheckMetaOk = {
   sourceDateKey: string;
   sourceFileName: string;
   workbookKey: string;
-  receivedAtIso: string | null;
-  subject: string | null;
-  totalAssets: number;
-  totalWorkOrders: number;
-  workOrderSheet: string | null;
-  fleetSheet: string | null;
 };
 
 type YardCheckMetaErr = { ok: false; error: string };
 
 async function handleYardCheckMeta(env: Env): Promise<Response> {
   const meta = await buildYardCheckMeta(env);
-  const status = meta.ok ? 200 : meta.error.includes("No source") ? 404 : 422;
+  const status = meta.ok ? 200 : 404;
   return Response.json(meta, { status, headers: cacheHeaders() });
 }
 
@@ -299,23 +293,11 @@ async function buildYardCheckMeta(env: Env): Promise<YardCheckMetaOk | YardCheck
     return { ok: false, error: `Source workbook not found in R2: ${workbookKey}` };
   }
 
-  const workbookBytes = await object.arrayBuffer();
-  const source = await extractYardCheckSource(workbookBytes);
-  if (!source) {
-    return { ok: false, error: "Could not locate a Work Orders sheet in the latest workbook." };
-  }
-
   return {
     ok: true,
     sourceDateKey,
     sourceFileName,
     workbookKey,
-    receivedAtIso: latest?.receivedAtIso ?? null,
-    subject: latest?.subject ?? null,
-    totalAssets: source.totalAssets,
-    totalWorkOrders: source.totalWorkOrders,
-    workOrderSheet: source.workOrderSheet ?? null,
-    fleetSheet: source.fleetSheet ?? null,
   };
 }
 
@@ -701,15 +683,12 @@ function renderDashboardHtml(): string {
       <dl id="meta">
         <dt>Source file</dt><dd id="m-file">…</dd>
         <dt>Report day</dt><dd id="m-day">…</dd>
-        <dt>Rows</dt><dd id="m-rows">…</dd>
       </dl>
       <button type="button" class="btn" id="download">Download yard check (.xlsx)</button>
       <div id="status"></div>
     </div>
   </main>
   <script>
-    const fmt = (n) => typeof n === "number" ? n.toLocaleString() : "—";
-
     async function loadMeta() {
       const dl = document.getElementById("meta");
       const st = document.getElementById("status");
@@ -724,8 +703,6 @@ function renderDashboardHtml(): string {
         }
         document.getElementById("m-file").textContent = data.sourceFileName;
         document.getElementById("m-day").textContent = data.sourceDateKey;
-        document.getElementById("m-rows").textContent =
-          fmt(data.totalAssets) + " assets · " + fmt(data.totalWorkOrders) + " work orders";
         st.textContent = "";
       } catch (e) {
         dl.style.display = "none";
