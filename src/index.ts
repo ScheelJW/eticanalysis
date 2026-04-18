@@ -71,13 +71,6 @@ type HistoryIndex = {
   entries: HistoryEntry[];
 };
 
-interface Env {
-  ETIC_BUCKET: R2Bucket;
-  ALLOWED_SENDERS?: string;
-  EXPECTED_ATTACHMENT_NAME?: string;
-  MAX_ATTACHMENT_BYTES?: string;
-}
-
 export default {
   async email(message: ForwardableEmailMessage, env: Env, _ctx: ExecutionContext): Promise<void> {
     if (!isAuthorizedSender(message.from, env)) {
@@ -140,6 +133,8 @@ export default {
       httpMetadata: { contentType: "application/json; charset=utf-8" },
     });
 
+    await upsertSnapshotRow(env, analysis, workbookKey);
+
     const history = await loadHistory(env);
     const upsertedHistory = upsertHistoryEntry(history, analysis, workbookKey, analysisKey);
     await env.ETIC_BUCKET.put(
@@ -158,7 +153,7 @@ export default {
     );
   },
 
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     if (url.pathname === "/healthz") {
@@ -170,9 +165,22 @@ export default {
       return Response.json(history, { headers: cacheHeaders() });
     }
 
+    if (url.pathname === "/api/snapshots") {
+      const sync = url.searchParams.get("sync");
+      if (request.method === "POST" && sync === "1") {
+        ctx.waitUntil(backfillSnapshotsFromHistory(env));
+        return Response.json(
+          { ok: true, message: "Rebuilding snapshot index from R2 (runs in background)." },
+          { headers: cacheHeaders() },
+        );
+      }
+      return handleSnapshotsList(env);
+    }
+
     if (url.pathname === "/api/latest") {
-      const analysis = await readJson<AnalysisResult>(env, "analyses/latest.json");
+      let analysis = await readJson<AnalysisResult>(env, "analyses/latest.json");
       if (!analysis) return new Response("Not Found", { status: 404 });
+      analysis = await enrichAnalysisAssetManagerFromR2(env, analysis);
       return Response.json(analysis, { headers: cacheHeaders() });
     }
 
@@ -181,9 +189,14 @@ export default {
       if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) {
         return new Response("Invalid date key", { status: 400 });
       }
-      const analysis = await readJson<AnalysisResult>(env, `analyses/${dateKey}.json`);
+      let analysis = await readJson<AnalysisResult>(env, `analyses/${dateKey}.json`);
       if (!analysis) return new Response("Not Found", { status: 404 });
+      analysis = await enrichAnalysisAssetManagerFromR2(env, analysis);
       return Response.json(analysis, { headers: cacheHeaders() });
+    }
+
+    if (url.pathname === "/api/workbook.xlsx") {
+      return handleWorkbookDownload(env, request);
     }
 
     if (url.pathname === "/api/yard-check.xlsx") {
@@ -349,6 +362,229 @@ function cacheHeaders(): HeadersInit {
   return {
     "Cache-Control": "no-store",
   };
+}
+
+function assetManagerFromAnalysis(analysis: AnalysisResult): AssetManagerKpis {
+  const am = analysis.assetManager;
+  if (am && typeof am === "object") return am;
+  return {
+    sheetFound: false,
+    mcRatePercent: null,
+    fleetTotal: null,
+    fmc: null,
+    nmc: null,
+    surplus: null,
+  };
+}
+
+async function upsertSnapshotRow(env: Env, analysis: AnalysisResult, workbookKey: string): Promise<void> {
+  const am = assetManagerFromAnalysis(analysis);
+  const now = new Date().toISOString();
+  await env.ETIC_SNAPSHOTS.prepare(
+    `INSERT INTO etic_snapshots (
+      date_key, workbook_key, workbook_file_name, received_at_iso,
+      mc_rate, fleet_total, fmc, nmc, surplus, asset_manager_ok,
+      total_rows, mel_total, visible_sheets, hidden_sheets, updated_at_iso
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(date_key) DO UPDATE SET
+      workbook_key = excluded.workbook_key,
+      workbook_file_name = excluded.workbook_file_name,
+      received_at_iso = excluded.received_at_iso,
+      mc_rate = excluded.mc_rate,
+      fleet_total = excluded.fleet_total,
+      fmc = excluded.fmc,
+      nmc = excluded.nmc,
+      surplus = excluded.surplus,
+      asset_manager_ok = excluded.asset_manager_ok,
+      total_rows = excluded.total_rows,
+      mel_total = excluded.mel_total,
+      visible_sheets = excluded.visible_sheets,
+      hidden_sheets = excluded.hidden_sheets,
+      updated_at_iso = excluded.updated_at_iso`,
+  )
+    .bind(
+      analysis.dateKey,
+      workbookKey,
+      analysis.workbookFileName,
+      analysis.receivedAtIso,
+      am.mcRatePercent,
+      am.fleetTotal,
+      am.fmc,
+      am.nmc,
+      am.surplus,
+      am.sheetFound ? 1 : 0,
+      analysis.totalRowsAcrossSheets,
+      analysis.melMentionsTotal,
+      analysis.totalVisibleSheets,
+      analysis.totalHiddenSheets,
+      now,
+    )
+    .run();
+}
+
+type SnapshotListRow = {
+  dateKey: string;
+  workbookFileName: string;
+  workbookKey: string;
+  receivedAtIso: string;
+  mcRatePercent: number | null;
+  fleetTotal: number | null;
+  fmc: number | null;
+  nmc: number | null;
+  surplus: number | null;
+  assetManagerOk: boolean;
+  totalRows: number | null;
+  melTotal: number | null;
+  visibleSheets: number | null;
+  hiddenSheets: number | null;
+  updatedAtIso: string;
+};
+
+async function handleSnapshotsList(env: Env): Promise<Response> {
+  const result = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT date_key, workbook_key, workbook_file_name, received_at_iso,
+            mc_rate, fleet_total, fmc, nmc, surplus, asset_manager_ok,
+            total_rows, mel_total, visible_sheets, hidden_sheets, updated_at_iso
+     FROM etic_snapshots ORDER BY date_key DESC`,
+  ).all<{
+    date_key: string;
+    workbook_key: string;
+    workbook_file_name: string;
+    received_at_iso: string;
+    mc_rate: number | null;
+    fleet_total: number | null;
+    fmc: number | null;
+    nmc: number | null;
+    surplus: number | null;
+    asset_manager_ok: number;
+    total_rows: number | null;
+    mel_total: number | null;
+    visible_sheets: number | null;
+    hidden_sheets: number | null;
+    updated_at_iso: string;
+  }>();
+
+  const rows: SnapshotListRow[] = (result.results ?? []).map((r) => ({
+    dateKey: r.date_key,
+    workbookKey: r.workbook_key,
+    workbookFileName: r.workbook_file_name,
+    receivedAtIso: r.received_at_iso,
+    mcRatePercent: r.mc_rate,
+    fleetTotal: r.fleet_total,
+    fmc: r.fmc,
+    nmc: r.nmc,
+    surplus: r.surplus,
+    assetManagerOk: Boolean(r.asset_manager_ok),
+    totalRows: r.total_rows,
+    melTotal: r.mel_total,
+    visibleSheets: r.visible_sheets,
+    hiddenSheets: r.hidden_sheets,
+    updatedAtIso: r.updated_at_iso,
+  }));
+
+  return Response.json({ updatedAtIso: new Date().toISOString(), snapshots: rows }, { headers: cacheHeaders() });
+}
+
+async function persistAnalysisIfChanged(env: Env, analysis: AnalysisResult): Promise<void> {
+  await env.ETIC_BUCKET.put(
+    `analyses/${analysis.dateKey}.json`,
+    JSON.stringify(analysis, null, 2),
+    { httpMetadata: { contentType: "application/json; charset=utf-8" } },
+  );
+  const history = await loadHistory(env);
+  const entry = history.entries.find((e) => e.dateKey === analysis.dateKey);
+  if (entry) {
+    await upsertSnapshotRow(env, analysis, entry.workbookKey);
+  }
+  const latest = await readJson<AnalysisResult>(env, "analyses/latest.json");
+  if (latest?.dateKey === analysis.dateKey) {
+    await env.ETIC_BUCKET.put("analyses/latest.json", JSON.stringify(analysis, null, 2), {
+      httpMetadata: { contentType: "application/json; charset=utf-8" },
+    });
+  }
+}
+
+async function enrichAnalysisAssetManagerFromR2(env: Env, analysis: AnalysisResult): Promise<AnalysisResult> {
+  let am = assetManagerFromAnalysis(analysis);
+  if (am.sheetFound) return { ...analysis, assetManager: am };
+
+  const history = await loadHistory(env);
+  const entry = history.entries.find((e) => e.dateKey === analysis.dateKey);
+  if (entry) {
+    const obj = await env.ETIC_BUCKET.get(entry.workbookKey);
+    if (obj) {
+      const bytes = await obj.arrayBuffer();
+      const workbook = new ExcelJS.Workbook();
+      await workbook.xlsx.load(bytes);
+      am = extractAssetManagerKpis(workbook);
+    }
+  }
+
+  if (!am.sheetFound) {
+    const row = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT mc_rate, fleet_total, fmc, nmc, surplus, asset_manager_ok FROM etic_snapshots WHERE date_key = ?`,
+    )
+      .bind(analysis.dateKey)
+      .first<{
+        mc_rate: number | null;
+        fleet_total: number | null;
+        fmc: number | null;
+        nmc: number | null;
+        surplus: number | null;
+        asset_manager_ok: number;
+      }>();
+    if (row && row.asset_manager_ok) {
+      am = {
+        sheetFound: true,
+        mcRatePercent: row.mc_rate,
+        fleetTotal: row.fleet_total,
+        fmc: row.fmc,
+        nmc: row.nmc,
+        surplus: row.surplus,
+      };
+    }
+  }
+
+  const merged = { ...analysis, assetManager: am };
+  if (am.sheetFound && JSON.stringify(analysis.assetManager) !== JSON.stringify(am)) {
+    await persistAnalysisIfChanged(env, merged);
+  }
+  return merged;
+}
+
+async function backfillSnapshotsFromHistory(env: Env): Promise<void> {
+  const history = await loadHistory(env);
+  for (const entry of history.entries) {
+    let analysis = await readJson<AnalysisResult>(env, entry.analysisKey);
+    if (!analysis) continue;
+    analysis = await enrichAnalysisAssetManagerFromR2(env, analysis);
+    await upsertSnapshotRow(env, analysis, entry.workbookKey);
+  }
+}
+
+async function handleWorkbookDownload(env: Env, request: Request): Promise<Response> {
+  const paramDate = parseYardCheckDateParam(request);
+  const resolved = await resolveYardCheckWorkbook(env, paramDate);
+  if (!resolved.ok) {
+    return Response.json({ ok: false, error: resolved.error }, { status: 404 });
+  }
+  const { workbookKey, sourceFileName, sourceDateKey } = resolved;
+  const object = await env.ETIC_BUCKET.get(workbookKey);
+  if (!object) {
+    return Response.json({ ok: false, error: `Workbook not found: ${workbookKey}` }, { status: 404 });
+  }
+  const body = await object.arrayBuffer();
+  const safe = sourceFileName.replace(/[^A-Za-z0-9._-]/g, "_") || "Vehicle_ETIC.xlsx";
+  const downloadName = `etic_${sourceDateKey}_${safe}`;
+  return new Response(body, {
+    headers: {
+      "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "Content-Disposition": `attachment; filename="${downloadName}"`,
+      "Cache-Control": "no-store",
+      "X-Source-Date": sourceDateKey,
+      "X-Source-Key": workbookKey,
+    },
+  });
 }
 
 async function readJson<T>(env: Env, key: string): Promise<T | null> {
@@ -743,7 +979,7 @@ function renderDashboardHtml(): string {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="color-scheme" content="dark light" />
-  <meta name="etic-ui" content="asset-manager-kpis-v1" />
+  <meta name="etic-ui" content="d1-snapshots-compare-v1" />
   <title>${escapedTitle}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -1038,6 +1274,78 @@ function renderDashboardHtml(): string {
       opacity: 0.85;
     }
     .yard-export-btn .chev svg { width: 22px; height: 22px; display: block; }
+    .action-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-bottom: 10px;
+    }
+    @media (max-width: 560px) { .action-row { grid-template-columns: 1fr; } }
+    .btn-etic {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      width: 100%;
+      padding: 16px 18px;
+      border-radius: 14px;
+      border: 1px solid rgba(139, 154, 181, 0.35);
+      background: rgba(12, 18, 32, 0.85);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: border-color 0.15s ease, background 0.15s ease;
+    }
+    .btn-etic:hover:not(:disabled) {
+      border-color: rgba(106, 169, 255, 0.45);
+      background: rgba(18, 28, 48, 0.95);
+    }
+    .btn-etic:disabled { opacity: 0.5; cursor: not-allowed; }
+    .compare-card { margin-bottom: 22px; }
+    .compare-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }
+    .compare-head .hint { font-size: 0.8rem; color: var(--muted); margin: 0; }
+    .table-wrap { overflow-x: auto; border-radius: 12px; border: 1px solid var(--border); }
+    .compare-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.82rem;
+      min-width: 720px;
+    }
+    .compare-table th, .compare-table td {
+      padding: 10px 12px;
+      text-align: right;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    .compare-table th:first-child, .compare-table td:first-child {
+      text-align: left;
+      position: sticky;
+      left: 0;
+      background: var(--surface-solid);
+      z-index: 1;
+    }
+    .compare-table thead th {
+      background: var(--surface-solid);
+      color: var(--muted);
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      font-size: 0.68rem;
+    }
+    .compare-table tbody tr:hover td { background: rgba(106, 169, 255, 0.06); }
+    .compare-table .mc { color: #9dc6ff; font-weight: 700; }
+    .compare-table .fmc { color: #5ee397; }
+    .compare-table .nmc { color: #ff8a8a; }
+    .compare-table .surp { color: #f5d547; }
     .yard-status-wrap { margin-top: 14px; }
     .status {
       font-size: 0.88rem;
@@ -1063,7 +1371,7 @@ function renderDashboardHtml(): string {
     <header class="top">
       <div class="brand">
         <h1>${escapedTitle}</h1>
-        <p>Pick a report date, then export the yard check for that file.</p>
+        <p>Pick a report date, compare KPIs across days, download the raw ETIC or yard check.</p>
       </div>
       <div class="picker-wrap">
         <label for="etic-date">ETIC report date</label>
@@ -1094,9 +1402,26 @@ function renderDashboardHtml(): string {
         <dl class="detail-rows" id="ingest-details"></dl>
       </div>
 
+      <div class="card compare-card">
+        <div class="compare-head">
+          <h3 style="margin:0">Compare snapshots</h3>
+          <p class="hint" id="compare-hint">Asset Manager KPIs by report date (D1 index).</p>
+        </div>
+        <div class="table-wrap">
+          <table class="compare-table" id="compare-table" aria-label="Snapshot comparison">
+            <thead><tr><th>Report date</th><th>MC %</th><th>Fleet</th><th>FMC</th><th>NMC</th><th>Surplus</th></tr></thead>
+            <tbody id="compare-body"><tr><td colspan="6" style="text-align:center;color:var(--muted)">Loading…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+
       <div class="card yard-card">
-        <h3>Yard check</h3>
-        <p class="yard-lead">Work orders rolled up for a walkaround: asset, shops, VIN, locations, plus blank columns for what you find in the yard.</p>
+        <h3>Downloads</h3>
+        <p class="yard-lead">Get the raw Vehicle ETIC file for this date, or the yard check export for walkarounds.</p>
+        <div class="action-row">
+          <button type="button" class="btn-etic" id="btn-download-etic">Download Vehicle ETIC (.xlsx)</button>
+        </div>
+        <p class="status" id="etic-dl-status" role="status"></p>
         <button type="button" class="yard-export-btn" id="btn-yard-check" aria-describedby="yard-status">
           <span class="icon-wrap" aria-hidden="true">
             <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.75"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
@@ -1125,6 +1450,16 @@ function renderDashboardHtml(): string {
         .replace(/"/g, "&quot;");
     }
 
+    function fmtKpi(n) {
+      if (n === null || n === undefined || typeof n !== "number") return "—";
+      return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
+    }
+
+    function fmtMc(n) {
+      if (n === null || n === undefined || typeof n !== "number") return "—";
+      return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + "%";
+    }
+
     function sortDesc(entries) {
       return [...entries].sort((a, b) => b.dateKey.localeCompare(a.dateKey));
     }
@@ -1136,6 +1471,7 @@ function renderDashboardHtml(): string {
 
     let historyEntries = [];
     let selectedDate = null;
+    let snapshotRows = [];
 
     function setHash(dateKey) {
       if (dateKey) location.hash = "#" + dateKey;
@@ -1147,6 +1483,50 @@ function renderDashboardHtml(): string {
       if (!res.ok) throw new Error("Could not load history");
       const data = await res.json();
       return Array.isArray(data.entries) ? data.entries : [];
+    }
+
+    async function syncSnapshotsOnce() {
+      try {
+        if (sessionStorage.getItem("etic_d1_sync_v1")) return;
+        await fetch("/api/snapshots?sync=1", { method: "POST" });
+        sessionStorage.setItem("etic_d1_sync_v1", "1");
+      } catch (_) {}
+    }
+
+    async function loadSnapshots() {
+      const res = await fetch("/api/snapshots");
+      if (!res.ok) return [];
+      const data = await res.json();
+      return Array.isArray(data.snapshots) ? data.snapshots : [];
+    }
+
+    function renderCompareTable() {
+      const body = document.getElementById("compare-body");
+      const hint = document.getElementById("compare-hint");
+      if (!snapshotRows.length) {
+        body.innerHTML = "<tr><td colspan='6' style='text-align:center;color:var(--muted)'>No rows in index yet. Reload after a moment, or ingest a new ETIC.</td></tr>";
+        return;
+      }
+      hint.textContent = snapshotRows.length + " snapshots · newest first";
+      body.innerHTML = snapshotRows.map(function (r) {
+        const sel = r.dateKey === selectedDate ? " style='outline:1px solid rgba(106,169,255,0.5);'" : "";
+        const dash = "—";
+        const mc = r.mcRatePercent != null ? fmtMc(r.mcRatePercent) : dash;
+        const ft = r.fleetTotal != null ? fmtKpi(r.fleetTotal) : dash;
+        const fmc = r.fmc != null ? fmtKpi(r.fmc) : dash;
+        const nmc = r.nmc != null ? fmtKpi(r.nmc) : dash;
+        const sur = r.surplus != null ? fmtKpi(r.surplus) : dash;
+        return (
+          "<tr" + sel + ">" +
+          "<td><strong>" + esc(r.dateKey) + "</strong></td>" +
+          "<td class='mc'>" + esc(mc) + "</td>" +
+          "<td>" + esc(ft) + "</td>" +
+          "<td class='fmc'>" + esc(fmc) + "</td>" +
+          "<td class='nmc'>" + esc(nmc) + "</td>" +
+          "<td class='surp'>" + esc(sur) + "</td>" +
+          "</tr>"
+        );
+      }).join("");
     }
 
     function fillSelect(entries) {
@@ -1165,16 +1545,6 @@ function renderDashboardHtml(): string {
       const res = await fetch("/api/analysis/" + encodeURIComponent(dateKey));
       if (!res.ok) throw new Error("No analysis for " + dateKey);
       return res.json();
-    }
-
-    function fmtKpi(n) {
-      if (n === null || n === undefined || typeof n !== "number") return "—";
-      return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
-    }
-
-    function fmtMc(n) {
-      if (n === null || n === undefined || typeof n !== "number") return "—";
-      return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + "%";
     }
 
     function renderKpis(am) {
@@ -1209,6 +1579,7 @@ function renderDashboardHtml(): string {
         "File <strong>" + esc(analysis.workbookFileName) + "</strong>";
 
       renderKpis(analysis.assetManager);
+      renderCompareTable();
 
       const ing = document.getElementById("ingest-details");
       const recv = analysis.receivedAtIso
@@ -1243,6 +1614,48 @@ function renderDashboardHtml(): string {
       } catch (e) {
         document.getElementById("ingest-details").innerHTML =
           "<div class='detail-row'><dt>Error</dt><dd>" + esc(e.message || String(e)) + "</dd></div>";
+      }
+    }
+
+    async function downloadEticWorkbook() {
+      const btn = document.getElementById("btn-download-etic");
+      const st = document.getElementById("etic-dl-status");
+      if (!selectedDate) return;
+      btn.disabled = true;
+      st.className = "status";
+      st.textContent = "Downloading…";
+      try {
+        const url = "/api/workbook.xlsx?date=" + encodeURIComponent(selectedDate);
+        const res = await fetch(url);
+        if (!res.ok) {
+          let msg = "Could not download.";
+          try {
+            const j = await res.json();
+            if (j && j.error) msg = j.error;
+          } catch (_) {}
+          st.className = "status err";
+          st.textContent = msg;
+          return;
+        }
+        const disp = res.headers.get("Content-Disposition") || "";
+        const m = /filename="?([^";]+)"?/i.exec(disp);
+        const name = m ? m[1] : "etic.xlsx";
+        const blob = await res.blob();
+        const u = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = u;
+        a.download = name;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(u);
+        st.className = "status ok";
+        st.textContent = "Saved " + name;
+      } catch (e) {
+        st.className = "status err";
+        st.textContent = String(e && e.message ? e.message : e);
+      } finally {
+        btn.disabled = false;
       }
     }
 
@@ -1306,6 +1719,14 @@ function renderDashboardHtml(): string {
       document.getElementById("view-main").classList.remove("hidden");
       fillSelect(historyEntries);
 
+      snapshotRows = await loadSnapshots();
+      renderCompareTable();
+      await syncSnapshotsOnce();
+      setTimeout(async function () {
+        snapshotRows = await loadSnapshots();
+        renderCompareTable();
+      }, 3000);
+
       const sorted = sortDesc(historyEntries);
       const hashDate = readHashDate();
       const start =
@@ -1329,6 +1750,7 @@ function renderDashboardHtml(): string {
       });
 
       document.getElementById("btn-yard-check").addEventListener("click", downloadYardCheck);
+      document.getElementById("btn-download-etic").addEventListener("click", downloadEticWorkbook);
     }
 
     init();
