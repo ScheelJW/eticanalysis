@@ -712,7 +712,7 @@ function renderDashboardHtml(): string {
       margin: 0;
       color: var(--muted);
       font-size: 0.92rem;
-      max-width: 36ch;
+      max-width: 42ch;
       line-height: 1.45;
     }
     .picker-wrap {
@@ -797,13 +797,6 @@ function renderDashboardHtml(): string {
       font-size: 0.95rem;
     }
     .hero-file strong { color: #c5d4eb; font-weight: 500; }
-    .grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 16px;
-      margin-bottom: 22px;
-    }
-    @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
     .card {
       border-radius: var(--radius);
       background: var(--surface);
@@ -831,84 +824,80 @@ function renderDashboardHtml(): string {
     @media (max-width: 520px) { .detail-row { grid-template-columns: 1fr; gap: 4px; } }
     .detail-row dt { color: var(--muted); font-weight: 500; margin: 0; }
     .detail-row dd { margin: 0; color: #d2ddf0; line-height: 1.45; word-break: break-word; }
-    .subject-box {
-      margin: 0;
-      padding: 14px 16px;
-      border-radius: 12px;
-      background: rgba(7, 11, 20, 0.55);
-      border: 1px solid var(--border);
-      font-size: 0.88rem;
+    .ingest-card { margin-bottom: 22px; }
+    .yard-card { margin-bottom: 8px; }
+    .yard-card .yard-lead {
+      margin: 0 0 18px;
+      font-size: 0.92rem;
+      color: var(--muted);
       line-height: 1.5;
-      color: #c8d6ee;
-      white-space: pre-wrap;
+      max-width: 52ch;
     }
-    .sheet-list {
-      list-style: none;
+    .yard-export-btn {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      width: 100%;
       margin: 0;
-      padding: 0;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      max-height: 280px;
-      overflow-y: auto;
+      padding: 20px 22px;
+      border-radius: 14px;
+      border: 1px solid var(--border-strong);
+      background: linear-gradient(145deg, rgba(106, 169, 255, 0.12) 0%, rgba(7, 11, 20, 0.65) 55%);
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+      cursor: pointer;
+      font-family: var(--font);
+      text-align: left;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.12s ease;
     }
-    .sheet-list li {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 10px 12px;
-      border-radius: 10px;
-      background: rgba(7, 11, 20, 0.4);
-      border: 1px solid var(--border);
-      font-size: 0.88rem;
+    .yard-export-btn:hover:not(:disabled) {
+      border-color: rgba(106, 169, 255, 0.45);
+      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.32), 0 0 0 1px rgba(106, 169, 255, 0.12);
     }
-    .sheet-list .name { font-weight: 500; color: var(--text); }
-    .badge {
+    .yard-export-btn:active:not(:disabled) { transform: scale(0.992); }
+    .yard-export-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .yard-export-btn .icon-wrap {
       flex-shrink: 0;
-      font-size: 0.65rem;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      padding: 4px 8px;
-      border-radius: 6px;
-      background: rgba(106, 169, 255, 0.15);
-      color: var(--accent);
-      border: 1px solid rgba(106, 169, 255, 0.25);
-    }
-    .badge.hidden { background: rgba(139, 154, 181, 0.12); color: var(--muted); border-color: var(--border); }
-    .actions {
+      width: 52px;
+      height: 52px;
+      border-radius: 14px;
       display: flex;
-      flex-wrap: wrap;
-      gap: 12px;
-      align-items: center;
-    }
-    .btn {
-      display: inline-flex;
       align-items: center;
       justify-content: center;
-      gap: 10px;
-      padding: 14px 22px;
-      border-radius: 12px;
-      font-family: var(--font);
-      font-size: 0.95rem;
-      font-weight: 600;
-      cursor: pointer;
-      border: none;
-      transition: transform 0.12s ease, filter 0.15s ease, box-shadow 0.15s ease;
+      background: rgba(106, 169, 255, 0.18);
+      border: 1px solid rgba(106, 169, 255, 0.28);
+      color: var(--accent);
     }
-    .btn-primary {
-      color: #0a1628;
-      background: linear-gradient(180deg, #9dc6ff 0%, var(--accent) 100%);
-      box-shadow: 0 4px 24px rgba(106, 169, 255, 0.35);
+    .yard-export-btn .icon-wrap svg { width: 26px; height: 26px; }
+    .yard-export-btn .copy { flex: 1; min-width: 0; }
+    .yard-export-btn .title {
+      display: block;
+      font-size: 1.08rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--text);
+      margin-bottom: 4px;
     }
-    .btn-primary:hover { filter: brightness(1.06); }
-    .btn-primary:active { transform: translateY(1px); }
-    .btn-primary:disabled { opacity: 0.55; cursor: not-allowed; transform: none; }
+    .yard-export-btn .sub {
+      display: block;
+      font-size: 0.82rem;
+      color: var(--muted);
+      font-weight: 500;
+    }
+    .yard-export-btn .chev {
+      flex-shrink: 0;
+      color: var(--accent);
+      opacity: 0.85;
+    }
+    .yard-export-btn .chev svg { width: 22px; height: 22px; display: block; }
+    .yard-status-wrap { margin-top: 14px; }
     .status {
       font-size: 0.88rem;
       color: var(--muted);
       min-height: 22px;
+      margin: 0;
     }
     .status.err { color: #ff9e9e; }
     .status.ok { color: #8fd4a8; }
@@ -928,7 +917,7 @@ function renderDashboardHtml(): string {
     <header class="top">
       <div class="brand">
         <h1>${escapedTitle}</h1>
-        <p>Choose an ETIC report date to open that snapshot. Yard check uses the same workbook.</p>
+        <p>Pick a report date, then export the yard check for that file.</p>
       </div>
       <div class="picker-wrap">
         <label for="etic-date">ETIC report date</label>
@@ -937,7 +926,7 @@ function renderDashboardHtml(): string {
     </header>
 
     <div id="view-empty" class="empty-state hidden">
-      <p><strong>No ETIC files yet.</strong><br />Email the workbook to your ingest address. Dates from the subject line set the report day.</p>
+      <p><strong>No ETIC files yet.</strong><br />Email the Vehicle ETIC workbook to your ingest address to get dates here.</p>
     </div>
 
     <div id="view-main" class="hidden">
@@ -949,28 +938,29 @@ function renderDashboardHtml(): string {
         </div>
       </section>
 
-      <div class="grid">
-        <div class="card">
-          <h3>Ingest details</h3>
-          <dl class="detail-rows" id="ingest-details"></dl>
-        </div>
-        <div class="card">
-          <h3>Email subject</h3>
-          <p class="subject-box" id="subject-text"></p>
-        </div>
+      <div class="card ingest-card">
+        <h3>This snapshot</h3>
+        <dl class="detail-rows" id="ingest-details"></dl>
       </div>
 
-      <div class="card" style="margin-bottom:22px;">
-        <h3>Sheets in this workbook</h3>
-        <ul class="sheet-list" id="sheet-list"></ul>
-      </div>
-
-      <div class="actions">
-        <button type="button" class="btn btn-primary" id="btn-yard-check">
-          <span>Download yard check</span>
-          <span aria-hidden="true">.xlsx</span>
+      <div class="card yard-card">
+        <h3>Yard check</h3>
+        <p class="yard-lead">Work orders rolled up for a walkaround: asset, shops, VIN, locations, plus blank columns for what you find in the yard.</p>
+        <button type="button" class="yard-export-btn" id="btn-yard-check" aria-describedby="yard-status">
+          <span class="icon-wrap" aria-hidden="true">
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.75"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+          </span>
+          <span class="copy">
+            <span class="title">Export for compound walkaround</span>
+            <span class="sub">Excel workbook · landscape · ready to print</span>
+          </span>
+          <span class="chev" aria-hidden="true">
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+          </span>
         </button>
-        <p class="status" id="yard-status" role="status"></p>
+        <div class="yard-status-wrap">
+          <p class="status" id="yard-status" role="status"></p>
+        </div>
       </div>
     </div>
   </div>
@@ -1048,25 +1038,6 @@ function renderDashboardHtml(): string {
             : "—") +
           "</dd></div>",
       ].join("");
-
-      document.getElementById("subject-text").textContent = analysis.subject || "—";
-
-      const ul = document.getElementById("sheet-list");
-      ul.innerHTML = "";
-      const sheets = Array.isArray(analysis.sheetSummaries) ? analysis.sheetSummaries : [];
-      for (const s of sheets) {
-        const li = document.createElement("li");
-        const vis = s.state === "visible";
-        li.innerHTML =
-          "<span class='name'>" +
-          esc(s.name) +
-          "</span><span class='badge" +
-          (vis ? "" : " hidden") +
-          "'>" +
-          (vis ? "Visible" : s.state || "hidden") +
-          "</span>";
-        ul.appendChild(li);
-      }
     }
 
     async function selectDate(dateKey, pushHash) {
@@ -1081,8 +1052,6 @@ function renderDashboardHtml(): string {
         const analysis = await loadAnalysis(dateKey);
         renderDetails(analysis);
       } catch (e) {
-        document.getElementById("subject-text").textContent = "—";
-        document.getElementById("sheet-list").innerHTML = "";
         document.getElementById("ingest-details").innerHTML =
           "<div class='detail-row'><dt>Error</dt><dd>" + esc(e.message || String(e)) + "</dd></div>";
       }
@@ -1092,10 +1061,9 @@ function renderDashboardHtml(): string {
       const btn = document.getElementById("btn-yard-check");
       const st = document.getElementById("yard-status");
       if (!selectedDate) return;
-      const prev = btn.innerHTML;
       btn.disabled = true;
       st.className = "status";
-      st.textContent = "Preparing…";
+      st.textContent = "Building your file…";
       try {
         const url = "/api/yard-check.xlsx?date=" + encodeURIComponent(selectedDate);
         const res = await fetch(url);
@@ -1122,13 +1090,12 @@ function renderDashboardHtml(): string {
         a.remove();
         URL.revokeObjectURL(u);
         st.className = "status ok";
-        st.textContent = "Saved " + name;
+        st.textContent = "Saved as " + name;
       } catch (e) {
         st.className = "status err";
         st.textContent = String(e && e.message ? e.message : e);
       } finally {
         btn.disabled = false;
-        btn.innerHTML = prev;
       }
     }
 
