@@ -2,7 +2,7 @@ import PostalMime from "postal-mime";
 import type { Attachment } from "postal-mime";
 import ExcelJS from "exceljs";
 import {
-  extractWorkOrderRows,
+  extractYardCheckSource,
   generateYardCheckWorkbookBuffer,
 } from "./yardCheck";
 
@@ -219,8 +219,8 @@ async function handleYardCheckDownload(env: Env): Promise<Response> {
   }
 
   const workbookBytes = await object.arrayBuffer();
-  const extraction = await extractWorkOrderRows(workbookBytes);
-  if (!extraction) {
+  const source = await extractYardCheckSource(workbookBytes);
+  if (!source) {
     return Response.json(
       {
         ok: false,
@@ -231,7 +231,7 @@ async function handleYardCheckDownload(env: Env): Promise<Response> {
   }
 
   const generatedAtIso = new Date().toISOString();
-  const buffer = await generateYardCheckWorkbookBuffer(extraction, {
+  const buffer = await generateYardCheckWorkbookBuffer(source, {
     sourceWorkbookFileName: sourceFileName,
     sourceDateKey,
     generatedAtIso,
@@ -246,8 +246,10 @@ async function handleYardCheckDownload(env: Env): Promise<Response> {
       "Cache-Control": "no-store",
       "X-Source-Workbook": workbookKey,
       "X-Source-Date": sourceDateKey,
-      "X-Total-Rows": String(extraction.totalDataRows),
-      "X-Unmatched-Headers": String(extraction.unmatchedHeaders.length),
+      "X-Work-Order-Sheet": source.workOrderSheet ?? "",
+      "X-Fleet-Sheet": source.fleetSheet ?? "",
+      "X-Total-Assets": String(source.totalAssets),
+      "X-Total-Work-Orders": String(source.totalWorkOrders),
     },
   });
 }
@@ -802,8 +804,9 @@ function renderDashboardHtml(): string {
         link.click();
         link.remove();
         URL.revokeObjectURL(url);
-        const rowCount = res.headers.get("X-Total-Rows") || "0";
-        statusEl.textContent = "Downloaded " + fileName + " (" + rowCount + " rows).";
+        const assets = res.headers.get("X-Total-Assets") || "0";
+        const wo = res.headers.get("X-Total-Work-Orders") || "0";
+        statusEl.textContent = "Downloaded " + fileName + " (" + assets + " assets across " + wo + " work orders).";
       } catch (err) {
         statusEl.textContent = "Error: " + (err && err.message ? err.message : String(err));
       } finally {

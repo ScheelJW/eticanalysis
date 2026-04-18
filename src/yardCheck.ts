@@ -1,66 +1,60 @@
 import ExcelJS from "exceljs";
 
-export type YardCheckColumn =
-  | "assetId"
-  | "workOrderId"
-  | "workOrderRemarks"
-  | "vinSerial"
-  | "make"
-  | "model"
-  | "previousLocation";
-
 export type YardCheckRow = {
   assetId: string;
-  workOrderId: string;
-  workOrderRemarks: string;
+  workOrderIds: string[];
+  workOrderRemarks: string[];
   vinSerial: string;
-  make: string;
-  model: string;
-  previousLocation: string;
+  makeModel: string;
+  shops: string[];
+  previousLocations: string[];
 };
 
-export type YardCheckExtractionResult = {
-  sheetName: string;
-  headerRowIndex: number;
-  totalDataRows: number;
+export type YardCheckSource = {
+  workOrderSheet: string | null;
+  workOrderHeaderRowIndex: number | null;
+  fleetSheet: string | null;
+  fleetHeaderRowIndex: number | null;
+  totalAssets: number;
+  totalWorkOrders: number;
   rows: YardCheckRow[];
-  headerMap: Record<YardCheckColumn, string | null>;
-  unmatchedHeaders: string[];
+  unmatchedWorkOrderHeaders: string[];
+  unmatchedFleetHeaders: string[];
 };
 
-const HEADER_SYNONYMS: Record<YardCheckColumn, string[]> = {
-  assetId: [
-    "asset id",
-    "asset",
-    "asset #",
-    "asset no",
-    "asset number",
-    "asset num",
-    "equip id",
-    "equipment id",
-    "equipment #",
-    "equipment number",
-    "vehicle id",
-    "unit id",
-    "reg no",
-    "registration number",
-  ],
+export type YardCheckMeta = {
+  sourceWorkbookFileName: string;
+  sourceDateKey: string;
+  generatedAtIso: string;
+};
+
+type WorkOrderField =
+  | "assetId"
+  | "workOrderId"
+  | "remarks"
+  | "shop"
+  | "shop2"
+  | "etiCLocation"
+  | "makeModel";
+
+type FleetField = "assetId" | "vinSerial" | "makeModel" | "etiCLocation";
+
+const WORK_ORDER_SYNONYMS: Record<WorkOrderField, string[]> = {
+  assetId: ["asset id", "asset", "asset number", "asset #", "equipment id", "equip id", "unit id"],
   workOrderId: [
     "work order id",
-    "work order",
-    "wo id",
-    "wo #",
-    "wo no",
-    "wo num",
-    "wo number",
-    "work order #",
-    "work order no",
     "work order number",
-    "work order num",
+    "work order no",
+    "work order #",
+    "wo id",
+    "wo number",
+    "wo no",
+    "wo #",
+    "work order",
   ],
-  workOrderRemarks: [
-    "work order remarks",
+  remarks: [
     "remarks",
+    "work order remarks",
     "wo remarks",
     "comments",
     "notes",
@@ -70,30 +64,39 @@ const HEADER_SYNONYMS: Record<YardCheckColumn, string[]> = {
     "defect",
     "defect description",
   ],
+  shop: ["shop", "primary shop", "assigned shop"],
+  shop2: ["shop2", "secondary shop", "shop 2", "support shop"],
+  etiCLocation: [
+    "etic location",
+    "current location",
+    "last known location",
+    "last location",
+    "previous location",
+    "location",
+  ],
+  makeModel: ["make model", "make/model", "make / model"],
+};
+
+const FLEET_SYNONYMS: Record<FleetField, string[]> = {
+  assetId: ["asset id", "asset", "asset number", "asset #"],
   vinSerial: [
+    "serial nbr",
+    "serial number",
+    "serial",
+    "vin",
+    "vin number",
     "vin/serial",
     "vin / serial",
     "vin or serial",
     "vin-serial",
-    "vin",
-    "vin number",
-    "serial",
-    "serial number",
-    "serial #",
-    "serial no",
   ],
-  make: ["make", "manufacturer", "mfg"],
-  model: ["model"],
-  previousLocation: [
-    "previous location",
-    "prev location",
-    "last known location",
-    "last location",
+  makeModel: ["make/model", "make / model", "make model", "make", "model"],
+  etiCLocation: [
+    "wo inquiry.etic location",
+    "etic location",
     "current location",
     "location",
-    "parking location",
-    "yard location",
-    "where",
+    "previous location",
   ],
 };
 
@@ -134,56 +137,60 @@ function readCellString(cell: ExcelJS.Cell): string {
   }
 }
 
-export function matchHeaderToColumn(header: string): YardCheckColumn | null {
+function cleanText(raw: string): string {
+  return raw.replace(/\s+/g, " ").trim();
+}
+
+export function matchHeader<T extends string>(
+  header: string,
+  synonymMap: Record<T, string[]>,
+): T | null {
   const normalized = normalizeHeader(header);
   if (!normalized) return null;
 
-  let bestColumn: YardCheckColumn | null = null;
+  let bestField: T | null = null;
   let bestScore = 0;
 
-  (Object.keys(HEADER_SYNONYMS) as YardCheckColumn[]).forEach((column) => {
-    const synonyms = HEADER_SYNONYMS[column];
+  (Object.keys(synonymMap) as T[]).forEach((field) => {
+    const synonyms = synonymMap[field];
     for (const candidate of synonyms) {
       if (normalized === candidate) {
-        if (candidate.length > bestScore) {
-          bestColumn = column;
-          bestScore = candidate.length + 1000;
+        const s = candidate.length + 1000;
+        if (s > bestScore) {
+          bestField = field;
+          bestScore = s;
         }
         continue;
       }
       if (normalized.includes(candidate) && candidate.length > bestScore) {
-        bestColumn = column;
+        bestField = field;
         bestScore = candidate.length;
       }
     }
   });
 
-  return bestColumn;
+  return bestField;
 }
 
-function findWorkOrderSheet(workbook: ExcelJS.Workbook): ExcelJS.Worksheet | null {
-  const candidates = workbook.worksheets;
-  const preferred = candidates.find((s) => /work\s*orders?/i.test(s.name));
-  if (preferred) return preferred;
-  const loose = candidates.find((s) => /wo\b/i.test(s.name));
-  return loose ?? null;
-}
-
-type HeaderScan = {
+type HeaderScan<T extends string> = {
   rowIndex: number;
-  mapping: Map<number, YardCheckColumn>;
+  mapping: Map<number, T>;
   rawHeaders: Map<number, string>;
   unmatched: string[];
 };
 
-function scanHeaderRow(sheet: ExcelJS.Worksheet, maxRows = 25): HeaderScan | null {
-  let best: HeaderScan | null = null;
+function scanHeaderRow<T extends string>(
+  sheet: ExcelJS.Worksheet,
+  synonymMap: Record<T, string[]>,
+  maxRows = 25,
+): HeaderScan<T> | null {
+  let best: HeaderScan<T> | null = null;
 
   for (let rowIndex = 1; rowIndex <= maxRows; rowIndex += 1) {
     const row = sheet.getRow(rowIndex);
     if (!row || row.cellCount === 0) continue;
 
-    const mapping = new Map<number, YardCheckColumn>();
+    const mapping = new Map<number, T>();
     const rawHeaders = new Map<number, string>();
     const unmatched: string[] = [];
 
@@ -191,123 +198,218 @@ function scanHeaderRow(sheet: ExcelJS.Worksheet, maxRows = 25): HeaderScan | nul
       const raw = readCellString(cell).trim();
       if (!raw) return;
       rawHeaders.set(colNumber, raw);
-      const column = matchHeaderToColumn(raw);
-      if (column && !mapping.has(colNumber) && !isAlreadyAssigned(mapping, column)) {
-        mapping.set(colNumber, column);
-      } else if (!column) {
+      const matched = matchHeader<T>(raw, synonymMap);
+      if (matched) {
+        if (!mapping.has(colNumber) && !hasValue(mapping, matched)) {
+          mapping.set(colNumber, matched);
+        }
+      } else {
         unmatched.push(raw);
       }
     });
 
-    if (!mapping.has(0) && mapping.size === 0 && rawHeaders.size === 0) continue;
-
-    const score = mapping.size;
-    if (!best || score > best.mapping.size) {
+    if (rawHeaders.size === 0) continue;
+    if (!best || mapping.size > best.mapping.size) {
       best = { rowIndex, mapping, rawHeaders, unmatched };
     }
-    if (best && best.mapping.size >= 4) {
-      // Good enough match; stop scanning to avoid picking deeper rows
-      break;
-    }
+    if (best.mapping.size >= 4) break;
   }
 
   if (!best || best.mapping.size === 0) return null;
   return best;
 }
 
-function isAlreadyAssigned(mapping: Map<number, YardCheckColumn>, column: YardCheckColumn): boolean {
-  for (const existing of mapping.values()) {
-    if (existing === column) return true;
+function hasValue<T>(map: Map<number, T>, value: T): boolean {
+  for (const v of map.values()) {
+    if (v === value) return true;
   }
   return false;
 }
 
-export async function extractWorkOrderRows(
-  binary: ArrayBuffer,
-): Promise<YardCheckExtractionResult | null> {
+function findWorkOrderSheet(workbook: ExcelJS.Workbook): ExcelJS.Worksheet | null {
+  const all = workbook.worksheets;
+  return (
+    all.find((s) => /^work\s*orders?$/i.test(s.name)) ??
+    all.find((s) => /^wo\s*inquiry/i.test(s.name)) ??
+    all.find((s) => /work\s*orders?/i.test(s.name)) ??
+    all.find((s) => /\bwo\b/i.test(s.name)) ??
+    null
+  );
+}
+
+function findFleetSheet(workbook: ExcelJS.Workbook): ExcelJS.Worksheet | null {
+  const all = workbook.worksheets;
+  return (
+    all.find((s) => /^fleet\b/i.test(s.name)) ??
+    all.find((s) => /fleet/i.test(s.name)) ??
+    null
+  );
+}
+
+type RawWorkOrder = {
+  assetId: string;
+  workOrderId: string;
+  remarks: string;
+  shop: string;
+  shop2: string;
+  etiCLocation: string;
+  makeModel: string;
+};
+
+type FleetRecord = {
+  assetId: string;
+  vinSerial: string;
+  makeModel: string;
+  etiCLocation: string;
+};
+
+function extractWorkOrders(sheet: ExcelJS.Worksheet): {
+  rows: RawWorkOrder[];
+  scan: HeaderScan<WorkOrderField> | null;
+} {
+  const scan = scanHeaderRow<WorkOrderField>(sheet, WORK_ORDER_SYNONYMS);
+  if (!scan) return { rows: [], scan: null };
+
+  const rows: RawWorkOrder[] = [];
+  const lastRow = sheet.actualRowCount || sheet.rowCount;
+  for (let r = scan.rowIndex + 1; r <= lastRow; r += 1) {
+    const row = sheet.getRow(r);
+    if (!row || row.cellCount === 0) continue;
+    const record: RawWorkOrder = {
+      assetId: "",
+      workOrderId: "",
+      remarks: "",
+      shop: "",
+      shop2: "",
+      etiCLocation: "",
+      makeModel: "",
+    };
+    let hasAny = false;
+    scan.mapping.forEach((field, colNumber) => {
+      const text = cleanText(readCellString(row.getCell(colNumber)));
+      if (text) hasAny = true;
+      (record as Record<string, string>)[field] = text;
+    });
+    if (hasAny && record.assetId) rows.push(record);
+  }
+  return { rows, scan };
+}
+
+function extractFleet(sheet: ExcelJS.Worksheet): {
+  byAsset: Map<string, FleetRecord>;
+  scan: HeaderScan<FleetField> | null;
+} {
+  const scan = scanHeaderRow<FleetField>(sheet, FLEET_SYNONYMS);
+  if (!scan) return { byAsset: new Map(), scan: null };
+
+  const byAsset = new Map<string, FleetRecord>();
+  const lastRow = sheet.actualRowCount || sheet.rowCount;
+  for (let r = scan.rowIndex + 1; r <= lastRow; r += 1) {
+    const row = sheet.getRow(r);
+    if (!row || row.cellCount === 0) continue;
+    const record: FleetRecord = {
+      assetId: "",
+      vinSerial: "",
+      makeModel: "",
+      etiCLocation: "",
+    };
+    let hasAny = false;
+    scan.mapping.forEach((field, colNumber) => {
+      const text = cleanText(readCellString(row.getCell(colNumber)));
+      if (text) hasAny = true;
+      (record as Record<string, string>)[field] = text;
+    });
+    if (hasAny && record.assetId) {
+      byAsset.set(record.assetId, record);
+    }
+  }
+  return { byAsset, scan };
+}
+
+export async function extractYardCheckSource(binary: ArrayBuffer): Promise<YardCheckSource | null> {
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.load(binary);
 
-  const sheet = findWorkOrderSheet(workbook);
-  if (!sheet) return null;
+  const woSheet = findWorkOrderSheet(workbook);
+  if (!woSheet) return null;
 
-  const headerScan = scanHeaderRow(sheet);
-  if (!headerScan) {
-    return {
-      sheetName: sheet.name,
-      headerRowIndex: 1,
-      totalDataRows: 0,
-      rows: [],
-      headerMap: {
-        assetId: null,
-        workOrderId: null,
-        workOrderRemarks: null,
-        vinSerial: null,
-        make: null,
-        model: null,
-        previousLocation: null,
-      },
-      unmatchedHeaders: [],
-    };
+  const woResult = extractWorkOrders(woSheet);
+  const fleetSheet = findFleetSheet(workbook);
+  const fleetResult = fleetSheet ? extractFleet(fleetSheet) : { byAsset: new Map<string, FleetRecord>(), scan: null };
+
+  const grouped = new Map<string, YardCheckRow>();
+  for (const wo of woResult.rows) {
+    if (!wo.assetId) continue;
+    const existing = grouped.get(wo.assetId);
+    const fleet = fleetResult.byAsset.get(wo.assetId);
+    if (!existing) {
+      const row: YardCheckRow = {
+        assetId: wo.assetId,
+        workOrderIds: wo.workOrderId ? [wo.workOrderId] : [],
+        workOrderRemarks: formatRemark(wo) ? [formatRemark(wo)] : [],
+        vinSerial: fleet?.vinSerial ?? "",
+        makeModel: (fleet?.makeModel ?? "") || wo.makeModel,
+        shops: uniqNonEmpty([wo.shop, wo.shop2]),
+        previousLocations: uniqNonEmpty([wo.etiCLocation, fleet?.etiCLocation ?? ""]),
+      };
+      grouped.set(wo.assetId, row);
+    } else {
+      if (wo.workOrderId && !existing.workOrderIds.includes(wo.workOrderId)) {
+        existing.workOrderIds.push(wo.workOrderId);
+      }
+      const remark = formatRemark(wo);
+      if (remark && !existing.workOrderRemarks.includes(remark)) {
+        existing.workOrderRemarks.push(remark);
+      }
+      for (const shop of [wo.shop, wo.shop2]) {
+        if (shop && !existing.shops.includes(shop)) existing.shops.push(shop);
+      }
+      if (wo.etiCLocation && !existing.previousLocations.includes(wo.etiCLocation)) {
+        existing.previousLocations.push(wo.etiCLocation);
+      }
+      if (!existing.vinSerial && fleet?.vinSerial) existing.vinSerial = fleet.vinSerial;
+      if (!existing.makeModel) existing.makeModel = (fleet?.makeModel ?? "") || wo.makeModel;
+      if (fleet?.etiCLocation && !existing.previousLocations.includes(fleet.etiCLocation)) {
+        existing.previousLocations.push(fleet.etiCLocation);
+      }
+    }
   }
 
-  const rows: YardCheckRow[] = [];
-  const lastRow = sheet.actualRowCount || sheet.rowCount;
-  for (let rowIndex = headerScan.rowIndex + 1; rowIndex <= lastRow; rowIndex += 1) {
-    const row = sheet.getRow(rowIndex);
-    if (!row || row.cellCount === 0) continue;
-
-    const record: YardCheckRow = {
-      assetId: "",
-      workOrderId: "",
-      workOrderRemarks: "",
-      vinSerial: "",
-      make: "",
-      model: "",
-      previousLocation: "",
-    };
-    let hasAnyValue = false;
-
-    headerScan.mapping.forEach((column, colNumber) => {
-      const value = readCellString(row.getCell(colNumber)).trim();
-      if (value) hasAnyValue = true;
-      (record as Record<string, string>)[column] = value;
-    });
-
-    if (hasAnyValue) rows.push(record);
-  }
-
-  const headerMap: Record<YardCheckColumn, string | null> = {
-    assetId: null,
-    workOrderId: null,
-    workOrderRemarks: null,
-    vinSerial: null,
-    make: null,
-    model: null,
-    previousLocation: null,
-  };
-  headerScan.mapping.forEach((column, colNumber) => {
-    headerMap[column] = headerScan.rawHeaders.get(colNumber) ?? null;
-  });
+  const rows = [...grouped.values()].sort((a, b) => a.assetId.localeCompare(b.assetId));
 
   return {
-    sheetName: sheet.name,
-    headerRowIndex: headerScan.rowIndex,
-    totalDataRows: rows.length,
+    workOrderSheet: woSheet.name,
+    workOrderHeaderRowIndex: woResult.scan?.rowIndex ?? null,
+    fleetSheet: fleetSheet?.name ?? null,
+    fleetHeaderRowIndex: fleetResult.scan?.rowIndex ?? null,
+    totalAssets: rows.length,
+    totalWorkOrders: woResult.rows.length,
     rows,
-    headerMap,
-    unmatchedHeaders: headerScan.unmatched,
+    unmatchedWorkOrderHeaders: woResult.scan?.unmatched ?? [],
+    unmatchedFleetHeaders: fleetResult.scan?.unmatched ?? [],
   };
 }
 
-export type YardCheckMeta = {
-  sourceWorkbookFileName: string;
-  sourceDateKey: string;
-  generatedAtIso: string;
-};
+function formatRemark(wo: RawWorkOrder): string {
+  if (!wo.remarks) return "";
+  if (wo.workOrderId) return `${wo.workOrderId}: ${wo.remarks}`;
+  return wo.remarks;
+}
+
+function uniqNonEmpty(values: Array<string | undefined>): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const value of values) {
+    if (!value) continue;
+    if (seen.has(value)) continue;
+    seen.add(value);
+    out.push(value);
+  }
+  return out;
+}
 
 export async function generateYardCheckWorkbookBuffer(
-  extraction: YardCheckExtractionResult,
+  source: YardCheckSource,
   meta: YardCheckMeta,
 ): Promise<ArrayBuffer> {
   const workbook = new ExcelJS.Workbook();
@@ -342,27 +444,23 @@ export async function generateYardCheckWorkbookBuffer(
   });
 
   sheet.columns = [
-    { header: "Asset ID", key: "assetId", width: 12 },
-    { header: "Work Order ID", key: "workOrderId", width: 14 },
-    { header: "VIN / Serial", key: "vinSerial", width: 20 },
-    { header: "Make", key: "make", width: 12 },
-    { header: "Model", key: "model", width: 16 },
-    { header: "Previous Location", key: "previousLocation", width: 18 },
+    { header: "Asset ID", key: "assetId", width: 13 },
+    { header: "Work Order ID(s)", key: "workOrderIds", width: 20 },
+    { header: "VIN / Serial", key: "vinSerial", width: 22 },
+    { header: "Make / Model", key: "makeModel", width: 18 },
+    { header: "Shop(s)", key: "shops", width: 12 },
+    { header: "Previous Location", key: "previousLocations", width: 18 },
     { header: "New Location", key: "newLocation", width: 22 },
-    { header: "Discrepancies", key: "discrepancies", width: 30 },
-    { header: "Work Order Remarks", key: "workOrderRemarks", width: 40 },
+    { header: "Discrepancies", key: "discrepancies", width: 28 },
+    { header: "Work Order Remarks", key: "workOrderRemarks", width: 48 },
   ];
 
   const headerRow = sheet.getRow(1);
-  headerRow.height = 24;
+  headerRow.height = 26;
   headerRow.font = { bold: true, size: 11 };
   headerRow.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
   headerRow.eachCell((cell) => {
-    cell.fill = {
-      type: "pattern",
-      pattern: "solid",
-      fgColor: { argb: "FFEEF2F8" },
-    };
+    cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFEEF2F8" } };
     cell.border = {
       top: { style: "thin", color: { argb: "FF9FB1C8" } },
       left: { style: "thin", color: { argb: "FF9FB1C8" } },
@@ -371,17 +469,17 @@ export async function generateYardCheckWorkbookBuffer(
     };
   });
 
-  for (const record of extraction.rows) {
+  for (const record of source.rows) {
     const added = sheet.addRow({
       assetId: record.assetId,
-      workOrderId: record.workOrderId,
+      workOrderIds: record.workOrderIds.join("\n"),
       vinSerial: record.vinSerial,
-      make: record.make,
-      model: record.model,
-      previousLocation: record.previousLocation,
+      makeModel: record.makeModel,
+      shops: record.shops.join(", "),
+      previousLocations: record.previousLocations.join("\n"),
       newLocation: "",
       discrepancies: "",
-      workOrderRemarks: record.workOrderRemarks,
+      workOrderRemarks: record.workOrderRemarks.join("\n\n"),
     });
     added.font = { size: 10 };
     added.alignment = { vertical: "top", wrapText: true };
@@ -395,7 +493,7 @@ export async function generateYardCheckWorkbookBuffer(
     });
   }
 
-  if (extraction.rows.length === 0) {
+  if (source.rows.length === 0) {
     const empty = sheet.addRow({ assetId: "No work orders found in source workbook." });
     empty.font = { italic: true };
   }
@@ -406,16 +504,10 @@ export async function generateYardCheckWorkbookBuffer(
 
 function toArrayBuffer(buffer: ExcelJS.Buffer): ArrayBuffer {
   if (buffer instanceof ArrayBuffer) return buffer;
-  if (ArrayBuffer.isView(buffer)) {
-    const view = buffer as ArrayBufferView;
+  const view = buffer as unknown as { buffer?: ArrayBufferLike; byteOffset?: number; byteLength?: number };
+  if (view && view.buffer && typeof view.byteOffset === "number" && typeof view.byteLength === "number") {
     const clone = new Uint8Array(view.byteLength);
-    clone.set(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
-    return clone.buffer;
-  }
-  const anyBuf = buffer as unknown as { buffer?: ArrayBuffer; byteOffset?: number; byteLength?: number };
-  if (anyBuf.buffer && typeof anyBuf.byteOffset === "number" && typeof anyBuf.byteLength === "number") {
-    const clone = new Uint8Array(anyBuf.byteLength);
-    clone.set(new Uint8Array(anyBuf.buffer, anyBuf.byteOffset, anyBuf.byteLength));
+    clone.set(new Uint8Array(view.buffer as ArrayBuffer, view.byteOffset, view.byteLength));
     return clone.buffer;
   }
   throw new Error("Unsupported buffer type returned by ExcelJS");
