@@ -1928,7 +1928,7 @@ function renderDashboardHtml(): string {
         wrap.classList.add("hidden");
         st.className = "status err";
         st.textContent =
-          "No work order \u0022" + esc(data.workOrderId || "") + "\u0022 in the index yet. Check the ID or run Rebuild history.";
+          'No work order "' + esc(data.workOrderId || "") + '" in the index yet. Check the ID or run Rebuild history.';
         return;
       }
       const r = data.row;
