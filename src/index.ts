@@ -2,19 +2,8 @@ import PostalMime from "postal-mime";
 import type { Attachment } from "postal-mime";
 import ExcelJS from "exceljs";
 
-type AnalysisResult = {
-  workbookFileName: string;
-  receivedAtIso: string;
-  from: string;
-  to: string;
-  subject: string;
-  workbookBytes: number;
-  sheetSummaries: SheetSummary[];
-  totalVisibleSheets: number;
-  totalHiddenSheets: number;
-  totalRowsAcrossSheets: number;
-  melMentionsBySheet: Record<string, number>;
-};
+const DEFAULT_MAX_ATTACHMENT_BYTES = 30 * 1024 * 1024;
+const SITE_TITLE = "Minot Vehicle ETIC";
 
 type SheetSummary = {
   name: string;
@@ -26,139 +15,247 @@ type SheetSummary = {
   melMentions: number;
 };
 
+type AnalysisResult = {
+  workbookFileName: string;
+  receivedAtIso: string;
+  dateKey: string;
+  from: string;
+  to: string;
+  subject: string;
+  workbookBytes: number;
+  sheetSummaries: SheetSummary[];
+  totalVisibleSheets: number;
+  totalHiddenSheets: number;
+  totalRowsAcrossSheets: number;
+  melMentionsBySheet: Record<string, number>;
+  melMentionsTotal: number;
+};
+
+type HistoryEntryDiff = {
+  previousDateKey: string | null;
+  deltaTotalRows: number | null;
+  deltaMelMentionsTotal: number | null;
+  deltaSheetsVisible: number | null;
+};
+
+type HistoryEntry = {
+  dateKey: string;
+  receivedAtIso: string;
+  workbookFileName: string;
+  workbookKey: string;
+  analysisKey: string;
+  totalVisibleSheets: number;
+  totalHiddenSheets: number;
+  totalRowsAcrossSheets: number;
+  melMentionsTotal: number;
+  diff: HistoryEntryDiff;
+};
+
+type HistoryIndex = {
+  updatedAtIso: string;
+  entries: HistoryEntry[];
+};
+
 interface Env {
   ETIC_BUCKET: R2Bucket;
-  REPORT_EMAIL: SendEmail;
-  REPORT_TO: string;
-  REPORT_FROM: string;
-  EXPECTED_ATTACHMENT_NAME?: string;
   ALLOWED_SENDERS?: string;
+  EXPECTED_ATTACHMENT_NAME?: string;
   MAX_ATTACHMENT_BYTES?: string;
 }
 
-const DEFAULT_MAX_ATTACHMENT_BYTES = 30 * 1024 * 1024;
-const ALWAYS_CC_EMAIL = "jared.scheel@us.af.mil";
-
 export default {
-  async email(message: ForwardableEmailMessage, env: Env, ctx: ExecutionContext): Promise<void> {
-    const replyRecipient = resolveReportRecipient(message.from, env.REPORT_TO);
+  async email(message: ForwardableEmailMessage, env: Env, _ctx: ExecutionContext): Promise<void> {
+    if (!isAuthorizedSender(message.from, env)) {
+      message.setReject("Unauthorized sender");
+      return;
+    }
 
-    try {
-      if (!isAuthorizedSender(message.from, env)) {
-        message.setReject("Unauthorized sender");
-        return;
-      }
-
-      const parsed = await PostalMime.parse(message.raw, {
-        attachmentEncoding: "arraybuffer",
-      });
-
-      const workbookAttachment = pickWorkbookAttachment(parsed.attachments, env.EXPECTED_ATTACHMENT_NAME);
-      if (!workbookAttachment) {
-        await sendTextEmail(
-          env,
-          `[Vehicle ETIC] No workbook attachment`,
-          [
-            "An inbound email was received, but no .xlsx attachment was found.",
-            `From: ${message.from}`,
-            `To: ${message.to}`,
-            `Subject: ${parsed.subject ?? "(no subject)"}`,
-          ].join("\n"),
-          replyRecipient,
-        );
-        return;
-      }
-
-      const workbookBytes = normalizeAttachmentBinary(workbookAttachment.content);
-      if (workbookBytes.byteLength > parseMaxAttachmentBytes(env.MAX_ATTACHMENT_BYTES)) {
-        message.setReject("Attachment too large");
-        return;
-      }
-
-      const now = new Date();
-      const ts = compactTimestamp(now);
-      const safeName = sanitizeFileName(workbookAttachment.filename ?? "vehicle-etic.xlsx");
-      const rawKey = `incoming/${ts}/${safeName}`;
-
-      await env.ETIC_BUCKET.put(rawKey, workbookBytes, {
-        httpMetadata: {
-          contentType:
-            workbookAttachment.mimeType ||
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        },
-        customMetadata: {
+    const parsed = await PostalMime.parse(message.raw, { attachmentEncoding: "arraybuffer" });
+    const workbookAttachment = pickWorkbookAttachment(parsed.attachments, env.EXPECTED_ATTACHMENT_NAME);
+    if (!workbookAttachment) {
+      console.warn(
+        JSON.stringify({
+          level: "warn",
+          message: "No .xlsx attachment found on inbound email",
           from: message.from,
           to: message.to,
           subject: parsed.subject ?? "",
-        },
-      });
+        }),
+      );
+      return;
+    }
 
-      const analysis = await analyzeWorkbook({
-        binary: workbookBytes,
-        fileName: safeName,
-        receivedAtIso: now.toISOString(),
+    const workbookBytes = normalizeAttachmentBinary(workbookAttachment.content);
+    if (workbookBytes.byteLength > parseMaxAttachmentBytes(env.MAX_ATTACHMENT_BYTES)) {
+      message.setReject("Attachment too large");
+      return;
+    }
+
+    const now = new Date();
+    const dateKey = isoDateKey(now);
+    const safeName = sanitizeFileName(workbookAttachment.filename ?? "vehicle-etic.xlsx");
+    const workbookKey = `workbooks/${dateKey}/${safeName}`;
+    const analysisKey = `analyses/${dateKey}.json`;
+
+    await env.ETIC_BUCKET.put(workbookKey, workbookBytes, {
+      httpMetadata: {
+        contentType:
+          workbookAttachment.mimeType ||
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      },
+      customMetadata: {
         from: message.from,
         to: message.to,
         subject: parsed.subject ?? "",
-      });
+      },
+    });
 
-      const reportText = renderReportText(analysis);
-      const reportJsonKey = `reports/${ts}/analysis.json`;
-      const reportTxtKey = `reports/${ts}/report.txt`;
+    const analysis = await analyzeWorkbook({
+      binary: workbookBytes,
+      fileName: safeName,
+      receivedAtIso: now.toISOString(),
+      dateKey,
+      from: message.from,
+      to: message.to,
+      subject: parsed.subject ?? "",
+    });
 
-      await Promise.all([
-        env.ETIC_BUCKET.put(reportJsonKey, JSON.stringify(analysis, null, 2), {
-          httpMetadata: { contentType: "application/json; charset=utf-8" },
-        }),
-        env.ETIC_BUCKET.put(reportTxtKey, reportText, {
-          httpMetadata: { contentType: "text/plain; charset=utf-8" },
-        }),
-        env.ETIC_BUCKET.put("reports/latest.json", JSON.stringify(analysis, null, 2), {
-          httpMetadata: { contentType: "application/json; charset=utf-8" },
-        }),
-        env.ETIC_BUCKET.put("reports/latest.txt", reportText, {
-          httpMetadata: { contentType: "text/plain; charset=utf-8" },
-        }),
-      ]);
+    await env.ETIC_BUCKET.put(analysisKey, JSON.stringify(analysis, null, 2), {
+      httpMetadata: { contentType: "application/json; charset=utf-8" },
+    });
 
-      ctx.waitUntil(
-        sendTextEmail(
-          env,
-          `[Vehicle ETIC] Daily report - ${safeName}`,
-          [
-            "Vehicle ETIC analysis completed successfully.",
-            "",
-            `Workbook key: ${rawKey}`,
-            `JSON report key: ${reportJsonKey}`,
-            `Text report key: ${reportTxtKey}`,
-            "",
-            reportText,
-          ].join("\n"),
-          replyRecipient,
-        ),
-      );
-    } catch (error) {
-      const messageText = error instanceof Error ? error.message : String(error);
-      ctx.waitUntil(
-        sendTextEmail(
-          env,
-          `[Vehicle ETIC] Analysis failure`,
-          `The ETIC analysis worker failed.\n\nError: ${messageText}`,
-          replyRecipient,
-        ),
-      );
-      throw error;
-    }
+    const history = await loadHistory(env);
+    const upsertedHistory = upsertHistoryEntry(history, analysis, workbookKey, analysisKey);
+    await env.ETIC_BUCKET.put(
+      "history/index.json",
+      JSON.stringify(upsertedHistory, null, 2),
+      {
+        httpMetadata: { contentType: "application/json; charset=utf-8" },
+      },
+    );
+    await env.ETIC_BUCKET.put(
+      "analyses/latest.json",
+      JSON.stringify(analysis, null, 2),
+      {
+        httpMetadata: { contentType: "application/json; charset=utf-8" },
+      },
+    );
   },
 
-  async fetch(request: Request): Promise<Response> {
+  async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+
     if (url.pathname === "/healthz") {
-      return Response.json({ ok: true, service: "vehicle-etic-email-automation" });
+      return Response.json({ ok: true, service: "etic-email-automation" });
     }
+
+    if (url.pathname === "/api/history") {
+      const history = await loadHistory(env);
+      return Response.json(history, { headers: cacheHeaders() });
+    }
+
+    if (url.pathname === "/api/latest") {
+      const analysis = await readJson<AnalysisResult>(env, "analyses/latest.json");
+      if (!analysis) return new Response("Not Found", { status: 404 });
+      return Response.json(analysis, { headers: cacheHeaders() });
+    }
+
+    if (url.pathname.startsWith("/api/analysis/")) {
+      const dateKey = url.pathname.slice("/api/analysis/".length);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) {
+        return new Response("Invalid date key", { status: 400 });
+      }
+      const analysis = await readJson<AnalysisResult>(env, `analyses/${dateKey}.json`);
+      if (!analysis) return new Response("Not Found", { status: 404 });
+      return Response.json(analysis, { headers: cacheHeaders() });
+    }
+
+    if (url.pathname === "/" || url.pathname === "/index.html") {
+      return new Response(renderDashboardHtml(), {
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "no-store",
+        },
+      });
+    }
+
     return new Response("Not Found", { status: 404 });
   },
 } satisfies ExportedHandler<Env>;
+
+function cacheHeaders(): HeadersInit {
+  return {
+    "Cache-Control": "no-store",
+  };
+}
+
+async function readJson<T>(env: Env, key: string): Promise<T | null> {
+  const object = await env.ETIC_BUCKET.get(key);
+  if (!object) return null;
+  try {
+    const text = await object.text();
+    return JSON.parse(text) as T;
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        level: "error",
+        message: "Failed to parse R2 JSON object",
+        key,
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    );
+    return null;
+  }
+}
+
+async function loadHistory(env: Env): Promise<HistoryIndex> {
+  const existing = await readJson<HistoryIndex>(env, "history/index.json");
+  if (existing && Array.isArray(existing.entries)) {
+    return existing;
+  }
+  return { updatedAtIso: new Date().toISOString(), entries: [] };
+}
+
+function upsertHistoryEntry(
+  history: HistoryIndex,
+  analysis: AnalysisResult,
+  workbookKey: string,
+  analysisKey: string,
+): HistoryIndex {
+  const filtered = history.entries.filter((entry) => entry.dateKey !== analysis.dateKey);
+  const sortedPrevious = [...filtered].sort((a, b) => a.dateKey.localeCompare(b.dateKey));
+  const previous = sortedPrevious.length > 0 ? sortedPrevious[sortedPrevious.length - 1] : null;
+
+  const diff: HistoryEntryDiff = {
+    previousDateKey: previous ? previous.dateKey : null,
+    deltaTotalRows: previous ? analysis.totalRowsAcrossSheets - previous.totalRowsAcrossSheets : null,
+    deltaMelMentionsTotal: previous
+      ? analysis.melMentionsTotal - previous.melMentionsTotal
+      : null,
+    deltaSheetsVisible: previous
+      ? analysis.totalVisibleSheets - previous.totalVisibleSheets
+      : null,
+  };
+
+  const entry: HistoryEntry = {
+    dateKey: analysis.dateKey,
+    receivedAtIso: analysis.receivedAtIso,
+    workbookFileName: analysis.workbookFileName,
+    workbookKey,
+    analysisKey,
+    totalVisibleSheets: analysis.totalVisibleSheets,
+    totalHiddenSheets: analysis.totalHiddenSheets,
+    totalRowsAcrossSheets: analysis.totalRowsAcrossSheets,
+    melMentionsTotal: analysis.melMentionsTotal,
+    diff,
+  };
+
+  const merged = [...filtered, entry].sort((a, b) => a.dateKey.localeCompare(b.dateKey));
+  return {
+    updatedAtIso: new Date().toISOString(),
+    entries: merged,
+  };
+}
 
 function isAuthorizedSender(sender: string, env: Env): boolean {
   const configured = env.ALLOWED_SENDERS?.trim();
@@ -192,9 +289,7 @@ function pickWorkbookAttachment(
 
 function normalizeAttachmentBinary(content: Attachment["content"]): ArrayBuffer {
   if (content instanceof ArrayBuffer) return content;
-  if (content instanceof Uint8Array) {
-    return cloneToArrayBuffer(content);
-  }
+  if (content instanceof Uint8Array) return cloneToArrayBuffer(content);
   const encoded = new TextEncoder().encode(content);
   return cloneToArrayBuffer(encoded);
 }
@@ -213,35 +308,22 @@ function normalizeEmailAddress(email: string): string {
   return email.replace(/[<>]/g, "").trim().toLowerCase();
 }
 
-function resolveReportRecipient(sender: string, fallback: string): string {
-  const normalizedSender = normalizeEmailAddress(sender);
-  if (normalizedSender) return normalizedSender;
-  return normalizeEmailAddress(fallback);
-}
-
 function parseMaxAttachmentBytes(raw: string | undefined): number {
   if (!raw) return DEFAULT_MAX_ATTACHMENT_BYTES;
   const value = Number.parseInt(raw, 10);
   return Number.isFinite(value) && value > 0 ? value : DEFAULT_MAX_ATTACHMENT_BYTES;
 }
 
-function compactTimestamp(date: Date): string {
+function isoDateKey(date: Date): string {
   const p = (n: number) => String(n).padStart(2, "0");
-  return [
-    date.getUTCFullYear(),
-    p(date.getUTCMonth() + 1),
-    p(date.getUTCDate()),
-    "-",
-    p(date.getUTCHours()),
-    p(date.getUTCMinutes()),
-    p(date.getUTCSeconds()),
-  ].join("");
+  return `${date.getUTCFullYear()}-${p(date.getUTCMonth() + 1)}-${p(date.getUTCDate())}`;
 }
 
 async function analyzeWorkbook(input: {
   binary: ArrayBuffer;
   fileName: string;
   receivedAtIso: string;
+  dateKey: string;
   from: string;
   to: string;
   subject: string;
@@ -272,10 +354,12 @@ async function analyzeWorkbook(input: {
   const totalHiddenSheets = sheetSummaries.filter((s) => s.state !== "visible").length;
   const totalRowsAcrossSheets = sheetSummaries.reduce((sum, s) => sum + s.rowCount, 0);
   const melMentionsBySheet = Object.fromEntries(sheetSummaries.map((s) => [s.name, s.melMentions]));
+  const melMentionsTotal = sheetSummaries.reduce((sum, s) => sum + s.melMentions, 0);
 
   return {
     workbookFileName: input.fileName,
     receivedAtIso: input.receivedAtIso,
+    dateKey: input.dateKey,
     from: input.from,
     to: input.to,
     subject: input.subject,
@@ -285,6 +369,7 @@ async function analyzeWorkbook(input: {
     totalHiddenSheets,
     totalRowsAcrossSheets,
     melMentionsBySheet,
+    melMentionsTotal,
   };
 }
 
@@ -352,8 +437,6 @@ function readCellText(cell: ExcelJS.Cell): string {
   if (Array.isArray(value)) return value.map((part) => String(part ?? "")).join("");
 
   if (typeof value === "object") {
-    // ExcelJS cell values can be rich objects (formula, hyperlink, richText, etc.).
-    // Avoid calling `cell.text` directly because some malformed/null payloads can throw.
     const anyValue = value as unknown as Record<string, unknown>;
     const richText = anyValue.richText;
     if (Array.isArray(richText)) {
@@ -363,7 +446,6 @@ function readCellText(cell: ExcelJS.Cell): string {
         )
         .join("");
     }
-
     if (typeof anyValue.text === "string") return anyValue.text;
     if (anyValue.result !== null && anyValue.result !== undefined) return String(anyValue.result);
     if (typeof anyValue.formula === "string") return anyValue.formula;
@@ -378,68 +460,243 @@ function readCellText(cell: ExcelJS.Cell): string {
   }
 }
 
-function renderReportText(result: AnalysisResult): string {
-  const lines: string[] = [];
-  lines.push("Vehicle ETIC Daily Analysis");
-  lines.push("===========================");
-  lines.push(`Workbook: ${result.workbookFileName}`);
-  lines.push(`Received: ${result.receivedAtIso}`);
-  lines.push(`Sender: ${result.from}`);
-  lines.push(`Recipient: ${result.to}`);
-  lines.push(`Subject: ${result.subject || "(no subject)"}`);
-  lines.push(`Size: ${result.workbookBytes} bytes`);
-  lines.push("");
-  lines.push(`Visible sheets: ${result.totalVisibleSheets}`);
-  lines.push(`Hidden/veryHidden sheets: ${result.totalHiddenSheets}`);
-  lines.push(`Total non-empty rows (all sheets): ${result.totalRowsAcrossSheets}`);
-  lines.push("");
-  lines.push("Per-sheet summary:");
-  for (const sheet of result.sheetSummaries) {
-    lines.push(`- ${sheet.name}`);
-    lines.push(`  state: ${sheet.state}`);
-    lines.push(`  rows: ${sheet.rowCount}`);
-    lines.push(`  columns (max non-empty row width): ${sheet.columnCountEstimate}`);
-    lines.push(`  non-empty cells: ${sheet.nonEmptyCellCountEstimate}`);
-    lines.push(`  MEL mentions: ${sheet.melMentions}`);
-    lines.push(
-      `  sample headers: ${sheet.sampleHeaders.length ? sheet.sampleHeaders.join(" | ") : "(none detected)"}`,
-    );
-  }
-  return lines.join("\n");
+function renderDashboardHtml(): string {
+  const escapedTitle = escapeHtml(SITE_TITLE);
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark light" />
+  <title>${escapedTitle}</title>
+  <style>
+    :root {
+      color-scheme: dark light;
+      --bg: #0b1220;
+      --panel: #111a2e;
+      --panel-alt: #16213d;
+      --border: #1f2a44;
+      --text: #e6ecf5;
+      --muted: #96a2b8;
+      --accent: #6aa9ff;
+      --up: #ff8c8c;
+      --down: #8cff9f;
+      --flat: #c7d0df;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, sans-serif;
+      background: radial-gradient(1200px 800px at 10% -10%, #1a2748 0%, #0b1220 55%) fixed;
+      color: var(--text);
+      min-height: 100vh;
+    }
+    header {
+      padding: 24px 32px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: baseline;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+    header h1 { margin: 0; font-size: 22px; letter-spacing: 0.02em; }
+    header .sub { color: var(--muted); font-size: 13px; }
+    main { padding: 24px 32px 80px; max-width: 1100px; margin: 0 auto; }
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 14px;
+      margin-bottom: 24px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px 18px;
+    }
+    .card h3 { margin: 0 0 6px; font-size: 12px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; }
+    .card .v { font-size: 24px; font-weight: 600; }
+    .card .delta { margin-top: 6px; font-size: 12px; color: var(--muted); }
+    .up { color: var(--up); }
+    .down { color: var(--down); }
+    .flat { color: var(--flat); }
+    section { margin-bottom: 28px; }
+    h2 { font-size: 16px; margin: 0 0 10px; letter-spacing: 0.04em; }
+    table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+    th, td { padding: 10px 12px; text-align: left; font-size: 13px; border-bottom: 1px solid var(--border); }
+    th { background: var(--panel-alt); color: var(--muted); font-weight: 600; }
+    tr:last-child td { border-bottom: 0; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #1c2a4a; color: #cdd9ef; font-size: 11px; border: 1px solid var(--border); }
+    .muted { color: var(--muted); }
+    footer { padding: 24px 32px; color: var(--muted); font-size: 12px; text-align: center; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .empty { background: var(--panel); border: 1px dashed var(--border); border-radius: 12px; padding: 24px; color: var(--muted); text-align: center; }
+    code { background: #0e1729; padding: 2px 6px; border-radius: 6px; border: 1px solid var(--border); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>${escapedTitle}</h1>
+    <span class="sub" id="updated">Loading…</span>
+  </header>
+  <main>
+    <div class="cards" id="summary-cards"></div>
+    <section>
+      <h2>History</h2>
+      <div id="history-wrap"><div class="empty">Loading history…</div></div>
+    </section>
+    <section>
+      <h2>Latest per-sheet summary</h2>
+      <div id="sheets-wrap"><div class="empty">Loading latest analysis…</div></div>
+    </section>
+  </main>
+  <footer>
+    Ingest flow: email <code>etic@2t3.app</code> → R2 <code>eticanalysis</code> → this dashboard.
+  </footer>
+  <script>
+    const fmt = (n) => typeof n === "number" ? n.toLocaleString() : "—";
+    const deltaClass = (n) => n === null || n === undefined ? "flat" : n > 0 ? "up" : n < 0 ? "down" : "flat";
+    const deltaPrefix = (n) => n === null || n === undefined ? "" : n > 0 ? "+" : "";
+
+    async function loadAll() {
+      const [historyRes, latestRes] = await Promise.allSettled([
+        fetch("/api/history").then((r) => r.ok ? r.json() : null),
+        fetch("/api/latest").then((r) => r.ok ? r.json() : null),
+      ]);
+      const history = historyRes.status === "fulfilled" ? historyRes.value : null;
+      const latest = latestRes.status === "fulfilled" ? latestRes.value : null;
+      renderSummary(latest, history);
+      renderHistory(history);
+      renderSheets(latest);
+    }
+
+    function renderSummary(latest, history) {
+      const updatedEl = document.getElementById("updated");
+      if (!latest) {
+        updatedEl.textContent = "No analysis yet — waiting for first inbound email.";
+      } else {
+        updatedEl.textContent = "Latest: " + new Date(latest.receivedAtIso).toLocaleString() + " · " + latest.workbookFileName;
+      }
+
+      const cards = document.getElementById("summary-cards");
+      const lastEntry = history && history.entries && history.entries.length
+        ? history.entries[history.entries.length - 1]
+        : null;
+
+      const items = latest ? [
+        { label: "Visible sheets", value: latest.totalVisibleSheets, delta: lastEntry?.diff?.deltaSheetsVisible ?? null },
+        { label: "Hidden sheets", value: latest.totalHiddenSheets, delta: null },
+        { label: "Rows (all sheets)", value: latest.totalRowsAcrossSheets, delta: lastEntry?.diff?.deltaTotalRows ?? null },
+        { label: "MEL mentions", value: latest.melMentionsTotal, delta: lastEntry?.diff?.deltaMelMentionsTotal ?? null },
+      ] : [];
+
+      cards.innerHTML = items.length === 0
+        ? '<div class="empty">No metrics yet.</div>'
+        : items.map((item) => {
+            const deltaHtml = item.delta === null || item.delta === undefined
+              ? '<span class="muted">no prior snapshot</span>'
+              : '<span class="' + deltaClass(item.delta) + '">Δ ' + deltaPrefix(item.delta) + fmt(item.delta) + ' vs prior day</span>';
+            return '<div class="card"><h3>' + item.label + '</h3><div class="v">' + fmt(item.value) + '</div><div class="delta">' + deltaHtml + '</div></div>';
+          }).join("");
+    }
+
+    function renderHistory(history) {
+      const wrap = document.getElementById("history-wrap");
+      if (!history || !history.entries || history.entries.length === 0) {
+        wrap.innerHTML = '<div class="empty">No history yet.</div>';
+        return;
+      }
+      const rows = [...history.entries].sort((a, b) => b.dateKey.localeCompare(a.dateKey)).map((e) => {
+        const d = e.diff || {};
+        const cls = (v) => deltaClass(v ?? null);
+        const pref = (v) => deltaPrefix(v ?? null);
+        const row = [
+          '<tr>',
+          '<td>' + e.dateKey + '</td>',
+          '<td>' + e.workbookFileName + '</td>',
+          '<td>' + fmt(e.totalVisibleSheets) + '</td>',
+          '<td>' + fmt(e.totalHiddenSheets) + '</td>',
+          '<td>' + fmt(e.totalRowsAcrossSheets) + ' <span class="' + cls(d.deltaTotalRows) + '">' + pref(d.deltaTotalRows) + fmt(d.deltaTotalRows) + '</span></td>',
+          '<td>' + fmt(e.melMentionsTotal) + ' <span class="' + cls(d.deltaMelMentionsTotal) + '">' + pref(d.deltaMelMentionsTotal) + fmt(d.deltaMelMentionsTotal) + '</span></td>',
+          '<td><span class="pill">' + (d.previousDateKey || "initial") + '</span></td>',
+          '</tr>'
+        ].join("");
+        return row;
+      }).join("");
+      wrap.innerHTML = [
+        '<table>',
+        '<thead><tr>',
+          '<th>Date</th>',
+          '<th>Workbook</th>',
+          '<th>Visible</th>',
+          '<th>Hidden</th>',
+          '<th>Rows (Δ)</th>',
+          '<th>MEL (Δ)</th>',
+          '<th>Compared to</th>',
+        '</tr></thead>',
+        '<tbody>', rows, '</tbody>',
+        '</table>'
+      ].join("");
+    }
+
+    function renderSheets(latest) {
+      const wrap = document.getElementById("sheets-wrap");
+      if (!latest || !Array.isArray(latest.sheetSummaries) || latest.sheetSummaries.length === 0) {
+        wrap.innerHTML = '<div class="empty">No sheet data yet.</div>';
+        return;
+      }
+      const rows = latest.sheetSummaries.map((s) => [
+        '<tr>',
+        '<td>' + s.name + '</td>',
+        '<td>' + s.state + '</td>',
+        '<td>' + fmt(s.rowCount) + '</td>',
+        '<td>' + fmt(s.columnCountEstimate) + '</td>',
+        '<td>' + fmt(s.nonEmptyCellCountEstimate) + '</td>',
+        '<td>' + fmt(s.melMentions) + '</td>',
+        '<td class="muted">' + (s.sampleHeaders && s.sampleHeaders.length ? s.sampleHeaders.join(" | ") : "—") + '</td>',
+        '</tr>'
+      ].join("")).join("");
+      wrap.innerHTML = [
+        '<table>',
+        '<thead><tr>',
+          '<th>Sheet</th>',
+          '<th>State</th>',
+          '<th>Rows</th>',
+          '<th>Cols</th>',
+          '<th>Cells</th>',
+          '<th>MEL</th>',
+          '<th>Sample headers</th>',
+        '</tr></thead>',
+        '<tbody>', rows, '</tbody>',
+        '</table>'
+      ].join("");
+    }
+
+    loadAll().catch((err) => {
+      document.getElementById("updated").textContent = "Failed to load: " + (err && err.message ? err.message : String(err));
+    });
+  </script>
+</body>
+</html>`;
 }
 
-async function sendTextEmail(env: Env, subject: string, text: string, to: string): Promise<void> {
-  if (!env.REPORT_FROM || !to) {
-    console.error(
-      JSON.stringify({
-        level: "warn",
-        message: "Report email skipped due to missing REPORT_FROM or recipient",
-        subject,
-      }),
-    );
-    return;
-  }
-
-  const normalizedTo = normalizeEmailAddress(to);
-  const normalizedCc = normalizeEmailAddress(ALWAYS_CC_EMAIL);
-
-  await env.REPORT_EMAIL.send({
-    from: env.REPORT_FROM,
-    to,
-    ...(normalizedTo === normalizedCc ? {} : { cc: [ALWAYS_CC_EMAIL] }),
-    subject,
-    text,
-  });
+function escapeHtml(input: string): string {
+  return input
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 export {
   analyzeWorkbook,
-  compactTimestamp,
   countMelMentions,
+  isoDateKey,
   parseMaxAttachmentBytes,
   pickWorkbookAttachment,
   readCellText,
-  resolveReportRecipient,
-  renderReportText,
   sanitizeFileName,
+  upsertHistoryEntry,
 };

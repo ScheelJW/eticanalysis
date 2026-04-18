@@ -2,11 +2,11 @@ import { describe, expect, it } from "vitest";
 import ExcelJS from "exceljs";
 import {
   analyzeWorkbook,
-  compactTimestamp,
+  isoDateKey,
   parseMaxAttachmentBytes,
   pickWorkbookAttachment,
-  renderReportText,
   sanitizeFileName,
+  upsertHistoryEntry,
 } from "../src/index";
 
 describe("utility helpers", () => {
@@ -14,9 +14,9 @@ describe("utility helpers", () => {
     expect(sanitizeFileName("Vehicle ETIC (Daily).xlsx")).toBe("Vehicle_ETIC__Daily_.xlsx");
   });
 
-  it("formats compact UTC timestamps", () => {
+  it("formats ISO date keys", () => {
     const date = new Date("2026-04-17T12:34:56.000Z");
-    expect(compactTimestamp(date)).toBe("20260417-123456");
+    expect(isoDateKey(date)).toBe("2026-04-17");
   });
 
   it("parses max attachment bytes with fallback", () => {
@@ -50,6 +50,39 @@ describe("utility helpers", () => {
   });
 });
 
+async function makeAnalysis(
+  overrides: Partial<{
+    dateKey: string;
+    totalRowsAcrossSheets: number;
+    melMentionsTotal: number;
+    totalVisibleSheets: number;
+    totalHiddenSheets: number;
+    workbookFileName: string;
+  }>,
+) {
+  const workbook = new ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet("Vehicles");
+  sheet.addRow(["VIN", "MEL", "Status"]);
+  sheet.addRow(["123", "MEL 2", "Ready"]);
+  const binary = await workbook.xlsx.writeBuffer();
+  const analysis = await analyzeWorkbook({
+    binary,
+    fileName: overrides.workbookFileName ?? "Vehicle ETIC.xlsx",
+    receivedAtIso: new Date("2026-04-17T00:00:00.000Z").toISOString(),
+    dateKey: overrides.dateKey ?? "2026-04-17",
+    from: "ops@example.com",
+    to: "etic@2t3.app",
+    subject: "Daily ETIC",
+  });
+  return {
+    ...analysis,
+    totalRowsAcrossSheets: overrides.totalRowsAcrossSheets ?? analysis.totalRowsAcrossSheets,
+    melMentionsTotal: overrides.melMentionsTotal ?? analysis.melMentionsTotal,
+    totalVisibleSheets: overrides.totalVisibleSheets ?? analysis.totalVisibleSheets,
+    totalHiddenSheets: overrides.totalHiddenSheets ?? analysis.totalHiddenSheets,
+  };
+}
+
 describe("workbook analysis", () => {
   it("analyzes visible and hidden worksheets", async () => {
     const workbook = new ExcelJS.Workbook();
@@ -67,8 +100,9 @@ describe("workbook analysis", () => {
       binary,
       fileName: "Vehicle ETIC.xlsx",
       receivedAtIso: "2026-04-17T00:00:00.000Z",
+      dateKey: "2026-04-17",
       from: "ops@example.com",
-      to: "intake@example.com",
+      to: "etic@2t3.app",
       subject: "Daily ETIC",
     });
 
@@ -76,14 +110,10 @@ describe("workbook analysis", () => {
     expect(result.totalHiddenSheets).toBe(1);
     expect(result.sheetSummaries).toHaveLength(2);
     expect(result.melMentionsBySheet["Vehicle Status"]).toBeGreaterThanOrEqual(1);
-
-    const report = renderReportText(result);
-    expect(report).toContain("Vehicle ETIC Daily Analysis");
-    expect(report).toContain("Vehicle Status");
-    expect(report).toContain("Raw Data");
+    expect(result.melMentionsTotal).toBeGreaterThanOrEqual(2);
   });
 
-  it("handles null and formula cells without crashing", async () => {
+  it("handles formula cells without crashing", async () => {
     const workbook = new ExcelJS.Workbook();
     const sheet = workbook.addWorksheet("Formula Edge Cases");
     sheet.addRow(["Header A", "Header B"]);
@@ -97,13 +127,94 @@ describe("workbook analysis", () => {
       binary,
       fileName: "Vehicle ETIC.xlsx",
       receivedAtIso: "2026-04-18T00:00:00.000Z",
+      dateKey: "2026-04-18",
       from: "ops@example.com",
-      to: "intake@example.com",
+      to: "etic@2t3.app",
       subject: "Daily ETIC edge case",
     });
 
     expect(result.sheetSummaries[0]?.name).toBe("Formula Edge Cases");
     expect(result.sheetSummaries[0]?.sampleHeaders).toContain("Header A");
     expect(result.melMentionsBySheet["Formula Edge Cases"]).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("history upsert", () => {
+  it("appends the first entry with no diff", async () => {
+    const analysis = await makeAnalysis({
+      dateKey: "2026-04-17",
+      totalRowsAcrossSheets: 10,
+      melMentionsTotal: 3,
+    });
+    const history = upsertHistoryEntry(
+      { updatedAtIso: new Date().toISOString(), entries: [] },
+      analysis,
+      "workbooks/2026-04-17/x.xlsx",
+      "analyses/2026-04-17.json",
+    );
+    expect(history.entries).toHaveLength(1);
+    expect(history.entries[0]?.diff.previousDateKey).toBeNull();
+    expect(history.entries[0]?.diff.deltaTotalRows).toBeNull();
+  });
+
+  it("computes delta vs previous day", async () => {
+    const day1 = await makeAnalysis({
+      dateKey: "2026-04-17",
+      totalRowsAcrossSheets: 10,
+      melMentionsTotal: 3,
+      totalVisibleSheets: 5,
+    });
+    const day2 = await makeAnalysis({
+      dateKey: "2026-04-18",
+      totalRowsAcrossSheets: 12,
+      melMentionsTotal: 5,
+      totalVisibleSheets: 6,
+    });
+    let history = upsertHistoryEntry(
+      { updatedAtIso: new Date().toISOString(), entries: [] },
+      day1,
+      "workbooks/2026-04-17/x.xlsx",
+      "analyses/2026-04-17.json",
+    );
+    history = upsertHistoryEntry(
+      history,
+      day2,
+      "workbooks/2026-04-18/y.xlsx",
+      "analyses/2026-04-18.json",
+    );
+    expect(history.entries).toHaveLength(2);
+    const latest = history.entries[1];
+    expect(latest?.diff.previousDateKey).toBe("2026-04-17");
+    expect(latest?.diff.deltaTotalRows).toBe(2);
+    expect(latest?.diff.deltaMelMentionsTotal).toBe(2);
+    expect(latest?.diff.deltaSheetsVisible).toBe(1);
+  });
+
+  it("replaces same-day entry on re-send", async () => {
+    const initial = await makeAnalysis({
+      dateKey: "2026-04-18",
+      totalRowsAcrossSheets: 5,
+      melMentionsTotal: 1,
+    });
+    let history = upsertHistoryEntry(
+      { updatedAtIso: new Date().toISOString(), entries: [] },
+      initial,
+      "workbooks/2026-04-18/a.xlsx",
+      "analyses/2026-04-18.json",
+    );
+    const corrected = await makeAnalysis({
+      dateKey: "2026-04-18",
+      totalRowsAcrossSheets: 7,
+      melMentionsTotal: 2,
+    });
+    history = upsertHistoryEntry(
+      history,
+      corrected,
+      "workbooks/2026-04-18/b.xlsx",
+      "analyses/2026-04-18.json",
+    );
+    expect(history.entries).toHaveLength(1);
+    expect(history.entries[0]?.totalRowsAcrossSheets).toBe(7);
+    expect(history.entries[0]?.workbookKey).toBe("workbooks/2026-04-18/b.xlsx");
   });
 });

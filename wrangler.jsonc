@@ -16,14 +16,10 @@
       "bucket_name": "eticanalysis"
     }
   ],
-  "send_email": [
-    {
-      "name": "REPORT_EMAIL"
-    }
+  "routes": [
+    { "pattern": "minot.2t3.app", "custom_domain": true }
   ],
   "vars": {
-    "REPORT_TO": "",
-    "REPORT_FROM": "",
     "EXPECTED_ATTACHMENT_NAME": "Vehicle ETIC.xlsx",
     "ALLOWED_SENDERS": "*",
     "MAX_ATTACHMENT_BYTES": "20000000"

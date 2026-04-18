@@ -1,87 +1,62 @@
 # eticanalysis
 
-Cloudflare Worker automation for your **daily Vehicle ETIC** process:
+Cloudflare Worker that turns your **daily Vehicle ETIC** email into a live dashboard.
 
-1. Receive inbound email containing the ETIC workbook (`.xlsx` attachment).
-2. Save the workbook to R2 bucket `eticanalysis`.
-3. Analyze visible + hidden sheets (structure and MEL mentions).
-4. Save machine + human-readable reports to R2.
-5. Email the report back automatically.
+## Flow
+
+1. Email with `.xlsx` attachment lands at any `@2t3.app` mailbox (Email Routing catch-all).
+2. Worker parses the email, stores the workbook in R2 (`eticanalysis`) under `workbooks/<date>/<file>.xlsx`.
+3. Worker runs workbook analysis (visible + hidden sheets, row/cell estimates, MEL mentions).
+4. Analysis is saved in R2:
+   - `analyses/<date>.json`
+   - `analyses/latest.json`
+5. A history index is maintained at `history/index.json` with day-over-day deltas.
+6. Dashboard site serves live HTML + JSON APIs at `minot.2t3.app`.
 
 ## Architecture
 
 - **Runtime:** Cloudflare Workers (TypeScript)
-- **Inbound trigger:** Email Routing -> Worker `email()` handler
+- **Inbound trigger:** Email Routing → Worker `email()` handler
 - **Storage:** R2 bucket binding `ETIC_BUCKET`
-- **Parser:** `postal-mime` for inbound email + attachments
+- **Parser:** `postal-mime` for MIME + attachments
 - **Workbook analysis:** `exceljs`
-- **Outbound report email:** `send_email` binding `REPORT_EMAIL`
+- **Frontend:** Worker-served HTML dashboard + fetch-backed charts/tables
 
-## Project layout
+## Routes
 
-- `src/index.ts` - Worker handlers and workbook analysis logic.
-- `wrangler.jsonc` - Worker configuration (R2 + email bindings).
-- `test/index.test.ts` - Unit tests for analysis and report rendering.
+- `/` - HTML dashboard
+- `/healthz` - Service health JSON
+- `/api/latest` - Latest analysis JSON
+- `/api/history` - Historical entries with per-day deltas
+- `/api/analysis/<YYYY-MM-DD>` - Specific day's analysis
 
-## Environment variables (`wrangler.jsonc -> vars`)
+## R2 layout
 
-- `REPORT_TO` - Destination address for reports.
-- `REPORT_FROM` - Sender address (must be on your Email Routing domain).
-- `EXPECTED_ATTACHMENT_NAME` - Exact file name to prefer (default: `Vehicle ETIC.xlsx`).
-- `ALLOWED_SENDERS` - Sender policy:
-  - `*` = allow any inbound sender
-  - empty = allow any inbound sender
-  - comma-separated list = only allow those sender addresses
-- `MAX_ATTACHMENT_BYTES` - Max attachment size in bytes (default currently set to `20000000` in config).
-
-## One-time Cloudflare setup
-
-1. **Email Routing + domain setup (Cloudflare dashboard)**
-   - Add/activate your domain in Cloudflare and ensure DNS is active.
-   - Go to **Email > Email Routing** and click **Get started** (or Enable).
-   - Complete the required DNS records Cloudflare provides for Email Routing.
-   - Add at least one **Destination Address** and verify it.
-   - Create a route for the ETIC inbox address (example: `vehicle-etic@yourdomain.com`) and set action to **Send to Worker** -> `etic-email-automation`.
-   - For this project requirement ("allowed senders is anyone"), keep `ALLOWED_SENDERS` set to `*`.
-
-2. **R2 bucket**
-   - Ensure bucket `eticanalysis` exists (already done in your case).
-
-3. **Configure worker vars**
-   - Edit `wrangler.jsonc` and set:
-     - `REPORT_TO`
-     - `REPORT_FROM`
-     - keep `ALLOWED_SENDERS` as `*` to allow anyone
-   - Keep sensitive values in secrets if needed.
-
-4. **Deploy**
-   ```bash
-   npm install
-   npm run check
-   npm run deploy
-   ```
-
-## Daily flow
-
-1. Send your ETIC workbook by email to the inbound address tied to this Worker.
-2. Worker stores workbook at `incoming/<timestamp>/<filename>.xlsx`.
-3. Worker writes reports to:
-   - `reports/<timestamp>/analysis.json`
-   - `reports/<timestamp>/report.txt`
-   - `reports/latest.json`
-   - `reports/latest.txt`
-4. Worker emails the report text back to `REPORT_TO`.
-
-## Local development
-
-Run:
-
-```bash
-npm run dev
+```
+workbooks/<YYYY-MM-DD>/<file>.xlsx   -- raw received workbooks
+analyses/<YYYY-MM-DD>.json           -- analysis per ingest day
+analyses/latest.json                 -- most recent analysis
+history/index.json                   -- rolling index with day-over-day deltas
 ```
 
-Wrangler exposes local email test endpoint at `/cdn-cgi/handler/email` in dev mode.
+## Configuration (`wrangler.jsonc -> vars`)
 
-## Health endpoint
+- `EXPECTED_ATTACHMENT_NAME` - Preferred attachment filename (default: `Vehicle ETIC.xlsx`).
+- `ALLOWED_SENDERS` - `*` allows any sender, otherwise comma-separated allowlist.
+- `MAX_ATTACHMENT_BYTES` - Safety limit; anything larger is rejected.
 
-`GET /healthz` returns a simple JSON response for uptime checks.
+## Cloudflare wiring
+
+- Worker script: `etic-email-automation`
+- Custom domain: `minot.2t3.app` (managed via Worker `routes` in `wrangler.jsonc`)
+- R2 bucket: `eticanalysis`
+- Email Routing catch-all on `2t3.app` → this Worker
+
+## Development
+
+```bash
+npm install
+npm run check     # types + tests
+npm run dev       # local wrangler dev
+npm run deploy    # production deploy
+```
