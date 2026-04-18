@@ -82,4 +82,28 @@ describe("workbook analysis", () => {
     expect(report).toContain("Vehicle Status");
     expect(report).toContain("Raw Data");
   });
+
+  it("handles null and formula cells without crashing", async () => {
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet("Formula Edge Cases");
+    sheet.addRow(["Header A", "Header B"]);
+    sheet.getCell("A2").value = "";
+    sheet.getCell("B2").value = { formula: "A2", result: "" };
+    sheet.getCell("A3").value = { formula: "1+1", result: 2 };
+    sheet.getCell("B3").value = "MEL READY";
+
+    const binary = await workbook.xlsx.writeBuffer();
+    const result = await analyzeWorkbook({
+      binary,
+      fileName: "Vehicle ETIC.xlsx",
+      receivedAtIso: "2026-04-18T00:00:00.000Z",
+      from: "ops@example.com",
+      to: "intake@example.com",
+      subject: "Daily ETIC edge case",
+    });
+
+    expect(result.sheetSummaries[0]?.name).toBe("Formula Edge Cases");
+    expect(result.sheetSummaries[0]?.sampleHeaders).toContain("Header A");
+    expect(result.melMentionsBySheet["Formula Edge Cases"]).toBeGreaterThanOrEqual(1);
+  });
 });

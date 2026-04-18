@@ -315,7 +315,7 @@ function collectHeaders(sheet: ExcelJS.Worksheet): string[] {
   const firstRow = sheet.getRow(1);
   const headers: string[] = [];
   firstRow.eachCell({ includeEmpty: false }, (cell) => {
-    const value = cell.text?.trim();
+    const value = readCellText(cell).trim();
     if (value) headers.push(value);
   });
   return headers.slice(0, 12);
@@ -335,11 +335,47 @@ function countMelMentions(sheet: ExcelJS.Worksheet): number {
   let count = 0;
   sheet.eachRow({ includeEmpty: false }, (row) => {
     row.eachCell({ includeEmpty: false }, (cell) => {
-      const text = cell.text?.toLowerCase() ?? "";
+      const text = readCellText(cell).toLowerCase();
       if (text.includes("mel")) count += 1;
     });
   });
   return count;
+}
+
+function readCellText(cell: ExcelJS.Cell): string {
+  const value = cell.value;
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  if (value instanceof Date) return value.toISOString();
+  if (Array.isArray(value)) return value.map((part) => String(part ?? "")).join("");
+
+  if (typeof value === "object") {
+    // ExcelJS cell values can be rich objects (formula, hyperlink, richText, etc.).
+    // Avoid calling `cell.text` directly because some malformed/null payloads can throw.
+    const anyValue = value as unknown as Record<string, unknown>;
+    const richText = anyValue.richText;
+    if (Array.isArray(richText)) {
+      return richText
+        .map((part) =>
+          part && typeof part === "object" ? String((part as { text?: unknown }).text ?? "") : "",
+        )
+        .join("");
+    }
+
+    if (typeof anyValue.text === "string") return anyValue.text;
+    if (anyValue.result !== null && anyValue.result !== undefined) return String(anyValue.result);
+    if (typeof anyValue.formula === "string") return anyValue.formula;
+    if (typeof anyValue.hyperlink === "string") return anyValue.hyperlink;
+    if (typeof anyValue.error === "string") return anyValue.error;
+  }
+
+  try {
+    return String(value);
+  } catch {
+    return "";
+  }
 }
 
 function renderReportText(result: AnalysisResult): string {
@@ -402,6 +438,7 @@ export {
   countMelMentions,
   parseMaxAttachmentBytes,
   pickWorkbookAttachment,
+  readCellText,
   resolveReportRecipient,
   renderReportText,
   sanitizeFileName,
