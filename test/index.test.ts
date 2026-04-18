@@ -3,39 +3,23 @@ import ExcelJS from "exceljs";
 import {
   analyzeWorkbook,
   isoDateKey,
-  parseEticEmailSubject,
   parseMaxAttachmentBytes,
+  parseReportDateKeyFromSubject,
   pickWorkbookAttachment,
   resolveAnalysisDateKey,
   sanitizeFileName,
   upsertHistoryEntry,
 } from "../src/index";
 
-describe("ETIC email subject parsing", () => {
-  it("extracts MC rate and report date from typical forward subject (date-only below-MEL line)", () => {
-    const subject =
-      "Fw: Vehicle MC Rate: 75.49% - ETIC & Below MEL/Critical Report: 15-APR-26";
-    expect(parseEticEmailSubject(subject)).toEqual({
-      reportDateKey: "2026-04-15",
-      mcRatePercent: 75.49,
-      belowMelCriticalCount: null,
-    });
-  });
-
-  it("extracts below count only when count is separated from the report date", () => {
-    const subject = "Below MEL/Critical Report: 12 – 15-APR-26 — MC Rate: 50%";
-    expect(parseEticEmailSubject(subject).belowMelCriticalCount).toBe(12);
-    expect(parseEticEmailSubject(subject).reportDateKey).toBe("2026-04-15");
-  });
-
-  it("uses last DD-MMM-YY token as report date when multiple dates appear", () => {
+describe("ETIC email subject → report date (ingest path only)", () => {
+  it("uses last DD-MMM-YY token in subject as report date key", () => {
     const subject = "RE: Daily — 01-JAN-25 snapshot — MC Rate: 80% — Report: 14-FEB-26";
-    expect(parseEticEmailSubject(subject).reportDateKey).toBe("2026-02-14");
+    expect(parseReportDateKeyFromSubject(subject)).toBe("2026-02-14");
   });
 
   it("resolveAnalysisDateKey prefers parsed report date over receipt day", () => {
     const received = new Date("2026-04-18T12:00:00.000Z");
-    const subject = "Fw: Vehicle MC Rate: 10% - ETIC & Below MEL/Critical Report: 3 - 15-APR-26";
+    const subject = "Fw: Vehicle MC Rate: 10% - ETIC & Below MEL/Critical Report: 15-APR-26";
     expect(resolveAnalysisDateKey(subject, received)).toBe("2026-04-15");
   });
 
