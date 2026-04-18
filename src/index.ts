@@ -157,6 +157,7 @@ export default {
 function isAuthorizedSender(sender: string, env: Env): boolean {
   const configured = env.ALLOWED_SENDERS?.trim();
   if (!configured) return true;
+  if (configured === "*") return true;
   const normalizedSender = normalizeEmailAddress(sender);
   const allowed = configured
     .split(",")

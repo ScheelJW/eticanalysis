@@ -28,15 +28,21 @@ Cloudflare Worker automation for your **daily Vehicle ETIC** process:
 - `REPORT_TO` - Destination address for reports.
 - `REPORT_FROM` - Sender address (must be on your Email Routing domain).
 - `EXPECTED_ATTACHMENT_NAME` - Exact file name to prefer (default: `Vehicle ETIC.xlsx`).
-- `ALLOWED_SENDERS` - Optional comma-separated allowlist for inbound sender envelope addresses.
+- `ALLOWED_SENDERS` - Sender policy:
+  - `*` = allow any inbound sender
+  - empty = allow any inbound sender
+  - comma-separated list = only allow those sender addresses
 - `MAX_ATTACHMENT_BYTES` - Max attachment size in bytes (default currently set to `20000000` in config).
 
 ## One-time Cloudflare setup
 
-1. **Email Routing**
-   - Enable Email Routing for your domain in Cloudflare.
-   - Create verified destination address(es).
-   - Add routing rule from an inbound address (example: `vehicle-etic@yourdomain.com`) to this Worker.
+1. **Email Routing + domain setup (Cloudflare dashboard)**
+   - Add/activate your domain in Cloudflare and ensure DNS is active.
+   - Go to **Email > Email Routing** and click **Get started** (or Enable).
+   - Complete the required DNS records Cloudflare provides for Email Routing.
+   - Add at least one **Destination Address** and verify it.
+   - Create a route for the ETIC inbox address (example: `vehicle-etic@yourdomain.com`) and set action to **Send to Worker** -> `etic-email-automation`.
+   - For this project requirement ("allowed senders is anyone"), keep `ALLOWED_SENDERS` set to `*`.
 
 2. **R2 bucket**
    - Ensure bucket `eticanalysis` exists (already done in your case).
@@ -45,7 +51,7 @@ Cloudflare Worker automation for your **daily Vehicle ETIC** process:
    - Edit `wrangler.jsonc` and set:
      - `REPORT_TO`
      - `REPORT_FROM`
-     - optional `ALLOWED_SENDERS`
+     - keep `ALLOWED_SENDERS` as `*` to allow anyone
    - Keep sensitive values in secrets if needed.
 
 4. **Deploy**

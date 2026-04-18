@@ -24,7 +24,7 @@
     "REPORT_TO": "",
     "REPORT_FROM": "",
     "EXPECTED_ATTACHMENT_NAME": "Vehicle ETIC.xlsx",
-    "ALLOWED_SENDERS": "",
+    "ALLOWED_SENDERS": "*",
     "MAX_ATTACHMENT_BYTES": "20000000"
   }
 }
