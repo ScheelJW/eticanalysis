@@ -1078,7 +1078,7 @@ function renderDashboardHtml(): string {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="color-scheme" content="dark light" />
-  <meta name="etic-ui" content="tabs-snapshot-wo-v2" />
+  <meta name="etic-ui" content="tabs-snapshot-wo-v2b" />
   <title>${escapedTitle}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -1927,7 +1927,8 @@ function renderDashboardHtml(): string {
         empty.classList.remove("hidden");
         wrap.classList.add("hidden");
         st.className = "status err";
-        st.textContent = "No work order \"" + esc(data.workOrderId || "") + "\" in the index yet. Check the ID or run Rebuild history.";
+        st.textContent =
+          "No work order \u0022" + esc(data.workOrderId || "") + "\u0022 in the index yet. Check the ID or run Rebuild history.";
         return;
       }
       const r = data.row;
