@@ -2,9 +2,11 @@ import PostalMime from "postal-mime";
 import type { Attachment } from "postal-mime";
 import ExcelJS from "exceljs";
 import {
+  extractRawWorkOrdersFromBinary,
   extractYardCheckSource,
   generateYardCheckWorkbookBuffer,
 } from "./yardCheck";
+import { getChangelog, getWatchRowsLatest, ingestWorkOrderSnapshot } from "./workOrderWatch";
 
 const DEFAULT_MAX_ATTACHMENT_BYTES = 30 * 1024 * 1024;
 const SITE_TITLE = "Minot Vehicle ETIC";
@@ -135,6 +137,9 @@ export default {
 
     await upsertSnapshotRow(env, analysis, workbookKey);
 
+    const rawWos = await extractRawWorkOrdersFromBinary(workbookBytes);
+    await ingestWorkOrderSnapshot(env, dateKey, rawWos, now.toISOString());
+
     const history = await loadHistory(env);
     const upsertedHistory = upsertHistoryEntry(history, analysis, workbookKey, analysisKey);
     await env.ETIC_BUCKET.put(
@@ -197,6 +202,14 @@ export default {
 
     if (url.pathname === "/api/workbook.xlsx") {
       return handleWorkbookDownload(env, request);
+    }
+
+    if (url.pathname === "/api/watch") {
+      return handleWatchApi(env, request, ctx);
+    }
+
+    if (url.pathname === "/api/work-order-changelog") {
+      return handleWorkOrderChangelogApi(env, request);
     }
 
     if (url.pathname === "/api/yard-check.xlsx") {
@@ -560,6 +573,75 @@ async function backfillSnapshotsFromHistory(env: Env): Promise<void> {
     analysis = await enrichAnalysisAssetManagerFromR2(env, analysis);
     await upsertSnapshotRow(env, analysis, entry.workbookKey);
   }
+}
+
+/** Replay all workbooks in date order so changelog + ETIC push counts are correct. */
+async function rebuildWorkOrderWatchFromHistory(env: Env): Promise<void> {
+  await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM work_order_changelog`).run();
+  await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM work_order_state`).run();
+  const history = await loadHistory(env);
+  const sorted = [...history.entries].sort((a, b) => a.dateKey.localeCompare(b.dateKey));
+  const nowIso = new Date().toISOString();
+  for (const entry of sorted) {
+    const obj = await env.ETIC_BUCKET.get(entry.workbookKey);
+    if (!obj) continue;
+    const bytes = await obj.arrayBuffer();
+    const raw = await extractRawWorkOrdersFromBinary(bytes);
+    await ingestWorkOrderSnapshot(env, entry.dateKey, raw, nowIso);
+  }
+}
+
+async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext): Promise<Response> {
+  if (request.method === "POST") {
+    const url = new URL(request.url);
+    if (url.searchParams.get("rebuild") === "1") {
+      ctx.waitUntil(rebuildWorkOrderWatchFromHistory(env));
+      return Response.json(
+        {
+          ok: true,
+          message:
+            "Work order watch is rebuilding from R2 in chronological order (clears prior changelog). Takes a few minutes for large history.",
+        },
+        { headers: cacheHeaders() },
+      );
+    }
+    return new Response("Use POST /api/watch?rebuild=1", { status: 400 });
+  }
+
+  const url = new URL(request.url);
+  let asOf = url.searchParams.get("date");
+  if (asOf && !/^\d{4}-\d{2}-\d{2}$/.test(asOf)) {
+    return new Response("Invalid date", { status: 400 });
+  }
+  if (!asOf) {
+    const history = await loadHistory(env);
+    const latest = history.entries.length
+      ? [...history.entries].sort((a, b) => b.dateKey.localeCompare(a.dateKey))[0]
+      : null;
+    asOf = latest?.dateKey ?? null;
+  }
+  if (!asOf) {
+    return Response.json({ asOfDateKey: null, rows: [], staleCount: 0 }, { headers: cacheHeaders() });
+  }
+
+  const rows = await getWatchRowsLatest(env, asOf);
+  const staleOnly = url.searchParams.get("stale") === "1";
+  const filtered = staleOnly ? rows.filter((r) => r.remarkStale) : rows;
+  const staleCount = rows.filter((r) => r.remarkStale).length;
+  return Response.json(
+    { asOfDateKey: asOf, staleCount, total: rows.length, rows: filtered },
+    { headers: cacheHeaders() },
+  );
+}
+
+async function handleWorkOrderChangelogApi(env: Env, request: Request): Promise<Response> {
+  const url = new URL(request.url);
+  const wo = url.searchParams.get("workOrderId")?.trim();
+  if (!wo) {
+    return Response.json({ ok: false, error: "Missing workOrderId query parameter." }, { status: 400 });
+  }
+  const entries = await getChangelog(env, wo, 500);
+  return Response.json({ workOrderId: wo, entries }, { headers: cacheHeaders() });
 }
 
 async function handleWorkbookDownload(env: Env, request: Request): Promise<Response> {
@@ -979,7 +1061,7 @@ function renderDashboardHtml(): string {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="color-scheme" content="dark light" />
-  <meta name="etic-ui" content="d1-snapshots-compare-v1" />
+  <meta name="etic-ui" content="work-order-watch-v1" />
   <title>${escapedTitle}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -1346,6 +1428,37 @@ function renderDashboardHtml(): string {
     .compare-table .fmc { color: #5ee397; }
     .compare-table .nmc { color: #ff8a8a; }
     .compare-table .surp { color: #f5d547; }
+    .watch-card { margin-bottom: 22px; }
+    .watch-toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 12px; }
+    .watch-toolbar label { font-size: 0.8rem; color: var(--muted); display: flex; align-items: center; gap: 8px; cursor: pointer; }
+    .watch-toolbar button.linkish {
+      background: none; border: none; color: var(--accent); font-family: var(--font); font-size: 0.8rem;
+      cursor: pointer; text-decoration: underline; padding: 0;
+    }
+    .watch-table { font-size: 0.78rem; min-width: 920px; }
+    .watch-table th, .watch-table td { padding: 8px 10px; }
+    .watch-table .stale { background: rgba(255, 100, 100, 0.12); }
+    .watch-table .badge-tier { font-size: 0.62rem; font-weight: 700; text-transform: uppercase; padding: 2px 6px; border-radius: 4px; }
+    .tier-below { background: rgba(255, 138, 138, 0.2); color: #ff9a9a; }
+    .tier-at { background: rgba(255, 213, 71, 0.15); color: #f5d547; }
+    .tier-above { background: rgba(94, 227, 151, 0.15); color: #5ee397; }
+    .tier-unknown { background: rgba(139, 154, 181, 0.15); color: var(--muted); }
+    .modal-overlay {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.65); z-index: 1000;
+      display: flex; align-items: center; justify-content: center; padding: 20px;
+    }
+    .modal {
+      background: var(--surface-solid); border: 1px solid var(--border-strong); border-radius: 14px;
+      max-width: 640px; width: 100%; max-height: 85vh; overflow: hidden; display: flex; flex-direction: column;
+      box-shadow: 0 24px 64px rgba(0,0,0,0.5);
+    }
+    .modal header { padding: 16px 18px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+    .modal header h4 { margin: 0; font-size: 1rem; }
+    .modal .body { padding: 12px 18px; overflow-y: auto; font-size: 0.82rem; }
+    .modal .log-row { padding: 10px 0; border-bottom: 1px solid var(--border); }
+    .modal .log-row:last-child { border-bottom: 0; }
+    .modal .log-meta { color: var(--muted); font-size: 0.72rem; margin-bottom: 4px; }
+    .modal-close { background: none; border: none; color: var(--muted); font-size: 1.25rem; cursor: pointer; line-height: 1; }
     .yard-status-wrap { margin-top: 14px; }
     .status {
       font-size: 0.88rem;
@@ -1412,6 +1525,38 @@ function renderDashboardHtml(): string {
             <thead><tr><th>Report date</th><th>MC %</th><th>Fleet</th><th>FMC</th><th>NMC</th><th>Surplus</th></tr></thead>
             <tbody id="compare-body"><tr><td colspan="6" style="text-align:center;color:var(--muted)">Loading…</td></tr></tbody>
           </table>
+        </div>
+      </div>
+
+      <div class="card watch-card">
+        <h3>Work order watch</h3>
+        <p class="yard-lead" style="margin-bottom:12px">
+          Remark update expectations by MEL: below = 3 days, at = 5 days, above = 10 days. ETIC “pushes” count when the parsed ETIC date moves later. Use changelog for full history per WO.
+        </p>
+        <div class="watch-toolbar">
+          <label><input type="checkbox" id="watch-stale-only" /> Stale remarks only</label>
+          <button type="button" class="linkish" id="watch-rebuild">Rebuild history from all ETICs (chronological)</button>
+        </div>
+        <p class="status" id="watch-status"></p>
+        <div class="table-wrap">
+          <table class="compare-table watch-table" id="watch-table">
+            <thead>
+              <tr>
+                <th>WO ID</th><th>Asset</th><th>MEL</th><th>Parts</th><th>ETIC</th><th>Remark Δ</th><th>Stale</th><th>Pushes</th><th>Slip days</th><th></th>
+              </tr>
+            </thead>
+            <tbody id="watch-body"><tr><td colspan="10" style="text-align:center;color:var(--muted)">Loading…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div id="changelog-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="changelog-title">
+        <div class="modal">
+          <header>
+            <h4 id="changelog-title">Changelog</h4>
+            <button type="button" class="modal-close" id="changelog-close" aria-label="Close">×</button>
+          </header>
+          <div class="body" id="changelog-body"></div>
         </div>
       </div>
 
@@ -1573,6 +1718,86 @@ function renderDashboardHtml(): string {
       }).join("");
     }
 
+    async function loadWatch() {
+      if (!selectedDate) return;
+      const stale = document.getElementById("watch-stale-only").checked ? "&stale=1" : "";
+      const res = await fetch("/api/watch?date=" + encodeURIComponent(selectedDate) + stale);
+      if (!res.ok) return [];
+      const data = await res.json();
+      return data.rows || [];
+    }
+
+    function tierClass(t) {
+      if (t === "below") return "tier-below";
+      if (t === "at") return "tier-at";
+      if (t === "above") return "tier-above";
+      return "tier-unknown";
+    }
+
+    async function renderWatchTable() {
+      const body = document.getElementById("watch-body");
+      const st = document.getElementById("watch-status");
+      if (!selectedDate) return;
+      body.innerHTML = "<tr><td colspan='10' style='text-align:center;color:var(--muted)'>Loading…</td></tr>";
+      try {
+        const rows = await loadWatch();
+        if (!rows.length) {
+          body.innerHTML = "<tr><td colspan='10' style='text-align:center;color:var(--muted)'>No work orders in index yet. Ingest an ETIC or run Rebuild history.</td></tr>";
+          st.textContent = "";
+          return;
+        }
+        st.textContent = rows.length + " row(s) · toggle stale filter as needed";
+        body.innerHTML = rows.map(function (r) {
+          const staleRow = r.remarkStale ? " stale" : "";
+          const intv = r.requiredIntervalDays != null ? "/" + r.requiredIntervalDays + "d" : "";
+          return (
+            "<tr class='" + staleRow.trim() + "'>" +
+            "<td><strong>" + esc(r.workOrderId) + "</strong></td>" +
+            "<td>" + esc(r.assetId || "—") + "</td>" +
+            "<td><span class='badge-tier " + tierClass(r.melTier) + "'>" + esc(r.melTier) + "</span></td>" +
+            "<td style='max-width:140px;white-space:normal'>" + esc((r.partsStatus || "").slice(0, 80)) + "</td>" +
+            "<td>" + esc(r.eticRaw || r.eticDate || "—") + "</td>" +
+            "<td>" + esc(String(r.daysSinceRemarkChange)) + intv + "</td>" +
+            "<td>" + (r.remarkStale ? "<strong style='color:#ff9a9a'>Yes</strong>" : "—") + "</td>" +
+            "<td>" + esc(String(r.eticPushCount ?? 0)) + "</td>" +
+            "<td>" + esc(String(r.cumulativeEticSlipDays ?? 0)) + "</td>" +
+            "<td><button type='button' class='linkish watch-log-btn' data-wo='" + esc(r.workOrderId) + "'>Log</button></td>" +
+            "</tr>"
+          );
+        }).join("");
+      } catch (e) {
+        body.innerHTML = "<tr><td colspan='10' style='text-align:center;color:#ff9a9a'>" + esc(String(e.message || e)) + "</td></tr>";
+      }
+    }
+
+    async function openChangelog(woId) {
+      const modal = document.getElementById("changelog-modal");
+      const title = document.getElementById("changelog-title");
+      const body = document.getElementById("changelog-body");
+      title.textContent = "Changelog — " + woId;
+      body.innerHTML = "Loading…";
+      modal.classList.remove("hidden");
+      try {
+        const res = await fetch("/api/work-order-changelog?workOrderId=" + encodeURIComponent(woId));
+        const data = await res.json();
+        const entries = data.entries || [];
+        if (!entries.length) {
+          body.innerHTML = "<p style='color:var(--muted)'>No changes recorded yet.</p>";
+          return;
+        }
+        body.innerHTML = entries.map(function (e) {
+          return (
+            "<div class='log-row'>" +
+            "<div class='log-meta'>" + esc(e.snapshot_date_key) + " · " + esc(e.field) + " · " + esc(e.changed_at_iso) + "</div>" +
+            "<div>" + esc(e.old_value || "—") + " → " + esc(e.new_value || "—") + "</div>" +
+            "</div>"
+          );
+        }).join("");
+      } catch (err) {
+        body.innerHTML = "<p style='color:#ff9a9a'>" + esc(String(err.message || err)) + "</p>";
+      }
+    }
+
     function renderDetails(analysis) {
       document.getElementById("hero-title").textContent = analysis.dateKey;
       document.getElementById("hero-file").innerHTML =
@@ -1580,6 +1805,7 @@ function renderDashboardHtml(): string {
 
       renderKpis(analysis.assetManager);
       renderCompareTable();
+      renderWatchTable();
 
       const ing = document.getElementById("ingest-details");
       const recv = analysis.receivedAtIso
@@ -1751,6 +1977,34 @@ function renderDashboardHtml(): string {
 
       document.getElementById("btn-yard-check").addEventListener("click", downloadYardCheck);
       document.getElementById("btn-download-etic").addEventListener("click", downloadEticWorkbook);
+
+      document.getElementById("watch-stale-only").addEventListener("change", renderWatchTable);
+      document.getElementById("watch-rebuild").addEventListener("click", async function () {
+        const st = document.getElementById("watch-status");
+        if (!confirm("Rebuild clears work order changelog and replays every ETIC in date order. Continue?")) return;
+        st.textContent = "Starting rebuild…";
+        try {
+          const res = await fetch("/api/watch?rebuild=1", { method: "POST" });
+          const j = await res.json();
+          st.textContent = (j && j.message) ? j.message : "Rebuild started.";
+          setTimeout(renderWatchTable, 5000);
+        } catch (e) {
+          st.textContent = String(e && e.message ? e.message : e);
+        }
+      });
+      document.getElementById("watch-table").addEventListener("click", function (ev) {
+        const t = ev.target;
+        if (t && t.classList && t.classList.contains("watch-log-btn")) {
+          const wo = t.getAttribute("data-wo");
+          if (wo) openChangelog(wo);
+        }
+      });
+      document.getElementById("changelog-close").addEventListener("click", function () {
+        document.getElementById("changelog-modal").classList.add("hidden");
+      });
+      document.getElementById("changelog-modal").addEventListener("click", function (ev) {
+        if (ev.target.id === "changelog-modal") document.getElementById("changelog-modal").classList.add("hidden");
+      });
     }
 
     init();
