@@ -6928,6 +6928,34 @@ function renderDashboardHtml(): string {
       border-radius: 10px; padding: 10px 12px; font-size: 1rem;
       font-variant-numeric: tabular-nums;
     }
+    .wv-asset-browser {
+      margin-bottom: 16px; padding: 14px 16px; background: var(--surface);
+      border: 1px solid var(--border); border-radius: 12px;
+    }
+    .wv-asset-browser-head {
+      display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px;
+    }
+    .wv-asset-browser-title { font-weight: 600; font-size: 0.95rem; }
+    .wv-asset-browser-head .hint { margin: 0; }
+    .wv-asset-filter {
+      margin-left: auto; min-width: 140px; max-width: 220px; flex: 1;
+      background: var(--bg0, var(--bg)); color: var(--text); border: 1px solid var(--border);
+      border-radius: 8px; padding: 8px 10px; font-size: 0.88rem;
+    }
+    .wv-asset-chip-wrap {
+      max-height: 220px; overflow-y: auto; padding: 4px 2px 2px;
+    }
+    .wv-asset-chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: flex-start; }
+    .wv-asset-chip {
+      font-family: var(--font-mono); font-size: 0.82rem; font-weight: 600;
+      padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border);
+      background: var(--bg0, var(--bg)); color: var(--text); cursor: pointer;
+      max-width: 100%; text-align: left; transition: border-color 0.12s, background 0.12s;
+    }
+    .wv-asset-chip:hover { border-color: var(--accent-dim); color: var(--text); }
+    .wv-asset-chip.active {
+      border-color: var(--accent); background: rgba(94, 154, 255, 0.12);
+    }
     .wv-bv-result .vehicle-head {
       display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
       padding-bottom: 10px; border-bottom: 1px solid var(--border); margin-bottom: 14px;
@@ -9142,12 +9170,22 @@ function renderDashboardHtml(): string {
 
           <section id="wv-view-byvehicle" class="wv-view" hidden>
             <div class="wv-bv-bar">
-              <input type="text" id="wv-bv-input" placeholder="Asset ID (e.g. M-1234)"
+              <input type="text" id="wv-bv-input" placeholder="Asset ID (e.g. AF00C00488)"
                      autocomplete="off" autocapitalize="characters" spellcheck="false" />
               <button type="button" class="ghost" id="wv-bv-go">Look up</button>
             </div>
+            <div class="wv-asset-browser" id="wv-asset-browser">
+              <div class="wv-asset-browser-head">
+                <span class="wv-asset-browser-title">Assets with waivers</span>
+                <span class="hint" id="wv-asset-browser-count"></span>
+                <input type="search" id="wv-asset-filter" class="wv-asset-filter" placeholder="Filter IDs…" autocomplete="off" spellcheck="false" />
+              </div>
+              <div class="wv-asset-chip-wrap" id="wv-asset-chip-wrap">
+                <p class="hint" style="margin:0;color:var(--muted)">Open this tab to load every asset id that has an approved or pending waiver.</p>
+              </div>
+            </div>
             <div class="wv-bv-result" id="wv-bv-result">
-              <p class="hint" style="color:var(--muted)">Type an asset id to view its current waiver card and verification history.</p>
+              <p class="hint" style="color:var(--muted)">Pick an asset from the list above or type an asset id, then look up to view its waiver card and verification history.</p>
             </div>
           </section>
         </div>
@@ -13796,6 +13834,8 @@ function renderDashboardHtml(): string {
       subTab: "pending",          // "pending" | "byvehicle"
       pending: [],
       bv: { assetId: "", waivers: [], verifications: {} },
+      /** Sorted asset ids from last /api/waivers/counts (By vehicle list). */
+      bvAssetKeys: [],
     };
 
     function waiversWireOnce() {
@@ -13813,11 +13853,15 @@ function renderDashboardHtml(): string {
         document.getElementById("wv-view-pending").hidden = which !== "pending";
         document.getElementById("wv-view-byvehicle").hidden = which !== "byvehicle";
         if (which === "pending") loadWaiverPending();
+        if (which === "byvehicle") loadWaiverAssetBrowser();
       });
       const refresh = document.getElementById("wv-refresh");
       if (refresh) refresh.addEventListener("click", function () {
         if (waiversState.subTab === "pending") loadWaiverPending();
-        else if (waiversState.bv.assetId) loadWaiverByVehicle(waiversState.bv.assetId);
+        else if (waiversState.subTab === "byvehicle") {
+          loadWaiverAssetBrowser();
+          if (waiversState.bv.assetId) loadWaiverByVehicle(waiversState.bv.assetId);
+        }
         // Counts feed the badges everywhere — keep them fresh.
         loadWaiverCounts(true);
       });
@@ -13833,6 +13877,82 @@ function renderDashboardHtml(): string {
           const v = (bvInput.value || "").trim().toUpperCase();
           if (v) loadWaiverByVehicle(v);
         }
+      });
+      const wvAf = document.getElementById("wv-asset-filter");
+      if (wvAf) wvAf.addEventListener("input", function () { renderWaiverAssetChipList(); });
+    }
+
+    async function loadWaiverAssetBrowser() {
+      const wrap = document.getElementById("wv-asset-chip-wrap");
+      const meta = document.getElementById("wv-asset-browser-count");
+      if (!wrap) return;
+      wrap.innerHTML = "<div class='hint' style='color:var(--muted);padding:6px 0'>Loading asset list…</div>";
+      try {
+        const m = await loadWaiverCounts(true);
+        const keys = [];
+        m.forEach(function (c, assetId) {
+          var tot = (c.approved || 0) + (c.pending || 0);
+          if (tot > 0) keys.push(assetId);
+        });
+        keys.sort(function (a, b) {
+          return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
+        });
+        waiversState.bvAssetKeys = keys;
+        if (meta) meta.textContent = keys.length ? "(" + keys.length + " total)" : "(0)";
+        renderWaiverAssetChipList();
+      } catch (e) {
+        wrap.innerHTML = "<div class='wv-empty'>Could not load the asset list.</div>";
+        if (meta) meta.textContent = "";
+      }
+    }
+
+    function renderWaiverAssetChipList() {
+      const wrap = document.getElementById("wv-asset-chip-wrap");
+      if (!wrap) return;
+      const filterEl = document.getElementById("wv-asset-filter");
+      const q = (filterEl && filterEl.value || "").trim().toLowerCase();
+      const keys = (waiversState.bvAssetKeys || []).filter(function (id) {
+        return !q || id.toLowerCase().indexOf(q) !== -1;
+      });
+      if (!keys.length) {
+        wrap.innerHTML =
+          "<p class='hint' style='margin:8px 0;color:var(--muted)'>" +
+          ((waiversState.bvAssetKeys && waiversState.bvAssetKeys.length)
+            ? "No asset ids match this filter."
+            : "No waivers on file yet — nothing to list.") +
+          "</p>";
+        return;
+      }
+      wrap.innerHTML =
+        "<div class='wv-asset-chips'>" +
+        keys.map(function (id) {
+          var c = waiverCountState.map.get(id) || { approved: 0, pending: 0, overdueVerify: 0 };
+          var tip = (c.approved || 0) + " on card · " + (c.pending || 0) + " pending";
+          if (c.overdueVerify) tip += " · " + c.overdueVerify + " overdue verify";
+          return (
+            "<button type='button' class='wv-asset-chip' data-asset='" + esc(id) + "' title='" + esc(tip) + "'>" +
+            esc(id) +
+            "</button>"
+          );
+        }).join("") +
+        "</div>";
+      wrap.querySelectorAll(".wv-asset-chip").forEach(function (b) {
+        b.addEventListener("click", function () {
+          var aid = b.getAttribute("data-asset");
+          var inp = document.getElementById("wv-bv-input");
+          if (inp) inp.value = aid;
+          loadWaiverByVehicle(aid);
+        });
+      });
+      highlightWaiverAssetChip(waiversState.bv.assetId);
+    }
+
+    function highlightWaiverAssetChip(assetId) {
+      const wrap = document.getElementById("wv-asset-chip-wrap");
+      if (!wrap) return;
+      var cur = (assetId || "").trim();
+      wrap.querySelectorAll(".wv-asset-chip").forEach(function (x) {
+        x.classList.toggle("active", x.getAttribute("data-asset") === cur);
       });
     }
 
@@ -13999,6 +14119,7 @@ function renderDashboardHtml(): string {
       wrap.querySelectorAll("[data-delete]").forEach(function (b) {
         b.addEventListener("click", function () { promptDelete(Number(b.getAttribute("data-delete"))); });
       });
+      highlightWaiverAssetChip(assetId);
     }
 
     function renderBvCard(w) {
