@@ -1712,15 +1712,34 @@ function renderWaiverAppHtml(): string {
     .h-switch:active { background: var(--bg3); color: var(--text); }
     main { padding: 14px 16px 24px; max-width: 720px; margin: 0 auto; }
     .lookup {
-      display: flex; gap: 8px; margin-top: 4px;
+      display: flex; gap: 8px; margin-top: 4px; align-items: flex-start;
     }
-    .lookup input {
-      flex: 1; min-width: 0;
+    .asset-ac { flex: 1; min-width: 0; position: relative; }
+    .lookup .asset-ac input {
+      width: 100%;
       background: var(--bg1); border: 1px solid var(--border); color: var(--text);
       border-radius: 12px; padding: 14px 14px; font-size: 1.05rem;
       font-variant-numeric: tabular-nums;
+      box-sizing: border-box;
     }
-    .lookup input:focus { outline: none; border-color: var(--accent); }
+    .lookup .asset-ac input:focus { outline: none; border-color: var(--accent); }
+    .asset-ac-hint {
+      margin-top: 8px; font-size: 0.76rem; color: var(--muted2); line-height: 1.35;
+    }
+    .asset-suggest {
+      position: absolute; left: 0; right: 0; top: calc(100% + 4px);
+      max-height: min(52vh, 360px); overflow-y: auto; -webkit-overflow-scrolling: touch;
+      background: var(--bg1); border: 1px solid var(--border); border-radius: 12px;
+      list-style: none; padding: 6px; margin: 0; z-index: 40;
+      box-shadow: 0 14px 44px rgba(0,0,0,0.5);
+    }
+    .asset-suggest li { margin: 0; padding: 0; }
+    .asset-suggest button {
+      width: 100%; text-align: left; padding: 12px 12px;
+      border: 0; border-radius: 10px; background: transparent; color: var(--text);
+      font-size: 0.98rem; font-variant-numeric: tabular-nums; cursor: pointer;
+    }
+    .asset-suggest button:active { background: var(--bg2); }
     .btn {
       background: var(--accent); color: var(--accent-fg); border: 0;
       border-radius: 12px; padding: 14px 18px; font-size: 1rem; font-weight: 600;
@@ -1867,8 +1886,13 @@ function renderWaiverAppHtml(): string {
   <main>
     <div id="view-lookup">
       <div class="lookup">
-        <input id="asset-input" type="text" inputmode="text" autocapitalize="characters" autocorrect="off"
-               spellcheck="false" placeholder="Asset ID (e.g. M-1234)" />
+        <div class="asset-ac">
+          <input id="asset-input" type="text" inputmode="text" autocapitalize="characters" autocorrect="off"
+                 spellcheck="false" placeholder="Type part of an asset id…"
+                 autocomplete="off" role="combobox" aria-autocomplete="list" aria-controls="asset-suggest" aria-expanded="false" />
+          <ul id="asset-suggest" class="asset-suggest" hidden role="listbox" aria-label="Matching asset ids"></ul>
+          <p class="asset-ac-hint">Matches load automatically — tap a row or keep typing until only one match, then Open.</p>
+        </div>
         <button type="button" class="btn" id="lookup-btn">Open</button>
       </div>
       <div class="name-prompt">
@@ -1942,6 +1966,9 @@ function renderWaiverAppHtml(): string {
     waivers: [],
     pendingActionId: null,
   };
+  /** Asset ids that have at least one approved or pending waiver (from /api/waivers/counts). */
+  var waiverIndex = { keys: [], loaded: false, loadPromise: null };
+  var suggestTimer = null;
 
   function $(id) { return document.getElementById(id); }
   function esc(s) {
@@ -2007,6 +2034,113 @@ function renderWaiverAppHtml(): string {
     });
   }
 
+  function hideSuggest() {
+    var ul = $("asset-suggest");
+    var inp = $("asset-input");
+    if (ul) {
+      ul.hidden = true;
+      ul.innerHTML = "";
+    }
+    if (inp) inp.setAttribute("aria-expanded", "false");
+  }
+  function showSuggest() {
+    var ul = $("asset-suggest");
+    var inp = $("asset-input");
+    if (ul && ul.children.length) ul.hidden = false;
+    if (inp) inp.setAttribute("aria-expanded", ul && !ul.hidden ? "true" : "false");
+  }
+  function filterMatches(q) {
+    var ql = (q || "").trim().toLowerCase();
+    if (!ql || !waiverIndex.keys.length) return [];
+    var starts = [];
+    var subs = [];
+    for (var i = 0; i < waiverIndex.keys.length; i++) {
+      var k = waiverIndex.keys[i];
+      var kl = k.toLowerCase();
+      var ix = kl.indexOf(ql);
+      if (ix < 0) continue;
+      if (ix === 0) starts.push(k);
+      else subs.push(k);
+    }
+    starts.sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); });
+    subs.sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); });
+    return starts.concat(subs);
+  }
+  function renderSuggest(matches) {
+    var ul = $("asset-suggest");
+    if (!ul) return;
+    ul.innerHTML = matches.map(function (id) {
+      return "<li role='presentation'><button type='button' role='option' data-asset='" + esc(id) + "'>" + esc(id) + "</button></li>";
+    }).join("");
+    ul.querySelectorAll("button[data-asset]").forEach(function (b) {
+      b.addEventListener("click", function () {
+        pickSuggest(b.getAttribute("data-asset") || "");
+      });
+    });
+    showSuggest();
+  }
+  function updateSuggestFromInput() {
+    var q = ($("asset-input").value || "").trim();
+    if (!q || !waiverIndex.loaded) { hideSuggest(); return; }
+    var m = filterMatches(q);
+    if (!m.length) { hideSuggest(); return; }
+    if (m.length > 50) m = m.slice(0, 50);
+    renderSuggest(m);
+  }
+  function pickSuggest(id) {
+    if (!id) return;
+    $("asset-input").value = id;
+    hideSuggest();
+    openAsset(id);
+  }
+  async function ensureWaiverIndex() {
+    if (waiverIndex.loaded) return;
+    if (waiverIndex.loadPromise) return waiverIndex.loadPromise;
+    waiverIndex.loadPromise = (async function () {
+      try {
+        var r = await fetch("/api/waivers/counts", { cache: "no-store" });
+        var j = await r.json();
+        var c = (j && j.counts) || {};
+        var keys = [];
+        for (var id in c) {
+          if (!Object.prototype.hasOwnProperty.call(c, id)) continue;
+          var n = c[id];
+          var tot = ((n && n.approved) || 0) + ((n && n.pending) || 0);
+          if (tot > 0) keys.push(id);
+        }
+        keys.sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); });
+        waiverIndex.keys = keys;
+      } catch (e) {
+        waiverIndex.keys = [];
+      }
+      waiverIndex.loaded = true;
+      waiverIndex.loadPromise = null;
+    })();
+    return waiverIndex.loadPromise;
+  }
+  /**
+   * Resolve typed text to a single canonical asset id, or null if the user
+   * must pick from multiple matches (dropdown already shown).
+   */
+  function resolveCanonicalAssetId(inputVal) {
+    var q = (inputVal || "").trim();
+    if (!q) {
+      showToast("Enter an asset id", true);
+      return null;
+    }
+    var keys = waiverIndex.keys;
+    var qu = q.toUpperCase();
+    var i;
+    for (i = 0; i < keys.length; i++) {
+      if (keys[i].toUpperCase() === qu) return keys[i];
+    }
+    var m = filterMatches(q);
+    if (m.length === 1) return m[0];
+    if (!m.length) return q;
+    showToast("Several matches — pick one below", true);
+    renderSuggest(m);
+    return null;
+  }
   function showLookup() {
     document.body.classList.remove("detail");
     $("view-lookup").hidden = false;
@@ -2014,6 +2148,7 @@ function renderWaiverAppHtml(): string {
     $("h-title").textContent = "Waiver Card";
     $("h-sub").textContent = "Pull up an asset to view or request waivers.";
     state.assetId = "";
+    hideSuggest();
   }
   function showDetail() {
     document.body.classList.add("detail");
@@ -2021,8 +2156,25 @@ function renderWaiverAppHtml(): string {
     $("view-detail").hidden = false;
   }
 
-  async function openAsset() {
-    var raw = $("asset-input").value.trim().toUpperCase();
+  async function openAsset(forcedId) {
+    await ensureWaiverIndex();
+    var raw;
+    if (typeof forcedId === "string" && forcedId.trim()) {
+      raw = forcedId.trim();
+      var up = raw.toUpperCase();
+      for (var j = 0; j < waiverIndex.keys.length; j++) {
+        if (waiverIndex.keys[j].toUpperCase() === up) {
+          raw = waiverIndex.keys[j];
+          break;
+        }
+      }
+      $("asset-input").value = raw;
+    } else {
+      var resolved = resolveCanonicalAssetId($("asset-input").value);
+      if (resolved == null) return;
+      raw = resolved;
+    }
+    hideSuggest();
     if (!raw) { showToast("Enter an asset id", true); return; }
     state.assetId = raw;
     pushRecent(raw);
@@ -2195,19 +2347,36 @@ function renderWaiverAppHtml(): string {
   $("back-btn").addEventListener("click", function () { showLookup(); });
 
   // ---- Lookup binding ----
-  $("lookup-btn").addEventListener("click", openAsset);
+  $("lookup-btn").addEventListener("click", function () { openAsset(); });
   $("asset-input").addEventListener("keydown", function (e) {
     if (e.key === "Enter") { e.preventDefault(); openAsset(); }
+  });
+  $("asset-input").addEventListener("input", function () {
+    clearTimeout(suggestTimer);
+    suggestTimer = setTimeout(updateSuggestFromInput, 90);
+  });
+  $("asset-input").addEventListener("focus", function () {
+    ensureWaiverIndex().then(function () { updateSuggestFromInput(); });
+  });
+  var sug = $("asset-suggest");
+  if (sug) {
+    sug.addEventListener("mousedown", function (e) {
+      if (e.target.closest("button[data-asset]")) e.preventDefault();
+    });
+  }
+  document.addEventListener("click", function (e) {
+    if (!e.target.closest(".asset-ac")) hideSuggest();
   });
   $("name-input").addEventListener("change", function () { rememberName($("name-input").value.trim()); });
 
   // ---- Init ----
   $("name-input").value = localStorage.getItem(NAME_KEY) || "";
   renderRecent();
+  ensureWaiverIndex();
   // Allow ?asset=M-1234 deep link from desktop "Open in mobile" buttons.
   var hashParams = new URLSearchParams(location.search);
   var deep = hashParams.get("asset");
-  if (deep) { $("asset-input").value = deep; openAsset(); }
+  if (deep) { $("asset-input").value = deep; openAsset(deep); }
 })();
 </script>
 </body>
