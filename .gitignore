@@ -47,3 +47,6 @@ coverage/
 *.zip
 scratch/
 tmp/
+
+# One-off local scraper deps (run npm install inside the folder)
+scripts/pats-waiver-scrape/node_modules/

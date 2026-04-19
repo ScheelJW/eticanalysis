@@ -1,0 +1,14 @@
+{
+  "name": "pats-waiver-scrape",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "One-off Playwright scraper: NEI PATS waiver history to CSV",
+  "scripts": {
+    "scrape": "node scrape.mjs",
+    "install-browser": "playwright install chromium"
+  },
+  "dependencies": {
+    "playwright": "1.49.1"
+  }
+}
