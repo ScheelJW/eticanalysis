@@ -6,6 +6,7 @@
   "description": "One-off Playwright scraper: NEI PATS waiver history to CSV",
   "scripts": {
     "scrape": "node scrape.mjs",
+    "pats-to-sql": "node pats-to-d1-sql.mjs",
     "install-browser": "playwright install chromium"
   },
   "dependencies": {

@@ -99,6 +99,9 @@ scripts/
                       Exports NEI PATS repair waiver rows to CSV for offline use.
                       See scripts/pats-waiver-scrape/scrape.mjs. Run npm install there;
                       node_modules is gitignored. Does not deploy to minot.2t3.app.
+                      After scrape, `node pats-to-d1-sql.mjs pats_waivers.csv out.sql`
+                      builds D1 SQL (AF-prefixed asset_id, Outstanding-only); apply
+                      migrations/0019 first, then `wrangler d1 execute` with out.sql.
 ```
 
 **Worker vs tooling:** Everything that answers HTTP on `minot.2t3.app` lives

@@ -184,3 +184,24 @@ Include in your final message:
    appear in the current ETIC workbook").
 
 That's it. Ship the zip and the summary, you're done.
+
+---
+
+## 8. NEI PATS scrape → D1 (optional, repo tooling)
+
+If the legacy system is **NEI PATS** and you already ran
+`scripts/pats-waiver-scrape/scrape.mjs` to produce `pats_waivers.csv`:
+
+1. Apply D1 migration `migrations/0019_waiver_import_key.sql` (adds nullable
+   `waiver.import_key` + unique partial index).
+2. Run `node scripts/pats-waiver-scrape/pats-to-d1-sql.mjs pats_waivers.csv pats_waiver_import.sql`.
+   That emits SQL with **`AF` prefixed** to each `reg_no` for `asset_id`
+   (e.g. `00C00488` → `AF00C00488`), **Outstanding-only** rows, approved
+   status, `import_key = PATS:<waiver_row_id>` for idempotent re-run.
+3. Execute the SQL against the production D1 binding (see `wrangler.jsonc`):
+
+   `npx wrangler d1 execute etic-snapshots --remote --file=pats_waiver_import.sql`
+
+PATS had no defect photos in the export; `photo_r2_key` stays NULL. Rows
+like "No Waivered Items" are still imported as text if they were Outstanding
+in PATS — filter the CSV before conversion if you want to drop those.
