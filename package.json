@@ -14,7 +14,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "check": "npm run cf-typegen && npm run typecheck && npm run test",
-    "deploy": "wrangler deploy --env-file .env.cloudflare"
+    "deploy": "wrangler deploy",
+    "deploy:env": "wrangler deploy --env-file .env.cloudflare"
   },
   "repository": {
     "type": "git",
