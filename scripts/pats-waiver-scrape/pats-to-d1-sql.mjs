@@ -133,18 +133,12 @@ function main() {
     const title =
       waiverText.length <= 120 ? waiverText : `${waiverText.slice(0, 117)}...`;
     const iso = toIso(timeAdded) || new Date().toISOString();
-    const vehicleMeta = iVehicle >= 0 ? get(iVehicle) : "";
-    const desc =
-      `Legacy NEI PATS import.\n` +
-      `PATS waiver_row_id: ${waiverRowId}.\n` +
-      (vehicleMeta ? `PATS vehicle_id: ${vehicleMeta}.\n` : "") +
-      (emp ? `Recorded employee: ${emp}.\n` : "") +
-      `Original registration (before AF prefix in asset_id): ${regNo}.\n` +
-      `Full note: ${waiverText}`;
+    // Description is only the defect text shown in the app; traceability stays in import_key.
+    const desc = waiverText;
 
     const submittedBy = emp || "legacy import";
     const reviewedBy = "legacy import";
-    const reviewedNote = `Imported from NEI PATS (import_key ${importKey}).`;
+    const reviewedNote = "Imported from NEI PATS.";
 
     chunks.push(
       `INSERT INTO waiver (asset_id, title, description, status, submitted_by, submitted_at_iso, reviewed_by, reviewed_at_iso, reviewed_note, last_verified_by, last_verified_at_iso, photo_r2_key, photo_content_type, import_key)

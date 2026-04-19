@@ -115,6 +115,30 @@ const SELECT_WAIVER_COLS =
   "submitted_by, submitted_at_iso, reviewed_by, reviewed_at_iso, reviewed_note, " +
   "last_verified_by, last_verified_at_iso";
 
+/** Remove legacy PATS bulk-import boilerplate from stored descriptions. */
+function stripLegacyPatsDescription(raw: string | null | undefined): string {
+  const t = (raw ?? "").trim();
+  if (!t) return "";
+  const kept: string[] = [];
+  for (const line of t.split(/\r?\n/)) {
+    const s = line.trim();
+    if (!s) continue;
+    if (/^legacy nei pats import\.?$/i.test(s)) continue;
+    if (/^pats waiver_row_id:/i.test(s)) continue;
+    if (/^pats vehicle_id:/i.test(s)) continue;
+    if (/^original registration/i.test(s)) continue;
+    if (/^recorded employee:/i.test(s)) continue;
+    const fm = s.match(/^full note:\s*(.+)$/i);
+    if (fm) {
+      const inner = fm[1].trim();
+      if (inner) kept.push(inner);
+      continue;
+    }
+    kept.push(line);
+  }
+  return kept.join("\n").trim();
+}
+
 function rowToWaiver(r: WaiverRow): Waiver {
   const lastVerifiedAt = r.last_verified_at_iso ?? "";
   // "Anchor" date for staleness: prefer the last explicit verification; fall
@@ -135,11 +159,12 @@ function rowToWaiver(r: WaiverRow): Waiver {
       else verifyState = "fresh";
     }
   }
+  const descClean = stripLegacyPatsDescription(r.description);
   return {
     id: r.id,
     assetId: r.asset_id,
     title: r.title,
-    description: r.description ?? "",
+    description: descClean,
     status: r.status,
     hasPhoto: !!r.photo_r2_key,
     photoUrl: r.photo_r2_key ? `/api/waivers/${r.id}/photo` : "",

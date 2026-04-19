@@ -2210,42 +2210,29 @@ function renderWaiverAppHtml(): string {
  * button is one click → Cmd/Ctrl+P. Suppress on `?noprint=1`.
  */
 function renderWaiverPrintCardHtml(assetId: string, waivers: Waiver[]): string {
-  const today = new Date().toISOString().slice(0, 10);
   const escHtml = (s: string) =>
     String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-  const fmtDate = (iso: string) => {
-    if (!iso) return "—";
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return "—";
-    return d.toISOString().slice(0, 10);
+  const descForPrint = (w: Waiver): string => {
+    const d = String(w.description ?? "").trim();
+    if (!d) return "";
+    if (d.toLowerCase() === String(w.title ?? "").trim().toLowerCase()) return "";
+    return d;
   };
+  const n = waivers.length;
+  const densityClass =
+    n >= 16 ? "wv-print--vheavy" : n >= 10 ? "wv-print--heavy" : n >= 6 ? "wv-print--medium" : "";
   const rows = waivers
     .map((w, i) => {
       const verifyState =
         w.verifyState === "overdue" ? "overdue" :
         w.verifyState === "dueSoon" ? "due-soon" : "fresh";
-      const lastVerifiedTxt = w.lastVerifiedAtIso
-        ? `${fmtDate(w.lastVerifiedAtIso)} by ${escHtml(w.lastVerifiedBy || "—")}`
-        : `${fmtDate(w.reviewedAtIso)} (initial approval)`;
+      const descPrint = descForPrint(w);
       return `
         <article class="row ${verifyState}">
           <div class="num">${i + 1}</div>
           <div class="body">
-            <div class="head">
-              <div class="title">${escHtml(w.title)}</div>
-              <div class="approved-by">Approved ${fmtDate(w.reviewedAtIso)} · ${escHtml(w.reviewedBy || "—")}</div>
-            </div>
-            ${w.description ? `<div class="desc">${escHtml(w.description)}</div>` : ""}
-            <div class="footline">
-              <div><strong>Last verified:</strong> ${lastVerifiedTxt}</div>
-              <div class="next-verify-line">Next verify due by:
-                <span class="due-line"></span>
-              </div>
-            </div>
-            <div class="sig-row">
-              <div class="sig"><span class="lbl">Re-verified by</span></div>
-              <div class="sig"><span class="lbl">Date</span></div>
-            </div>
+            <div class="title">${escHtml(w.title)}</div>
+            ${descPrint ? `<div class="desc">${escHtml(descPrint)}</div>` : ""}
           </div>
         </article>`;
     })
@@ -2261,67 +2248,86 @@ function renderWaiverPrintCardHtml(assetId: string, waivers: Waiver[]): string {
     * { box-sizing: border-box; }
     html, body { margin: 0; padding: 0; background: #fff; color: #111;
                  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
-    body { padding: 24px; }
+    body { padding: 16px 18px; }
+    body.wv-print--medium { padding: 12px 14px; }
+    body.wv-print--heavy { padding: 10px 12px; }
+    body.wv-print--vheavy { padding: 8px 10px; }
     .page-head {
-      border-bottom: 2px solid #111; padding-bottom: 8px; margin-bottom: 14px;
-      display: flex; align-items: flex-end; justify-content: space-between; gap: 12px;
+      border-bottom: 2px solid #111; padding-bottom: 6px; margin-bottom: 10px;
     }
-    .page-head h1 { margin: 0; font-size: 1.6rem; letter-spacing: 0.02em; }
+    .page-head h1 { margin: 0; font-size: 1.35rem; letter-spacing: 0.02em; }
+    body.wv-print--medium .page-head h1 { font-size: 1.2rem; }
+    body.wv-print--heavy .page-head h1 { font-size: 1.05rem; }
+    body.wv-print--vheavy .page-head h1 { font-size: 1rem; }
     .page-head .asset {
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-size: 1.7rem; font-weight: 700; letter-spacing: -0.01em;
+      font-size: 1.45rem; font-weight: 700; letter-spacing: -0.01em; margin-top: 4px;
     }
-    .page-head .meta { font-size: 0.85rem; color: #444; text-align: right; }
+    body.wv-print--medium .page-head .asset { font-size: 1.25rem; }
+    body.wv-print--heavy .page-head .asset { font-size: 1.1rem; }
+    body.wv-print--vheavy .page-head .asset { font-size: 1rem; }
+    .page-head .countline {
+      font-size: 0.8rem; color: #444; margin-top: 4px;
+    }
+    body.wv-print--heavy .page-head .countline,
+    body.wv-print--vheavy .page-head .countline { font-size: 0.72rem; }
     .lead {
-      font-size: 0.85rem; color: #333; margin-bottom: 14px;
-      border: 1px solid #ccc; padding: 8px 10px; border-radius: 4px; background: #fafafa;
+      font-size: 0.78rem; color: #222; margin-bottom: 10px; line-height: 1.35;
+      border: 1px solid #ccc; padding: 6px 8px; border-radius: 4px; background: #fafafa;
     }
+    body.wv-print--medium .lead { font-size: 0.74rem; margin-bottom: 8px; padding: 5px 7px; }
+    body.wv-print--heavy .lead { font-size: 0.7rem; line-height: 1.3; margin-bottom: 6px; }
+    body.wv-print--vheavy .lead { font-size: 0.66rem; margin-bottom: 5px; }
     .row {
-      display: flex; gap: 14px; padding: 12px 12px;
-      border: 1px solid #888; border-radius: 6px;
-      margin-bottom: 10px; page-break-inside: avoid;
-      background: #fff;
+      display: flex; gap: 10px; padding: 8px 10px;
+      border: 1px solid #888; border-radius: 4px;
+      margin-bottom: 6px; page-break-inside: avoid;
+      background: #fff; align-items: flex-start;
     }
+    body.wv-print--medium .row { padding: 6px 8px; margin-bottom: 5px; gap: 8px; }
+    body.wv-print--heavy .row { padding: 5px 7px; margin-bottom: 4px; gap: 6px; }
+    body.wv-print--vheavy .row { padding: 4px 6px; margin-bottom: 3px; border-radius: 3px; }
     .row.overdue { border-color: #b00; background: #fff5f5; }
     .row.due-soon { border-color: #b08000; background: #fffbe6; }
     .num {
-      font-size: 1.4rem; font-weight: 700; color: #111;
-      width: 36px; flex: 0 0 36px; text-align: center;
-      border-right: 1px solid #ccc; padding-right: 12px;
+      font-size: 1.1rem; font-weight: 700; color: #111;
+      width: 26px; flex: 0 0 26px; text-align: center;
+      border-right: 1px solid #ccc; padding-right: 8px; line-height: 1.2;
     }
+    body.wv-print--medium .num { font-size: 1rem; width: 22px; flex-basis: 22px; padding-right: 6px; }
+    body.wv-print--heavy .num { font-size: 0.9rem; width: 20px; flex-basis: 20px; }
+    body.wv-print--vheavy .num { font-size: 0.82rem; width: 18px; flex-basis: 18px; }
     .body { flex: 1; min-width: 0; }
-    .head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
-    .title { font-size: 1.05rem; font-weight: 600; }
-    .approved-by { font-size: 0.78rem; color: #555; white-space: nowrap; }
-    .desc { font-size: 0.9rem; margin: 4px 0 8px; white-space: pre-wrap; }
-    .footline {
-      display: flex; gap: 24px; flex-wrap: wrap;
-      font-size: 0.82rem; color: #333; margin-bottom: 8px;
+    .title { font-size: 0.98rem; font-weight: 600; line-height: 1.25; }
+    body.wv-print--medium .title { font-size: 0.9rem; }
+    body.wv-print--heavy .title { font-size: 0.82rem; line-height: 1.2; }
+    body.wv-print--vheavy .title { font-size: 0.76rem; }
+    .desc {
+      font-size: 0.8rem; margin-top: 3px; white-space: pre-wrap; line-height: 1.25;
+      color: #333;
     }
-    .due-line {
-      display: inline-block; min-width: 110px;
-      border-bottom: 1px solid #888; padding: 0 4px;
+    body.wv-print--medium .desc { font-size: 0.74rem; line-height: 1.2; }
+    body.wv-print--heavy .desc {
+      font-size: 0.68rem; line-height: 1.18;
+      display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4;
+      overflow: hidden;
     }
-    .sig-row { display: flex; gap: 18px; margin-top: 4px; }
-    .sig {
-      flex: 1; border-bottom: 1px solid #888; height: 28px;
-      position: relative;
-    }
-    .sig .lbl {
-      position: absolute; bottom: -14px; left: 0;
-      font-size: 0.7rem; color: #666; text-transform: uppercase; letter-spacing: 0.06em;
+    body.wv-print--vheavy .desc {
+      font-size: 0.62rem; line-height: 1.15;
+      -webkit-line-clamp: 3;
     }
     .empty {
       padding: 36px; text-align: center; border: 1px dashed #999; border-radius: 8px;
       color: #555;
     }
     .footer {
-      margin-top: 24px; padding-top: 10px; border-top: 1px solid #ccc;
-      font-size: 0.72rem; color: #666; text-align: center;
+      margin-top: 10px; padding-top: 6px; border-top: 1px solid #ddd;
+      font-size: 0.65rem; color: #777; text-align: center;
     }
-    @page { size: letter; margin: 0.5in; }
+    @page { size: letter; margin: 0.35in; }
     @media print {
       body { padding: 0; }
+      body.wv-print--heavy, body.wv-print--vheavy { padding: 0; }
       .noprint { display: none !important; }
     }
     .noprint {
@@ -2330,27 +2336,20 @@ function renderWaiverPrintCardHtml(assetId: string, waivers: Waiver[]): string {
       padding: 8px 14px; font-size: 0.85rem; cursor: pointer;
     }
   </style>
-</head><body>
+</head><body class="wv-print ${densityClass}">
   <button class="noprint" onclick="window.print()">Print</button>
   <div class="page-head">
-    <div>
-      <h1>Vehicle Waiver Card</h1>
-      <div class="asset">Asset ${escHtml(assetId)}</div>
-    </div>
-    <div class="meta">
-      Printed ${today}<br />
-      ${waivers.length} approved waiver${waivers.length === 1 ? "" : "s"}
-    </div>
+    <h1>Vehicle Waiver Card</h1>
+    <div class="asset">${escHtml(assetId)}</div>
+    <div class="countline">${waivers.length} accepted waiver${waivers.length === 1 ? "" : "s"} (management-approved)</div>
   </div>
   <div class="lead">
-    These items have been formally accepted by management and do <strong>not</strong> need to be repaired
-    on the next maintenance visit. They <strong>must</strong> be re-verified at least annually — sign and
-    date the line below each entry when you re-confirm. If a defect changes (gets worse, or is no longer
-    present), open a new request from the mobile app instead of overwriting this card.
+    These defects are formally waived — they do <strong>not</strong> require repair on routine maintenance.
+    Use the ETIC / waiver app for annual re-verification and for any change in condition.
   </div>
   ${rows}
   ${empty}
-  <div class="footer">Generated by Vehicle ETIC dashboard · ${today}</div>
+  <div class="footer">Vehicle ETIC · in-cab reference</div>
   <script>
     if (!new URLSearchParams(location.search).has("noprint")) {
       setTimeout(function () { window.print(); }, 250);
