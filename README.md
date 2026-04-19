@@ -12,7 +12,8 @@ to D1 + R2, and serves a dashboard at `minot.2t3.app` covering:
 - **ETIC Meeting** — live presenter + controller views for the daily standup.
   TV (`/?present=<id>`) auto-syncs with whatever the controller has selected.
 - **Yard Check** — mobile walker UI at `/yard` for tagging where each asset
-  actually is. Drives the FM&A "things to fix" follow-up queue.
+  actually is (a parking location is required to mark an asset present).
+  Drives the FM&A "things to fix" follow-up queue.
 - **Ask AI** — chat over the current snapshot context.
 
 > **AI agents and contributors: read [`AGENTS.md`](./AGENTS.md) before touching code.**

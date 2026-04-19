@@ -407,7 +407,8 @@ function normalizeHeaderKey(raw: string): string {
   return raw.toLowerCase().replace(/\s+/g, " ").trim();
 }
 
-type FleetRecord = {
+/** One Fleet (P&A) row — exported for schedule-maintenance and other fleet-wide reads. */
+export type FleetRecord = {
   assetId: string;
   vinSerial: string;
   makeModel: string;
@@ -562,6 +563,22 @@ function extractFleet(sheet: ExcelJS.Worksheet): {
     }
   }
   return { byAsset, rawByAsset, scan };
+}
+
+/**
+ * Read the Fleet (P&A) sheet only — every asset row with `fleet.*` raw cells.
+ * Used for schedule-maintenance status across the full fleet (not WO-limited).
+ */
+export async function extractFleetMapsFromBinary(binary: ArrayBuffer): Promise<{
+  rawByAsset: Map<string, Record<string, string>>;
+  byAsset: Map<string, FleetRecord>;
+} | null> {
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(binary);
+  const fleetSheet = findFleetSheet(workbook);
+  if (!fleetSheet) return null;
+  const { byAsset, rawByAsset } = extractFleet(fleetSheet);
+  return { rawByAsset, byAsset };
 }
 
 /**

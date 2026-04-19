@@ -1,5 +1,5 @@
-import type { RawWorkOrder } from "./yardCheck";
-import { FLEET_SYNONYMS, WORK_ORDER_SYNONYMS, scoreHeaderMatch } from "./yardCheck";
+import type { FleetRecord, RawWorkOrder } from "./yardCheck";
+import { extractFleetMapsFromBinary, FLEET_SYNONYMS, WORK_ORDER_SYNONYMS, scoreHeaderMatch } from "./yardCheck";
 import { getStalenessThresholds } from "./melWatch";
 
 export type MelTier = "below" | "at" | "above" | "unknown";
@@ -360,6 +360,9 @@ export async function ingestWorkOrderSnapshot(
   }
 }
 
+/** Schedule maintenance (Fleet P&A Schedule Mx / due columns). */
+export type ScheduleMxBucket = "missing" | "no_due" | "overdue" | "due_soon" | "ok";
+
 export type WatchRow = {
   workOrderId: string;
   assetId: string;
@@ -390,6 +393,16 @@ export type WatchRow = {
   woReason: string;
   nce: boolean;
   nceStatus: string;
+  /** Raw Schedule Mx Status / due cell text from Fleet (P&A). */
+  scheduleMxStatus: string;
+  scheduleMxDueIso: string | null;
+  /** Days until scheduled/call-in date vs snapshot; not used to assert overdue (slicer does). */
+  scheduleMxDaysUntil: number | null;
+  /** Reserved; overdue is slicer-driven — no calendar day count. */
+  scheduleMxOverdueByDays: number | null;
+  scheduleMxBucket: ScheduleMxBucket;
+  /** No fleet schedule-mx / due data — should be added in the workbook. */
+  scheduleMxNeedsEntry: boolean;
 };
 
 type WatchReadRow = {
@@ -446,6 +459,132 @@ function pickRawValue(raw: Record<string, string>, candidates: string[]): string
   return "";
 }
 
+function findScheduleMxStatus(raw: Record<string, string>): string {
+  const direct = pickRawValue(raw, [
+    "fleet.schedule mx status",
+    "fleet.schedule maintenance status",
+    "schedule mx status",
+    "schedule maintenance status",
+    "scheduled mx status",
+  ]);
+  if (direct) return direct;
+  for (const [k, v] of Object.entries(raw)) {
+    if (!v?.trim()) continue;
+    const kn = k.toLowerCase();
+    if (kn.includes("wo inquiry")) continue;
+    if (kn.includes("schedule mx status")) return v.trim();
+    if (kn.includes("schedule maintenance") && kn.includes("status")) return v.trim();
+  }
+  return "";
+}
+
+function findScheduleMxDueText(raw: Record<string, string>): string {
+  const direct = pickRawValue(raw, [
+    "fleet.next schedule mx",
+    "fleet.schedule mx due",
+    "fleet.next scheduled maintenance",
+    "next schedule mx",
+    "schedule mx due",
+    "next sched mx",
+  ]);
+  if (direct) return direct;
+  for (const [k, v] of Object.entries(raw)) {
+    if (!v?.trim()) continue;
+    const kn = k.toLowerCase();
+    if (kn.includes("next schedule mx") || kn.includes("schedule mx due") || kn.includes("next sched mx")) {
+      return v.trim();
+    }
+  }
+  return "";
+}
+
+/** Excel "Schedule Mx Slicer" — authoritative for whether work is overdue (vs scheduled call-in dates). */
+function findScheduleMxSlicer(raw: Record<string, string>): string {
+  const direct = pickRawValue(raw, [
+    "fleet.schedule mx slicer",
+    "schedule mx slicer",
+    "scheduled mx slicer",
+  ]);
+  if (direct) return direct;
+  for (const [k, v] of Object.entries(raw)) {
+    if (!v?.trim()) continue;
+    const kn = k.toLowerCase();
+    if (kn.includes("wo inquiry")) continue;
+    if (kn.includes("schedule mx slicer") || (kn.includes("slicer") && kn.includes("schedule mx"))) {
+      return v.trim();
+    }
+  }
+  return "";
+}
+
+function slicerSaysOverdue(slicerText: string): boolean {
+  const s = slicerText.replace(/\s+/g, " ").trim().toLowerCase();
+  return /\boverdue\b|\bpast\s*due\b/i.test(s);
+}
+
+/**
+ * Derive schedule-maintenance health from merged Fleet (P&A) columns vs snapshot date.
+ * Matches headers like "Schedule Mx Status" → `fleet.schedule mx status` in raw JSON.
+ * **Overdue** follows the workbook "Schedule Mx Slicer" only: unless that cell says overdue,
+ * we do not mark overdue from scheduled/call-in dates alone.
+ */
+export function analyzeScheduleMxFromRaw(
+  raw: Record<string, string>,
+  asOfDateKey: string,
+): {
+  scheduleMxStatus: string;
+  scheduleMxDueIso: string | null;
+  scheduleMxDaysUntil: number | null;
+  scheduleMxOverdueByDays: number | null;
+  scheduleMxBucket: ScheduleMxBucket;
+  scheduleMxNeedsEntry: boolean;
+} {
+  const DUE_SOON_DAYS = 30;
+  const slicer = findScheduleMxSlicer(raw);
+  const status = findScheduleMxStatus(raw);
+  const dueText = findScheduleMxDueText(raw);
+  let dueIso = parseEticDate(dueText);
+  if (!dueIso && status) dueIso = parseEticDate(status);
+
+  const statusLower = status.toLowerCase();
+  const slicerOverdue = slicerSaysOverdue(slicer);
+
+  let daysUntil: number | null = null;
+  if (dueIso) {
+    daysUntil = calendarDaysBetween(asOfDateKey, dueIso);
+  }
+  const overdueByDays: number | null = null;
+
+  const hasAnyText = !!(slicer.trim() || status.trim() || dueText.trim());
+  const needsScheduleMxEntry = !hasAnyText && !dueIso;
+
+  let bucket: ScheduleMxBucket;
+  if (needsScheduleMxEntry) {
+    bucket = "missing";
+  } else if (slicerOverdue) {
+    bucket = "overdue";
+  } else if (dueIso !== null && daysUntil !== null && daysUntil >= 0 && daysUntil <= DUE_SOON_DAYS) {
+    bucket = "due_soon";
+  } else if (!dueIso && hasAnyText) {
+    if (/\bcurrent\b|\bgreen\b|\bok\b|\bcompliant\b|\bontime\b|\bon[- ]?track\b/i.test(statusLower)) bucket = "ok";
+    else bucket = "no_due";
+  } else {
+    bucket = "ok";
+  }
+
+  const displayParts = [slicer.trim(), status.trim(), dueText.trim()].filter(Boolean);
+  const displayStatus = displayParts.length ? displayParts.join(" · ") : "";
+
+  return {
+    scheduleMxStatus: displayStatus,
+    scheduleMxDueIso: dueIso,
+    scheduleMxDaysUntil: daysUntil,
+    scheduleMxOverdueByDays: overdueByDays,
+    scheduleMxBucket: bucket,
+    scheduleMxNeedsEntry: needsScheduleMxEntry,
+  };
+}
+
 /** Excel exports dates as ISO strings, "YYYY-MM-DD HH:MM" or "M/D/YY". */
 function parseEstablishedDate(raw: string): string | null {
   if (!raw) return null;
@@ -494,6 +633,7 @@ function rowToWatchRow(
   // not changed since then — i.e., the count below is a lower bound only.
   const historyBounded =
     !!firstSeen && !!earliest && firstSeen === earliest && row.last_remark_change_date <= firstSeen;
+  const rawCols = readRawColumns(row.raw_row_json);
   return {
     workOrderId: row.work_order_id,
     assetId: row.asset_id,
@@ -519,18 +659,18 @@ function rowToWatchRow(
     vehNomen: row.veh_nomen ?? "",
     firstSeenDate: firstSeen,
     historyBounded,
-    ...extractRawExtras(row.raw_row_json),
+    ...extractRawExtrasFromColumns(rawCols),
+    ...analyzeScheduleMxFromRaw(rawCols, asOfDateKey),
   };
 }
 
-function extractRawExtras(rawJson: string | null): {
+function extractRawExtrasFromColumns(raw: Record<string, string>): {
   establishedDate: string;
   establishedDateIso: string | null;
   woReason: string;
   nce: boolean;
   nceStatus: string;
 } {
-  const raw = readRawColumns(rawJson);
   const establishedDate = pickRawValue(raw, [
     "estbd dt/time",
     "estbd dt time",
@@ -565,6 +705,190 @@ function extractRawExtras(rawJson: string | null): {
     nce: !!nceStatus,
     nceStatus,
   };
+}
+
+export type ScheduleMxFleetRow = {
+  assetId: string;
+  makeModel: string;
+  mgmtCd: string;
+  workOrderCount: number;
+  nce: boolean;
+  nceStatus: string;
+  /** Overdue schedule maintenance on an NCE asset — highest leadership priority. */
+  scheduleMxNceCritical: boolean;
+} & ReturnType<typeof analyzeScheduleMxFromRaw>;
+
+async function loadWoCountsPerAsset(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  dateKey: string,
+): Promise<Map<string, number>> {
+  const m = new Map<string, number>();
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT asset_id, COUNT(*) AS c FROM work_order_snapshot WHERE snapshot_date_key = ? GROUP BY asset_id`,
+  )
+    .bind(dateKey)
+    .all<{ asset_id: string; c: number }>();
+  for (const row of r.results ?? []) {
+    const aid = (row.asset_id ?? "").trim();
+    if (aid) m.set(aid, Number(row.c) || 0);
+  }
+  return m;
+}
+
+function sortScheduleMxRows(out: ScheduleMxFleetRow[]): ScheduleMxFleetRow[] {
+  function rank(a: ScheduleMxFleetRow): number {
+    if (a.scheduleMxNceCritical) return 0;
+    if (a.scheduleMxBucket === "overdue") return 1;
+    if (a.scheduleMxBucket === "due_soon") return 2;
+    if (a.scheduleMxBucket === "missing") return 3;
+    return 4;
+  }
+  out.sort(function (a, b) {
+    const ra = rank(a);
+    const rb = rank(b);
+    if (ra !== rb) return ra - rb;
+    return a.assetId.localeCompare(b.assetId);
+  });
+  return out;
+}
+
+function buildScheduleMxRowsFromFleetSheet(
+  rawByAsset: Map<string, Record<string, string>>,
+  typedByAsset: Map<string, FleetRecord>,
+  woCounts: Map<string, number>,
+  dateKey: string,
+): ScheduleMxFleetRow[] {
+  const out: ScheduleMxFleetRow[] = [];
+  for (const [assetId, merged] of rawByAsset) {
+    const typed = typedByAsset.get(assetId);
+    const nceStatus = pickRawValue(merged, [
+      "fleet.nce vehicle listing.status",
+      "fleet.nce vehicle listing status",
+      "fleet.nce status",
+      "fleet.nce",
+    ]);
+    const nce = !!nceStatus;
+    const smx = analyzeScheduleMxFromRaw(merged, dateKey);
+    const scheduleMxNceCritical = nce && smx.scheduleMxBucket === "overdue";
+    const makeModel =
+      (typed?.makeModel ?? "").trim() ||
+      pickRawValue(merged, ["fleet.make/model", "fleet.make model", "make model"]);
+    const mgmtCd =
+      (typed?.mgmtCd ?? "").trim() ||
+      pickRawValue(merged, ["fleet.mgmt cd", "fleet.mgmt code", "mgmt cd"]);
+    out.push({
+      assetId,
+      makeModel,
+      mgmtCd,
+      workOrderCount: woCounts.get(assetId) ?? 0,
+      nce,
+      nceStatus,
+      scheduleMxNceCritical,
+      ...smx,
+    });
+  }
+  return sortScheduleMxRows(out);
+}
+
+/** Fallback when the workbook is missing from R2 or has no Fleet sheet. */
+async function scheduleMxFleetRowsFromWorkOrderSnapshotsOnly(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  dateKey: string,
+): Promise<ScheduleMxFleetRow[]> {
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT asset_id, raw_row_json, make_model, mgmt_cd
+       FROM work_order_snapshot
+      WHERE snapshot_date_key = ?`,
+  )
+    .bind(dateKey)
+    .all<{ asset_id: string; raw_row_json: string | null; make_model: string | null; mgmt_cd: string | null }>();
+
+  type Agg = { raws: Record<string, string>[]; make: string; mgmt: string; woCount: number };
+  const byAsset = new Map<string, Agg>();
+  for (const row of r.results ?? []) {
+    const aid = (row.asset_id ?? "").trim();
+    if (!aid) continue;
+    const parsed = readRawColumns(row.raw_row_json);
+    let g = byAsset.get(aid);
+    if (!g) {
+      g = {
+        raws: [],
+        make: (row.make_model ?? "").trim(),
+        mgmt: (row.mgmt_cd ?? "").trim(),
+        woCount: 0,
+      };
+      byAsset.set(aid, g);
+    }
+    g.raws.push(parsed);
+    g.woCount += 1;
+    if (!g.make && row.make_model) g.make = row.make_model.trim();
+    if (!g.mgmt && row.mgmt_cd) g.mgmt = row.mgmt_cd.trim();
+  }
+
+  const out: ScheduleMxFleetRow[] = [];
+  for (const [assetId, g] of byAsset) {
+    const merged: Record<string, string> = {};
+    for (const rr of g.raws) {
+      for (const [k, v] of Object.entries(rr)) {
+        if (v && String(v).trim()) merged[k] = String(v).trim();
+      }
+    }
+    const nceStatus = pickRawValue(merged, [
+      "fleet.nce vehicle listing.status",
+      "fleet.nce vehicle listing status",
+      "fleet.nce status",
+      "fleet.nce",
+    ]);
+    const nce = !!nceStatus;
+    const smx = analyzeScheduleMxFromRaw(merged, dateKey);
+    const scheduleMxNceCritical = nce && smx.scheduleMxBucket === "overdue";
+    out.push({
+      assetId,
+      makeModel: g.make,
+      mgmtCd: g.mgmt,
+      workOrderCount: g.woCount,
+      nce,
+      nceStatus,
+      scheduleMxNceCritical,
+      ...smx,
+    });
+  }
+  return sortScheduleMxRows(out);
+}
+
+/**
+ * Full Fleet (P&A) fleet: reads the stored ETIC workbook from R2 and parses the Fleet sheet
+ * so every asset row appears (not only assets with open work orders). WO counts are joined from
+ * `work_order_snapshot` when present.
+ */
+export async function getScheduleMxFleetForDate(
+  env: { ETIC_SNAPSHOTS: D1Database; ETIC_BUCKET: R2Bucket },
+  dateKey: string,
+): Promise<ScheduleMxFleetRow[]> {
+  const woCounts = await loadWoCountsPerAsset(env, dateKey);
+
+  const snap = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT workbook_key FROM etic_snapshots WHERE date_key = ?`,
+  )
+    .bind(dateKey)
+    .first<{ workbook_key: string | null }>();
+
+  if (snap?.workbook_key) {
+    const obj = await env.ETIC_BUCKET.get(snap.workbook_key);
+    if (obj) {
+      try {
+        const bytes = await obj.arrayBuffer();
+        const ex = await extractFleetMapsFromBinary(bytes);
+        if (ex && ex.rawByAsset.size > 0) {
+          return buildScheduleMxRowsFromFleetSheet(ex.rawByAsset, ex.byAsset, woCounts, dateKey);
+        }
+      } catch (err) {
+        console.error("getScheduleMxFleetForDate: fleet extract failed", err);
+      }
+    }
+  }
+
+  return scheduleMxFleetRowsFromWorkOrderSnapshotsOnly(env, dateKey);
 }
 
 async function getEarliestSnapshotDate(env: { ETIC_SNAPSHOTS: D1Database }): Promise<string> {
@@ -780,6 +1104,106 @@ export async function getChangelog(env: { ETIC_SNAPSHOTS: D1Database }, workOrde
       new_value: string | null;
     }>();
   return r.results ?? [];
+}
+
+/** ETIC meeting rows for this WO (notes / due-outs) for the work-order timeline. */
+export type WoTimelineMeetingNote = {
+  meetingId: number;
+  meetingTitle: string;
+  startedAtIso: string;
+  updatedAtIso: string;
+  notes: string;
+  dueOuts: string;
+};
+
+/** Rolling yard_check rows for the asset tied to this WO. */
+export type WoTimelineYardWalk = {
+  id: number;
+  location: string;
+  discrepancies: string;
+  status: string;
+  checkedBy: string;
+  checkedAtIso: string;
+  sourceDateKey: string;
+};
+
+export async function getAssetIdForWorkOrder(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  workOrderId: string,
+): Promise<string | null> {
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT asset_id FROM work_order_state WHERE work_order_id = ?`,
+  )
+    .bind(workOrderId)
+    .first<{ asset_id: string }>();
+  const a = (r?.asset_id ?? "").trim();
+  return a || null;
+}
+
+export async function getMeetingNotesForWorkOrder(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  workOrderId: string,
+): Promise<WoTimelineMeetingNote[]> {
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT n.notes, n.due_outs, n.updated_at_iso, m.id AS meeting_id, m.title AS meeting_title, m.started_at_iso
+       FROM meeting_wo_note n
+       JOIN meeting m ON m.id = n.meeting_id
+      WHERE n.work_order_id = ?
+        AND (length(trim(ifnull(n.notes,''))) > 0 OR length(trim(ifnull(n.due_outs,''))) > 0)
+      ORDER BY n.updated_at_iso DESC
+      LIMIT 200`,
+  )
+    .bind(workOrderId)
+    .all<{
+      notes: string;
+      due_outs: string;
+      updated_at_iso: string;
+      meeting_id: number;
+      meeting_title: string;
+      started_at_iso: string;
+    }>();
+  return (r.results ?? []).map((row) => ({
+    meetingId: row.meeting_id,
+    meetingTitle: row.meeting_title ?? "",
+    startedAtIso: row.started_at_iso ?? "",
+    updatedAtIso: row.updated_at_iso ?? "",
+    notes: row.notes ?? "",
+    dueOuts: row.due_outs ?? "",
+  }));
+}
+
+export async function getYardWalksForAsset(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  assetId: string,
+  limit = 80,
+): Promise<WoTimelineYardWalk[]> {
+  const aid = assetId.trim();
+  if (!aid) return [];
+  const lim = Math.max(1, Math.min(limit, 200));
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key
+       FROM yard_check WHERE asset_id = ?
+       ORDER BY checked_at_iso DESC LIMIT ?`,
+  )
+    .bind(aid, lim)
+    .all<{
+      id: number;
+      location: string;
+      discrepancies: string;
+      status: string;
+      checked_by: string;
+      checked_at_iso: string;
+      source_date_key: string;
+    }>();
+  return (r.results ?? []).map((row) => ({
+    id: row.id,
+    location: row.location ?? "",
+    discrepancies: row.discrepancies ?? "",
+    status: row.status ?? "",
+    checkedBy: row.checked_by ?? "",
+    checkedAtIso: row.checked_at_iso ?? "",
+    sourceDateKey: row.source_date_key ?? "",
+  }));
 }
 
 // ---------------------------------------------------------------------------

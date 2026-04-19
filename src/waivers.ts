@@ -63,6 +63,10 @@ export type Waiver = {
   verifyState: WaiverVerifyState;
   /** Whole days since the most-recent verification (or since approval if none). */
   daysSinceVerified: number | null;
+  /** Soft-removed from the card; row kept for audit. */
+  isRemoved: boolean;
+  deletedAtIso: string;
+  deletedBy: string;
 };
 
 /**
@@ -114,6 +118,8 @@ type WaiverRow = {
   reviewed_note: string | null;
   last_verified_by: string | null;
   last_verified_at_iso: string | null;
+  deleted_at_iso: string | null;
+  deleted_by: string | null;
 };
 
 type VerificationRow = {
@@ -130,7 +136,10 @@ type VerificationRow = {
 const SELECT_WAIVER_COLS =
   "id, asset_id, title, description, photo_r2_key, photo_content_type, status, " +
   "submitted_by, submitted_at_iso, reviewed_by, reviewed_at_iso, reviewed_note, " +
-  "last_verified_by, last_verified_at_iso";
+  "last_verified_by, last_verified_at_iso, deleted_at_iso, deleted_by";
+
+/** Active rows for lists, counts, approve/reject/verify, and printable card. */
+const WAIVER_NOT_SOFT_DELETED_SQL = `(deleted_at_iso IS NULL OR trim(ifnull(deleted_at_iso,'')) = '')`;
 
 /** Remove legacy PATS bulk-import boilerplate from stored descriptions. */
 function stripLegacyPatsDescription(raw: string | null | undefined): string {
@@ -194,6 +203,8 @@ function rowToWaiver(r: WaiverRow, waiverPhotos: WaiverPhotoRef[] = []): Waiver 
       : r.photo_r2_key
         ? [{ id: 0, url: `/api/waivers/${r.id}/photo` }]
         : [];
+  const isRemoved =
+    r.deleted_at_iso != null && String(r.deleted_at_iso).trim().length > 0;
   return {
     id: r.id,
     assetId: r.asset_id,
@@ -212,6 +223,9 @@ function rowToWaiver(r: WaiverRow, waiverPhotos: WaiverPhotoRef[] = []): Waiver 
     lastVerifiedAtIso: lastVerifiedAt,
     verifyState,
     daysSinceVerified,
+    isRemoved,
+    deletedAtIso: isRemoved ? (r.deleted_at_iso ?? "") : "",
+    deletedBy: isRemoved ? (r.deleted_by ?? "").trim() : "",
   };
 }
 
@@ -359,7 +373,7 @@ export async function listWaiversForAsset(
     : "asset_id = ? AND status IN ('pending','approved')";
   const r = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT ${SELECT_WAIVER_COLS} FROM waiver
-      WHERE ${where} AND NOT ${WAIVER_ROW_IS_NOISE_SQL}
+      WHERE ${where} AND ${WAIVER_NOT_SOFT_DELETED_SQL} AND NOT ${WAIVER_ROW_IS_NOISE_SQL}
       ORDER BY status DESC, submitted_at_iso DESC`,
   )
     .bind(id)
@@ -377,9 +391,31 @@ export async function listWaiversForAsset(
 export async function listPendingWaivers(env: Env): Promise<Waiver[]> {
   const r = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT ${SELECT_WAIVER_COLS} FROM waiver
-      WHERE status = 'pending' AND NOT ${WAIVER_ROW_IS_NOISE_SQL}
+      WHERE status = 'pending' AND ${WAIVER_NOT_SOFT_DELETED_SQL} AND NOT ${WAIVER_ROW_IS_NOISE_SQL}
       ORDER BY submitted_at_iso DESC`,
   ).all<WaiverRow>();
+  const rows = r.results ?? [];
+  const ids = rows.map((row) => row.id);
+  const pmap = await listWaiverPhotosForWaiverIds(env, ids);
+  return rows.map((row) => rowToWaiver(row, pmap.get(row.id) ?? []));
+}
+
+/**
+ * Soft-deleted waivers for one asset (audit). Newest removal first.
+ * Desktop "By vehicle" uses this for an expandable section — never on print.
+ */
+export async function listRemovedWaiversForAsset(env: Env, assetId: string): Promise<Waiver[]> {
+  const id = (assetId ?? "").trim();
+  if (!id) return [];
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT ${SELECT_WAIVER_COLS} FROM waiver
+      WHERE asset_id = ?
+        AND NOT ${WAIVER_NOT_SOFT_DELETED_SQL}
+        AND NOT ${WAIVER_ROW_IS_NOISE_SQL}
+      ORDER BY deleted_at_iso DESC, id DESC`,
+  )
+    .bind(id)
+    .all<WaiverRow>();
   const rows = r.results ?? [];
   const ids = rows.map((row) => row.id);
   const pmap = await listWaiverPhotosForWaiverIds(env, ids);
@@ -418,7 +454,7 @@ export async function approveWaiver(
             reviewed_note = ?,
             last_verified_by = ?,
             last_verified_at_iso = ?
-      WHERE id = ? AND status = 'pending'
+      WHERE id = ? AND status = 'pending' AND ${WAIVER_NOT_SOFT_DELETED_SQL}
       RETURNING ${SELECT_WAIVER_COLS}`,
   )
     .bind(by, nowIso, (note ?? "").trim() || null, by, nowIso, id)
@@ -454,7 +490,7 @@ export async function rejectWaiver(
             reviewed_by = ?,
             reviewed_at_iso = ?,
             reviewed_note = ?
-      WHERE id = ? AND status = 'pending'
+      WHERE id = ? AND status = 'pending' AND ${WAIVER_NOT_SOFT_DELETED_SQL}
       RETURNING ${SELECT_WAIVER_COLS}`,
   )
     .bind(by, nowIso, r, id)
@@ -481,7 +517,7 @@ export async function verifyWaiver(
   const nowIso = new Date().toISOString();
   // Only approved waivers can be verified — pending/rejected has no card.
   const cur = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT status FROM waiver WHERE id = ?`,
+    `SELECT status FROM waiver WHERE id = ? AND ${WAIVER_NOT_SOFT_DELETED_SQL}`,
   )
     .bind(id)
     .first<{ status: WaiverStatus }>();
@@ -514,7 +550,7 @@ export async function verifyWaiver(
   const updated = await env.ETIC_SNAPSHOTS.prepare(
     `UPDATE waiver
         SET last_verified_by = ?, last_verified_at_iso = ?
-      WHERE id = ?
+      WHERE id = ? AND ${WAIVER_NOT_SOFT_DELETED_SQL}
       RETURNING ${SELECT_WAIVER_COLS}`,
   )
     .bind(by, nowIso, id)
@@ -556,45 +592,22 @@ export async function getVerificationPhoto(env: Env, verificationId: number): Pr
 // Delete (admin)
 // ---------------------------------------------------------------------------
 
-export async function deleteWaiver(env: Env, id: number): Promise<boolean> {
-  const exists = await env.ETIC_SNAPSHOTS.prepare(`SELECT 1 AS ok FROM waiver WHERE id = ?`)
-    .bind(id)
-    .first<{ ok: number }>();
-  if (!exists) return false;
-  const keys = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT r2_key FROM waiver_photo WHERE waiver_id = ?`,
+/**
+ * Soft-delete: row stays for audit; photos stay in R2. Name is stored on the row.
+ */
+export async function deleteWaiver(env: Env, id: number, deletedBy: string): Promise<boolean> {
+  const by = (deletedBy ?? "").trim();
+  if (!by) throw new Error("deletedBy required");
+  const nowIso = new Date().toISOString();
+  const updated = await env.ETIC_SNAPSHOTS.prepare(
+    `UPDATE waiver
+        SET deleted_at_iso = ?, deleted_by = ?
+      WHERE id = ? AND ${WAIVER_NOT_SOFT_DELETED_SQL}
+      RETURNING id`,
   )
-    .bind(id)
-    .all<{ r2_key: string }>();
-  const legacy = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT photo_r2_key FROM waiver WHERE id = ?`,
-  )
-    .bind(id)
-    .first<{ photo_r2_key: string | null }>();
-  const seen = new Set<string>();
-  for (const row of keys.results ?? []) {
-    if (!row.r2_key || seen.has(row.r2_key)) continue;
-    seen.add(row.r2_key);
-    try {
-      await env.ETIC_BUCKET.delete(row.r2_key);
-    } catch {
-      // Best effort — never block delete on R2 cleanup.
-    }
-  }
-  if (legacy?.photo_r2_key && !seen.has(legacy.photo_r2_key)) {
-    try {
-      await env.ETIC_BUCKET.delete(legacy.photo_r2_key);
-    } catch {
-      /* ignore */
-    }
-  }
-  const r = await env.ETIC_SNAPSHOTS.prepare(
-    `DELETE FROM waiver WHERE id = ?`,
-  )
-    .bind(id)
-    .run();
-  const m = (r as unknown as { meta?: { changes?: number } }).meta;
-  return (m?.changes ?? 0) > 0;
+    .bind(nowIso, by, id)
+    .first<{ id: number }>();
+  return !!updated?.id;
 }
 
 // ---------------------------------------------------------------------------
@@ -675,6 +688,7 @@ export async function getWaiverCounts(env: Env): Promise<Map<string, WaiverCount
                   THEN 1 ELSE 0 END) AS overdue_verify
        FROM waiver
       WHERE status IN ('approved','pending')
+        AND ${WAIVER_NOT_SOFT_DELETED_SQL}
         AND NOT ${WAIVER_ROW_IS_NOISE_SQL}
       GROUP BY asset_id`,
   )

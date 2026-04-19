@@ -537,6 +537,22 @@ export type YardCheckRow = {
   sourceDateKey: string;
 };
 
+/** One correction applied to an existing `yard_check` row (see migrations/0022). */
+export type YardCheckEditSnapshot = {
+  location: string;
+  discrepancies: string;
+  status: YardEntryStatus;
+};
+
+export type YardCheckEditRow = {
+  id: number;
+  checkId: number;
+  editedAtIso: string;
+  editedBy: string;
+  before: YardCheckEditSnapshot;
+  after: YardCheckEditSnapshot;
+};
+
 export type YardPhotoRow = {
   id: number;
   assetId: string;
@@ -579,6 +595,8 @@ export type RollingAsset = YardAsset & {
    * to the snapshot's "previous location" extracted from raw row JSON.
    */
   lastLocation: string;
+  /** Notes / discrepancies from the most recent yard_check (may be empty). */
+  lastNotes: string;
   /** True if any open WO for this asset has mel_tier === 'below'. */
   isBelowMel: boolean;
 };
@@ -600,10 +618,12 @@ export type RollingRoster = {
   };
 };
 
-type LatestCheckRow = {
+/** One row per asset: latest yard_check by time (ties broken by id). */
+type LatestCheckFullRow = {
   asset_id: string;
   checked_at_iso: string;
-  checked_by: string;
+  checked_by: string | null;
+  discrepancies: string | null;
 };
 
 type CheckReadRow = {
@@ -685,13 +705,17 @@ export async function getRollingRoster(env: Env): Promise<RollingRoster> {
   const [roster, latestChecks, photoCounts, priorAssets, latestLocs, belowMelRows] = await Promise.all([
     getYardRosterForDate(env, dateKey),
     env.ETIC_SNAPSHOTS.prepare(
-      `SELECT asset_id, MAX(checked_at_iso) AS checked_at_iso,
-              (SELECT checked_by FROM yard_check yc2
-                WHERE yc2.asset_id = yc.asset_id
-                ORDER BY checked_at_iso DESC LIMIT 1) AS checked_by
-         FROM yard_check yc
-         GROUP BY asset_id`,
-    ).all<LatestCheckRow>(),
+      `SELECT asset_id, checked_at_iso, checked_by, discrepancies
+       FROM (
+         SELECT
+           asset_id,
+           checked_at_iso,
+           checked_by,
+           discrepancies,
+           ROW_NUMBER() OVER (PARTITION BY asset_id ORDER BY checked_at_iso DESC, id DESC) AS rn
+         FROM yard_check
+       ) WHERE rn = 1`,
+    ).all<LatestCheckFullRow>(),
     env.ETIC_SNAPSHOTS.prepare(
       `SELECT asset_id, COUNT(*) AS c FROM yard_photo GROUP BY asset_id`,
     ).all<{ asset_id: string; c: number }>(),
@@ -714,9 +738,15 @@ export async function getRollingRoster(env: Env): Promise<RollingRoster> {
     ).bind(dateKey).all<{ asset_id: string }>(),
   ]);
 
-  const lastByAsset = new Map<string, { at: string; by: string }>();
+  const lastByAsset = new Map<string, { at: string; by: string; notes: string }>();
   for (const row of latestChecks.results ?? []) {
-    if (row.asset_id) lastByAsset.set(row.asset_id, { at: row.checked_at_iso, by: row.checked_by ?? "" });
+    if (row.asset_id) {
+      lastByAsset.set(row.asset_id, {
+        at: row.checked_at_iso,
+        by: row.checked_by ?? "",
+        notes: (row.discrepancies ?? "").trim(),
+      });
+    }
   }
   const photoByAsset = new Map<string, number>();
   for (const row of photoCounts.results ?? []) {
@@ -761,6 +791,7 @@ export async function getRollingRoster(env: Env): Promise<RollingRoster> {
       isUnlisted: false,
       photoCount: photoByAsset.get(a.assetId) ?? 0,
       lastLocation: lastLocByAsset.get(a.assetId) || a.previousLocation,
+      lastNotes: last?.notes ?? "",
       isBelowMel: belowMelAssets.has(a.assetId),
     });
     totals.total += 1;
@@ -801,6 +832,7 @@ export async function getRollingRoster(env: Env): Promise<RollingRoster> {
       isUnlisted: true,
       photoCount: photoByAsset.get(assetId) ?? 0,
       lastLocation: lastLocByAsset.get(assetId) || "",
+      lastNotes: last.notes ?? "",
       isBelowMel: false,
     });
     totals.total += 1;
@@ -850,6 +882,10 @@ export type RecordCheckInput = {
 export async function recordCheck(env: Env, input: RecordCheckInput): Promise<YardCheckRow> {
   const assetId = input.assetId.trim();
   if (!assetId) throw new Error("assetId required");
+  const status = normalizeEntryStatus(input.status);
+  if (status === "present" && !(input.location ?? "").trim()) {
+    throw new Error("Location is required when marking present (checked)");
+  }
   const sourceDateKey = input.sourceDateKey || (await getLatestSnapshotDateKey(env));
   const nowIso = new Date().toISOString();
   const r = await env.ETIC_SNAPSHOTS.prepare(
@@ -862,7 +898,7 @@ export async function recordCheck(env: Env, input: RecordCheckInput): Promise<Ya
       assetId,
       (input.location ?? "").trim(),
       (input.discrepancies ?? "").trim(),
-      normalizeEntryStatus(input.status),
+      status,
       (input.checkedBy ?? "").trim(),
       nowIso,
       sourceDateKey,
@@ -870,6 +906,133 @@ export async function recordCheck(env: Env, input: RecordCheckInput): Promise<Ya
     .first<CheckReadRow>();
   if (!r) throw new Error("failed to record check");
   return rowToCheck(r);
+}
+
+export type UpdateYardCheckInput = {
+  checkId: number;
+  editedBy: string;
+  location: string;
+  discrepancies: string;
+  status?: YardEntryStatus;
+};
+
+function snapshotFromCheckRow(r: CheckReadRow): YardCheckEditSnapshot {
+  return {
+    location: (r.location ?? "").trim(),
+    discrepancies: (r.discrepancies ?? "").trim(),
+    status: normalizeEntryStatus(r.status),
+  };
+}
+
+/**
+ * Correct an existing check in place. Logs a row in `yard_check_edit`.
+ * Original `checked_at_iso` / `checked_by` are preserved (walker's sighting).
+ */
+export async function updateYardCheck(env: Env, input: UpdateYardCheckInput): Promise<YardCheckRow> {
+  const editedBy = (input.editedBy ?? "").trim();
+  if (!editedBy) throw new Error("editedBy required");
+  const checkId = input.checkId;
+  if (!Number.isFinite(checkId) || checkId <= 0) throw new Error("checkId required");
+
+  const r0 = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key
+     FROM yard_check WHERE id = ?`,
+  )
+    .bind(checkId)
+    .first<CheckReadRow>();
+  if (!r0) throw new Error("check not found");
+
+  const before = snapshotFromCheckRow(r0);
+  const after: YardCheckEditSnapshot = {
+    location: (input.location ?? "").trim(),
+    discrepancies: (input.discrepancies ?? "").trim(),
+    status: input.status !== undefined ? normalizeEntryStatus(input.status) : before.status,
+  };
+
+  if (
+    before.location === after.location &&
+    before.discrepancies === after.discrepancies &&
+    before.status === after.status
+  ) {
+    return rowToCheck(r0);
+  }
+
+  if (after.status === "present" && !after.location.trim()) {
+    throw new Error("Location is required when status is Present / found");
+  }
+
+  const nowIso = new Date().toISOString();
+  const assetId = r0.asset_id;
+
+  await env.ETIC_SNAPSHOTS.prepare(
+    `UPDATE yard_check SET location = ?, discrepancies = ?, status = ? WHERE id = ?`,
+  )
+    .bind(after.location, after.discrepancies, after.status, checkId)
+    .run();
+
+  await env.ETIC_SNAPSHOTS.prepare(
+    `INSERT INTO yard_check_edit (asset_id, check_id, edited_at_iso, edited_by, before_json, after_json)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(
+      assetId,
+      checkId,
+      nowIso,
+      editedBy,
+      JSON.stringify(before),
+      JSON.stringify(after),
+    )
+    .run();
+
+  const r1 = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key
+     FROM yard_check WHERE id = ?`,
+  )
+    .bind(checkId)
+    .first<CheckReadRow>();
+  if (!r1) throw new Error("failed to reload check");
+  return rowToCheck(r1);
+}
+
+type EditReadRow = {
+  id: number;
+  check_id: number;
+  edited_at_iso: string;
+  edited_by: string | null;
+  before_json: string | null;
+  after_json: string | null;
+};
+
+function parseEditSnapshotJson(json: string | null): YardCheckEditSnapshot {
+  try {
+    const o = JSON.parse(json || "{}") as Record<string, unknown>;
+    return {
+      location: String(o.location ?? ""),
+      discrepancies: String(o.discrepancies ?? ""),
+      status: normalizeEntryStatus(typeof o.status === "string" ? o.status : "present"),
+    };
+  } catch {
+    return { location: "", discrepancies: "", status: "present" };
+  }
+}
+
+export async function getCheckEditsForAsset(env: Env, assetId: string): Promise<YardCheckEditRow[]> {
+  const id = assetId.trim();
+  if (!id) return [];
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT id, check_id, edited_at_iso, edited_by, before_json, after_json
+     FROM yard_check_edit WHERE asset_id = ? ORDER BY edited_at_iso DESC`,
+  )
+    .bind(id)
+    .all<EditReadRow>();
+  return (r.results ?? []).map((row) => ({
+    id: row.id,
+    checkId: row.check_id,
+    editedAtIso: row.edited_at_iso,
+    editedBy: row.edited_by ?? "",
+    before: parseEditSnapshotJson(row.before_json),
+    after: parseEditSnapshotJson(row.after_json),
+  }));
 }
 
 export async function getChecksForAsset(
@@ -1100,10 +1263,50 @@ export async function deletePhoto(env: Env, photoId: number): Promise<boolean> {
   return (m?.changes ?? 0) > 0;
 }
 
+/** When an asset has yard_check rows but getRollingRoster hasn't matched yet (race) or id casing edge case, synthesize a minimal row so the client can render. */
+function rollingAssetSyntheticUnlisted(
+  id: string,
+  checks: YardCheckRow[],
+  photos: YardPhotoRow[],
+  intervalDays: number,
+): RollingAsset {
+  const last = checks[0];
+  const nowIso = new Date().toISOString();
+  const days = daysBetween(last.checkedAtIso, nowIso);
+  const rollingState = bucketState(days, intervalDays);
+  return {
+    assetId: id,
+    owningUnit: "",
+    shop: "",
+    mgmtCd: "",
+    makeModel: "",
+    vehNomen: "",
+    melKey: "",
+    melTier: "",
+    vinSerial: "",
+    previousLocation: "",
+    openWoCount: 0,
+    isNce: false,
+    lastCheckedAtIso: last.checkedAtIso,
+    lastCheckedBy: last.checkedBy,
+    daysSinceLastCheck: days,
+    rollingState,
+    isNeverChecked: false,
+    isNewAsset: false,
+    isUnlisted: true,
+    photoCount: photos.length,
+    lastLocation: last.location || "",
+    lastNotes: (last.discrepancies ?? "").trim(),
+    isBelowMel: false,
+  };
+}
+
 /** Detail view for one asset: roster info + check history + photos + WO context + FM&A actions. */
 export type AssetDetail = {
   asset: RollingAsset | null;
   checks: YardCheckRow[];
+  /** In-place corrections to checks, newest first (group client-side by checkId). */
+  checkEdits: YardCheckEditRow[];
   photos: YardPhotoRow[];
   /** Open work orders against this asset on the latest snapshot, with remarks. */
   openWorkOrders: AssetWorkOrder[];
@@ -1168,20 +1371,26 @@ async function getOpenWorkOrdersForAsset(
 
 export async function getAssetDetail(env: Env, assetId: string): Promise<AssetDetail> {
   const id = assetId.trim();
-  const [roster, checks, photos, actions] = await Promise.all([
+  const [roster, checks, checkEdits, photos, actions] = await Promise.all([
     getRollingRoster(env),
     getChecksForAsset(env, id),
+    getCheckEditsForAsset(env, id),
     listPhotosForAsset(env, id),
     listFindingActionsForAsset(env, id),
   ]);
-  const asset = roster.assets.find((a) => a.assetId === id) ?? null;
+  const inRoster = roster.assets.find((a) => a.assetId === id) ?? null;
+  let asset: RollingAsset | null = inRoster;
+  if (!asset && checks.length > 0) {
+    asset = rollingAssetSyntheticUnlisted(id, checks, photos, roster.intervalDays);
+  }
   const openWorkOrders = await getOpenWorkOrdersForAsset(env, roster.dateKey, id);
   return {
     asset,
     checks,
+    checkEdits,
     photos,
     openWorkOrders,
-    isUnlisted: !asset,
+    isUnlisted: inRoster ? inRoster.isUnlisted : checks.length > 0,
     actions,
   };
 }
@@ -1189,37 +1398,19 @@ export async function getAssetDetail(env: Env, assetId: string): Promise<AssetDe
 /* =============================================================================
    FM&A FOLLOW-UP QUEUE
 
-   Findings are computed live from the latest yard_check per asset_id plus the
-   latest snapshot's asset roster:
+   `listOpenFindings` returns only kinds that need explicit FM&A follow-up on
+   walker-tagged evidence:
 
-     - asset is on the latest snapshot but no walker has logged a 'present'
-       check within MISSING_THRESHOLD_DAYS (or never)  ->  MISSING
-       (absence-derived; the walker can't be expected to declare absence —
-       they don't know what *should* be on the lot. So we infer it from
-       "nobody has confirmed seeing this thing in two cycles.")
+     - UNLISTED — asset has yard_check history but not on latest ETIC snapshot
+     - DISCREPANCY — latest check has non-empty discrepancy text
+     - UNKNOWN — legacy rows only
 
-     - asset has check history but isn't in the latest snapshot  ->  UNLISTED
-       (floor-to-book reconciliation)
+   Absence-derived "not checked in time" is NOT listed here: cadence / never
+   checked is visible on the rolling fleet list (getRollingRoster). The
+   MISSING kind remains in the schema for old yard_finding_action rows.
 
-     - any non-empty discrepancy on the latest check  ->  DISCREPANCY
-
-   FM&A "resolves" a finding by inserting a yard_finding_action row.
-
-     - For DISCREPANCY/UNLISTED, the action is tied to the specific yard_check
-       that triggered it; a newer walker check breaks that anchor and the
-       finding re-opens.
-
-     - For MISSING (absence-derived) there is no triggering check. We tie the
-       action to the asset's last-seen check_id (may be null if never seen).
-       A newer 'present' check after the action makes the absence go away
-       entirely, so the finding silently disappears.
-
-   `unknown` was a kind in the old data model but is no longer emitted —
-   the walker's "I'm not sure" button was removed (it produced low-signal
-   findings). Old action rows with kind='unknown' remain readable for
-   history but no new ones are created.
-
-   See MISSING_THRESHOLD_DAYS below for the absence window.
+   FM&A records yard_finding_action rows; for DISCREPANCY/UNLISTED the action
+   anchors to the triggering yard_check id so a newer check can re-open.
    ========================================================================== */
 
 /** How long an asset can go un-confirmed before it counts as Missing. Defaults
@@ -1333,27 +1524,11 @@ export async function listOpenFindings(env: Env): Promise<{
 }> {
   const dateKey = await getLatestSnapshotDateKey(env);
 
-  // Fetch in parallel: roster (for asset metadata + isUnlisted), latest
-  // *present* check per asset (used for the Missing absence window AND for
-  // the "last seen" badge on Missing finding cards), latest check of any
-  // status per asset (used to anchor unlisted/discrepancy findings + show
-  // the most-recent walker note even if it was a non-present status), and
-  // the latest action per (asset, kind) pair.
-  const [
-    roster,
-    latestPresentRows,
-    latestAnyRows,
-    latestActionRows,
-  ] = await Promise.all([
+  // Fetch in parallel: rolling asset list (metadata + isUnlisted), latest
+  // check of any status per asset (unlisted/discrepancy anchors), and the
+  // latest FM&A action per (asset, kind).
+  const [roster, latestAnyRows, latestActionRows] = await Promise.all([
     getRollingRoster(env),
-    env.ETIC_SNAPSHOTS.prepare(
-      `SELECT yc.* FROM yard_check yc
-       JOIN (
-         SELECT asset_id, MAX(checked_at_iso) AS m FROM yard_check
-          WHERE LOWER(COALESCE(status, 'present')) = 'present'
-          GROUP BY asset_id
-       ) m ON m.asset_id = yc.asset_id AND m.m = yc.checked_at_iso`,
-    ).all<CheckReadRow>(),
     env.ETIC_SNAPSHOTS.prepare(
       `SELECT yc.* FROM yard_check yc
        JOIN (
@@ -1369,10 +1544,6 @@ export async function listOpenFindings(env: Env): Promise<{
     ).all<FindingActionRow>(),
   ]);
 
-  const latestPresentByAsset = new Map<string, YardCheckRow>();
-  for (const row of latestPresentRows.results ?? []) {
-    if (row.asset_id) latestPresentByAsset.set(row.asset_id, rowToCheck(row));
-  }
   const latestAnyByAsset = new Map<string, YardCheckRow>();
   for (const row of latestAnyRows.results ?? []) {
     if (row.asset_id) latestAnyByAsset.set(row.asset_id, rowToCheck(row));
@@ -1437,21 +1608,9 @@ export async function listOpenFindings(env: Env): Promise<{
     if (acknowledged) totals.acknowledged += 1;
   }
 
-  // ---- MISSING (absence-derived) ------------------------------------------
-  // For each asset on the latest ETIC roster: if no walker has logged a
-  // 'present' check within the threshold window, surface as Missing. The
-  // trigger context is the most-recent present check (so FM&A sees "last
-  // seen by Bob 28 days ago in lot B"), or null if it's never been seen.
-  const intervalDays = roster.intervalDays;
-  const missingThreshold = getMissingThresholdDays(intervalDays);
-  const cutoffMs = Date.now() - missingThreshold * 24 * 60 * 60 * 1000;
-  for (const asset of roster.assets) {
-    if (asset.isUnlisted) continue; // these come from latestAnyByAsset below
-    const lastPresent = latestPresentByAsset.get(asset.assetId) ?? null;
-    const lastPresentMs = lastPresent ? Date.parse(lastPresent.checkedAtIso) : NaN;
-    const isStale = !lastPresent || !Number.isFinite(lastPresentMs) || lastPresentMs < cutoffMs;
-    if (isStale) pushFinding(asset.assetId, "missing", lastPresent);
-  }
+  // Absence-derived "missing" / not-seen items are intentionally NOT listed here:
+  // the embedded fleet list (walker view) already shows due / overdue / never
+  // checked. This queue is only for walker-tagged or floor-to-book issues.
 
   // ---- UNLISTED + DISCREPANCY (and legacy UNKNOWN) ------------------------
   // Walk every asset that has any check history.

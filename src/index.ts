@@ -11,9 +11,13 @@ import {
   backfillTypedColumnsFromJson,
   deleteWorkOrderAction,
   getChangelog,
+  getAssetIdForWorkOrder,
+  getMeetingNotesForWorkOrder,
+  getYardWalksForAsset,
   getWatchRowById,
   getWatchRowByIdForDate,
   getWatchRowsForDate,
+  getScheduleMxFleetForDate,
   getWatchRowsLatest,
   getWorkOrderActions,
   getWorkOrderTimeline,
@@ -50,8 +54,10 @@ import {
   listOpenFindings as listYardOpenFindings,
   listPhotosForAsset as listYardPhotosForAsset,
   recordCheck as recordYardCheck,
+  deleteCheck as deleteYardCheckRow,
   reopenFinding as reopenYardFinding,
   resolveFinding as resolveYardFinding,
+  updateYardCheck as updateYardCheckRow,
   type FindingKind,
   type FindingResolution,
   type YardEntryStatus,
@@ -65,6 +71,7 @@ import {
   getWaiverPhoto,
   getWaiverPhotoFile,
   listPendingWaivers,
+  listRemovedWaiversForAsset,
   listVerifications as listWaiverVerifications,
   listWaiversForAsset,
   rejectWaiver,
@@ -93,7 +100,7 @@ import {
 } from "./melWatch";
 
 const DEFAULT_MAX_ATTACHMENT_BYTES = 30 * 1024 * 1024;
-const SITE_TITLE = "Minot Vehicle ETIC";
+const SITE_TITLE = "Minot AFB Vehicle Management";
 
 type SheetSummary = {
   name: string;
@@ -315,6 +322,10 @@ export default {
       return handleWatchApi(env, request, ctx);
     }
 
+    if (url.pathname === "/api/schedule-mx") {
+      return handleScheduleMxApi(env, request);
+    }
+
     if (url.pathname === "/api/work-order-changelog") {
       return handleWorkOrderChangelogApi(env, request);
     }
@@ -483,8 +494,8 @@ export default {
     }
     if (url.pathname === "/yard/manifest.webmanifest") {
       return Response.json({
-        name: "Yard Check",
-        short_name: "YardCheck",
+        name: "Minot AFB Vehicle Management · Yard",
+        short_name: "Minot VM",
         start_url: "/yard",
         display: "standalone",
         background_color: "#0a0a0d",
@@ -507,8 +518,8 @@ export default {
     }
     if (url.pathname === "/waivers/manifest.webmanifest") {
       return Response.json({
-        name: "Waiver Card",
-        short_name: "Waivers",
+        name: "Minot AFB Vehicle Management · Waivers",
+        short_name: "Minot VM",
         start_url: "/waivers",
         display: "standalone",
         background_color: "#0a0a0d",
@@ -1525,8 +1536,62 @@ async function handleYardActivityApi(env: Env, url: URL): Promise<Response> {
   return Response.json({ items }, { headers: cacheHeaders() });
 }
 
-/** POST — record a yard check for one asset. */
+/** POST — record a yard check for one asset. PATCH — correct an existing check (changelog). DELETE — remove a check row. */
 async function handleYardCheckApi(env: Env, request: Request): Promise<Response> {
+  if (request.method === "DELETE") {
+    const body = await readJsonBody<{ checkId?: number; deletedBy?: string }>(request);
+    const rawId = body?.checkId;
+    const checkId =
+      typeof rawId === "number" && Number.isFinite(rawId)
+        ? rawId
+        : Number.parseInt(String(rawId ?? ""), 10);
+    if (!Number.isFinite(checkId) || checkId <= 0) {
+      return Response.json({ error: "checkId is required" }, { status: 400, headers: cacheHeaders() });
+    }
+    const deletedByTrim = String(body?.deletedBy ?? "").trim();
+    if (!deletedByTrim) {
+      return Response.json({ error: "deletedBy (your name) is required" }, { status: 400, headers: cacheHeaders() });
+    }
+    const removed = await deleteYardCheckRow(env, checkId);
+    if (!removed) {
+      return Response.json({ error: "check not found" }, { status: 404, headers: cacheHeaders() });
+    }
+    return Response.json({ ok: true, deleted: checkId }, { headers: cacheHeaders() });
+  }
+  if (request.method === "PATCH") {
+    const body = await readJsonBody<{
+      checkId?: number;
+      location?: string;
+      discrepancies?: string;
+      status?: string;
+      editedBy?: string;
+    }>(request);
+    const rawId = body?.checkId;
+    const checkId =
+      typeof rawId === "number" && Number.isFinite(rawId)
+        ? rawId
+        : Number.parseInt(String(rawId ?? ""), 10);
+    if (!Number.isFinite(checkId) || checkId <= 0) {
+      return Response.json({ error: "checkId is required" }, { status: 400, headers: cacheHeaders() });
+    }
+    const editedByTrim = String(body?.editedBy ?? "").trim();
+    if (!editedByTrim) {
+      return Response.json({ error: "editedBy (your name) is required" }, { status: 400, headers: cacheHeaders() });
+    }
+    try {
+      const check = await updateYardCheckRow(env, {
+        checkId,
+        location: body?.location ?? "",
+        discrepancies: body?.discrepancies ?? "",
+        status: body?.status as YardEntryStatus | undefined,
+        editedBy: editedByTrim,
+      });
+      return Response.json({ check }, { headers: cacheHeaders() });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "update failed";
+      return Response.json({ error: msg }, { status: 400, headers: cacheHeaders() });
+    }
+  }
   if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
   const body = await readJsonBody<{
     assetId?: string;
@@ -1539,13 +1604,17 @@ async function handleYardCheckApi(env: Env, request: Request): Promise<Response>
   if (!body?.assetId) {
     return Response.json({ error: "assetId is required" }, { status: 400, headers: cacheHeaders() });
   }
+  const checkedByTrim = String(body.checkedBy ?? "").trim();
+  if (!checkedByTrim) {
+    return Response.json({ error: "checkedBy (your name) is required" }, { status: 400, headers: cacheHeaders() });
+  }
   try {
     const check = await recordYardCheck(env, {
       assetId: body.assetId,
       location: body.location,
       discrepancies: body.discrepancies,
       status: body.status as YardEntryStatus | undefined,
-      checkedBy: body.checkedBy,
+      checkedBy: checkedByTrim,
       sourceDateKey: body.sourceDateKey,
     });
     return Response.json({ check }, { headers: cacheHeaders() });
@@ -1596,6 +1665,10 @@ async function handleYardPhotoUploadApi(env: Env, request: Request): Promise<Res
   if (!(file instanceof File)) {
     return Response.json({ error: "photo file is required" }, { status: 400, headers: cacheHeaders() });
   }
+  const uploadedByTrim = String(form.get("uploadedBy") ?? "").trim();
+  if (!uploadedByTrim) {
+    return Response.json({ error: "uploadedBy (your name) is required" }, { status: 400, headers: cacheHeaders() });
+  }
   // Cap upload size — phones throw out big HEICs even at "medium" quality.
   const MAX_BYTES = 10 * 1024 * 1024;
   if (file.size > MAX_BYTES) {
@@ -1609,7 +1682,7 @@ async function handleYardPhotoUploadApi(env: Env, request: Request): Promise<Res
     body: buf,
     contentType: file.type || "image/jpeg",
     sizeBytes: buf.byteLength,
-    uploadedBy: String(form.get("uploadedBy") ?? ""),
+    uploadedBy: uploadedByTrim,
     caption: String(form.get("caption") ?? ""),
     checkId: Number.isFinite(checkId) ? checkId : null,
   });
@@ -1669,26 +1742,29 @@ function renderWaiverAppHtml(): string {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <meta name="theme-color" content="#0a0a0d" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="theme-color" content="#003a8c" />
+  <meta name="color-scheme" content="light" />
   <link rel="manifest" href="/waivers/manifest.webmanifest" />
-  <title>Waiver Card</title>
+  <title>${SITE_TITLE} · Waivers</title>
   <style>
     :root {
-      --bg: #0a0a0d;
-      --bg1: #14141b;
-      --bg2: #1c1c25;
-      --bg3: #262631;
-      --border: #2f2f3c;
-      --text: #f4f4f7;
-      --muted: #9b9bab;
-      --muted2: #6f6f80;
-      --accent: #6aa9ff;
-      --accent-fg: #0a0a0d;
-      --ok: #4ade80;
-      --warn: #facc15;
-      --danger: #ef4444;
-      --pending: #c084fc;
+      color-scheme: light;
+      --bg: #f3f5f8;
+      --bg1: #ffffff;
+      --bg2: #eef2f7;
+      --bg3: #e0e6ee;
+      --border: #d3d9e2;
+      --text: #0a1a3a;
+      --muted: #5b6675;
+      --muted2: #8a94a4;
+      --accent: #003a8c;
+      --accent-strong: #00276b;
+      --accent-fg: #ffffff;
+      --ok: #157f3a;
+      --warn: #a0670a;
+      --danger: #b00020;
+      --pending: #6a3fb8;
       --safe-top: env(safe-area-inset-top, 0px);
       --safe-bottom: env(safe-area-inset-bottom, 0px);
     }
@@ -1703,27 +1779,27 @@ function renderWaiverAppHtml(): string {
     }
     header {
       position: sticky; top: 0; z-index: 5;
-      background: linear-gradient(180deg, rgba(10,10,13,0.98), rgba(10,10,13,0.85));
-      backdrop-filter: blur(8px);
-      border-bottom: 1px solid var(--border);
+      background: var(--accent);
+      color: #ffffff;
+      border-bottom: 3px solid var(--accent-strong);
       padding: 12px 16px 10px;
       padding-top: calc(var(--safe-top) + 12px);
     }
     .h-row { display: flex; align-items: center; gap: 10px; }
     .h-back {
-      background: var(--bg2); border: 1px solid var(--border); color: var(--text);
-      width: 38px; height: 38px; border-radius: 10px; font-size: 20px; line-height: 1;
+      background: rgba(255,255,255,0.14); border: 1px solid rgba(255,255,255,0.30); color: #ffffff;
+      width: 38px; height: 38px; border-radius: 8px; font-size: 20px; line-height: 1;
       display: none; align-items: center; justify-content: center;
     }
     body.detail .h-back { display: inline-flex; }
-    .h-title { font-weight: 600; font-size: 1.05rem; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .h-sub { font-size: 0.78rem; color: var(--muted); margin-top: 2px; }
+    .h-title { font-weight: 700; font-size: 1.05rem; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #ffffff; }
+    .h-sub { font-size: 0.78rem; color: rgba(255,255,255,0.78); margin-top: 2px; }
     .h-switch {
-      flex: 0 0 auto; font-size: 0.72rem; font-weight: 600; color: var(--muted);
-      text-decoration: none; padding: 8px 10px; border-radius: 10px;
-      border: 1px solid var(--border); background: var(--bg2);
+      flex: 0 0 auto; font-size: 0.72rem; font-weight: 600; color: #ffffff;
+      text-decoration: none; padding: 8px 10px; border-radius: 6px;
+      border: 1px solid rgba(255,255,255,0.35); background: rgba(255,255,255,0.10);
     }
-    .h-switch:active { background: var(--bg3); color: var(--text); }
+    .h-switch:active { background: rgba(255,255,255,0.20); color: #ffffff; }
     main { padding: 14px 16px 24px; max-width: 720px; margin: 0 auto; }
     .lookup {
       display: flex; gap: 8px; margin-top: 4px; align-items: flex-start;
@@ -1802,12 +1878,12 @@ function renderWaiverAppHtml(): string {
 
     .wlist { margin-top: 14px; display: flex; flex-direction: column; gap: 10px; }
     .wcard {
-      background: var(--bg1); border: 1px solid var(--border); border-radius: 14px;
-      overflow: hidden;
+      background: var(--bg1); border: 1px solid var(--border); border-radius: 10px;
+      overflow: hidden; box-shadow: 0 1px 2px rgba(15,30,60,0.04);
     }
-    .wcard.pending { border-color: rgba(192,132,252,0.35); }
-    .wcard.overdue { border-color: rgba(239,68,68,0.45); }
-    .wcard.dueSoon { border-color: rgba(250,204,21,0.45); }
+    .wcard.pending { border-color: rgba(106,63,184,0.45); border-left: 3px solid var(--pending); }
+    .wcard.overdue { border-color: rgba(176,0,32,0.45); border-left: 3px solid var(--danger); }
+    .wcard.dueSoon { border-color: rgba(160,103,10,0.45); border-left: 3px solid var(--warn); }
     .wcard-head {
       padding: 12px 14px 6px;
       display: flex; align-items: flex-start; gap: 10px;
@@ -1818,10 +1894,10 @@ function renderWaiverAppHtml(): string {
       border: 1px solid transparent; white-space: nowrap;
       text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600;
     }
-    .pill.approved { background: rgba(74,222,128,0.12); color: var(--ok); border-color: rgba(74,222,128,0.30); }
-    .pill.pending  { background: rgba(192,132,252,0.12); color: var(--pending); border-color: rgba(192,132,252,0.30); }
-    .pill.overdue  { background: rgba(239,68,68,0.12); color: var(--danger); border-color: rgba(239,68,68,0.40); }
-    .pill.dueSoon  { background: rgba(250,204,21,0.10); color: var(--warn); border-color: rgba(250,204,21,0.35); }
+    .pill.approved { background: rgba(21,127,58,0.10); color: var(--ok); border-color: rgba(21,127,58,0.35); }
+    .pill.pending  { background: rgba(106,63,184,0.10); color: var(--pending); border-color: rgba(106,63,184,0.35); }
+    .pill.overdue  { background: rgba(176,0,32,0.08); color: var(--danger); border-color: rgba(176,0,32,0.40); }
+    .pill.dueSoon  { background: rgba(160,103,10,0.10); color: var(--warn); border-color: rgba(160,103,10,0.40); }
     .wcard-body { padding: 0 14px 12px; color: var(--muted); font-size: 0.9rem; }
     .wcard-body .desc { color: var(--text); margin-bottom: 6px; white-space: pre-wrap; }
     .wcard-body .meta { font-size: 0.78rem; }
@@ -1833,8 +1909,8 @@ function renderWaiverAppHtml(): string {
     .wcard-photo {
       display: block; width: calc(50% - 4px); max-width: 100%; min-width: 120px;
       flex: 1 1 140px; max-height: 200px; object-fit: cover;
-      border-radius: 10px; border: 1px solid var(--border);
-      background: #000;
+      border-radius: 8px; border: 1px solid var(--border);
+      background: #0a1a3a;
     }
     @media (max-width: 420px) {
       .wcard-photo { width: 100%; flex: 1 1 100%; max-height: 240px; }
@@ -1843,27 +1919,29 @@ function renderWaiverAppHtml(): string {
       display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px;
     }
     .sub-preview-grid .sub-thumb {
-      width: 76px; height: 76px; object-fit: cover; border-radius: 10px;
-      border: 1px solid var(--border); background: #000;
+      width: 76px; height: 76px; object-fit: cover; border-radius: 8px;
+      border: 1px solid var(--border); background: #0a1a3a;
     }
     .wcard-actions {
-      display: flex; gap: 8px; padding: 10px 12px;
+      display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 12px;
       background: var(--bg2); border-top: 1px solid var(--border);
     }
-    .wcard-actions .btn { flex: 1; padding: 12px; font-size: 0.92rem; }
+    .wcard-actions .btn { flex: 1 1 120px; padding: 12px; font-size: 0.92rem; }
+    .wcard-actions .btn.danger { flex: 1 1 100px; }
 
     .modal-back {
       position: fixed; inset: 0; z-index: 20;
-      background: rgba(0,0,0,0.6); backdrop-filter: blur(2px);
+      background: rgba(15,30,60,0.45); backdrop-filter: blur(2px);
       display: none; align-items: flex-end; justify-content: center;
     }
     .modal-back.open { display: flex; }
     .modal {
       width: 100%; max-width: 720px; background: var(--bg1);
       border-top: 1px solid var(--border);
-      border-radius: 18px 18px 0 0;
+      border-radius: 14px 14px 0 0;
       padding: 16px 16px calc(var(--safe-bottom) + 16px);
       max-height: 90vh; overflow-y: auto;
+      box-shadow: 0 -8px 24px rgba(15,30,60,0.18);
     }
     .modal h2 { margin: 0 0 12px; font-size: 1.1rem; }
     .modal label { display: block; color: var(--muted); font-size: 0.78rem; margin: 10px 0 4px; }
@@ -1880,7 +1958,7 @@ function renderWaiverAppHtml(): string {
     }
     .modal .preview {
       margin-top: 10px; max-width: 100%; max-height: 240px; object-fit: contain;
-      border-radius: 10px; background: #000;
+      border-radius: 8px; background: #0a1a3a;
     }
     .modal .err { color: var(--danger); font-size: 0.85rem; margin-top: 10px; }
     .modal .ok  { color: var(--ok); font-size: 0.85rem; margin-top: 10px; }
@@ -1892,13 +1970,14 @@ function renderWaiverAppHtml(): string {
     .toast {
       position: fixed; bottom: calc(var(--safe-bottom) + 18px); left: 50%;
       transform: translateX(-50%) translateY(20px);
-      background: var(--bg2); border: 1px solid var(--border); color: var(--text);
-      padding: 10px 16px; border-radius: 12px; font-size: 0.92rem;
+      background: #0a1a3a; border: 1px solid #0a1a3a; color: #ffffff;
+      padding: 10px 16px; border-radius: 8px; font-size: 0.92rem;
+      box-shadow: 0 6px 18px rgba(15,30,60,0.25);
       opacity: 0; transition: opacity 0.2s, transform 0.2s; pointer-events: none;
       z-index: 30;
     }
     .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
-    .toast.err { border-color: rgba(239,68,68,0.5); }
+    .toast.err { background: var(--danger); border-color: var(--danger); color: #ffffff; }
   </style>
 </head>
 <body>
@@ -1906,7 +1985,7 @@ function renderWaiverAppHtml(): string {
     <div class="h-row">
       <button type="button" class="h-back" id="back-btn" aria-label="Back">‹</button>
       <div style="flex:1; min-width:0;">
-        <div class="h-title" id="h-title">Waiver Card</div>
+        <div class="h-title" id="h-title">${SITE_TITLE}</div>
         <div class="h-sub" id="h-sub">Pull up an asset to view or request waivers.</div>
       </div>
       <a class="h-switch" href="/go">Apps</a>
@@ -2182,7 +2261,7 @@ function renderWaiverAppHtml(): string {
     document.body.classList.remove("detail");
     $("view-lookup").hidden = false;
     $("view-detail").hidden = true;
-    $("h-title").textContent = "Waiver Card";
+    $("h-title").textContent = ${JSON.stringify(SITE_TITLE)};
     $("h-sub").textContent = "Pull up an asset to view or request waivers.";
     state.assetId = "";
     hideSuggest();
@@ -2252,6 +2331,31 @@ function renderWaiverAppHtml(): string {
     $("wlist").querySelectorAll("[data-verify]").forEach(function (b) {
       b.addEventListener("click", function () { openVerifyModal(Number(b.getAttribute("data-verify"))); });
     });
+    $("wlist").querySelectorAll("[data-waiver-remove]").forEach(function (b) {
+      b.addEventListener("click", function () { removeWaiverFromCard(Number(b.getAttribute("data-waiver-remove"))); });
+    });
+  }
+
+  async function removeWaiverFromCard(id) {
+    var name = readName();
+    if (!name) {
+      showToast("Enter your name in the field above first.", true);
+      return;
+    }
+    if (!confirm("Remove this waiver? Your name is stored for the audit trail.")) return;
+    try {
+      var r = await fetch("/api/waivers/" + id, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ deletedBy: name }),
+      });
+      var j = await r.json().catch(function () { return {}; });
+      if (!r.ok) throw new Error((j && j.error) || "Could not remove");
+      showToast("Removed");
+      await openAsset();
+    } catch (e) {
+      showToast(e && e.message ? e.message : "Remove failed", true);
+    }
   }
 
   function renderCard(w) {
@@ -2275,11 +2379,19 @@ function renderWaiverAppHtml(): string {
           return '<img class="wcard-photo" src="' + esc(p.url) + '" alt="" loading="lazy" />';
         }).join("") + "</div>")
       : "";
-    var actions = (status === "approved")
-      ? ('<div class="wcard-actions">' +
-           '<button type="button" class="btn" data-verify="' + w.id + '">Verify</button>' +
-         '</div>')
-      : '';
+    var actions = "";
+    if (status === "approved") {
+      actions =
+        '<div class="wcard-actions">' +
+        '<button type="button" class="btn" data-verify="' + w.id + '">Verify</button>' +
+        '<button type="button" class="btn danger" data-waiver-remove="' + w.id + '">Remove</button>' +
+        "</div>";
+    } else if (status === "pending") {
+      actions =
+        '<div class="wcard-actions">' +
+        '<button type="button" class="btn danger" data-waiver-remove="' + w.id + '">Withdraw</button>' +
+        "</div>";
+    }
     return '<div class="wcard ' + state + '">' +
              '<div class="wcard-head">' +
                '<div class="title">' + esc(w.title) + '</div>' +
@@ -2447,6 +2559,14 @@ function renderWaiverAppHtml(): string {
   var hashParams = new URLSearchParams(location.search);
   var deep = hashParams.get("asset");
   if (deep) { $("asset-input").value = deep; openAsset(deep); }
+
+  var appsL = document.querySelector("a.h-switch");
+  if (appsL) {
+    appsL.addEventListener("click", function (e) {
+      e.preventDefault();
+      window.location.assign(appsL.href);
+    });
+  }
 })();
 </script>
 </body>
@@ -2454,27 +2574,35 @@ function renderWaiverAppHtml(): string {
 }
 
 /**
- * Minimal mobile splash — choose Waiver Card or Yard Check. Linked from `/`
- * on phone user-agents (`?desktop=1` on `/` skips this and loads the dashboard).
+ * Mobile landing at /go: first choose FM&A vs Customer Service, then the
+ * matching primary app (Yard vs Waiver) plus shared GT/OSI form links.
+ * Linked from `/` on phone user-agents (`?desktop=1` skips to dashboard).
  */
 function renderMobileAppPickerHtml(): string {
+  const towForm =
+    "https://forms.osi.apps.mil/Pages/ResponsePage.aspx?id=jbExg4ct70ijX6yIGOv5tPHDJz2zbGJKhBRgITU-EY1UMjY4M0Y4TEhFMkVFM01ENkRNMjZDRjEySS4u";
+  const standbyForm =
+    "https://forms.osi.apps.mil/Pages/ResponsePage.aspx?id=jbExg4ct70ijX6yIGOv5tPHDJz2zbGJKhBRgITU-EY1UNTdaRTIwRldEMkMzQ1pQUjdLOTFQMlJWRy4u";
+  const mobileMxForm = "https://forms.osi.apps.mil/r/yYxcvYWrbn";
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="theme-color" content="#0a0a0d" />
-  <title>Vehicle ETIC</title>
+  <meta name="theme-color" content="#003a8c" />
+  <meta name="color-scheme" content="light" />
+  <title>${SITE_TITLE}</title>
   <style>
     :root {
-      --bg: #0a0a0d;
-      --bg1: #14141b;
-      --border: #2f2f3c;
-      --text: #f4f4f7;
-      --muted: #9b9bab;
-      --accent: #6aa9ff;
-      --accent-fg: #0a0a0d;
-      --ok: #4ade80;
+      color-scheme: light;
+      --bg: #f3f5f8;
+      --bg1: #ffffff;
+      --border: #d3d9e2;
+      --text: #0a1a3a;
+      --muted: #5b6675;
+      --accent: #003a8c;
+      --accent-fg: #ffffff;
+      --ok: #157f3a;
       --safe-top: env(safe-area-inset-top, 0px);
       --safe-bottom: env(safe-area-inset-bottom, 0px);
     }
@@ -2484,61 +2612,266 @@ function renderMobileAppPickerHtml(): string {
     .shell {
       min-height: 100dvh; padding: calc(var(--safe-top) + 20px) 18px calc(var(--safe-bottom) + 24px);
       max-width: 440px; margin: 0 auto;
-      display: flex; flex-direction: column; gap: 22px;
+      display: flex; flex-direction: column; gap: 20px;
     }
+    .panel[hidden] { display: none !important; }
     header h1 { margin: 0; font-size: 1.45rem; font-weight: 700; letter-spacing: -0.02em; }
     header p { margin: 8px 0 0; color: var(--muted); font-size: 0.95rem; line-height: 1.45; }
+    #apps-intro[hidden] { display: none !important; }
+    .role-grid {
+      display: flex; flex-direction: column; gap: 12px;
+    }
+    .role-btn {
+      width: 100%; text-align: left; cursor: pointer; font: inherit;
+      display: flex; align-items: center; gap: 14px;
+      padding: 20px 16px; border-radius: 10px; border: 1px solid var(--border);
+      background: var(--bg1); color: var(--text);
+      box-shadow: 0 1px 2px rgba(15,30,60,0.05);
+      transition: border-color 0.15s, transform 0.12s;
+      touch-action: manipulation;
+      position: relative;
+      z-index: 1;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    /* iOS Safari: taps on text/icons inside <button> often miss the click; force hit target on the button */
+    .role-btn * { pointer-events: none; }
+    .role-btn:active { transform: scale(0.99); border-color: var(--accent); }
+    .role-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .role-icon {
+      flex: 0 0 auto; width: 48px; height: 48px; border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 1.35rem; background: rgba(0,58,140,0.10); color: var(--accent);
+      border: 1px solid rgba(0,58,140,0.30);
+    }
+    .role-text { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+    .role-title { font-weight: 700; font-size: 1.08rem; }
+    .role-sub { font-size: 0.82rem; color: var(--muted); line-height: 1.35; }
+    .role-go { flex: 0 0 auto; color: var(--muted); font-size: 1.2rem; font-weight: 600; }
+    .section-label {
+      font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--muted); margin: 4px 0 0;
+    }
+    #go-forms-section { margin-top: 14px; }
     .choices { display: flex; flex-direction: column; gap: 12px; }
     .choice {
       display: flex; align-items: center; gap: 14px;
-      padding: 18px 16px; border-radius: 16px; border: 1px solid var(--border);
+      padding: 18px 16px; border-radius: 10px; border: 1px solid var(--border);
       background: var(--bg1); color: inherit; text-decoration: none;
+      box-shadow: 0 1px 2px rgba(15,30,60,0.05);
       transition: border-color 0.15s, transform 0.12s;
+      position: relative; z-index: 1; touch-action: manipulation;
     }
-    .choice:active { transform: scale(0.99); }
+    .choice.primary { border-width: 2px; border-color: var(--accent); }
+    .choice:active { transform: scale(0.99); border-color: var(--accent); }
     .choice:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     .choice-icon {
-      flex: 0 0 auto; width: 48px; height: 48px; border-radius: 14px;
+      flex: 0 0 auto; width: 48px; height: 48px; border-radius: 8px;
       display: flex; align-items: center; justify-content: center;
-      font-size: 1.35rem; background: rgba(106,169,255,0.12); border: 1px solid rgba(106,169,255,0.25);
+      font-size: 1.35rem; background: rgba(0,58,140,0.10); color: var(--accent); border: 1px solid rgba(0,58,140,0.30);
     }
-    .choice-yard .choice-icon { background: rgba(74,222,128,0.12); border-color: rgba(74,222,128,0.28); }
+    .choice-yard .choice-icon { background: rgba(21,127,58,0.10); color: var(--ok); border-color: rgba(21,127,58,0.30); }
     .choice-text { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
     .choice-title { font-weight: 700; font-size: 1.05rem; }
     .choice-sub { font-size: 0.82rem; color: var(--muted); line-height: 1.35; }
     .choice-go { flex: 0 0 auto; color: var(--muted); font-size: 1.2rem; font-weight: 600; }
+    .form-tiles { display: flex; flex-direction: column; gap: 12px; }
+    .form-tile {
+      display: flex; align-items: center; gap: 14px;
+      padding: 16px 16px; border-radius: 12px; border: 1px solid var(--border);
+      background: linear-gradient(180deg, #ffffff 0%, #f7f9fc 100%);
+      color: inherit; text-decoration: none;
+      box-shadow: 0 2px 8px rgba(15,30,60,0.06);
+      transition: border-color 0.15s, transform 0.12s, box-shadow 0.15s;
+      position: relative; z-index: 1; touch-action: manipulation;
+      min-height: 56px;
+    }
+    .form-tile:active { transform: scale(0.99); border-color: var(--accent); }
+    .form-tile:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .form-tile-icon {
+      flex: 0 0 auto; width: 48px; height: 48px; border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 1.35rem;
+      border: 1px solid rgba(0,58,140,0.22);
+      background: rgba(0,58,140,0.08);
+    }
+    .form-tile--tow .form-tile-icon { background: rgba(0,58,140,0.12); color: var(--accent); border-color: rgba(0,58,140,0.35); }
+    .form-tile--standby .form-tile-icon { background: rgba(160,103,10,0.12); color: #8a5a00; border-color: rgba(160,103,10,0.35); }
+    .form-tile--mx .form-tile-icon { background: rgba(21,127,58,0.12); color: var(--ok); border-color: rgba(21,127,58,0.35); }
+    .form-tile-text { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+    .form-tile-title { font-weight: 700; font-size: 1.02rem; color: var(--text); letter-spacing: -0.01em; }
+    .form-tile-sub { font-size: 0.78rem; color: var(--muted); line-height: 1.35; }
+    .form-tile-go {
+      flex: 0 0 auto; color: var(--muted); font-size: 1rem; font-weight: 600;
+      opacity: 0.85;
+    }
+    .back-btn {
+      align-self: flex-start; background: none; border: none; color: var(--accent);
+      font-size: 0.92rem; font-weight: 600; cursor: pointer; padding: 6px 0;
+      text-decoration: underline;
+    }
+    .back-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     footer { margin-top: auto; text-align: center; padding-top: 8px; }
-    footer a { color: var(--accent); font-size: 0.88rem; }
+    footer a { color: var(--accent); font-size: 0.88rem; touch-action: manipulation; }
+    a.form-tile, a.choice, footer a { cursor: pointer; touch-action: manipulation; }
   </style>
 </head>
 <body>
   <div class="shell">
-    <header>
-      <h1>Vehicle ETIC</h1>
-      <p>Pick the tool you need. You can switch apps anytime from the <strong>Apps</strong> link inside each screen.</p>
-    </header>
-    <nav class="choices" aria-label="Choose app">
-      <a class="choice choice-waivers" href="/waivers">
-        <span class="choice-icon" aria-hidden="true">📋</span>
-        <span class="choice-text">
-          <span class="choice-title">Waiver card</span>
-          <span class="choice-sub">Look up a vehicle, verify waivers, or submit a new waiver request.</span>
-        </span>
-        <span class="choice-go" aria-hidden="true">→</span>
-      </a>
-      <a class="choice choice-yard" href="/yard">
-        <span class="choice-icon" aria-hidden="true">📍</span>
-        <span class="choice-text">
-          <span class="choice-title">Yard check</span>
-          <span class="choice-sub">Walk the yard — confirm assets, photos, and findings.</span>
-        </span>
-        <span class="choice-go" aria-hidden="true">→</span>
-      </a>
-    </nav>
-    <footer>
-      <a href="/?desktop=1">Open full desktop dashboard instead</a>
-    </footer>
+    <div id="panel-role" class="panel">
+      <header>
+        <h1>${SITE_TITLE}</h1>
+        <p>Who are you? We’ll open the right tool first; you can still switch apps from <strong>Apps</strong> inside any screen.</p>
+      </header>
+      <div class="role-grid" role="group" aria-label="Your role">
+        <button type="button" class="role-btn" id="pick-fma" data-role="fma">
+          <span class="role-icon" aria-hidden="true">🛠</span>
+          <span class="role-text">
+            <span class="role-title">FM&amp;A</span>
+            <span class="role-sub">Fleet management &amp; analysis — yard checks, fleet data.</span>
+          </span>
+          <span class="role-go" aria-hidden="true">→</span>
+        </button>
+        <button type="button" class="role-btn" id="pick-cs" data-role="cs">
+          <span class="role-icon" aria-hidden="true">🎧</span>
+          <span class="role-text">
+            <span class="role-title">Customer Service</span>
+            <span class="role-sub">Waiver card and vehicle support.</span>
+          </span>
+          <span class="role-go" aria-hidden="true">→</span>
+        </button>
+      </div>
+      <footer>
+        <a href="/?desktop=1">Open full desktop dashboard instead</a>
+      </footer>
+    </div>
+
+    <div id="panel-apps" class="panel" hidden>
+      <button type="button" class="back-btn" id="back-role">← Change role</button>
+      <header>
+        <h1 id="apps-head">Apps</h1>
+        <p id="apps-intro"></p>
+      </header>
+      <nav class="choices" id="primary-nav" aria-label="Primary app"></nav>
+      <div id="go-forms-section">
+      <div class="form-tiles" aria-label="GT and maintenance forms">
+        <a class="form-tile form-tile--tow" href="${towForm}" target="_blank" rel="noopener noreferrer">
+          <span class="form-tile-icon" aria-hidden="true">🚚</span>
+          <span class="form-tile-text">
+            <span class="form-tile-title">Request tow from GT</span>
+            <span class="form-tile-sub">Ground transportation — opens official form</span>
+          </span>
+          <span class="form-tile-go" aria-hidden="true">↗</span>
+        </a>
+        <a class="form-tile form-tile--standby" href="${standbyForm}" target="_blank" rel="noopener noreferrer">
+          <span class="form-tile-icon" aria-hidden="true">⏱</span>
+          <span class="form-tile-text">
+            <span class="form-tile-title">Log standby action</span>
+            <span class="form-tile-sub">Record standby event</span>
+          </span>
+          <span class="form-tile-go" aria-hidden="true">↗</span>
+        </a>
+        <a class="form-tile form-tile--mx" href="${mobileMxForm}" target="_blank" rel="noopener noreferrer">
+          <span class="form-tile-icon" aria-hidden="true">🔧</span>
+          <span class="form-tile-text">
+            <span class="form-tile-title">Log mobile maintenance</span>
+            <span class="form-tile-sub">Field / mobile mx action</span>
+          </span>
+          <span class="form-tile-go" aria-hidden="true">↗</span>
+        </a>
+      </div>
+      </div>
+      <footer>
+        <a href="/?desktop=1">Open full desktop dashboard instead</a>
+      </footer>
+    </div>
   </div>
+  <template id="go-nav-fma">
+    <a class="choice choice-yard primary" href="/yard">
+      <span class="choice-icon" aria-hidden="true">📍</span>
+      <span class="choice-text">
+        <span class="choice-title">Yard check</span>
+        <span class="choice-sub">Walk the yard — confirm assets, photos, and findings.</span>
+      </span>
+      <span class="choice-go" aria-hidden="true">→</span>
+    </a>
+  </template>
+  <template id="go-nav-cs">
+    <a class="choice choice-waivers primary" href="/waivers">
+      <span class="choice-icon" aria-hidden="true">📋</span>
+      <span class="choice-text">
+        <span class="choice-title">Waiver card</span>
+        <span class="choice-sub">Look up vehicles, verify waivers, and submit requests.</span>
+      </span>
+      <span class="choice-go" aria-hidden="true">→</span>
+    </a>
+  </template>
+  <script>
+(function(){
+  var panelRole = document.getElementById("panel-role");
+  var panelApps = document.getElementById("panel-apps");
+  var primaryNav = document.getElementById("primary-nav");
+  var appsHead = document.getElementById("apps-head");
+  var appsIntro = document.getElementById("apps-intro");
+  var backBtn = document.getElementById("back-role");
+  var tplFma = document.getElementById("go-nav-fma");
+  var tplCs = document.getElementById("go-nav-cs");
+  var formsSection = document.getElementById("go-forms-section");
+
+  function showRole(){
+    panelApps.hidden = true;
+    panelRole.hidden = false;
+  }
+  function showApps(role){
+    panelRole.hidden = true;
+    panelApps.hidden = false;
+    primaryNav.innerHTML = "";
+    if (role === "fma") {
+      appsHead.textContent = "FM\u0026A";
+      appsIntro.textContent = "Yard check is your FM\u0026A tool — fleet walks, assets, and photos.";
+      if (appsIntro) appsIntro.hidden = false;
+      primaryNav.innerHTML = tplFma ? tplFma.innerHTML : "";
+      if (formsSection) formsSection.hidden = true;
+    } else {
+      appsHead.textContent = "Customer Service";
+      if (appsIntro) {
+        appsIntro.textContent = "";
+        appsIntro.hidden = true;
+      }
+      primaryNav.innerHTML = tplCs ? tplCs.innerHTML : "";
+      if (formsSection) formsSection.hidden = false;
+    }
+  }
+
+  var roleGrid = document.querySelector(".role-grid");
+  if (roleGrid) {
+    roleGrid.addEventListener("click", function (ev) {
+      var btn = ev.target.closest(".role-btn");
+      if (!btn || !roleGrid.contains(btn)) return;
+      var role = btn.getAttribute("data-role");
+      if (role === "fma" || role === "cs") showApps(role);
+    });
+  }
+  if (backBtn) backBtn.addEventListener("click", showRole);
+
+  // Some mobile / embedded browsers drop default in-page link navigation; force assign.
+  var shell = document.querySelector(".shell");
+  if (shell) {
+    shell.addEventListener(
+      "click",
+      function (ev) {
+        var a = ev.target.closest("a[href]");
+        if (!a) return;
+        var h = a.getAttribute("href") || "";
+        if (!h || h.charAt(0) === "#") return;
+        ev.preventDefault();
+        window.location.assign(a.href);
+      },
+      false
+    );
+  }
+})();
+</script>
 </body>
 </html>`;
 }
@@ -2555,6 +2888,7 @@ function renderMobileAppPickerHtml(): string {
  * button is one click → Cmd/Ctrl+P. Suppress on `?noprint=1`.
  */
 function renderWaiverPrintCardHtml(assetId: string, waivers: Waiver[]): string {
+  const printRows = waivers.filter((w) => !w.isRemoved);
   const escHtml = (s: string) =>
     String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
   const descForPrint = (w: Waiver): string => {
@@ -2563,10 +2897,10 @@ function renderWaiverPrintCardHtml(assetId: string, waivers: Waiver[]): string {
     if (d.toLowerCase() === String(w.title ?? "").trim().toLowerCase()) return "";
     return d;
   };
-  const n = waivers.length;
+  const n = printRows.length;
   const densityClass =
     n >= 16 ? "wv-print--vheavy" : n >= 10 ? "wv-print--heavy" : n >= 6 ? "wv-print--medium" : "";
-  const rows = waivers
+  const rows = printRows
     .map((w, i) => {
       const verifyState =
         w.verifyState === "overdue" ? "overdue" :
@@ -2583,7 +2917,7 @@ function renderWaiverPrintCardHtml(assetId: string, waivers: Waiver[]): string {
         </article>`;
     })
     .join("");
-  const empty = waivers.length === 0
+  const empty = printRows.length === 0
     ? `<div class="empty">No approved waivers on file for this vehicle.</div>`
     : "";
   return `<!doctype html>
@@ -2700,7 +3034,7 @@ function renderWaiverPrintCardHtml(assetId: string, waivers: Waiver[]): string {
   </div>
   ${rows}
   ${empty}
-  <div class="footer">Vehicle ETIC · in-cab reference</div>
+  <div class="footer">${SITE_TITLE} · in-cab reference</div>
   <script>
     if (!new URLSearchParams(location.search).has("noprint")) {
       setTimeout(function () { window.print(); }, 250);
@@ -2718,7 +3052,8 @@ function renderWaiverPrintCardHtml(assetId: string, waivers: Waiver[]): string {
 async function handleWaiverAssetApi(env: Env, url: URL, assetId: string): Promise<Response> {
   const approvedOnly = url.searchParams.get("card") === "1";
   const waivers = await listWaiversForAsset(env, assetId, { approvedOnly });
-  return Response.json({ assetId, waivers }, { headers: cacheHeaders() });
+  const removed = approvedOnly ? [] : await listRemovedWaiversForAsset(env, assetId);
+  return Response.json({ assetId, waivers, removed }, { headers: cacheHeaders() });
 }
 
 /** GET /api/waivers/pending — management review queue. */
@@ -2791,7 +3126,7 @@ async function handleWaiverSubmitApi(env: Env, request: Request): Promise<Respon
   }
 }
 
-/** POST /api/waivers/:id/(approve|reject|verify) — JSON body. DELETE /:id also handled. */
+/** POST /api/waivers/:id/(approve|reject|verify) — JSON body. DELETE /:id — JSON { deletedBy }. */
 async function handleWaiverActionApi(
   env: Env,
   request: Request,
@@ -2802,8 +3137,22 @@ async function handleWaiverActionApi(
     if (request.method !== "DELETE" && request.method !== "POST") {
       return new Response("Method Not Allowed", { status: 405 });
     }
-    const ok = await deleteWaiver(env, id);
-    return Response.json({ ok }, { headers: cacheHeaders() });
+    const body = (await readJsonBody<{ deletedBy?: string }>(request)) ?? {};
+    const deletedBy = String(body.deletedBy ?? "").trim();
+    if (!deletedBy) {
+      return Response.json(
+        { error: "deletedBy (your name) is required" },
+        { status: 400, headers: cacheHeaders() },
+      );
+    }
+    const ok = await deleteWaiver(env, id, deletedBy);
+    if (!ok) {
+      return Response.json(
+        { ok: false, error: "waiver not found or already removed" },
+        { status: 404, headers: cacheHeaders() },
+      );
+    }
+    return Response.json({ ok: true }, { headers: cacheHeaders() });
   }
   if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
   try {
@@ -3170,6 +3519,36 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
   );
 }
 
+async function handleScheduleMxApi(env: Env, request: Request): Promise<Response> {
+  if (request.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
+  const url = new URL(request.url);
+  let dateKey = url.searchParams.get("date")?.trim() ?? "";
+  if (!dateKey) {
+    const history = await loadHistory(env);
+    const latest = history.entries.length
+      ? [...history.entries].sort((a, b) => b.dateKey.localeCompare(a.dateKey))[0]
+      : null;
+    dateKey = latest?.dateKey ?? "";
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) {
+    return Response.json(
+      { error: "date=YYYY-MM-DD required, or ingest a snapshot first." },
+      { status: 400, headers: cacheHeaders() },
+    );
+  }
+  const rows = await getScheduleMxFleetForDate(env, dateKey);
+  const stats = {
+    assets: rows.length,
+    missing: rows.filter((r) => r.scheduleMxBucket === "missing").length,
+    noDue: rows.filter((r) => r.scheduleMxBucket === "no_due").length,
+    overdue: rows.filter((r) => r.scheduleMxBucket === "overdue").length,
+    dueSoon: rows.filter((r) => r.scheduleMxBucket === "due_soon").length,
+    ok: rows.filter((r) => r.scheduleMxBucket === "ok").length,
+    nceCritical: rows.filter((r) => r.scheduleMxNceCritical).length,
+  };
+  return Response.json({ dateKey, stats, rows }, { headers: cacheHeaders() });
+}
+
 async function handleWorkOrderTimelineApi(env: Env, request: Request): Promise<Response> {
   const url = new URL(request.url);
   const wo = url.searchParams.get("workOrderId")?.trim();
@@ -3186,11 +3565,24 @@ async function handleWorkOrderChangelogApi(env: Env, request: Request): Promise<
   if (!wo) {
     return Response.json({ ok: false, error: "Missing workOrderId query parameter." }, { status: 400 });
   }
-  const [entries, actions] = await Promise.all([
+  const assetId = await getAssetIdForWorkOrder(env, wo);
+  const [entries, actions, meetingNotes, yardWalks] = await Promise.all([
     getChangelog(env, wo, 500),
     getWorkOrderActions(env, wo, 200),
+    getMeetingNotesForWorkOrder(env, wo),
+    assetId ? getYardWalksForAsset(env, assetId) : Promise.resolve([]),
   ]);
-  return Response.json({ workOrderId: wo, entries, actions }, { headers: cacheHeaders() });
+  return Response.json(
+    {
+      workOrderId: wo,
+      assetId: assetId ?? "",
+      entries,
+      actions,
+      meetingNotes,
+      yardWalks,
+    },
+    { headers: cacheHeaders() },
+  );
 }
 
 const VALID_ACTION_TYPES: ReadonlySet<WorkOrderActionType> = new Set([
@@ -3859,27 +4251,31 @@ function renderYardAppHtml(): string {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <meta name="theme-color" content="#0a0a0d" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="theme-color" content="#003a8c" />
+  <meta name="color-scheme" content="light" />
   <link rel="manifest" href="/yard/manifest.webmanifest" />
-  <title>Yard Check</title>
+  <title>${SITE_TITLE} · Yard Check</title>
   <style>
     :root {
-      --bg: #0a0a0d;
-      --bg1: #14141b;
-      --bg2: #1c1c25;
-      --bg3: #262631;
-      --border: #2f2f3c;
-      --text: #f4f4f7;
-      --muted: #9b9bab;
-      --muted2: #6f6f80;
-      --accent: #6aa9ff;
-      --accent-fg: #0a0a0d;
-      --ok: #4ade80;
-      --warn: #facc15;
-      --danger: #ef4444;
-      --due: #fb923c;
-      --never: #c084fc;
+      color-scheme: light;
+      --bg: #f3f5f8;
+      --bg1: #ffffff;
+      --bg2: #eef2f7;
+      --bg3: #e0e6ee;
+      --border: #d3d9e2;
+      --text: #0a1a3a;
+      --muted: #5b6675;
+      --muted2: #8a94a4;
+      --accent: #003a8c;
+      --accent-strong: #00276b;
+      --accent-fg: #ffffff;
+      --ok: #157f3a;
+      --warn: #a0670a;
+      --danger: #b00020;
+      --due: #c75b00;
+      --never: #6a3fb8;
+      --text-dim: #2c3a55;
       --safe-top: env(safe-area-inset-top, 0px);
       --safe-bottom: env(safe-area-inset-bottom, 0px);
     }
@@ -3900,6 +4296,10 @@ function renderYardAppHtml(): string {
     input:focus, textarea:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
     textarea { resize: vertical; min-height: 84px; }
     a { color: var(--accent); }
+    .hidden { display: none !important; }
+
+    .yard-mobile-only { display: block; }
+    .yard-desktop-only { display: none; }
 
     /* App shell */
     #app { display: flex; flex-direction: column; min-height: 100dvh; }
@@ -3908,43 +4308,52 @@ function renderYardAppHtml(): string {
     .topbar {
       position: sticky; top: 0; z-index: 30;
       padding: calc(var(--safe-top) + 8px) 12px 10px;
-      background: rgba(10,10,13,0.96);
-      backdrop-filter: blur(8px);
-      border-bottom: 1px solid var(--border);
+      background: var(--accent);
+      color: #ffffff;
+      border-bottom: 3px solid var(--accent-strong);
     }
-    .topbar-row { display: flex; align-items: center; gap: 10px; min-height: 30px; }
-    .brand { font-weight: 700; font-size: 17px; letter-spacing: 0.2px; }
+    .topbar-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      min-height: 30px;
+    }
+    .topbar-lead { display: flex; align-items: center; gap: 10px; min-width: 0; }
+    .brand { font-weight: 700; font-size: 17px; letter-spacing: 0.2px; color: #ffffff; }
     .topbar-apps {
-      margin-left: auto; font-size: 12px; font-weight: 600; color: var(--muted);
-      text-decoration: none; padding: 6px 10px; border-radius: 9px;
-      border: 1px solid var(--border); background: var(--bg2);
+      margin-left: auto; font-size: 12px; font-weight: 600; color: #ffffff;
+      text-decoration: none; padding: 6px 10px; border-radius: 6px;
+      border: 1px solid rgba(255,255,255,0.35); background: rgba(255,255,255,0.10);
     }
-    .topbar-apps:active { background: var(--bg3); color: var(--text); }
-    .stats { margin-left: 8px; font-size: 12px; color: var(--muted); display: flex; gap: 6px; }
-    .stat-pill { padding: 3px 9px; border-radius: 999px; background: var(--bg2); border: 1px solid var(--border); }
-    .stat-pill b { color: var(--text); font-weight: 700; }
+    .topbar-apps:active { background: rgba(255,255,255,0.20); color: #ffffff; }
+    .stats { margin-left: 8px; font-size: 12px; color: rgba(255,255,255,0.85); display: flex; gap: 6px; }
+    .stat-pill { padding: 3px 9px; border-radius: 999px; background: rgba(255,255,255,0.14); border: 1px solid rgba(255,255,255,0.30); color: #ffffff; }
+    .stat-pill b { color: #ffffff; font-weight: 700; }
 
     .topbar .search-row { margin-top: 8px; padding: 0; }
     .search-row { position: relative; }
     .search-row input {
       padding-left: 38px; padding-right: 84px; height: 42px; padding-top: 0; padding-bottom: 0;
+      background-color: #ffffff; color: var(--text); border-color: var(--border);
       background-image:
-        url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='18' height='18' viewBox='0 0 24 24' fill='none' stroke='%239b9bab' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><circle cx='11' cy='11' r='7'/><path d='m20 20-3-3'/></svg>");
+        url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='18' height='18' viewBox='0 0 24 24' fill='none' stroke='%235b6675' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><circle cx='11' cy='11' r='7'/><path d='m20 20-3-3'/></svg>");
       background-repeat: no-repeat; background-position: 12px center;
     }
     /* "+ Find" button lives inside the search row to save vertical space */
     .find-btn {
       position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
-      padding: 7px 12px; border-radius: 9px;
-      background: var(--accent); color: var(--accent-fg);
+      padding: 7px 12px; border-radius: 6px;
+      background: var(--accent-strong); color: #ffffff;
       font-size: 13px; font-weight: 700; line-height: 1;
+      border: 1px solid rgba(255,255,255,0.30);
     }
 
-    .walker-row { margin-top: 6px; display: flex; gap: 8px; align-items: center; font-size: 12px; color: var(--muted); }
+    .walker-row { margin-top: 6px; display: flex; gap: 8px; align-items: center; font-size: 12px; color: rgba(255,255,255,0.85); }
     .walker-row.input { display: block; }
-    .walker-row.input input { height: 36px; }
-    .walker-row b { color: var(--text); }
-    .walker-row a { font-size: 12px; }
+    .walker-row.input input { height: 36px; background: #ffffff; color: var(--text); border-color: var(--border); }
+    .walker-row b { color: #ffffff; }
+    .walker-row a { font-size: 12px; color: #ffffff; }
 
     .chiprow {
       display: flex; gap: 6px; padding: 8px 12px; overflow-x: auto;
@@ -3952,27 +4361,29 @@ function renderYardAppHtml(): string {
       position: sticky; z-index: 25;
       /* Will be set by JS once topbar height is measured. */
       top: calc(var(--safe-top) + 110px);
-      background: var(--bg);
+      background: #ffffff;
       border-bottom: 1px solid var(--border);
+      box-shadow: 0 1px 2px rgba(15,30,60,0.04);
     }
     .chiprow::-webkit-scrollbar { display: none; }
     .chip {
       flex: 0 0 auto; padding: 7px 13px; border-radius: 999px;
-      background: var(--bg2); border: 1px solid var(--border);
+      background: var(--bg1); border: 1px solid var(--border);
       color: var(--text); font-size: 13px; white-space: nowrap;
     }
-    .chip.active { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 600; }
+    .chip.active { background: var(--accent); color: #ffffff; border-color: var(--accent); font-weight: 700; }
     .chip .count { opacity: 0.7; margin-left: 6px; font-size: 11px; }
-    .chip.active .count { opacity: 0.85; }
+    .chip.active .count { opacity: 0.95; }
 
     /* Asset list */
     .list { flex: 1 1 auto; padding: 4px 10px 120px; }
     .row {
       display: flex; align-items: center; gap: 12px; padding: 14px 14px;
       background: var(--bg1); border: 1px solid var(--border);
-      border-radius: 14px; margin-bottom: 8px; cursor: pointer;
+      border-radius: 10px; margin-bottom: 8px; cursor: pointer;
+      box-shadow: 0 1px 2px rgba(15,30,60,0.04);
     }
-    .row:active { background: var(--bg2); }
+    .row:active { background: var(--bg2); border-color: var(--accent); }
     .row .id { font-weight: 700; font-size: 17px; }
     .row .meta { color: var(--muted); font-size: 13px; margin-top: 2px; }
     .row .body { flex: 1 1 auto; min-width: 0; }
@@ -3984,14 +4395,14 @@ function renderYardAppHtml(): string {
       padding: 3px 7px; border-radius: 5px; text-transform: uppercase;
       background: var(--bg3); color: var(--text); border: 1px solid var(--border);
     }
-    .badge.fresh { background: #15321f; color: var(--ok); border-color: #1f5232; }
-    .badge.due { background: #3a230f; color: var(--due); border-color: #5a3819; }
-    .badge.overdue { background: #3b1416; color: var(--danger); border-color: #6b2024; }
-    .badge.never { background: #2a1a3a; color: var(--never); border-color: #3e2756; }
-    .badge.nce { background: #1a2438; color: #93c5fd; border-color: #2a3a5a; }
-    .badge.below-mel { background: #3b1416; color: var(--danger); border-color: #6b2024; }
-    .badge.new { background: #15321f; color: var(--ok); border-color: #1f5232; }
-    .badge.unlisted { background: #3a2a05; color: var(--warn); border-color: #5a4308; }
+    .badge.fresh { background: #e6f4ec; color: var(--ok); border-color: #9bd6b1; }
+    .badge.due { background: #fff1dc; color: var(--due); border-color: #f0c98a; }
+    .badge.overdue { background: #fde8eb; color: var(--danger); border-color: #f1a3ab; }
+    .badge.never { background: #efe6fa; color: var(--never); border-color: #cdb8e8; }
+    .badge.nce { background: #e6efff; color: var(--accent); border-color: #9fbce0; }
+    .badge.below-mel { background: #fde8eb; color: var(--danger); border-color: #f1a3ab; }
+    .badge.new { background: #e6f4ec; color: var(--ok); border-color: #9bd6b1; }
+    .badge.unlisted { background: #fff4d6; color: var(--warn); border-color: #e7c779; }
     .badge.photos { background: var(--bg2); color: var(--muted); border-color: var(--border); }
     .badge.shop { background: var(--bg2); color: var(--muted); border-color: var(--border); }
 
@@ -4016,21 +4427,24 @@ function renderYardAppHtml(): string {
     .sheet-top {
       position: sticky; top: 0; padding: calc(var(--safe-top) + 10px) 12px 10px;
       display: flex; align-items: center; gap: 6px;
-      background: var(--bg); border-bottom: 1px solid var(--border);
+      background: var(--accent); color: #ffffff;
+      border-bottom: 3px solid var(--accent-strong);
       z-index: 5;
     }
     .iconbtn {
       width: 40px; height: 40px; display: inline-flex; align-items: center; justify-content: center;
-      border-radius: 10px; background: var(--bg2); color: var(--text); font-size: 18px;
+      border-radius: 8px; background: rgba(255,255,255,0.14); color: #ffffff; font-size: 18px;
+      border: 1px solid rgba(255,255,255,0.30);
     }
-    .iconbtn:active { background: var(--bg3); }
-    .sheet-title { flex: 1 1 auto; font-weight: 700; font-size: 17px; min-width: 0;
+    .iconbtn:active { background: rgba(255,255,255,0.24); }
+    .sheet-title { flex: 1 1 auto; font-weight: 700; font-size: 17px; min-width: 0; color: #ffffff;
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
     .sheet-body { flex: 1 1 auto; overflow-y: auto; padding: 12px 14px 140px; }
     .card {
       background: var(--bg1); border: 1px solid var(--border);
-      border-radius: 14px; padding: 14px; margin-bottom: 12px;
+      border-radius: 10px; padding: 14px; margin-bottom: 12px;
+      box-shadow: 0 1px 2px rgba(15,30,60,0.04);
     }
     .card h4 { margin: 0 0 8px; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
     .kv { display: grid; grid-template-columns: 110px 1fr; gap: 6px 12px; font-size: 14px; }
@@ -4039,23 +4453,23 @@ function renderYardAppHtml(): string {
 
     .status-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
     .status-btn {
-      padding: 14px 8px; border-radius: 12px; text-align: center;
-      background: var(--bg2); border: 1px solid var(--border);
-      font-weight: 600; font-size: 14px;
+      padding: 14px 8px; border-radius: 8px; text-align: center;
+      background: var(--bg1); border: 1px solid var(--border);
+      font-weight: 600; font-size: 14px; color: var(--text);
     }
     .status-btn .icon { display: block; font-size: 22px; margin-bottom: 4px; }
-    .status-btn.active.present { background: #15321f; color: var(--ok); border-color: var(--ok); }
-    .status-btn.active.missing { background: #3b1416; color: var(--danger); border-color: var(--danger); }
-    .status-btn.active.unknown { background: #2a1a3a; color: var(--never); border-color: var(--never); }
+    .status-btn.active.present { background: #e6f4ec; color: var(--ok); border-color: var(--ok); }
+    .status-btn.active.missing { background: #fde8eb; color: var(--danger); border-color: var(--danger); }
+    .status-btn.active.unknown { background: #efe6fa; color: var(--never); border-color: var(--never); }
 
     .chip-pick { display: flex; flex-wrap: wrap; gap: 6px; }
     .chip-pick .chip { font-size: 13px; padding: 7px 12px; }
-    .chip-pick .chip.on { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+    .chip-pick .chip.on { background: var(--accent); color: #ffffff; border-color: var(--accent); }
 
     .photos { display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 8px; margin-top: 8px; }
     .photo {
-      position: relative; aspect-ratio: 1 / 1; border-radius: 10px; overflow: hidden;
-      background: var(--bg2); border: 1px solid var(--border);
+      position: relative; aspect-ratio: 1 / 1; border-radius: 8px; overflow: hidden;
+      background: #0a1a3a; border: 1px solid var(--border);
     }
     .photo img { width: 100%; height: 100%; object-fit: cover; display: block; }
     .photo .meta { position: absolute; bottom: 0; left: 0; right: 0; padding: 4px 6px; font-size: 10px;
@@ -4068,7 +4482,7 @@ function renderYardAppHtml(): string {
     }
     .photo-add {
       display: flex; align-items: center; justify-content: center;
-      aspect-ratio: 1 / 1; border-radius: 10px;
+      aspect-ratio: 1 / 1; border-radius: 8px;
       background: var(--bg2); border: 1px dashed var(--border);
       color: var(--muted); flex-direction: column; gap: 4px;
       font-size: 12px; cursor: pointer;
@@ -4080,6 +4494,17 @@ function renderYardAppHtml(): string {
     .history li { padding: 8px 0; border-top: 1px solid var(--border); list-style: none; color: var(--muted); }
     .history li:first-child { border-top: none; }
     .history li b { color: var(--text); }
+    .history-actions { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .history-actions button, .yard-desk-edit-check {
+      font-size: 12px; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--border);
+      background: var(--bg1); color: var(--accent); cursor: pointer; font-weight: 600;
+    }
+    .yard-changelog {
+      font-size: 11px; color: var(--muted2); margin-top: 8px; padding: 8px 10px;
+      border-radius: 6px; background: var(--bg2); border: 1px solid var(--border);
+    }
+    .yard-changelog .cl-title { font-weight: 600; color: var(--muted); margin-bottom: 4px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; }
+    .yard-changelog .cl-line { margin: 3px 0; line-height: 1.35; }
 
     /* Open WO panel inside the asset detail */
     .wo {
@@ -4095,9 +4520,9 @@ function renderYardAppHtml(): string {
       font-size: 11px; padding: 2px 7px; border-radius: 5px;
       background: var(--bg2); border: 1px solid var(--border); color: var(--muted);
     }
-    .wo-head .pill.below { background: #3b1416; color: var(--danger); border-color: #6b2024; }
-    .wo-head .pill.at { background: #3a230f; color: var(--due); border-color: #5a3819; }
-    .wo-head .pill.above { background: #15321f; color: var(--ok); border-color: #1f5232; }
+    .wo-head .pill.below { background: #fde8eb; color: var(--danger); border-color: #f1a3ab; }
+    .wo-head .pill.at { background: #fff1dc; color: var(--due); border-color: #f0c98a; }
+    .wo-head .pill.above { background: #e6f4ec; color: var(--ok); border-color: #9bd6b1; }
     .wo-remark {
       font-size: 13px; color: var(--text); white-space: pre-wrap; word-break: break-word;
       margin-top: 2px;
@@ -4105,80 +4530,401 @@ function renderYardAppHtml(): string {
     .wo-meta { font-size: 11px; color: var(--muted2); margin-top: 4px; }
 
     .unlisted-banner {
-      background: #3a2a05; border: 1px solid #5a4308; border-radius: 12px;
+      background: #fff4d6; border: 1px solid #e7c779; border-radius: 8px;
       padding: 12px 14px; margin-bottom: 12px; color: var(--warn); font-size: 13px;
     }
     .unlisted-banner b { display: block; color: var(--text); font-size: 14px; margin-bottom: 4px; }
 
     /* Find / floor-to-book modal */
     .modal-overlay {
-      position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+      position: fixed; inset: 0; background: rgba(15,30,60,0.45);
       z-index: 70; display: none; align-items: center; justify-content: center;
       padding: 20px;
     }
     .modal-overlay.open { display: flex; }
     .modal {
-      background: var(--bg1); border: 1px solid var(--border); border-radius: 16px;
+      background: var(--bg1); border: 1px solid var(--border); border-radius: 12px;
       padding: 18px; width: 100%; max-width: 460px;
+      box-shadow: 0 12px 32px rgba(15,30,60,0.18);
     }
-    .modal h3 { margin: 0 0 4px; font-size: 17px; }
+    .modal h3 { margin: 0 0 4px; font-size: 17px; color: var(--text); }
     .modal p.hint { margin: 0 0 12px; color: var(--muted); font-size: 13px; }
     .modal label { display: block; margin-top: 10px; font-size: 12px; color: var(--muted); }
     .modal label input, .modal label textarea, .modal label select { margin-top: 4px; }
     .modal-actions { display: flex; gap: 8px; margin-top: 16px; }
     .modal-actions .grow { flex: 1 1 auto; }
     .modal-actions .secondary {
-      background: var(--bg2); border: 1px solid var(--border); color: var(--text);
-      padding: 12px; border-radius: 10px; flex: 0 0 auto;
+      background: var(--bg1); border: 1px solid var(--border); color: var(--text);
+      padding: 12px; border-radius: 6px; flex: 0 0 auto;
+    }
+    .modal-actions .secondary.danger {
+      color: var(--danger); border-color: rgba(176, 0, 32, 0.45); background: #fff8f8;
     }
     .modal-actions .primary {
-      background: var(--accent); color: var(--accent-fg); padding: 12px 16px;
-      border-radius: 10px; font-weight: 700; flex: 1 1 auto;
+      background: var(--accent); color: #ffffff; padding: 12px 16px;
+      border-radius: 6px; font-weight: 700; flex: 1 1 auto;
+      border: 1px solid var(--accent);
     }
+    .modal-actions .primary:active { background: var(--accent-strong); border-color: var(--accent-strong); }
 
     .save-bar {
       position: fixed; left: 0; right: 0; bottom: 0;
       padding: 12px 14px calc(var(--safe-bottom) + 12px);
-      background: linear-gradient(0deg, var(--bg), rgba(10,10,13,0.92));
+      background: var(--bg1);
       border-top: 1px solid var(--border);
+      box-shadow: 0 -4px 14px rgba(15,30,60,0.08);
       z-index: 65;
     }
     .save-btn {
-      width: 100%; padding: 16px; border-radius: 14px;
-      background: var(--accent); color: var(--accent-fg);
+      width: 100%; padding: 16px; border-radius: 8px;
+      background: var(--accent); color: #ffffff;
       font-weight: 700; font-size: 16px;
-      box-shadow: 0 6px 24px rgba(106,169,255,0.25);
+      border: 1px solid var(--accent);
+      box-shadow: 0 4px 14px rgba(0,58,140,0.25);
     }
-    .save-btn:disabled { background: var(--bg3); color: var(--muted); box-shadow: none; }
+    .save-btn:active { background: var(--accent-strong); border-color: var(--accent-strong); }
+    .save-btn:disabled { background: var(--bg3); color: var(--muted); border-color: var(--border); box-shadow: none; }
     .save-btn.saving { opacity: 0.7; }
 
     .toast {
       position: fixed; bottom: calc(var(--safe-bottom) + 80px); left: 50%; transform: translateX(-50%);
-      background: var(--ok); color: var(--accent-fg); padding: 10px 18px;
+      background: #0a1a3a; color: #ffffff; padding: 10px 18px;
       border-radius: 999px; font-weight: 600; font-size: 14px;
-      box-shadow: 0 8px 24px rgba(0,0,0,0.4); z-index: 100;
+      box-shadow: 0 6px 18px rgba(15,30,60,0.25); z-index: 100;
       opacity: 0; transition: opacity 200ms ease;
       pointer-events: none;
     }
     .toast.show { opacity: 1; }
     .toast.err { background: var(--danger); color: white; }
 
-    @media (min-width: 720px) {
-      #app { max-width: 600px; margin: 0 auto; box-shadow: 0 0 0 1px var(--border); }
-      .sheet { max-width: 600px; left: 50%; transform: translate(-50%, 100%); }
+    @media (min-width: 720px) and (max-width: 959px) {
+      #app { max-width: 600px; margin: 0 auto; box-shadow: 0 0 0 1px var(--border), 0 6px 24px rgba(15,30,60,0.06); background: var(--bg); }
+      .sheet { max-width: 600px; left: 50%; transform: translate(-50%, 100%); box-shadow: 0 0 0 1px var(--border); }
       .sheet.open { transform: translate(-50%, 0); }
     }
+    /* Desktop: wide lookup table + detail (like MEL slide) */
+    @media (min-width: 960px) {
+      body { font-size: 14px; }
+      body.yard-desk-sheet-open::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        background: rgba(10, 26, 58, 0.28);
+        z-index: 59;
+      }
+      #app {
+        max-width: none;
+        margin: 0;
+        width: 100%;
+        min-height: 100dvh;
+        display: flex;
+        flex-direction: column;
+      }
+      .yard-mobile-only { display: none !important; }
+      .yard-desktop-only {
+        display: flex !important;
+        flex-direction: column;
+        flex-shrink: 0;
+        background: #e4e9f0;
+        border-bottom: 1px solid #b8c4d4;
+        box-shadow: inset 0 -1px 0 rgba(255,255,255,0.6);
+      }
+      .yard-desktop-top {
+        display: grid;
+        grid-template-columns: minmax(160px, 220px) minmax(200px, 1fr) minmax(120px, auto) auto minmax(100px, 200px);
+        gap: 12px 20px;
+        align-items: center;
+        padding: 8px 20px 10px;
+        background: linear-gradient(180deg, #f5f7fb 0%, #e8edf4 100%);
+        border-bottom: 1px solid #c5cedc;
+      }
+      .yard-desktop-brand {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        min-width: 0;
+      }
+      .yard-desktop-product {
+        font-family: "Segoe UI", system-ui, sans-serif;
+        font-size: 15px;
+        font-weight: 700;
+        color: #0a1a3a;
+        letter-spacing: -0.02em;
+      }
+      .yard-desktop-tagline {
+        font-size: 11px;
+        color: var(--muted);
+        font-weight: 500;
+      }
+      .yard-desktop-search {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-width: 0;
+      }
+      .yard-desktop-search input {
+        flex: 1 1 auto;
+        min-width: 0;
+        height: 34px;
+        padding: 0 12px;
+        border-radius: 4px;
+        border: 1px solid #a8b4c8;
+        background: #fff;
+        font-size: 13px;
+        box-shadow: inset 0 1px 2px rgba(15,30,60,0.06);
+      }
+      .yard-desktop-search input:focus {
+        outline: none;
+        border-color: var(--accent);
+        box-shadow: inset 0 1px 2px rgba(15,30,60,0.06), 0 0 0 2px rgba(0,58,140,0.15);
+      }
+      .yard-desktop-find {
+        flex: 0 0 auto;
+        height: 34px;
+        padding: 0 14px;
+        border-radius: 4px;
+        border: 1px solid #7a8aa3;
+        background: linear-gradient(180deg, #fff 0%, #eef1f6 100%);
+        font-size: 12px;
+        font-weight: 600;
+        color: #1a2a44;
+        cursor: pointer;
+      }
+      .yard-desktop-find:hover {
+        background: linear-gradient(180deg, #fff 0%, #e4e9f2 100%);
+      }
+      .yard-desktop-stats {
+        font-size: 12px;
+        color: #3a4a62;
+        white-space: nowrap;
+      }
+      .yard-desktop-stats b { color: var(--accent); font-weight: 700; }
+      .yard-desktop-apps {
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--accent);
+        text-decoration: none;
+        padding: 6px 12px;
+        border: 1px solid #a8b4c8;
+        border-radius: 4px;
+        background: #fff;
+      }
+      .yard-desktop-apps:hover { background: #f0f3f8; }
+      .yard-desktop-walker {
+        font-size: 12px;
+        justify-self: end;
+        max-width: 200px;
+      }
+      .yard-desktop-walker.walker-row.input { max-width: 200px; }
+      .yard-desktop-walker.walker-row.input input {
+        height: 32px;
+        font-size: 13px;
+        border-radius: 4px;
+      }
+      .yard-desktop-filterbar {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        padding: 0 16px 0 20px;
+        min-height: 40px;
+        background: #dce3ee;
+        border-bottom: 1px solid #b8c4d4;
+      }
+      .yard-desktop-filterbar .yard-desk-filters {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow-x: auto;
+      }
+      .yard-desktop-filterbar-label {
+        flex: 0 0 auto;
+        font-size: 11px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: #5a6578;
+        margin-right: 12px;
+      }
+      .yard-desk-filters {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: flex-end;
+        gap: 0;
+        min-height: 40px;
+      }
+      .yard-desk-filters .yard-filter-btn {
+        position: relative;
+        margin: 0;
+        padding: 10px 14px 8px;
+        border: none;
+        border-bottom: 3px solid transparent;
+        background: transparent;
+        color: #3a4a62;
+        font-size: 13px;
+        font-weight: 500;
+        cursor: pointer;
+        border-radius: 0;
+        font-family: inherit;
+      }
+      .yard-desk-filters .yard-filter-btn:hover {
+        color: var(--accent);
+        background: rgba(255,255,255,0.35);
+      }
+      .yard-desk-filters .yard-filter-btn.active {
+        color: var(--accent);
+        font-weight: 700;
+        border-bottom-color: var(--accent);
+        background: rgba(255,255,255,0.5);
+      }
+      .yard-ftab-n {
+        margin-left: 6px;
+        font-size: 11px;
+        font-weight: 600;
+        color: #6a7588;
+        font-variant-numeric: tabular-nums;
+      }
+      .yard-desk-filters .yard-filter-btn.active .yard-ftab-n { color: var(--accent); }
+
+      .yard-list-mobile { display: none !important; }
+      .yard-desk {
+        display: flex !important;
+        flex-direction: column;
+        flex: 1 1 auto;
+        min-height: 0;
+        padding: 14px 24px 20px;
+        background: var(--bg);
+      }
+      .yard-desk-hint {
+        font-size: 13px;
+        color: var(--muted);
+        margin-bottom: 12px;
+        letter-spacing: 0;
+      }
+      .yard-desk-split {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(300px, 400px);
+        gap: 20px;
+        align-items: start;
+        max-width: 1760px;
+        margin: 0 auto;
+        width: 100%;
+        min-height: 0;
+        flex: 1 1 auto;
+      }
+      .yard-desk-table-wrap {
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--bg1);
+        overflow: auto;
+        max-height: calc(100dvh - 168px);
+        box-shadow: 0 1px 0 rgba(15, 30, 60, 0.04);
+      }
+      .yard-desk-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; table-layout: fixed; }
+      .yard-desk-table thead th {
+        position: sticky; top: 0; z-index: 2; text-align: left; padding: 10px 12px;
+        background: var(--bg3); color: var(--muted); font-size: 0.65rem; font-weight: 700;
+        text-transform: uppercase; letter-spacing: 0.08em; border-bottom: 1px solid var(--border);
+      }
+      .yard-desk-table tbody td { padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+      .yard-desk-table tbody tr { cursor: pointer; transition: background 0.1s ease; }
+      .yard-desk-table tbody tr:hover { background: rgba(0,58,140,0.04); }
+      .yard-desk-table tbody tr.yard-desk-active { background: rgba(0,58,140,0.10); outline: 1px solid rgba(0,58,140,0.35); outline-offset: -1px; }
+      .yard-desk-table .col-asset { font-family: ui-monospace, monospace; font-weight: 700; font-size: 0.9rem; }
+      .yard-desk-table .col-loc { color: var(--text); word-break: break-word; }
+      .yard-desk-table .col-notes { color: var(--muted); font-size: 0.82rem; line-height: 1.35; }
+      .yard-desk-table .col-meta { font-size: 0.78rem; color: var(--muted); white-space: nowrap; }
+      .yard-desk-table .yard-pill {
+        display: inline-block; font-size: 0.58rem; font-weight: 700; padding: 2px 6px; border-radius: 4px;
+        text-transform: uppercase; letter-spacing: 0.04em; margin-right: 4px;
+      }
+      .yard-pill-fresh { background: #e6f4ec; color: var(--ok); }
+      .yard-pill-due { background: #fff1dc; color: var(--due); }
+      .yard-pill-overdue { background: #fde8eb; color: var(--danger); }
+      .yard-pill-never { background: #efe6fa; color: var(--never); }
+      .yard-desk-aside {
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--bg1);
+        padding: 16px 18px;
+        max-height: calc(100dvh - 168px);
+        overflow: auto;
+        box-shadow: 0 1px 0 rgba(15, 30, 60, 0.04);
+      }
+      .yard-desk-empty { color: var(--muted); font-size: 0.92rem; line-height: 1.5; text-align: center; padding: 32px 12px; }
+      .yard-desk-aside .lbl {
+        display: block; font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); margin-bottom: 6px;
+      }
+      .yard-desk-loc-big {
+        font-size: 1.25rem; font-weight: 600; color: var(--text); line-height: 1.3; word-break: break-word;
+      }
+      .yard-desk-loc-meta {
+        font-size: 0.82rem;
+        color: var(--muted);
+        margin-top: 6px;
+        line-height: 1.45;
+        word-break: break-word;
+      }
+      .yard-desk-notes-block {
+        margin-top: 14px; padding: 12px; background: var(--bg2); border-radius: 10px; font-size: 0.88rem; line-height: 1.45; color: var(--text); white-space: pre-wrap; word-break: break-word;
+      }
+      .yard-desk-hist-lbl { display: block; margin-top: 14px; }
+      .yard-desk-hist-lbl span { display: block; margin-bottom: 6px; font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+      .yard-desk-hist-lbl select { padding: 10px 12px; font-size: 0.86rem; }
+      .yard-hist-detail { margin-top: 10px; font-size: 0.84rem; color: var(--text-dim); line-height: 1.45; }
+      .yard-hist-detail .h-when { font-size: 0.78rem; color: var(--muted); margin-bottom: 6px; }
+      .yard-hist-actions { margin-top: 10px; }
+      .yard-desk-open-full {
+        margin-top: 16px; width: 100%; padding: 12px; border-radius: 10px;
+        background: var(--accent); color: #fff; font-weight: 700; font-size: 0.92rem; border: 1px solid var(--accent-strong);
+      }
+      .yard-desk-open-full:hover { filter: brightness(1.05); }
+      /* Check workflow: right-hand pane (not a tall phone bottom sheet). */
+      .sheet {
+        left: auto;
+        top: 0;
+        right: 0;
+        bottom: 0;
+        width: min(460px, 44vw);
+        max-width: 100%;
+        transform: translateX(100%);
+        transition: transform 240ms ease;
+        box-shadow: -8px 0 40px rgba(15, 30, 60, 0.14);
+        border-left: 1px solid var(--border);
+      }
+      .sheet.open { transform: translateX(0); }
+      .sheet-top {
+        background: var(--bg1);
+        color: var(--text);
+        border-bottom: 1px solid var(--border);
+      }
+      .iconbtn {
+        background: var(--bg2);
+        color: var(--text);
+        border-color: var(--border);
+      }
+      .sheet-title { color: var(--text); }
+      .save-bar {
+        left: auto;
+        right: 0;
+        width: min(460px, 44vw);
+        max-width: 100%;
+        border-left: 1px solid var(--border);
+      }
+    }
+    .yard-desk { display: none; }
   </style>
 </head>
 <body>
   <div id="app">
+    <div class="yard-mobile-only">
     <header class="topbar" id="topbar">
-      <div class="topbar-row">
-        <div class="brand">Yard Check</div>
-        <a class="topbar-apps" href="/go">Apps</a>
+      <div class="topbar-head">
+        <div class="topbar-lead">
+          <div class="brand">${SITE_TITLE}</div>
+          <a class="topbar-apps" href="/go">Apps</a>
+        </div>
         <div class="stats">
-          <span class="stat-pill"><b id="t-due">0</b> due</span>
-          <span class="stat-pill"><b id="t-today">0</b> today</span>
+          <span class="stat-pill"><b data-stat="t-due">0</b> due</span>
+          <span class="stat-pill"><b data-stat="t-today">0</b> today</span>
         </div>
       </div>
       <div class="search-row">
@@ -4189,19 +4935,87 @@ function renderYardAppHtml(): string {
     </header>
 
     <nav class="chiprow" id="filters">
-      <button class="chip active" data-filter="all">All <span class="count" id="c-all">0</span></button>
-      <button class="chip" data-filter="due">Due now <span class="count" id="c-due">0</span></button>
-      <button class="chip" data-filter="overdue">Overdue <span class="count" id="c-overdue">0</span></button>
-      <button class="chip" data-filter="never">Never checked <span class="count" id="c-never">0</span></button>
-      <button class="chip" data-filter="fresh">Done <span class="count" id="c-fresh">0</span></button>
-      <button class="chip" data-filter="unlisted">Unlisted <span class="count" id="c-unlisted">0</span></button>
-      <button class="chip" data-filter="nce">NCE <span class="count" id="c-nce">0</span></button>
-      <button class="chip" data-filter="below">Below MEL <span class="count" id="c-below">0</span></button>
+      <button type="button" class="chip yard-filter-btn active" data-filter="all">All <span class="count" data-yc="all">0</span></button>
+      <button type="button" class="chip yard-filter-btn" data-filter="needs_action">Needs action <span class="count" data-yc="needs_action">0</span></button>
+      <button type="button" class="chip yard-filter-btn" data-filter="done">Done <span class="count" data-yc="done">0</span></button>
     </nav>
 
-    <main class="list" id="list">
-      <div class="empty"><div class="big">⏳</div>Loading roster…</div>
+    <main class="list yard-list-mobile" id="list">
+      <div class="empty"><div class="big">⏳</div>Loading fleet…</div>
     </main>
+    </div>
+
+    <div class="yard-desktop-only">
+      <div class="yard-desktop-top">
+        <div class="yard-desktop-brand">
+          <span class="yard-desktop-product">${SITE_TITLE}</span>
+          <span class="yard-desktop-tagline">Yard Check · Fleet lookup</span>
+        </div>
+        <div class="yard-desktop-search">
+          <input id="search-desk" type="search" inputmode="search" placeholder="Search asset, VIN, shop, location…" autocomplete="off" />
+          <button type="button" class="yard-desktop-find" id="find-btn-desk">Find unlisted…</button>
+        </div>
+        <div class="yard-desktop-stats" aria-live="polite">
+          <b data-stat="t-due">0</b> due · <b data-stat="t-today">0</b> today
+        </div>
+        <a class="yard-desktop-apps" href="/go">Apps</a>
+        <div id="walker-desk" class="walker-row yard-desktop-walker"></div>
+      </div>
+      <div class="yard-desktop-filterbar">
+        <span class="yard-desktop-filterbar-label">Show</span>
+        <nav id="filters-desk" class="yard-desk-filters" aria-label="Fleet list filters">
+          <button type="button" class="yard-filter-btn active" data-filter="all">All <span class="yard-ftab-n" data-yc="all">0</span></button>
+          <button type="button" class="yard-filter-btn" data-filter="needs_action">Needs action <span class="yard-ftab-n" data-yc="needs_action">0</span></button>
+          <button type="button" class="yard-filter-btn" data-filter="done">Done <span class="yard-ftab-n" data-yc="done">0</span></button>
+        </nav>
+      </div>
+    </div>
+
+    <div class="yard-desk" id="yard-desk">
+      <p class="yard-desk-hint">Search and pick a row for location, notes, and history. <span style="color:var(--muted)">Unlisted / NCE / Below MEL still appear as row tags when they apply.</span></p>
+      <div class="yard-desk-split">
+        <div class="yard-desk-table-wrap">
+          <table class="yard-desk-table" aria-label="Yard vehicle lookup">
+            <colgroup>
+              <col style="width:22%" /><col style="width:26%" /><col style="width:32%" /><col style="width:20%" />
+            </colgroup>
+            <thead>
+              <tr>
+                <th>Asset</th>
+                <th>Parked at</th>
+                <th>Notes</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="yard-desk-tbody"></tbody>
+          </table>
+        </div>
+        <aside class="yard-desk-aside" id="yard-desk-aside">
+          <div id="yard-desk-empty" class="yard-desk-empty">Select a vehicle in the table to see its last known location, notes, and location history.</div>
+          <div id="yard-desk-fill" class="hidden">
+            <div class="yard-desk-asset-id" id="yard-d-asset" style="font-family:ui-monospace,monospace;font-weight:700;font-size:1.1rem;margin-bottom:12px;"></div>
+            <div>
+              <span class="lbl">Parked at</span>
+              <div class="yard-desk-loc-big" id="yard-d-loc">—</div>
+              <div class="yard-desk-loc-meta" id="yard-d-loc-meta"></div>
+            </div>
+            <div style="margin-top:12px;">
+              <span class="lbl">Latest notes</span>
+              <div class="yard-desk-notes-block" id="yard-d-notes">—</div>
+            </div>
+            <label class="yard-desk-hist-lbl" for="yard-hist-sel">
+              <span>Location &amp; note history</span>
+              <select id="yard-hist-sel" aria-label="Past yard checks for this asset"></select>
+            </label>
+            <div id="yard-hist-detail" class="yard-hist-detail"></div>
+            <div class="yard-hist-actions">
+              <button type="button" class="yard-desk-edit-check" id="yard-desk-edit-check" disabled>Edit this check…</button>
+            </div>
+            <button type="button" class="yard-desk-open-full" id="yard-desk-open-full">Log check / photos / full detail</button>
+          </div>
+        </aside>
+      </div>
+    </div>
   </div>
 
   <div id="sheet" class="sheet" aria-hidden="true">
@@ -4217,6 +5031,33 @@ function renderYardAppHtml(): string {
 
   <div class="toast" id="toast"></div>
 
+  <div class="modal-overlay" id="edit-check-modal" aria-hidden="true">
+    <div class="modal" role="dialog" aria-labelledby="edit-check-title">
+      <h3 id="edit-check-title">Edit yard check</h3>
+      <p class="hint">Correct location, notes, or status. The original walk time and walker stay on record; your name is logged in the changelog.</p>
+      <input type="hidden" id="edit-check-id" value="" />
+      <label>Location
+        <input id="edit-check-loc" type="text" list="loc-options" placeholder="Where it was parked" />
+      </label>
+      <label>Notes
+        <textarea id="edit-check-disc" rows="3" placeholder="Discrepancies / notes"></textarea>
+      </label>
+      <label>Status
+        <select id="edit-check-status">
+          <option value="present">Present / found</option>
+          <option value="missing">Missing</option>
+          <option value="unknown">Unknown</option>
+          <option value="not_applicable">Not applicable</option>
+        </select>
+      </label>
+      <div class="modal-actions">
+        <button type="button" class="secondary danger" id="edit-check-delete">Delete check</button>
+        <button type="button" class="secondary" id="edit-check-cancel">Cancel</button>
+        <button type="button" class="primary" id="edit-check-save">Save changes</button>
+      </div>
+    </div>
+  </div>
+
   <div class="modal-overlay" id="find-modal" aria-hidden="true">
     <div class="modal" role="dialog" aria-labelledby="find-title">
       <h3 id="find-title">Found unlisted asset</h3>
@@ -4229,6 +5070,9 @@ function renderYardAppHtml(): string {
       </label>
       <label>Notes (optional)
         <textarea id="find-notes" rows="2" placeholder="Anything notable about it?"></textarea>
+      </label>
+      <label>Photos (optional)
+        <input id="find-photos-input" type="file" accept="image/*" multiple />
       </label>
       <div class="modal-actions">
         <button type="button" class="secondary" id="find-cancel">Cancel</button>
@@ -4267,7 +5111,11 @@ function renderYardAppHtml(): string {
       detail: null,
       draft: { status: "present", location: "", discrepancies: "" },
       saving: false,
-      photoCache: {} // assetId -> photos[]
+      photoCache: {}, // assetId -> photos[]
+      deskSelectedId: null,
+      deskDetailById: {},
+      deskHistChecks: null,
+      deskHistEdits: null
     };
 
     var $ = function(id){ return document.getElementById(id); };
@@ -4293,34 +5141,41 @@ function renderYardAppHtml(): string {
       t._h = setTimeout(function(){ t.className = "toast"; }, 2200);
     }
 
+    function requireWalkerName(){
+      if ((state.walker || "").trim()) return true;
+      showToast("Enter your name before saving", true);
+      var inp = document.querySelector(".walker-name-input");
+      if (inp) inp.focus();
+      return false;
+    }
+
     function renderWalker(){
-      var w = $("walker");
-      if (state.walker) {
-        w.className = "walker-row";
-        w.innerHTML = "Walking as <b>" + escapeHtml(state.walker) +
-          "</b> &middot; <a href='#' id='walker-edit'>change</a>";
-        $("walker-edit").addEventListener("click", function(e){
-          e.preventDefault();
-          state.walker = "";
-          renderWalker();
-          if (typeof syncChiprowOffset === "function") syncChiprowOffset();
-        });
-      } else {
-        w.className = "walker-row input";
-        w.innerHTML = '<input id="walker-input" placeholder="Your name (saved on this phone)" autocomplete="name" />';
-        var inp = $("walker-input");
-        inp.value = "";
-        inp.addEventListener("change", saveWalker);
-        inp.addEventListener("blur", saveWalker);
-        function saveWalker(){
+      var htmlNamed = state.walker
+        ? ("Walking as <b>" + escapeHtml(state.walker) + "</b> &middot; <a href='#' class='walker-edit'>change</a>")
+        : ("<input class='walker-name-input' type='text' placeholder='Your name (required)' autocomplete='name' />");
+      [["walker", "walker-row"], ["walker-desk", "walker-row yard-desktop-walker"]].forEach(function(pair){
+        var w = $(pair[0]);
+        if (!w) return;
+        w.className = pair[1] + (state.walker ? "" : " input");
+        w.innerHTML = htmlNamed;
+      });
+      document.querySelectorAll(".walker-name-input").forEach(function(inp){
+        inp.value = state.walker || "";
+        if (inp._yardSave) {
+          inp.removeEventListener("change", inp._yardSave);
+          inp.removeEventListener("blur", inp._yardSave);
+        }
+        inp._yardSave = function(){
           var v = inp.value.trim();
           if (!v) return;
           state.walker = v;
           localStorage.setItem("yard.walker", v);
           renderWalker();
           if (typeof syncChiprowOffset === "function") syncChiprowOffset();
-        }
-      }
+        };
+        inp.addEventListener("change", inp._yardSave);
+        inp.addEventListener("blur", inp._yardSave);
+      });
     }
 
     function escapeHtml(s){
@@ -4329,17 +5184,19 @@ function renderYardAppHtml(): string {
         .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
     }
 
+    /** True when the asset should appear under "Needs action" (one bucket for walkers). */
+    function yardNeedsAction(a){
+      if (a.isUnlisted || a.isNce || a.isBelowMel) return true;
+      if (a.rollingState === "due" || a.rollingState === "overdue" || a.rollingState === "never") return true;
+      return false;
+    }
+
     function applyFilter(){
       var q = state.search.trim().toLowerCase();
       var filt = state.filter;
       return state.assets.filter(function(a){
-        if (filt === "due" && !(a.rollingState === "due" || a.rollingState === "overdue" || a.rollingState === "never")) return false;
-        if (filt === "overdue" && a.rollingState !== "overdue") return false;
-        if (filt === "never" && !a.isNeverChecked) return false;
-        if (filt === "fresh" && a.rollingState !== "fresh") return false;
-        if (filt === "unlisted" && !a.isUnlisted) return false;
-        if (filt === "nce" && !a.isNce) return false;
-        if (filt === "below" && !a.isBelowMel) return false;
+        if (filt === "needs_action" && !yardNeedsAction(a)) return false;
+        if (filt === "done" && a.rollingState !== "fresh") return false;
         if (!q) return true;
         var hay = (a.assetId + " " + (a.vinSerial||"") + " " + (a.makeModel||"") + " " +
           (a.owningUnit||"") + " " + (a.shop||"") + " " + (a.lastLocation||"")).toLowerCase();
@@ -4350,16 +5207,15 @@ function renderYardAppHtml(): string {
     function refreshCounts(){
       if (!state.roster) return;
       var t = state.roster.totals || {};
-      $("t-due").textContent = (t.due||0) + (t.overdue||0) + (t.never||0);
-      $("t-today").textContent = t.checkedToday || 0;
-      $("c-all").textContent = state.assets.length;
-      $("c-due").textContent = (t.due||0) + (t.overdue||0) + (t.never||0);
-      $("c-overdue").textContent = t.overdue || 0;
-      $("c-never").textContent = t.never || 0;
-      $("c-fresh").textContent = t.fresh || 0;
-      $("c-unlisted").textContent = state.assets.filter(function(a){return a.isUnlisted;}).length;
-      $("c-nce").textContent = state.assets.filter(function(a){return a.isNce;}).length;
-      $("c-below").textContent = state.assets.filter(function(a){return a.isBelowMel;}).length;
+      var dueSum = (t.due||0) + (t.overdue||0) + (t.never||0);
+      document.querySelectorAll("[data-stat='t-due']").forEach(function(el){ el.textContent = String(dueSum); });
+      document.querySelectorAll("[data-stat='t-today']").forEach(function(el){ el.textContent = String(t.checkedToday || 0); });
+      function yc(key, val){
+        document.querySelectorAll("[data-yc='" + key + "']").forEach(function(el){ el.textContent = String(val); });
+      }
+      yc("all", state.assets.length);
+      yc("needs_action", state.assets.filter(yardNeedsAction).length);
+      yc("done", state.assets.filter(function(a){ return a.rollingState === "fresh"; }).length);
     }
 
     function renderList(){
@@ -4367,7 +5223,7 @@ function renderYardAppHtml(): string {
       var list = $("list");
       if (!rows.length) {
         list.innerHTML = '<div class="empty"><div class="big">\u2728</div>' +
-          (state.assets.length ? "No assets match." : "No assets in roster.") + '</div>';
+          (state.assets.length ? "No assets match." : "No assets in fleet.") + '</div>';
         return;
       }
       var html = "";
@@ -4398,6 +5254,201 @@ function renderYardAppHtml(): string {
         '</div>';
       }
       list.innerHTML = html;
+      if (state.deskSelectedId && !rows.some(function(r){ return r.assetId === state.deskSelectedId; })) {
+        state.deskSelectedId = null;
+        var yde = document.getElementById("yard-desk-empty");
+        var ydf = document.getElementById("yard-desk-fill");
+        if (yde) yde.classList.remove("hidden");
+        if (ydf) ydf.classList.add("hidden");
+      }
+      renderDeskTable();
+    }
+
+    function truncDeskHtml(s, n){
+      s = String(s == null ? "" : s);
+      if (s.length <= n) return escapeHtml(s);
+      return escapeHtml(s.slice(0, n)) + "\u2026";
+    }
+    function deskRollPillHtml(a){
+      if (a.isNeverChecked) return "<span class=\\"yard-pill yard-pill-never\\">Never</span>";
+      if (a.rollingState === "overdue") return "<span class=\\"yard-pill yard-pill-overdue\\">Overdue</span>";
+      if (a.rollingState === "due") return "<span class=\\"yard-pill yard-pill-due\\">Due</span>";
+      return "<span class=\\"yard-pill yard-pill-fresh\\">OK</span>";
+    }
+    function renderDeskTable(){
+      var tb = document.getElementById("yard-desk-tbody");
+      if (!tb) return;
+      var rows = applyFilter();
+      if (!rows.length) {
+        tb.innerHTML = "<tr><td colspan=\\"4\\" style=\\"text-align:center;color:var(--muted);padding:24px\\">No vehicles match.</td></tr>";
+        return;
+      }
+      var h = "";
+      for (var i = 0; i < rows.length; i++) {
+        var a = rows[i];
+        var loc = a.lastLocation ? escapeHtml(a.lastLocation) : "\u2014";
+        var notesRaw = (a.lastNotes || "").trim();
+        var notesCell = notesRaw ? truncDeskHtml(notesRaw, 160) : "<span style=\\"color:var(--subtle)\\">\u2014</span>";
+        var active = state.deskSelectedId === a.assetId ? " yard-desk-active" : "";
+        h += "<tr class=\\"yard-desk-tr" + active + "\\" data-id=\\"" + escapeHtml(a.assetId) + "\\">" +
+          "<td class=\\"col-asset\\">" + escapeHtml(a.assetId) + "</td>" +
+          "<td class=\\"col-loc\\">" + loc + "</td>" +
+          "<td class=\\"col-notes\\">" + notesCell + "</td>" +
+          "<td class=\\"col-meta\\">" + deskRollPillHtml(a) +
+          (a.isNeverChecked ? "" : (" <span style=\\"color:var(--subtle)\\">" + escapeHtml(fmtAge(a.daysSinceLastCheck, false)) + "</span>")) +
+          "</td>" +
+          "</tr>";
+      }
+      tb.innerHTML = h;
+    }
+    function formatLastParkedMeta(a){
+      if (!a) return "";
+      if (a.isNeverChecked) {
+        return "Location from ETIC only — no yard check recorded yet.";
+      }
+      var iso = a.lastCheckedAtIso;
+      var by = (a.lastCheckedBy || "").trim();
+      if (!iso) {
+        return by ? ("Logged by " + by + " (time unavailable)") : "";
+      }
+      var d = new Date(iso);
+      if (isNaN(d.getTime())) return by ? ("By " + by) : "";
+      var rel = fmtRel(iso);
+      var abs = d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+      var s = rel + " · " + abs;
+      if (by) s += " · by " + by;
+      return s;
+    }
+
+    function selectDeskAsset(assetId){
+      state.deskSelectedId = assetId;
+      renderDeskTable();
+      var a = state.assets.find(function(x){ return x.assetId === assetId; });
+      var empty = document.getElementById("yard-desk-empty");
+      var fill = document.getElementById("yard-desk-fill");
+      if (!a || !empty || !fill) return;
+      empty.classList.add("hidden");
+      fill.classList.remove("hidden");
+      var elAsset = document.getElementById("yard-d-asset");
+      var elLoc = document.getElementById("yard-d-loc");
+      var elLocMeta = document.getElementById("yard-d-loc-meta");
+      var elNotes = document.getElementById("yard-d-notes");
+      if (elAsset) elAsset.textContent = a.assetId;
+      if (elLoc) elLoc.textContent = a.lastLocation || "\u2014";
+      if (elLocMeta) elLocMeta.textContent = formatLastParkedMeta(a);
+      if (elNotes) elNotes.textContent = (a.lastNotes || "").trim() || "(no notes on last check)";
+      loadDeskDetail(assetId);
+    }
+    function fillDeskHistory(d){
+      var sel = document.getElementById("yard-hist-sel");
+      var detailBox = document.getElementById("yard-hist-detail");
+      var deskEdit = document.getElementById("yard-desk-edit-check");
+      if (!sel) return;
+      var checks = (d && d.checks) ? d.checks.slice() : [];
+      checks.sort(function(a, b){ return (b.checkedAtIso || "").localeCompare(a.checkedAtIso || ""); });
+      state.deskHistChecks = checks;
+      state.deskHistEdits = (d && d.checkEdits) ? d.checkEdits.slice() : [];
+      if (!checks.length) {
+        sel.innerHTML = "<option value=\\"\\">No past checks</option>";
+        sel.disabled = true;
+        if (detailBox) detailBox.innerHTML = "<p style=\\"color:var(--muted);margin:0\\">No check history yet.</p>";
+        if (deskEdit) { deskEdit.disabled = true; deskEdit.removeAttribute("data-edit-check"); }
+        return;
+      }
+      sel.disabled = false;
+      var opts = [];
+      for (var i = 0; i < checks.length; i++) {
+        var c = checks[i];
+        var loc = (c.location || "").trim() || "\u2014";
+        var t = fmtRel(c.checkedAtIso) + " \u00B7 " + loc;
+        opts.push("<option value=\\"" + i + "\\">" + escapeHtml(t) + "</option>");
+      }
+      sel.innerHTML = opts.join("");
+      sel.selectedIndex = 0;
+      renderDeskHistDetail();
+    }
+    function renderDeskHistDetail(){
+      var sel = document.getElementById("yard-hist-sel");
+      var box = document.getElementById("yard-hist-detail");
+      var deskEdit = document.getElementById("yard-desk-edit-check");
+      if (!sel || !box || !state.deskHistChecks || !state.deskHistChecks.length) return;
+      var idx = parseInt(sel.value, 10);
+      if (!Number.isFinite(idx) || !state.deskHistChecks[idx]) {
+        box.innerHTML = "";
+        if (deskEdit) { deskEdit.disabled = true; deskEdit.removeAttribute("data-edit-check"); }
+        return;
+      }
+      var c = state.deskHistChecks[idx];
+      var when = fmtRel(c.checkedAtIso) + (c.checkedBy ? " \u00B7 " + c.checkedBy : "");
+      var loc = (c.location || "").trim() || "\u2014";
+      var disc = (c.discrepancies || "").trim();
+      var chg = changelogBlockForCheck(c.id, state.deskHistEdits);
+      box.innerHTML =
+        "<div class=\\"h-when\\">" + escapeHtml(when) + "</div>" +
+        "<div><strong>Location:</strong> " + escapeHtml(loc) + "</div>" +
+        (disc ? "<div style=\\"margin-top:8px;white-space:pre-wrap\\"><strong>Notes:</strong> " + escapeHtml(disc) + "</div>" : "") +
+        (chg || "");
+      if (deskEdit) {
+        deskEdit.disabled = false;
+        deskEdit.setAttribute("data-edit-check", String(c.id));
+      }
+    }
+    function loadDeskDetail(assetId){
+      var sel = document.getElementById("yard-hist-sel");
+      var detailBox = document.getElementById("yard-hist-detail");
+      if (sel) {
+        sel.innerHTML = "<option value=\\"\\">Loading history\u2026</option>";
+        sel.disabled = true;
+      }
+      if (detailBox) detailBox.textContent = "";
+      state.deskHistChecks = null;
+      state.deskHistEdits = null;
+      var deskEdit = document.getElementById("yard-desk-edit-check");
+      if (deskEdit) { deskEdit.disabled = true; deskEdit.removeAttribute("data-edit-check"); }
+      if (state.deskDetailById && state.deskDetailById[assetId]) {
+        fillDeskHistory(state.deskDetailById[assetId]);
+        return;
+      }
+      fetch("/api/yard/asset/" + encodeURIComponent(assetId), { cache: "no-store" })
+        .then(function(r){ return r.json(); })
+        .then(function(d){
+          if (state.deskSelectedId !== assetId) return;
+          state.deskDetailById = state.deskDetailById || {};
+          state.deskDetailById[assetId] = d;
+          fillDeskHistory(d);
+        })
+        .catch(function(){
+          if (state.deskSelectedId !== assetId) return;
+          if (sel) {
+            sel.innerHTML = "<option value=\\"\\">Could not load history</option>";
+            sel.disabled = true;
+          }
+          if (detailBox) detailBox.innerHTML = "<p style=\\"color:var(--danger);margin:0\\">Could not load history.</p>";
+        });
+    }
+    function wireYardDesk(){
+      var tb = document.getElementById("yard-desk-tbody");
+      if (tb && !tb._yardDesk) {
+        tb._yardDesk = true;
+        tb.addEventListener("click", function(e){
+          var tr = e.target.closest(".yard-desk-tr");
+          if (!tr) return;
+          var id = tr.getAttribute("data-id");
+          if (id) selectDeskAsset(id);
+        });
+      }
+      var btn = document.getElementById("yard-desk-open-full");
+      if (btn && !btn._yardDesk) {
+        btn._yardDesk = true;
+        btn.addEventListener("click", function(){
+          if (state.deskSelectedId) openSheet(state.deskSelectedId);
+        });
+      }
+      var hsel = document.getElementById("yard-hist-sel");
+      if (hsel && !hsel._yardDesk) {
+        hsel._yardDesk = true;
+        hsel.addEventListener("change", function(){ renderDeskHistDetail(); });
+      }
     }
 
     function rebuildLocations(){
@@ -4417,20 +5468,33 @@ function renderYardAppHtml(): string {
           state.roster = data;
           state.assets = data.assets || [];
           state.locations = data.locations || [];
+          state.deskDetailById = {};
           rebuildLocations();
           refreshCounts();
           renderList();
+          wireYardDesk();
+          if (state.deskSelectedId) {
+            var stillHere = state.assets.some(function(x){ return x.assetId === state.deskSelectedId; });
+            if (stillHere) loadDeskDetail(state.deskSelectedId);
+            else {
+              state.deskSelectedId = null;
+              var yde = document.getElementById("yard-desk-empty");
+              var ydf = document.getElementById("yard-desk-fill");
+              if (yde) yde.classList.remove("hidden");
+              if (ydf) ydf.classList.add("hidden");
+            }
+          }
         })
         .catch(function(err){
           console.error("roster load failed", err);
-          showToast("Couldn't load roster", true);
+          showToast("Couldn't load fleet list", true);
         });
     }
 
     function openSheet(assetId){
       state.openId = assetId;
       var asset = state.assets.find(function(a){ return a.assetId === assetId; });
-      state.detail = { asset: asset, photos: state.photoCache[assetId] || [], checks: [], openWorkOrders: [] };
+      state.detail = { asset: asset, photos: state.photoCache[assetId] || [], checks: [], checkEdits: [], openWorkOrders: [] };
       state.draft = {
         status: "present",
         location: (asset && asset.lastLocation) || "",
@@ -4439,6 +5503,7 @@ function renderYardAppHtml(): string {
       renderSheet();
       $("sheet").classList.add("open");
       $("sheet").setAttribute("aria-hidden", "false");
+      document.body.classList.add("yard-desk-sheet-open");
       document.body.style.overflow = "hidden";
       // Pull the live detail (history + photos) async.
       fetch("/api/yard/asset/" + encodeURIComponent(assetId), { cache: "no-store" })
@@ -4455,6 +5520,7 @@ function renderYardAppHtml(): string {
     function closeSheet(){
       $("sheet").classList.remove("open");
       $("sheet").setAttribute("aria-hidden", "true");
+      document.body.classList.remove("yard-desk-sheet-open");
       document.body.style.overflow = "";
       state.openId = null;
     }
@@ -4502,6 +5568,7 @@ function renderYardAppHtml(): string {
       '</label>';
 
       var checks = d.checks || [];
+      var allEdits = d.checkEdits || [];
       var historyHtml = "";
       if (checks.length) {
         historyHtml = '<ul class="history">';
@@ -4511,9 +5578,12 @@ function renderYardAppHtml(): string {
           if (c.location) det.push("\uD83D\uDCCD " + escapeHtml(c.location));
           if (c.status && c.status !== "present") det.push(escapeHtml(c.status));
           if (c.discrepancies) det.push(escapeHtml(c.discrepancies));
+          var chg = changelogBlockForCheck(c.id, allEdits);
           historyHtml += '<li><b>' + fmtRel(c.checkedAtIso) + '</b>' +
             (c.checkedBy ? " by " + escapeHtml(c.checkedBy) : "") +
             (det.length ? "<br/>" + det.join(" \u00B7 ") : "") +
+            (chg || "") +
+            '<div class="history-actions"><button type="button" data-edit-check="' + c.id + '">Edit</button></div>' +
           '</li>';
         }
         historyHtml += '</ul>';
@@ -4534,7 +5604,7 @@ function renderYardAppHtml(): string {
           var tier = (w.melTier || "").toLowerCase();
           var tierPill = tier ? '<span class="pill ' + escapeHtml(tier) + '">' + escapeHtml(tier.toUpperCase()) + ' MEL</span>' : '';
           var partsPill = w.partsStatus ? '<span class="pill">Parts: ' + escapeHtml(w.partsStatus) + '</span>' : '';
-          var eticPill = w.eticRaw ? '<span class="pill">ETIC ' + escapeHtml(w.eticRaw) + '</span>' : '';
+          var eticPill = w.eticRaw ? '<span class="pill">ETIC ' + escapeHtml(fmtEtic(w.eticRaw)) + '</span>' : '';
           var pushPill = (w.eticPushCount || 0) > 0 ? '<span class="pill">' + w.eticPushCount + 'x pushed</span>' : '';
           var remark = (w.remarks || "").trim();
           var remarkAge = w.lastRemarkChangeDate ? "Remark updated " + fmtRel(w.lastRemarkChangeDate) : "";
@@ -4578,7 +5648,7 @@ function renderYardAppHtml(): string {
         var woTxt = act.woOpened ? " (WO #" + escapeHtml(act.woOpened) + ")" : "";
         var noteTxt = act.note ? '<div style="margin-top:4px;font-style:italic;">\u201C' + escapeHtml(act.note) + '\u201D</div>' : "";
         fmaBanner =
-          '<div class="unlisted-banner" style="background:#15321f;border-color:#1e6b3a;color:#b6e8c5;">' +
+          '<div class="unlisted-banner" style="background:#e6f4ec;border-color:#9bd6b1;color:#0a3318;">' +
             '<b>FM&amp;A acknowledged</b>' +
             kindLbl + ' \u2192 ' + escapeHtml(label) + woTxt +
             ' \u00B7 by ' + escapeHtml(act.resolvedBy || "(unknown)") +
@@ -4648,6 +5718,181 @@ function renderYardAppHtml(): string {
       return d.toLocaleDateString(undefined, { day: "2-digit", month: "short", year: "2-digit" });
     }
 
+    function changelogBlockForCheck(checkId, allEdits){
+      var eds = (allEdits || []).filter(function(e){ return e.checkId === checkId; });
+      if (!eds.length) return "";
+      var lines = eds.map(function(e){
+        var parts = [];
+        if (e.before && e.after && e.before.location !== e.after.location) parts.push("location");
+        if (e.before && e.after && e.before.discrepancies !== e.after.discrepancies) parts.push("notes");
+        if (e.before && e.after && e.before.status !== e.after.status) {
+          parts.push("status (" + (e.before.status || "") + " \u2192 " + (e.after.status || "") + ")");
+        }
+        var summary = parts.length ? parts.join(", ") : "updated";
+        return '<div class="cl-line">' + escapeHtml(e.editedBy) + " \u00B7 " + fmtRel(e.editedAtIso) + " \u2014 " + escapeHtml(summary) + "</div>";
+      });
+      return '<div class="yard-changelog"><div class="cl-title">Changelog</div>' + lines.join("") + "</div>";
+    }
+
+    function openEditCheckModal(check){
+      if (!check) return;
+      $("edit-check-id").value = String(check.id);
+      $("edit-check-loc").value = check.location || "";
+      $("edit-check-disc").value = check.discrepancies || "";
+      $("edit-check-status").value = check.status || "present";
+      var m = $("edit-check-modal");
+      m.classList.add("open");
+      m.setAttribute("aria-hidden", "false");
+    }
+    function closeEditCheckModal(){
+      var m = $("edit-check-modal");
+      m.classList.remove("open");
+      m.setAttribute("aria-hidden", "true");
+    }
+    function findCheckById(id){
+      var n = typeof id === "number" ? id : parseInt(String(id), 10);
+      if (!Number.isFinite(n)) return null;
+      var fromDesk = state.deskHistChecks && state.deskHistChecks.find(function(c){ return c.id === n; });
+      if (fromDesk) return fromDesk;
+      var fromDetail = state.detail && state.detail.checks && state.detail.checks.find(function(c){ return c.id === n; });
+      return fromDetail || null;
+    }
+    function saveEditCheck(){
+      if (!requireWalkerName()) return;
+      var raw = $("edit-check-id").value;
+      var id = parseInt(raw, 10);
+      if (!Number.isFinite(id)) return;
+      var st = $("edit-check-status").value;
+      var locEdit = ($("edit-check-loc").value || "").trim();
+      if (st === "present" && !locEdit) {
+        showToast("Enter location when status is Present / found.", true);
+        return;
+      }
+      var btn = $("edit-check-save");
+      btn.disabled = true;
+      fetch("/api/yard/check", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          checkId: id,
+          location: $("edit-check-loc").value,
+          discrepancies: $("edit-check-disc").value,
+          status: $("edit-check-status").value,
+          editedBy: (state.walker || "").trim()
+        })
+      })
+        .then(function(r){
+          if (!r.ok) return r.json().then(function(j){ throw new Error(j.error || "update failed"); });
+          return r.json();
+        })
+        .then(function(){
+          closeEditCheckModal();
+          showToast("Check updated");
+          var check = findCheckById(id);
+          var aid = check && check.assetId;
+          if (!aid) {
+            loadRoster();
+            return;
+          }
+          return fetch("/api/yard/asset/" + encodeURIComponent(aid), { cache: "no-store" })
+            .then(function(r){ return r.json(); })
+            .then(function(d){
+              if (state.openId === aid) {
+                state.detail = d;
+                state.photoCache[aid] = d.photos || [];
+                renderSheet();
+              }
+              if (state.deskSelectedId === aid) {
+                state.deskDetailById = state.deskDetailById || {};
+                state.deskDetailById[aid] = d;
+                fillDeskHistory(d);
+              }
+              loadRoster();
+            });
+        })
+        .catch(function(err){
+          showToast(err.message || "Update failed", true);
+        })
+        .finally(function(){
+          btn.disabled = false;
+        });
+    }
+
+    function deleteEditCheck(){
+      if (!requireWalkerName()) return;
+      var raw = $("edit-check-id").value;
+      var id = parseInt(raw, 10);
+      if (!Number.isFinite(id)) return;
+      var check = findCheckById(id);
+      var aid = check && check.assetId;
+      if (!confirm("Delete this yard check? This cannot be undone.")) return;
+      var delBtn = $("edit-check-delete");
+      var saveBtn = $("edit-check-save");
+      delBtn.disabled = true;
+      saveBtn.disabled = true;
+      fetch("/api/yard/check", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          checkId: id,
+          deletedBy: (state.walker || "").trim()
+        })
+      })
+        .then(function(r){
+          if (!r.ok) return r.json().then(function(j){ throw new Error(j.error || "delete failed"); });
+          return r.json();
+        })
+        .then(function(){
+          closeEditCheckModal();
+          showToast("Check deleted");
+          if (!aid) {
+            loadRoster();
+            return;
+          }
+          return fetch("/api/yard/asset/" + encodeURIComponent(aid), { cache: "no-store" })
+            .then(function(r){ return r.json(); })
+            .then(function(d){
+              if (state.openId === aid) {
+                state.detail = d;
+                state.photoCache[aid] = d.photos || [];
+                renderSheet();
+              }
+              if (state.deskSelectedId === aid) {
+                state.deskDetailById = state.deskDetailById || {};
+                state.deskDetailById[aid] = d;
+                fillDeskHistory(d);
+              }
+              loadRoster();
+            });
+        })
+        .catch(function(err){
+          showToast(err.message || "Delete failed", true);
+        })
+        .finally(function(){
+          delBtn.disabled = false;
+          saveBtn.disabled = false;
+        });
+    }
+
+    /* The ETIC raw cell can be either a real Excel date (parsed as ISO) or
+       free-text the unit typed in. Render dates compactly (e.g. "22 APR 26")
+       and pass anything else through untouched so weird notes still show. */
+    function fmtEtic(raw){
+      if (raw == null) return "";
+      var s = String(raw).trim();
+      if (!s) return "";
+      var iso = /^\\d{4}-\\d{2}-\\d{2}/.test(s) ? s : "";
+      if (iso) {
+        var d = new Date(iso.length === 10 ? (iso + "T00:00:00Z") : iso);
+        if (!isNaN(d.getTime())) {
+          return d.toLocaleDateString("en-US", {
+            day: "2-digit", month: "short", year: "2-digit", timeZone: "UTC"
+          }).toUpperCase().replace(/,/g, "");
+        }
+      }
+      return s;
+    }
+
     function bindSheetEvents(){
       // No status row anymore — see comment above STATUS. Walker only logs
       // assets they actually see, and "presence" is implicit in saving.
@@ -4668,34 +5913,50 @@ function renderYardAppHtml(): string {
       if (disc) disc.addEventListener("input", function(){ state.draft.discrepancies = disc.value; });
       var pi = $("photo-input");
       if (pi) pi.addEventListener("change", onPhotoPicked);
-      // Photo delete
-      $("sheet-body").addEventListener("click", function(e){
-        var del = e.target.closest("[data-del-photo]");
-        if (del) {
-          e.preventDefault();
-          var pid = del.getAttribute("data-del-photo");
-          if (!confirm("Delete this photo?")) return;
-          fetch("/api/yard/photo/" + pid, { method: "DELETE" })
-            .then(function(){
-              if (!state.detail) return;
-              state.detail.photos = (state.detail.photos || []).filter(function(p){ return String(p.id) !== String(pid); });
-              if (state.openId) state.photoCache[state.openId] = state.detail.photos;
-              renderSheet();
-              showToast("Photo deleted");
-            })
-            .catch(function(){ showToast("Delete failed", true); });
-        }
-      });
+      // Photo delete + edit check (delegate once — renderSheet runs often)
+      var sb = $("sheet-body");
+      if (sb && !sb._yardDelEv) {
+        sb._yardDelEv = true;
+        sb.addEventListener("click", function(e){
+          var editB = e.target.closest("[data-edit-check]");
+          if (editB) {
+            e.preventDefault();
+            var cid = parseInt(editB.getAttribute("data-edit-check"), 10);
+            var ch = findCheckById(cid);
+            if (ch) openEditCheckModal(ch);
+            return;
+          }
+          var del = e.target.closest("[data-del-photo]");
+          if (del) {
+            e.preventDefault();
+            var pid = del.getAttribute("data-del-photo");
+            if (!confirm("Delete this photo?")) return;
+            fetch("/api/yard/photo/" + pid, { method: "DELETE" })
+              .then(function(){
+                if (!state.detail) return;
+                state.detail.photos = (state.detail.photos || []).filter(function(p){ return String(p.id) !== String(pid); });
+                if (state.openId) state.photoCache[state.openId] = state.detail.photos;
+                renderSheet();
+                showToast("Photo deleted");
+              })
+              .catch(function(){ showToast("Delete failed", true); });
+          }
+        });
+      }
     }
 
     function onPhotoPicked(e){
       var input = e.target;
       var file = input.files && input.files[0];
       if (!file || !state.openId) return;
+      if (!requireWalkerName()) {
+        input.value = "";
+        return;
+      }
       var fd = new FormData();
       fd.append("assetId", state.openId);
       fd.append("photo", file, file.name || "photo.jpg");
-      if (state.walker) fd.append("uploadedBy", state.walker);
+      fd.append("uploadedBy", (state.walker || "").trim());
       var btn = input.parentElement;
       btn.style.opacity = "0.5";
       fetch("/api/yard/photo", { method: "POST", body: fd })
@@ -4704,7 +5965,7 @@ function renderYardAppHtml(): string {
           return r.json();
         })
         .then(function(j){
-          if (!state.detail) state.detail = { asset: null, photos: [], checks: [] };
+          if (!state.detail) state.detail = { asset: null, photos: [], checks: [], checkEdits: [] };
           state.detail.photos = state.detail.photos || [];
           state.detail.photos.unshift(j.photo);
           if (state.openId) state.photoCache[state.openId] = state.detail.photos;
@@ -4725,6 +5986,12 @@ function renderYardAppHtml(): string {
 
     function saveCheck(){
       if (state.saving || !state.openId) return;
+      if (!requireWalkerName()) return;
+      var loc = (state.draft.location || "").trim();
+      if (!loc) {
+        showToast("Enter where the vehicle is parked before marking checked.", true);
+        return;
+      }
       state.saving = true;
       var btn = $("save-btn");
       btn.classList.add("saving");
@@ -4737,7 +6004,7 @@ function renderYardAppHtml(): string {
           location: state.draft.location,
           discrepancies: state.draft.discrepancies,
           status: "present",
-          checkedBy: state.walker
+          checkedBy: (state.walker || "").trim()
         })
       })
         .then(function(r){
@@ -4750,11 +6017,12 @@ function renderYardAppHtml(): string {
           var a = state.assets.find(function(x){ return x.assetId === state.openId; });
           if (a) {
             a.lastCheckedAtIso = new Date().toISOString();
-            a.lastCheckedBy = state.walker || a.lastCheckedBy;
+            a.lastCheckedBy = (state.walker || "").trim() || a.lastCheckedBy;
             a.daysSinceLastCheck = 0;
             a.rollingState = "fresh";
             a.isNeverChecked = false;
             if (state.draft.location) a.lastLocation = state.draft.location;
+            a.lastNotes = state.draft.discrepancies || "";
           }
           // Update totals quickly
           if (state.roster && state.roster.totals) {
@@ -4784,6 +6052,8 @@ function renderYardAppHtml(): string {
       $("find-asset-id").value = "";
       $("find-location").value = "";
       $("find-notes").value = "";
+      var fp = $("find-photos-input");
+      if (fp) fp.value = "";
       setTimeout(function(){ $("find-asset-id").focus(); }, 50);
     }
     function closeFindModal(){
@@ -4794,8 +6064,13 @@ function renderYardAppHtml(): string {
     function saveFind(){
       var id = ($("find-asset-id").value || "").trim();
       if (!id) { showToast("Asset ID required", true); return; }
+      if (!requireWalkerName()) return;
       var loc = ($("find-location").value || "").trim();
       var notes = ($("find-notes").value || "").trim();
+      if (!loc) {
+        showToast("Enter where the vehicle is parked before logging.", true);
+        return;
+      }
       var btn = $("find-save");
       btn.disabled = true;
       btn.textContent = "Saving\u2026";
@@ -4804,21 +6079,52 @@ function renderYardAppHtml(): string {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           assetId: id, location: loc, discrepancies: notes,
-          status: "present", checkedBy: state.walker
+          status: "present", checkedBy: (state.walker || "").trim()
         })
       })
         .then(function(r){
           if (!r.ok) return r.json().then(function(j){ throw new Error(j.error || "save failed"); });
           return r.json();
         })
-        .then(function(){
-          showToast("Logged " + id);
-          closeFindModal();
-          loadRoster().then(function(){
-            // Drop the user straight into the asset's detail so they can add
-            // a photo / notes without searching for it.
-            openSheet(id);
-          });
+        .then(function(j){
+          var checkId = j && j.check && j.check.id;
+          var photoInp = $("find-photos-input");
+          var files = photoInp && photoInp.files ? Array.prototype.slice.call(photoInp.files) : [];
+          var by = (state.walker || "").trim();
+          function doneUi(msg){
+            showToast(msg);
+            closeFindModal();
+            if (photoInp) photoInp.value = "";
+            loadRoster().then(function(){
+              openSheet(id);
+            });
+          }
+          if (!files.length) {
+            doneUi("Logged " + id);
+            return;
+          }
+          function uploadAt(index){
+            if (index >= files.length) {
+              doneUi("Logged " + id + " \u00B7 " + files.length + " photo" + (files.length === 1 ? "" : "s"));
+              return;
+            }
+            var fd = new FormData();
+            fd.append("assetId", id);
+            fd.append("photo", files[index], files[index].name || "photo.jpg");
+            fd.append("uploadedBy", by);
+            if (checkId != null) fd.append("checkId", String(checkId));
+            fetch("/api/yard/photo", { method: "POST", body: fd })
+              .then(function(r){
+                if (!r.ok) return r.json().then(function(x){ throw new Error(x.error || "upload failed"); });
+                return r.json();
+              })
+              .then(function(){ uploadAt(index + 1); })
+              .catch(function(e){
+                showToast(e.message || "Photo upload failed", true);
+                doneUi("Logged " + id);
+              });
+          }
+          uploadAt(0);
         })
         .catch(function(err){
           showToast(err.message || "Save failed", true);
@@ -4831,13 +6137,31 @@ function renderYardAppHtml(): string {
 
     /* ----- wire-up ----- */
     document.addEventListener("click", function(e){
+      var eb = e.target.closest("[data-edit-check]");
+      if (eb && !eb.closest("#sheet-body")) {
+        var cid = parseInt(eb.getAttribute("data-edit-check"), 10);
+        if (Number.isFinite(cid)) {
+          var ch = findCheckById(cid);
+          if (ch) { openEditCheckModal(ch); return; }
+        }
+      }
       var row = e.target.closest(".row[data-id]");
       if (row) { openSheet(row.getAttribute("data-id")); return; }
-      var chip = e.target.closest("#filters .chip");
-      if (chip) {
-        document.querySelectorAll("#filters .chip").forEach(function(c){ c.classList.remove("active"); });
-        chip.classList.add("active");
-        state.filter = chip.getAttribute("data-filter") || "all";
+      var wedit = e.target.closest(".walker-edit");
+      if (wedit && (wedit.closest("#walker") || wedit.closest("#walker-desk"))) {
+        e.preventDefault();
+        state.walker = "";
+        renderWalker();
+        if (typeof syncChiprowOffset === "function") syncChiprowOffset();
+        return;
+      }
+      var chip = e.target.closest(".yard-filter-btn");
+      if (chip && chip.closest("#filters, #filters-desk")) {
+        var f = chip.getAttribute("data-filter") || "all";
+        document.querySelectorAll("#filters .yard-filter-btn, #filters-desk .yard-filter-btn").forEach(function(c){
+          c.classList.toggle("active", c.getAttribute("data-filter") === f);
+        });
+        state.filter = f;
         renderList();
         return;
       }
@@ -4846,24 +6170,41 @@ function renderYardAppHtml(): string {
     $("sheet-back").addEventListener("click", closeSheet);
     $("save-btn").addEventListener("click", saveCheck);
     $("find-btn").addEventListener("click", openFindModal);
+    var findDesk = $("find-btn-desk");
+    if (findDesk) findDesk.addEventListener("click", openFindModal);
     $("find-cancel").addEventListener("click", closeFindModal);
     $("find-save").addEventListener("click", saveFind);
     $("find-modal").addEventListener("click", function(e){
       if (e.target === e.currentTarget) closeFindModal();
     });
+    $("edit-check-cancel").addEventListener("click", closeEditCheckModal);
+    $("edit-check-delete").addEventListener("click", deleteEditCheck);
+    $("edit-check-save").addEventListener("click", saveEditCheck);
+    $("edit-check-modal").addEventListener("click", function(e){
+      if (e.target === e.currentTarget) closeEditCheckModal();
+    });
 
     var searchTimer;
-    $("search").addEventListener("input", function(e){
-      clearTimeout(searchTimer);
-      searchTimer = setTimeout(function(){
-        state.search = e.target.value || "";
-        renderList();
-      }, 120);
-    });
+    function wireSearchInput(el){
+      if (!el) return;
+      el.addEventListener("input", function(e){
+        var target = e.target;
+        clearTimeout(searchTimer);
+        searchTimer = setTimeout(function(){
+          state.search = target.value || "";
+          var other = target.id === "search" ? $("search-desk") : $("search");
+          if (other && other !== target) other.value = target.value;
+          renderList();
+        }, 120);
+      });
+    }
+    wireSearchInput($("search"));
+    wireSearchInput($("search-desk"));
 
     // ESC key for desktop testing
     document.addEventListener("keydown", function(e){
       if (e.key === "Escape") {
+        if ($("edit-check-modal").classList.contains("open")) { closeEditCheckModal(); return; }
         if ($("find-modal").classList.contains("open")) { closeFindModal(); return; }
         if (state.openId) closeSheet();
       }
@@ -4878,6 +6219,10 @@ function renderYardAppHtml(): string {
       var topbar = $("topbar");
       var chiprow = document.querySelector(".chiprow");
       if (!topbar || !chiprow) return;
+      if (window.matchMedia("(min-width: 960px)").matches) {
+        chiprow.style.top = "";
+        return;
+      }
       var h = topbar.getBoundingClientRect().height;
       chiprow.style.top = "calc(var(--safe-top) + " + Math.round(h) + "px)";
     }
@@ -4885,8 +6230,15 @@ function renderYardAppHtml(): string {
     if (ro) ro.observe($("topbar"));
     window.addEventListener("resize", syncChiprowOffset);
 
+    document.querySelectorAll("a.topbar-apps, a.yard-desktop-apps").forEach(function (el) {
+      el.addEventListener("click", function (e) {
+        e.preventDefault();
+        window.location.assign(el.href);
+      });
+    });
+
     renderWalker();
-    loadRoster().then(syncChiprowOffset);
+    loadRoster().then(function(){ syncChiprowOffset(); wireYardDesk(); });
     setInterval(loadRoster, 30000);
   })();
   </script>
@@ -4901,42 +6253,45 @@ function renderDashboardHtml(): string {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="color-scheme" content="dark light" />
-  <meta name="etic-ui" content="ia-rebuild-v4" />
+  <meta name="color-scheme" content="light" />
+  <meta name="theme-color" content="#003a8c" />
+  <meta name="etic-ui" content="usaf-light-v1" />
   <title>${escapedTitle}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;500;600;700&family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
   <style>
     :root {
-      color-scheme: dark;
-      /* neutral warm-cool near-black palette */
-      --bg0: #0a0a0d;
-      --bg1: #0e0e12;
-      --surface: #131318;
-      --surface-elev: #17171d;
-      --surface-solid: #131318;
-      --border: rgba(255, 255, 255, 0.06);
-      --border-strong: rgba(255, 255, 255, 0.12);
-      --text: #f4f5f7;
-      --text-dim: #c8ccd4;
-      --muted: #8a8f9b;
-      --subtle: #5a5f6b;
-      --accent: #8ab4ff;
-      --accent-strong: #a7c4ff;
-      --accent-dim: #4f6fb8;
-      --accent-soft: rgba(138, 180, 255, 0.12);
-      --success: #5ee397;
-      --warn: #f5c754;
-      --danger: #ff8a8a;
-      --glow: rgba(138, 180, 255, 0.10);
-      --radius: 14px;
-      --radius-sm: 10px;
-      --radius-lg: 20px;
-      --shadow-sm: 0 1px 2px rgba(0,0,0,0.3), 0 1px 1px rgba(0,0,0,0.2);
-      --shadow-md: 0 4px 16px rgba(0,0,0,0.35), 0 1px 2px rgba(0,0,0,0.25);
-      --shadow-lg: 0 12px 40px rgba(0,0,0,0.45), 0 2px 6px rgba(0,0,0,0.25);
-      --font: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      color-scheme: light;
+      /* USAF / Federal-government light palette.
+         Air Force blue: #003a8c. Page bg is a near-white cool gray. */
+      --bg0: #f3f5f8;
+      --bg1: #e9edf3;
+      --bg2: #f0f3f8;
+      --surface: #ffffff;
+      --surface-elev: #ffffff;
+      --surface-solid: #ffffff;
+      --border: rgba(15, 30, 60, 0.12);
+      --border-strong: rgba(15, 30, 60, 0.22);
+      --text: #0a1a3a;
+      --text-dim: #2c3a55;
+      --muted: #5b6675;
+      --subtle: #8a94a4;
+      --accent: #003a8c;
+      --accent-strong: #00276b;
+      --accent-dim: #6286c4;
+      --accent-soft: rgba(0, 58, 140, 0.08);
+      --success: #157f3a;
+      --warn: #a0670a;
+      --danger: #b00020;
+      --glow: rgba(0, 58, 140, 0.10);
+      --radius: 8px;
+      --radius-sm: 6px;
+      --radius-lg: 12px;
+      --shadow-sm: 0 1px 2px rgba(15,30,60,0.06);
+      --shadow-md: 0 2px 8px rgba(15,30,60,0.08), 0 1px 2px rgba(15,30,60,0.04);
+      --shadow-lg: 0 8px 24px rgba(15,30,60,0.12), 0 2px 6px rgba(15,30,60,0.06);
+      --font: "Source Sans 3", "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
       --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
     }
     * { box-sizing: border-box; }
@@ -4945,45 +6300,70 @@ function renderDashboardHtml(): string {
       margin: 0;
       min-height: 100vh;
       font-family: var(--font);
-      font-feature-settings: "cv11", "ss01", "ss03";
       color: var(--text);
-      background:
-        radial-gradient(1200px 600px at 85% -10%, rgba(138,180,255,0.06), transparent 60%),
-        radial-gradient(900px 500px at 10% 100%, rgba(167,140,255,0.04), transparent 60%),
-        var(--bg0);
+      background: var(--bg0);
       background-attachment: fixed;
-      letter-spacing: -0.005em;
+      letter-spacing: 0;
+    }
+    /* Government-style accent strap at the very top of every page. */
+    body::before {
+      content: "";
+      display: block;
+      height: 4px;
+      background: linear-gradient(90deg, #003a8c 0%, #003a8c 60%, #b00020 60%, #b00020 100%);
     }
     .app {
       max-width: 1120px;
       margin: 0 auto;
-      padding: 48px 32px 88px;
+      padding: 0 32px 88px;
     }
-    @media (max-width: 640px) { .app { padding: 28px 20px 56px; } }
+    @media (max-width: 640px) { .app { padding: 0 20px 56px; } }
 
-    /* --- Top brand row ---------------------------------------------------- */
+    /* --- Top brand row (USAF / federal site header) -----------------------
+       Spans the full viewport width but keeps inner content aligned with the
+       .app column. Sits flush under the 4px accent strap. */
     .top {
       display: flex;
       flex-wrap: wrap;
-      align-items: flex-end;
+      align-items: center;
       justify-content: space-between;
-      gap: 24px;
-      margin-bottom: 32px;
+      gap: 20px;
+      margin-left: calc(50% - 50vw);
+      margin-right: calc(50% - 50vw);
+      margin-top: 0;
+      margin-bottom: 24px;
+      padding: 14px max(32px, calc(50vw - 528px));
+      background: var(--accent);
+      color: #ffffff;
+      border-bottom: 3px solid var(--accent-strong);
     }
+    @media (max-width: 640px) {
+      .top { padding: 12px 20px; margin-bottom: 18px; }
+    }
+    .brand { display: flex; align-items: center; gap: 14px; min-width: 0; }
+    .brand-mark {
+      width: 40px; height: 40px; flex: 0 0 auto;
+      border-radius: 4px;
+      background: #ffffff; color: var(--accent);
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 800; font-size: 0.9rem; letter-spacing: 0.04em;
+      border: 1px solid rgba(255,255,255,0.6);
+    }
+    .brand-text { min-width: 0; }
     .brand h1 {
-      margin: 0 0 8px;
-      font-size: clamp(1.6rem, 2.6vw, 2rem);
+      margin: 0;
+      font-size: clamp(1.05rem, 2vw, 1.25rem);
       font-weight: 700;
-      letter-spacing: -0.035em;
-      line-height: 1.1;
-      color: var(--text);
+      letter-spacing: -0.01em;
+      line-height: 1.15;
+      color: #ffffff;
     }
     .brand p {
-      margin: 0;
-      color: var(--muted);
-      font-size: 0.95rem;
-      max-width: 46ch;
-      line-height: 1.5;
+      margin: 2px 0 0;
+      color: rgba(255,255,255,0.85);
+      font-size: 0.82rem;
+      max-width: 60ch;
+      line-height: 1.35;
     }
 
     /* --- Picker / select -------------------------------------------------- */
@@ -5003,41 +6383,40 @@ function renderDashboardHtml(): string {
     select, select#etic-date {
       appearance: none;
       width: 100%;
-      padding: 12px 42px 12px 14px;
+      padding: 10px 38px 10px 12px;
       font-family: var(--font);
       font-size: 0.95rem;
       font-weight: 500;
       color: var(--text);
-      background: var(--surface) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='18' height='18' viewBox='0 0 24 24' fill='none' stroke='%238a8f9b' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E") no-repeat right 14px center;
+      background: var(--surface) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='18' height='18' viewBox='0 0 24 24' fill='none' stroke='%235b6675' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E") no-repeat right 12px center;
       border: 1px solid var(--border-strong);
       border-radius: var(--radius-sm);
       cursor: pointer;
       transition: border-color 0.15s ease, box-shadow 0.15s ease;
     }
-    select:hover { border-color: rgba(255,255,255,0.2); }
+    select:hover { border-color: var(--accent); }
     select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
-    /* Make the native popup readable on Windows/Chromium dark mode. */
-    select { color-scheme: dark; }
+    select { color-scheme: light; }
     select option,
     select optgroup {
-      background-color: #161922;
-      color: #e8eaf0;
+      background-color: #ffffff;
+      color: var(--text);
     }
     select option:checked,
     select option:hover {
-      background-color: #2a3042;
-      color: #ffffff;
+      background-color: #e6efff;
+      color: var(--text);
     }
 
     /* --- Segmented nav ---------------------------------------------------- */
     .main-nav {
       display: inline-flex;
-      gap: 4px;
+      gap: 2px;
       padding: 4px;
-      margin-bottom: 40px;
+      margin-bottom: 24px;
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 12px;
+      border-radius: 8px;
       box-shadow: var(--shadow-sm);
     }
     .main-nav button {
@@ -5054,11 +6433,12 @@ function renderDashboardHtml(): string {
     }
     .main-nav button:hover { color: var(--text); }
     .main-nav button.active {
-      background: var(--surface-elev);
-      color: var(--text);
-      border-color: var(--border-strong);
-      box-shadow: 0 1px 2px rgba(0,0,0,0.3);
+      background: var(--accent);
+      color: #ffffff;
+      border-color: var(--accent);
+      box-shadow: 0 1px 2px rgba(0,0,0,0.08);
     }
+    .main-nav button.active:hover { color: #ffffff; }
 
     /* --- Hero page header ------------------------------------------------- */
     .hero {
@@ -5164,10 +6544,7 @@ function renderDashboardHtml(): string {
       font-weight: 800;
     }
     .kpi-val-mc {
-      background: linear-gradient(180deg, #ffffff 0%, #a7c4ff 55%, #6890e8 100%);
-      -webkit-background-clip: text;
-      background-clip: text;
-      color: transparent;
+      color: var(--accent);
     }
     .kpi-val-fleet { color: var(--text); }
     .kpi-val-fmc { color: var(--success); }
@@ -5298,8 +6675,8 @@ function renderDashboardHtml(): string {
       font-size: 0.68rem;
       border-bottom: 1px solid var(--border-strong);
     }
-    .compare-table tbody tr:nth-child(even) td { background: rgba(255,255,255,0.015); }
-    .compare-table tbody tr:nth-child(even) td:first-child { background: rgba(255,255,255,0.015); }
+    .compare-table tbody tr:nth-child(even) td { background: rgba(15,30,60,0.025); }
+    .compare-table tbody tr:nth-child(even) td:first-child { background: rgba(15,30,60,0.025); }
     .compare-table tbody tr:hover td { background: var(--accent-soft); }
     .compare-table tbody tr:hover td:first-child { background: var(--accent-soft); }
     .compare-table .mc { color: var(--accent-strong); font-weight: 600; }
@@ -5308,7 +6685,7 @@ function renderDashboardHtml(): string {
     .compare-table .surp { color: var(--warn); }
     .compare-table tr[data-in-range="true"] td,
     .compare-table tr[data-in-range="true"] td:first-child {
-      background: rgba(138,180,255,0.06);
+      background: rgba(0,58,140,0.06);
     }
     .compare-table tr[data-selected="true"] td,
     .compare-table tr[data-selected="true"] td:first-child {
@@ -5349,8 +6726,8 @@ function renderDashboardHtml(): string {
       transition: border-color 0.15s ease, background 0.15s ease, transform 0.08s ease;
     }
     .btn-etic:hover:not(:disabled) {
-      border-color: rgba(138,180,255,0.4);
-      background: rgba(138,180,255,0.06);
+      border-color: rgba(0,58,140,0.4);
+      background: rgba(0,58,140,0.06);
     }
     .btn-etic:active:not(:disabled) { transform: translateY(1px); }
     .btn-etic:disabled { opacity: 0.45; cursor: not-allowed; }
@@ -5372,7 +6749,7 @@ function renderDashboardHtml(): string {
       transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.08s ease;
     }
     .yard-export-btn:hover:not(:disabled) {
-      border-color: rgba(138,180,255,0.4);
+      border-color: rgba(0,58,140,0.4);
       box-shadow: var(--shadow-md);
     }
     .yard-export-btn:active:not(:disabled) { transform: translateY(1px); }
@@ -5386,7 +6763,7 @@ function renderDashboardHtml(): string {
       align-items: center;
       justify-content: center;
       background: var(--accent-soft);
-      border: 1px solid rgba(138,180,255,0.2);
+      border: 1px solid rgba(0,58,140,0.2);
       color: var(--accent-strong);
     }
     .yard-export-btn .icon-wrap svg { width: 24px; height: 24px; }
@@ -5444,30 +6821,80 @@ function renderDashboardHtml(): string {
       border-radius: var(--radius-sm);
       border: 1px solid var(--accent-dim);
       background: var(--accent);
-      color: #0a0a0d;
+      color: #0a1a3a;
       cursor: pointer;
       transition: background 0.15s ease, transform 0.08s ease;
     }
     .btn-primary:hover { background: var(--accent-strong); }
     .btn-primary:active { transform: translateY(1px); }
-    /* --- Detail pane: facts + remarks + stale banner --------------------- */
+    /* --- Detail pane: layout stack + grouped facts ------------------------ */
+    .wo-detail-inner {
+      display: flex;
+      flex-direction: column;
+      gap: 22px;
+    }
+    .wo-detail-overview {
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 2px;
+    }
+    .wo-detail-block { margin: 0; }
+    .wo-detail-block-title {
+      margin: 0 0 12px;
+      font-size: 0.72rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      color: var(--muted);
+    }
+    #wo-facts-wrap.hidden { display: none; }
+
     .wo-facts {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-      gap: 14px 24px;
-      margin: 22px 0 8px;
-      padding: 16px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+      margin: 0;
+      padding: 16px 18px;
       background: var(--bg1);
       border: 1px solid var(--border);
       border-radius: var(--radius);
     }
-    .wo-facts dt { font-size: 0.64rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); margin: 0 0 5px; }
-    .wo-facts dd { margin: 0; font-size: 0.9rem; line-height: 1.4; word-break: break-word; color: var(--text-dim); font-variant-numeric: tabular-nums; }
     .wo-facts:empty { display: none; }
+    .wo-facts-group { margin: 0; }
+    .wo-facts-group-h {
+      margin: 0 0 10px;
+      font-size: 0.65rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--subtle);
+    }
+    .wo-facts-dl {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+      gap: 12px 20px;
+      margin: 0;
+    }
+    .wo-facts-pair { margin: 0; min-width: 0; }
+    .wo-facts-pair dt {
+      font-size: 0.62rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      margin: 0 0 4px;
+    }
+    .wo-facts-pair dd {
+      margin: 0;
+      font-size: 0.92rem;
+      line-height: 1.45;
+      word-break: break-word;
+      color: var(--text);
+      font-variant-numeric: tabular-nums;
+    }
 
     .wo-remarks-card {
-      margin-top: 18px;
-      padding: 16px 20px;
+      margin-top: 0;
+      padding: 16px 18px;
       border-radius: var(--radius);
       background: var(--bg1);
       border: 1px solid var(--border);
@@ -5479,12 +6906,8 @@ function renderDashboardHtml(): string {
       gap: 12px;
       margin-bottom: 10px;
     }
-    .wo-remarks-head .t {
-      font-size: 0.7rem;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.1em;
-      color: var(--muted);
+    .wo-remarks-head .wo-detail-block-title {
+      margin: 0;
     }
     .wo-remarks-head .when {
       font-size: 0.76rem;
@@ -5493,9 +6916,9 @@ function renderDashboardHtml(): string {
     }
     .wo-remarks-body {
       font-family: var(--font);
-      font-size: 0.9rem;
-      line-height: 1.55;
-      color: var(--text-dim);
+      font-size: 0.95rem;
+      line-height: 1.6;
+      color: var(--text);
       word-break: break-word;
     }
     .wo-remarks-body .sep {
@@ -5511,7 +6934,7 @@ function renderDashboardHtml(): string {
       display: flex;
       align-items: flex-start;
       gap: 10px;
-      margin: 18px 0 0;
+      margin: 0;
       padding: 12px 16px;
       border-radius: var(--radius-sm);
       background: rgba(245, 199, 84, 0.08);
@@ -5544,7 +6967,7 @@ function renderDashboardHtml(): string {
     .tier-below { background: rgba(255, 138, 138, 0.14); color: var(--danger); }
     .tier-at { background: rgba(245, 199, 84, 0.14); color: var(--warn); }
     .tier-above { background: rgba(94, 227, 151, 0.14); color: var(--success); }
-    .tier-unknown { background: rgba(255, 255, 255, 0.06); color: var(--muted); }
+    .tier-unknown { background: rgba(15,30,60,0.08); color: var(--muted); }
 
     /* --- Modal ------------------------------------------------------------ */
     .modal-overlay {
@@ -5563,7 +6986,7 @@ function renderDashboardHtml(): string {
     .modal .log-row:last-child { border-bottom: 0; }
     .modal .log-meta { color: var(--muted); font-size: 0.72rem; margin-bottom: 4px; letter-spacing: 0.02em; }
     .modal-close { background: none; border: none; color: var(--muted); font-size: 1.3rem; cursor: pointer; line-height: 1; padding: 4px 8px; border-radius: 6px; transition: background 0.15s ease, color 0.15s ease; }
-    .modal-close:hover { background: rgba(255,255,255,0.05); color: var(--text); }
+    .modal-close:hover { background: rgba(15,30,60,0.06); color: var(--text); }
 
     /* --- Utilities / misc ------------------------------------------------- */
     .yard-status-wrap { margin-top: 14px; }
@@ -5588,7 +7011,7 @@ function renderDashboardHtml(): string {
     }
     .empty-state strong { color: var(--text); font-weight: 600; }
     .hidden { display: none !important; }
-    ::selection { background: rgba(138, 180, 255, 0.28); color: var(--text); }
+    ::selection { background: rgba(0,58,140, 0.28); color: var(--text); }
 
     /* --- Date picker (snapshot screen) ----------------------------------- */
     .date-picker {
@@ -5713,7 +7136,7 @@ function renderDashboardHtml(): string {
       margin-right: 4px;
     }
     .preset-chip {
-      background: rgba(255,255,255,0.04);
+      background: rgba(15,30,60,0.05);
       border: 1px solid var(--border);
       color: var(--text);
       padding: 4px 10px;
@@ -5727,8 +7150,8 @@ function renderDashboardHtml(): string {
       line-height: 1.2;
     }
     .preset-chip:hover:not(:disabled) {
-      background: rgba(138,180,255,0.10);
-      border-color: rgba(138,180,255,0.35);
+      background: rgba(0,58,140,0.10);
+      border-color: rgba(0,58,140,0.35);
       color: var(--accent);
     }
     .preset-chip:disabled {
@@ -5736,14 +7159,14 @@ function renderDashboardHtml(): string {
       cursor: not-allowed;
     }
     .preset-chip.active {
-      background: rgba(138,180,255,0.16);
+      background: rgba(0,58,140,0.16);
       border-color: var(--accent);
       color: var(--accent);
     }
     .cmp-preset-row {
       margin: 6px 0 12px;
       padding: 8px 12px;
-      background: rgba(255,255,255,0.02);
+      background: rgba(15,30,60,0.03);
       border: 1px solid var(--border);
       border-radius: 10px;
     }
@@ -5764,8 +7187,8 @@ function renderDashboardHtml(): string {
     }
     .bd-tile-delta.up { color: var(--success); background: rgba(94,227,151,0.12); }
     .bd-tile-delta.down { color: var(--danger); background: rgba(255,138,138,0.12); }
-    .bd-tile-delta.flat { color: var(--muted); background: rgba(255,255,255,0.05); }
-    .bd-tile-delta.new { color: var(--accent); background: rgba(138,180,255,0.12); }
+    .bd-tile-delta.flat { color: var(--muted); background: rgba(15,30,60,0.06); }
+    .bd-tile-delta.new { color: var(--accent); background: rgba(0,58,140,0.12); }
     .bd-tile-delta-sub {
       font-size: 0.68rem;
       color: var(--muted);
@@ -5788,9 +7211,9 @@ function renderDashboardHtml(): string {
       cursor: pointer;
       transition: border-color 0.12s ease, color 0.12s ease, background 0.12s ease;
     }
-    .bd-tab:hover { color: var(--text); border-color: rgba(255,255,255,0.22); }
+    .bd-tab:hover { color: var(--text); border-color: rgba(15,30,60,0.32); }
     .bd-tab.active {
-      color: #0a0a0d;
+      color: #0a1a3a;
       background: var(--accent);
       border-color: var(--accent);
     }
@@ -5808,7 +7231,7 @@ function renderDashboardHtml(): string {
       flex-direction: column;
       gap: 6px;
     }
-    .bd-tile.is-nce { border-color: rgba(138,180,255,0.32); background: rgba(138,180,255,0.04); }
+    .bd-tile.is-nce { border-color: rgba(0,58,140,0.32); background: rgba(0,58,140,0.04); }
     .bd-tile-label {
       font-size: 0.74rem;
       font-weight: 600;
@@ -5972,7 +7395,7 @@ function renderDashboardHtml(): string {
       text-transform: uppercase;
       color: var(--accent);
       background: var(--accent-soft);
-      border: 1px solid rgba(138,180,255,0.24);
+      border: 1px solid rgba(0,58,140,0.24);
       white-space: nowrap;
     }
     .wo-asof-pill::before {
@@ -6228,10 +7651,10 @@ function renderDashboardHtml(): string {
       cursor: pointer;
       transition: color 0.12s ease, border-color 0.12s ease, background 0.12s ease;
     }
-    .wo-filter-btn:hover { color: var(--text); border-color: rgba(255,255,255,0.2); }
+    .wo-filter-btn:hover { color: var(--text); border-color: rgba(15,30,60,0.30); }
     .wo-filter-btn.active {
       background: var(--accent-soft);
-      border-color: rgba(138,180,255,0.4);
+      border-color: rgba(0,58,140,0.4);
       color: var(--accent-strong);
     }
     .wo-filter-btn .count {
@@ -6273,7 +7696,7 @@ function renderDashboardHtml(): string {
       font-weight: 500;
       padding: 2px 7px;
       border-radius: 999px;
-      background: rgba(255,255,255,0.04);
+      background: rgba(15,30,60,0.05);
       color: var(--text-dim);
       letter-spacing: 0.01em;
       font-variant-numeric: tabular-nums;
@@ -6337,7 +7760,7 @@ function renderDashboardHtml(): string {
     .wo-card:hover { background: var(--bg1); border-color: var(--border); }
     .wo-card.active {
       background: var(--accent-soft);
-      border-color: rgba(138,180,255,0.4);
+      border-color: rgba(0,58,140,0.4);
     }
     .wo-card .top-line {
       display: flex;
@@ -6345,17 +7768,30 @@ function renderDashboardHtml(): string {
       justify-content: space-between;
       gap: 10px;
     }
+    .wo-card .wo-card-asset-row {
+      margin-top: 2px;
+      align-items: baseline;
+    }
     .wo-card .wo-id {
       font-family: var(--font-mono);
-      font-size: 0.88rem;
-      font-weight: 500;
+      font-size: 0.92rem;
+      font-weight: 600;
       color: var(--text);
       letter-spacing: -0.01em;
     }
     .wo-card .asset {
-      font-size: 0.76rem;
-      color: var(--muted);
+      font-size: 0.8rem;
+      color: var(--text-dim);
       font-variant-numeric: tabular-nums;
+    }
+    .wo-card .asset.parts-inline {
+      font-size: 0.74rem;
+      color: var(--muted);
+      text-align: right;
+      max-width: 55%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     .wo-card .badges { display: inline-flex; gap: 6px; align-items: center; flex-shrink: 0; }
     .wo-card .chip {
@@ -6382,7 +7818,7 @@ function renderDashboardHtml(): string {
     .sighting-badge.sighting-fresh { background: rgba(94,227,151,0.10); color: #8bd9ae; border-color: rgba(94,227,151,0.25); }
     .sighting-badge.sighting-stale { background: rgba(245,199,84,0.12);  color: #e6c66d; border-color: rgba(245,199,84,0.30); }
     .sighting-badge.sighting-old   { background: rgba(255,138,138,0.10); color: #e69b9b; border-color: rgba(255,138,138,0.30); }
-    .sighting-badge.sighting-never { background: rgba(255,255,255,0.04); color: var(--muted); border-color: rgba(255,255,255,0.08); }
+    .sighting-badge.sighting-never { background: rgba(15,30,60,0.05); color: var(--muted); border-color: rgba(15,30,60,0.12); }
     .wo-card .meta {
       display: flex;
       flex-wrap: wrap;
@@ -6408,14 +7844,29 @@ function renderDashboardHtml(): string {
 
     /* NCE chip + WO open date + WO reason chips on cards */
     .chip.nce {
-      background: rgba(138,180,255,0.15);
+      background: rgba(0,58,140,0.15);
       color: var(--accent);
-      border: 1px solid rgba(138,180,255,0.42);
+      border: 1px solid rgba(0,58,140,0.42);
       font-weight: 700;
       letter-spacing: 0.06em;
       padding: 2px 8px;
       border-radius: 999px;
       font-size: 0.66rem;
+    }
+    .chip.smx-missing {
+      background: rgba(160,103,10,0.14); color: var(--warn); border: 1px solid rgba(160,103,10,0.45);
+      font-weight: 600; font-size: 0.64rem;
+    }
+    .chip.smx-overdue {
+      background: rgba(176,0,32,0.14); color: var(--danger); border: 1px solid rgba(176,0,32,0.45);
+      font-weight: 700; font-size: 0.64rem;
+    }
+    .chip.smx-overdue.smx-nce-critical {
+      background: rgba(120,0,40,0.22); box-shadow: 0 0 0 1px rgba(176,0,32,0.55);
+    }
+    .chip.smx-soon {
+      background: rgba(245,199,84,0.18); color: #8a5a00; border: 1px solid rgba(212,160,20,0.5);
+      font-weight: 600; font-size: 0.64rem;
     }
     .wo-card[data-nce="1"] {
       box-shadow: inset 3px 0 0 var(--accent);
@@ -6436,8 +7887,8 @@ function renderDashboardHtml(): string {
       font-size: 0.78rem;
       color: var(--text-dim);
       line-height: 1.45;
-      background: rgba(138,180,255,0.04);
-      border-left: 2px solid rgba(138,180,255,0.32);
+      background: rgba(0,58,140,0.04);
+      border-left: 2px solid rgba(0,58,140,0.32);
       padding: 4px 10px;
       border-radius: 4px;
     }
@@ -6476,8 +7927,8 @@ function renderDashboardHtml(): string {
 
     /* --- Detail pane: hero + kpis ---------------------------------------- */
     .wo-hero {
-      padding: 2px 0 18px;
-      border-bottom: 1px solid var(--border);
+      padding: 2px 0 0;
+      border-bottom: none;
     }
     .wo-hero-row {
       display: flex;
@@ -6511,19 +7962,19 @@ function renderDashboardHtml(): string {
     .wo-chip.tier-below { background: rgba(255,138,138,0.14); color: var(--danger); border-color: rgba(255,138,138,0.3); }
     .wo-chip.tier-at { background: rgba(245,199,84,0.14); color: var(--warn); border-color: rgba(245,199,84,0.3); }
     .wo-chip.tier-above { background: rgba(94,227,151,0.14); color: var(--success); border-color: rgba(94,227,151,0.3); }
-    .wo-chip.tier-unknown { background: rgba(255,255,255,0.05); color: var(--muted); border-color: rgba(255,255,255,0.08); }
+    .wo-chip.tier-unknown { background: rgba(15,30,60,0.06); color: var(--muted); border-color: rgba(15,30,60,0.12); }
     .wo-chip.nce {
-      background: rgba(138,180,255,0.14);
+      background: rgba(0,58,140,0.14);
       color: var(--accent);
-      border-color: rgba(138,180,255,0.42);
+      border-color: rgba(0,58,140,0.42);
       letter-spacing: 0.10em;
       font-weight: 700;
     }
     .wo-hero-reason {
       margin-top: 14px;
       padding: 10px 14px;
-      background: rgba(138,180,255,0.05);
-      border-left: 3px solid rgba(138,180,255,0.38);
+      background: rgba(0,58,140,0.05);
+      border-left: 3px solid rgba(0,58,140,0.38);
       border-radius: 6px;
       color: var(--text-dim);
       font-size: 0.92rem;
@@ -6539,10 +7990,20 @@ function renderDashboardHtml(): string {
       font-weight: 700;
     }
     .wo-hero-sub {
-      margin-top: 6px;
+      margin-top: 8px;
       font-size: 0.82rem;
       color: var(--muted);
       font-variant-numeric: tabular-nums;
+      line-height: 1.45;
+    }
+    .wo-hero-sub-primary {
+      font-size: 0.88rem;
+      color: var(--text-dim);
+    }
+    .wo-hero-sub-meta {
+      margin-top: 4px;
+      font-size: 0.78rem;
+      color: var(--muted);
     }
     .wo-hero-sub .dot {
       margin: 0 8px;
@@ -6567,8 +8028,8 @@ function renderDashboardHtml(): string {
       gap: 6px;
       padding: 1px 8px;
       border-radius: 6px;
-      background: rgba(138,180,255,0.06);
-      border: 1px solid rgba(138,180,255,0.18);
+      background: rgba(0,58,140,0.06);
+      border: 1px solid rgba(0,58,140,0.18);
       color: var(--text-dim);
       font-variant-numeric: normal;
     }
@@ -6583,7 +8044,7 @@ function renderDashboardHtml(): string {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 10px;
-      margin: 18px 0 4px;
+      margin: 16px 0 0;
       container-type: inline-size;
       container-name: kpis;
     }
@@ -6643,15 +8104,20 @@ function renderDashboardHtml(): string {
     /* --- WO Timeline ------------------------------------------------------ */
     .wo-timeline-head {
       display: flex;
-      align-items: baseline;
+      align-items: center;
       justify-content: space-between;
       gap: 12px;
-      margin-top: 28px;
+      margin: 0 0 12px;
+      padding-top: 8px;
+      border-top: 1px solid var(--border);
+    }
+    .wo-timeline-head .wo-section-title {
+      margin: 0;
     }
     .wo-section-title {
       margin: 0 0 12px;
       font-size: 0.72rem;
-      font-weight: 600;
+      font-weight: 700;
       text-transform: uppercase;
       letter-spacing: 0.1em;
       color: var(--muted);
@@ -6703,6 +8169,8 @@ function renderDashboardHtml(): string {
     .wo-tl-day.has-mel .wo-tl-date::before { border-color: var(--accent); }
     .wo-tl-day.has-remarks .wo-tl-date::before { border-color: var(--accent-strong); }
     .wo-tl-day.has-initial .wo-tl-date::before { border-color: var(--muted); background: var(--muted); }
+    .wo-tl-day.has-meeting .wo-tl-date::before { border-color: #6a3fb8; background: #6a3fb8; }
+    .wo-tl-day.has-yard .wo-tl-date::before { border-color: var(--ok); background: var(--ok); }
     .wo-tl-date .dow {
       color: var(--subtle);
       font-weight: 400;
@@ -6734,18 +8202,38 @@ function renderDashboardHtml(): string {
       border-radius: 999px;
       letter-spacing: 0.06em;
       text-transform: uppercase;
-      background: rgba(255,255,255,0.04);
+      background: rgba(15,30,60,0.05);
       color: var(--text-dim);
       justify-self: start;
       line-height: 1.3;
     }
     .wo-tl-event.field-etic_date_slip .ev-label { background: rgba(255,138,138,0.12); color: var(--danger); }
     .wo-tl-event.field-etic .ev-label { background: rgba(245,199,84,0.1); color: var(--warn); }
-    .wo-tl-event.field-mel_tier .ev-label { background: rgba(138,180,255,0.1); color: var(--accent); }
+    .wo-tl-event.field-mel_tier .ev-label { background: rgba(0,58,140,0.1); color: var(--accent); }
     .wo-tl-event.field-remarks .ev-label { background: rgba(167,196,255,0.1); color: var(--accent-strong); }
     .wo-tl-event.field-parts_status .ev-label { background: rgba(94,227,151,0.1); color: var(--success); }
     .wo-tl-event.field-shop .ev-label { background: rgba(255,196,61,0.12); color: var(--warn); }
     .wo-tl-event.field-initial .ev-label { background: rgba(138,143,155,0.1); color: var(--muted); }
+    .wo-tl-event.meeting-entry .ev-label { background: rgba(106,63,184,0.12); color: #5a3488; }
+    .wo-tl-event.yard-walk .ev-label { background: rgba(21,127,58,0.12); color: var(--ok); }
+    .ev-meet-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+    .ev-meet-title { font-weight: 600; }
+    .ev-meet-block { margin-top: 8px; }
+    .ev-meet-text { white-space: pre-wrap; margin-top: 4px; font-size: 0.9rem; }
+    pre.ev-meet-dueouts {
+      margin: 6px 0 0; padding: 10px 12px; background: var(--bg2); border-radius: 8px;
+      font-size: 0.82rem; white-space: pre-wrap; border: 1px solid var(--border);
+    }
+    .yard-disc-tl { white-space: pre-wrap; margin-top: 4px; font-size: 0.9rem; }
+    .wo-tl-day.has-meeting { border-left: 3px solid rgba(106,63,184,0.45); }
+    .wo-tl-day.has-yard { border-left: 3px solid rgba(21,127,58,0.4); }
+    details.wo-yard-details { border: 1px solid var(--border); border-radius: 10px; padding: 0 14px 12px; background: var(--bg1); }
+    details.wo-yard-details summary { cursor: pointer; padding: 12px 0; list-style: none; }
+    details.wo-yard-details summary::-webkit-details-marker { display: none; }
+    .wo-yard-details-body { display: flex; flex-direction: column; gap: 12px; }
+    .wo-yard-snap-row { padding: 10px 12px; border-radius: 8px; background: var(--bg2); border: 1px solid var(--border); }
+    .wo-yard-snap-meta { font-size: 0.78rem; color: var(--muted); margin-bottom: 6px; }
+    .wo-yard-disc { white-space: pre-wrap; margin-top: 4px; font-size: 0.9rem; }
     /* FM&A hand-logged actions in the timeline */
     .wo-tl-event.fma-action {
       border-left: 2px solid rgba(167,196,255,0.45);
@@ -6803,31 +8291,42 @@ function renderDashboardHtml(): string {
       border: 1px solid var(--border);
       border-radius: 14px;
       padding: 0;
-      margin: 18px 0 14px;
+      margin: 0;
       background: rgba(167,196,255,0.04);
     }
     .wo-action-summary {
-      display: grid;
-      grid-template-columns: auto 1fr auto;
-      gap: 12px;
-      align-items: center;
+      display: flex;
+      flex-direction: row;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 14px;
       padding: 14px 18px;
       cursor: pointer;
       list-style: none;
     }
     .wo-action-summary::-webkit-details-marker { display: none; }
+    .wo-action-summary-text {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      min-width: 0;
+      flex: 1 1 auto;
+    }
     .wo-action-title {
       font-weight: 700;
       font-size: 0.95rem;
       color: var(--text);
     }
     .wo-action-hint {
-      font-size: 0.78rem;
+      font-size: 0.8rem;
       color: var(--muted);
+      line-height: 1.45;
     }
     .wo-action-chev {
       color: var(--muted);
       transition: transform 0.18s ease;
+      flex-shrink: 0;
+      margin-top: 2px;
     }
     .wo-action-card[open] .wo-action-chev { transform: rotate(180deg); }
     .wo-action-form {
@@ -6873,7 +8372,7 @@ function renderDashboardHtml(): string {
     .wo-action-field select:focus {
       outline: none;
       border-color: var(--accent);
-      box-shadow: 0 0 0 2px rgba(138,180,255,0.18);
+      box-shadow: 0 0 0 2px rgba(0,58,140,0.18);
     }
     .wo-action-status {
       font-size: 0.78rem;
@@ -6970,37 +8469,99 @@ function renderDashboardHtml(): string {
     /* ---- Critical slide view ---- */
     .mel-slide { display: block; }
     .mel-slide.hidden { display: none; }
-    .mel-slide-meta { color: var(--muted); font-size: 0.8rem; margin-bottom: 12px; }
-    .mel-slide-body { display: flex; flex-direction: column; gap: 18px; }
-    .slide-unit {
-      background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden;
+    .mel-slide-bar {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 12px; margin-bottom: 12px;
     }
-    .slide-unit-bar {
-      background: #1f3a8a; color: #fff; font-weight: 700; letter-spacing: 0.05em;
-      padding: 8px 14px; font-size: 0.92rem; text-transform: uppercase;
+    .mel-slide-meta { color: var(--muted); font-size: 0.82rem; }
+    .mel-slide-export { padding: 6px 12px; font-size: 0.82rem; }
+    /* overflow-y must not clip sticky thead (page scroll). Horizontal scroll only. */
+    .mel-slide-body {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 8px; overflow-x: auto; overflow-y: visible;
     }
+    /* One single table — fixed column widths so every section stays aligned.
+     * border-collapse: separate so thead position:sticky works reliably. */
     .slide-table {
-      width: 100%; border-collapse: collapse; font-size: 0.82rem;
-      font-variant-numeric: tabular-nums;
+      width: 100%; border-collapse: separate; border-spacing: 0; font-size: 0.85rem;
+      font-variant-numeric: tabular-nums; table-layout: fixed;
     }
-    .slide-table th {
+    .slide-table thead th {
       background: var(--bg1); color: var(--text-dim);
-      text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border);
+      text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border);
       font-size: 0.7rem; letter-spacing: 0.06em; text-transform: uppercase;
+      position: -webkit-sticky; position: sticky; top: 0; z-index: 3;
+      box-shadow: 0 1px 0 var(--border);
     }
+    .slide-table th.num, .slide-table td.num { text-align: right; }
     .slide-table td {
-      padding: 6px 8px; border-bottom: 1px solid var(--border-soft, var(--border));
+      padding: 8px 10px; border-bottom: 1px solid var(--border);
+      color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .slide-table tr.slide-unit-row td {
+      background: var(--accent); color: #ffffff; font-weight: 700; letter-spacing: 0.05em;
+      padding: 8px 12px; font-size: 0.86rem; text-transform: uppercase;
+      border-bottom: 0;
+    }
+    .slide-table tr.slide-row { cursor: pointer; }
+    .slide-table tr.slide-row:hover td { background: var(--accent-soft); }
+    .slide-table tr.slide-row.below { background: rgba(176,0,32,0.06); }
+    .slide-table tr.slide-row.at    { background: rgba(160,103,10,0.06); }
+    .slide-table tr.slide-row.sub td { background: rgba(15,30,60,0.04); }
+    .slide-table tr.slide-row.expanded td { background: var(--accent-soft); }
+    .slide-table .td-type { font-weight: 600; white-space: normal; }
+    .slide-table .td-type.sub { padding-left: 18px; color: var(--text-dim); font-weight: 500; }
+    .slide-table .td-key { font-family: var(--font-mono); font-size: 0.82rem; }
+    .slide-table .cell-bad  { background: rgba(176,0,32,0.18); color: var(--danger); font-weight: 700; }
+    .slide-table .cell-warn { background: rgba(160,103,10,0.18); color: var(--warn); font-weight: 700; }
+    .slide-table .cell-good { color: var(--success); }
+    .slide-table tr.slide-wo-row > td {
+      padding: 0; background: var(--bg1); border-bottom: 2px solid var(--border);
+    }
+    .slide-wo-wrap { padding: 12px 16px 14px; }
+    .slide-wo-head {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 12px; margin-bottom: 8px;
+      font-size: 0.78rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600;
+    }
+    .slide-wo-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+    .slide-wo-table th {
+      text-align: left; padding: 4px 8px; color: var(--muted);
+      font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.06em;
+      border-bottom: 1px solid var(--border); background: transparent; position: static;
+    }
+    .slide-wo-table td {
+      padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top;
+      white-space: normal;
+    }
+    .slide-wo-table .wo-id { font-family: var(--font-mono); font-weight: 600; color: var(--accent); }
+    .slide-wo-table .wo-tier-below { color: var(--danger); font-weight: 700; }
+    .slide-wo-table .wo-remark { color: var(--text); white-space: pre-wrap; word-break: break-word; }
+    .slide-wo-empty { color: var(--muted); font-size: 0.82rem; padding: 6px 0; }
+    /* Asset-grouped expansion: each asset gets a header row then its WOs.
+       Makes "13 open WOs across 7 assets" visually obvious. */
+    .slide-wo-table tr.wo-asset-row > td {
+      background: var(--accent-soft);
+      font-weight: 700;
+      padding: 8px 10px;
+      border-top: 1px solid var(--border);
       color: var(--text);
     }
-    .slide-table tr.slide-row.below { background: rgba(255,90,99,0.06); }
-    .slide-table tr.slide-row.at    { background: rgba(255,194,77,0.05); }
-    .slide-table tr.slide-row.sub td { background: rgba(255,255,255,0.02); }
-    .slide-table .td-type { font-weight: 600; }
-    .slide-table .td-type.sub { padding-left: 18px; color: var(--text-dim); font-weight: 500; }
-    .slide-table .td-key { font-family: var(--mono); }
-    .slide-table .cell-bad  { background: rgba(255,90,99,0.18); color: var(--danger); font-weight: 600; }
-    .slide-table .cell-warn { background: rgba(255,194,77,0.18); color: var(--warn); font-weight: 600; }
-    .slide-table .cell-good { color: var(--success); }
+    .slide-wo-table tr.wo-asset-row .wo-asset-id {
+      font-family: var(--font-mono); color: var(--accent); margin-right: 8px;
+    }
+    .slide-wo-table tr.wo-asset-row .wo-asset-meta {
+      color: var(--muted); font-weight: 500; font-size: 0.78rem; margin-left: 8px;
+    }
+    .slide-wo-table tr.wo-asset-row .wo-asset-veh {
+      margin-left: 10px; font-size: 0.82rem; font-weight: 500;
+      color: var(--text-dim); max-width: min(52vw, 42rem); display: inline-block; vertical-align: bottom;
+    }
+    .slide-wo-table tr.wo-asset-row .wo-asset-make { color: var(--text); }
+    .slide-wo-table tr.wo-asset-row .wo-asset-mgmt {
+      font-family: var(--font-mono); font-weight: 600; color: var(--accent); margin-left: 4px;
+    }
+    .slide-wo-table tr.wo-line td:first-child { padding-left: 18px; }
 
     /* ---- Yard check (mobile-first) ---- */
     #panel-yard .hidden { display: none; }
@@ -7039,12 +8600,12 @@ function renderDashboardHtml(): string {
     .yard-finding-icon {
       width: 38px; height: 38px; border-radius: 10px;
       display: flex; align-items: center; justify-content: center;
-      font-size: 18px; font-weight: 700;
+      font-size: 18px; font-weight: 700; box-sizing: border-box;
     }
-    .yard-finding-icon.missing { background: #3b1416; color: var(--danger); }
-    .yard-finding-icon.unlisted { background: #3a2a05; color: var(--warn); }
-    .yard-finding-icon.discrepancy { background: #3a230f; color: var(--due); }
-    .yard-finding-icon.unknown { background: #2a1a3a; color: var(--never); }
+    .yard-finding-icon.missing { background: #fde8eb; color: var(--danger); border: 1px solid #f1a3ab; }
+    .yard-finding-icon.unlisted { background: #fff8e6; color: #8a5a00; border: 1px solid #e7c779; }
+    .yard-finding-icon.discrepancy { background: #e8eef8; color: #003a8c; border: 1px solid #9fbce0; }
+    .yard-finding-icon.unknown { background: #eef1f5; color: #3d4a5c; border: 1px solid var(--border); }
     .yard-finding-body { min-width: 0; }
     .yard-finding-id { font-weight: 700; font-size: 16px; }
     .yard-finding-meta { color: var(--muted); font-size: 13px; margin-top: 2px; }
@@ -7078,7 +8639,7 @@ function renderDashboardHtml(): string {
       align-self: flex-start; text-transform: uppercase; letter-spacing: 0.4px;
     }
     .yard-activity-row .what.check { background: var(--bg2); color: var(--text); }
-    .yard-activity-row .what.action { background: #15321f; color: var(--ok); }
+    .yard-activity-row .what.action { background: #e6f4ec; color: var(--ok); }
     .yard-activity-row .who { color: var(--muted); }
     .yard-activity-row .text { color: var(--text); }
 
@@ -7120,13 +8681,13 @@ function renderDashboardHtml(): string {
       text-transform: uppercase; letter-spacing: 0.04em;
     }
     .yard-session-card .ys-status.open { background: rgba(94,227,151,0.18); color: var(--success); }
-    .yard-session-card .ys-status.closed { background: rgba(255,255,255,0.08); color: var(--muted); }
+    .yard-session-card .ys-status.closed { background: rgba(15,30,60,0.12); color: var(--muted); }
     .yard-progress {
       background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
       padding: 10px 14px; margin-bottom: 12px; display: flex; flex-direction: column; gap: 6px;
     }
     .yard-progress-bar {
-      height: 8px; background: rgba(255,255,255,0.06); border-radius: 999px; overflow: hidden;
+      height: 8px; background: rgba(15,30,60,0.08); border-radius: 999px; overflow: hidden;
     }
     .yard-progress-fill {
       height: 100%; background: linear-gradient(90deg, var(--accent), var(--success));
@@ -7174,7 +8735,7 @@ function renderDashboardHtml(): string {
     .yard-asset-status-icon {
       width: 28px; height: 28px; border-radius: 50%; flex: none;
       display: flex; align-items: center; justify-content: center;
-      background: rgba(255,255,255,0.06); color: var(--muted);
+      background: rgba(15,30,60,0.08); color: var(--muted);
       font-size: 0.95rem; font-weight: 700;
     }
     .yard-asset.done .yard-asset-status-icon { background: rgba(94,227,151,0.2); color: var(--success); }
@@ -7189,7 +8750,7 @@ function renderDashboardHtml(): string {
     .yard-asset-badge {
       padding: 2px 7px; border-radius: 6px; font-size: 0.65rem; font-weight: 600;
       text-transform: uppercase; letter-spacing: 0.04em;
-      background: rgba(255,255,255,0.08); color: var(--muted);
+      background: rgba(15,30,60,0.12); color: var(--muted);
     }
     .yard-asset-badge.nce { background: rgba(167,113,255,0.22); color: #c8a4ff; }
     .yard-asset-badge.below { background: rgba(255,90,99,0.22); color: var(--danger); }
@@ -7198,7 +8759,7 @@ function renderDashboardHtml(): string {
       padding: 6px 14px 14px; border-top: 1px solid var(--border);
     }
     .yard-asset.expanded .yard-asset-form { display: flex; }
-    .yard-asset.expanded { background: rgba(255,255,255,0.02); }
+    .yard-asset.expanded { background: rgba(15,30,60,0.03); }
     .yard-asset-form label.field { display: flex; flex-direction: column; gap: 4px; }
     .yard-asset-form .label { font-size: 0.78rem; color: var(--muted); font-weight: 500; }
     .yard-asset-form input,
@@ -7271,17 +8832,21 @@ function renderDashboardHtml(): string {
 
     /* ---- Waivers tab ---- */
     #panel-waivers .hidden { display: none; }
-    .waivers-wrap { display: flex; flex-direction: column; gap: 16px; max-width: 1320px; margin: 0 auto; }
-    .waivers-strap { padding-bottom: 2px; }
-    .waivers-strap-title { margin: 0; font-size: 1.35rem; font-weight: 600; letter-spacing: -0.02em; }
-    .waivers-strap-desc { margin: 8px 0 0; color: var(--muted); font-size: 0.9rem; line-height: 1.45; max-width: 52rem; }
+    /* .wv-pending-zero sets display:flex — must not override the [hidden] attribute. */
+    #panel-waivers #wv-pending-empty[hidden] {
+      display: none !important;
+    }
+    .waivers-wrap { display: flex; flex-direction: column; gap: 12px; max-width: 1320px; margin: 0 auto; }
+    .waivers-strap { padding-bottom: 0; }
+    .waivers-strap-title { margin: 0; font-size: 1.2rem; font-weight: 600; letter-spacing: -0.02em; }
+    .waivers-strap-desc { margin: 6px 0 0; color: var(--muted); font-size: 0.85rem; line-height: 1.4; max-width: 48rem; }
     .waivers-head {
       display: flex; align-items: center; gap: 14px; justify-content: space-between;
       flex-wrap: wrap; border-bottom: 1px solid var(--border);
     }
     .waivers-subnav { display: flex; gap: 0; }
     .waivers-sub {
-      background: transparent; border: 0; padding: 12px 14px; cursor: pointer;
+      background: transparent; border: 0; padding: 10px 12px; cursor: pointer;
       color: var(--muted); font: inherit; font-weight: 600; font-size: 14px;
       border-bottom: 2px solid transparent; margin-bottom: -1px;
     }
@@ -7295,25 +8860,29 @@ function renderDashboardHtml(): string {
     .waivers-sub .wv-count:empty { display: none; }
     .waivers-actions { display: flex; align-items: center; gap: 8px; padding: 8px 0; }
 
-    .wv-view { display: block; }
+    /* Do not set display on .wv-view — it overrides the [hidden] attribute and
+       stacks both sub-views (pending + by vehicle), breaking layout and focus. */
+    #panel-waivers .wv-view[hidden] {
+      display: none !important;
+    }
     .wv-empty {
-      padding: 28px; text-align: center; color: var(--muted);
+      padding: 18px 20px; text-align: center; color: var(--muted);
       background: var(--surface); border: 1px dashed var(--border); border-radius: 12px;
     }
     .wv-pending-zero {
-      display: flex; flex-direction: column; align-items: center; gap: 10px;
-      padding: 40px 28px; border-style: solid; border-color: var(--border);
+      display: flex; flex-direction: column; align-items: center; gap: 8px;
+      padding: 22px 20px; border-style: solid; border-color: var(--border);
       background: linear-gradient(180deg, rgba(94,227,151,0.06), var(--surface));
     }
     .wv-pending-zero strong { font-size: 1.08rem; color: var(--text); font-weight: 600; }
     .wv-zero-msg { font-size: 0.88rem; max-width: 26rem; line-height: 1.45; }
     .wv-zero-icon {
-      width: 52px; height: 52px; border-radius: 50%;
+      width: 44px; height: 44px; border-radius: 50%;
       display: flex; align-items: center; justify-content: center;
-      font-size: 1.35rem; font-weight: 700;
+      font-size: 1.2rem; font-weight: 700;
       background: rgba(94,227,151,0.14); color: var(--success); border: 1px solid rgba(94,227,151,0.35);
     }
-    .wv-pending-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 16px; }
+    .wv-pending-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
     .wv-pcard {
       background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
       overflow: hidden; display: flex; flex-direction: column;
@@ -7335,9 +8904,9 @@ function renderDashboardHtml(): string {
     }
     .wv-photo-grid img.photo {
       display: block; width: auto; max-width: min(48%, 280px); max-height: 220px;
-      object-fit: cover; border-radius: 8px; border: 1px solid var(--border); background: #000;
+      object-fit: cover; border-radius: 8px; border: 1px solid var(--border); background: #0a1a3a;
     }
-    .wv-pcard .actions { display: flex; gap: 8px; padding: 10px 12px; background: rgba(255,255,255,0.02); }
+    .wv-pcard .actions { display: flex; gap: 8px; padding: 10px 12px; background: rgba(15,30,60,0.03); }
     .wv-pcard .actions button { flex: 1; }
     .wv-pcard textarea {
       width: 100%; background: var(--bg2, var(--surface)); color: var(--text);
@@ -7353,27 +8922,27 @@ function renderDashboardHtml(): string {
     .wv-pcard .review-block label { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
 
     .wv-byvehicle-layout {
-      display: grid; grid-template-columns: minmax(300px, 400px) minmax(0, 1fr);
-      gap: 22px; align-items: start;
+      display: grid; grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
+      gap: 14px; align-items: start;
     }
     @media (max-width: 980px) {
       .wv-byvehicle-layout { grid-template-columns: 1fr; }
     }
-    .wv-byvehicle-side { display: flex; flex-direction: column; gap: 16px; }
+    .wv-byvehicle-side { display: flex; flex-direction: column; gap: 12px; }
     .wv-hero-card {
-      padding: 20px 20px 18px;
-      border-radius: 16px; border: 1px solid var(--border);
-      background: linear-gradient(155deg, rgba(106,169,255,0.1), var(--surface) 55%);
+      padding: 14px 16px 14px;
+      border-radius: 14px; border: 1px solid var(--border);
+      background: linear-gradient(155deg, rgba(0,58,140,0.1), var(--surface) 55%);
     }
     .wv-hero-title { margin: 0 0 6px; font-size: 1.12rem; font-weight: 600; letter-spacing: -0.02em; }
-    .wv-hero-lead { margin: 0 0 16px; color: var(--muted); font-size: 0.86rem; line-height: 1.45; }
+    .wv-hero-lead { margin: 0 0 12px; color: var(--muted); font-size: 0.82rem; line-height: 1.4; }
     .wv-hero-form { display: flex; flex-direction: column; gap: 10px; }
     .wv-hero-form input {
       width: 100%; background: var(--bg0, var(--bg)); color: var(--text);
       border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px;
       font-size: 1.02rem; font-variant-numeric: tabular-nums;
     }
-    .wv-hero-form input:focus { outline: 2px solid rgba(106,169,255,0.35); outline-offset: 0; }
+    .wv-hero-form input:focus { outline: 2px solid rgba(0,58,140,0.35); outline-offset: 0; }
     .wv-hero-form .primary { width: 100%; justify-content: center; min-height: 44px; }
     @media (min-width: 480px) {
       .wv-hero-form { flex-direction: row; align-items: stretch; }
@@ -7411,13 +8980,13 @@ function renderDashboardHtml(): string {
       border-color: var(--accent); background: rgba(94, 154, 255, 0.12);
     }
     .wv-byvehicle-main .wv-bv-result {
-      background: var(--surface); border: 1px solid var(--border); border-radius: 16px;
-      padding: 18px 20px 20px; min-height: 220px;
+      background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+      padding: 14px 16px 16px; min-height: 160px;
     }
     .wv-bv-placeholder {
       display: flex; flex-direction: column; align-items: center; justify-content: center;
-      text-align: center; gap: 10px; padding: 36px 20px; color: var(--muted);
-      min-height: 180px;
+      text-align: center; gap: 8px; padding: 24px 16px; color: var(--muted);
+      min-height: 120px;
     }
     .wv-bv-placeholder strong { color: var(--text); font-size: 1.02rem; }
     .wv-bv-placeholder span:last-child { font-size: 0.88rem; max-width: 22rem; line-height: 1.45; }
@@ -7442,6 +9011,12 @@ function renderDashboardHtml(): string {
     .wv-bv-card.overdue { border-color: rgba(255,138,138,0.4); }
     .wv-bv-card.dueSoon { border-color: rgba(245,199,84,0.4); }
     .wv-bv-card.pending { border-color: rgba(192,132,252,0.4); }
+    .wv-bv-card.removed-record { border-style: dashed; opacity: 0.95; }
+    .wv-bv-card .pill.removed {
+      background: rgba(148,163,184,0.12); color: var(--muted); border-color: rgba(148,163,184,0.35);
+    }
+    .wv-removed-wrap { margin-top: 18px; border-top: 1px dashed var(--border); padding-top: 12px; }
+    .wv-removed-summary { cursor: pointer; color: var(--muted); font-size: 0.82rem; user-select: none; }
     .wv-bv-card .row1 { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
     .wv-bv-card .row1 .title { font-weight: 600; flex: 1; min-width: 0; }
     .wv-bv-card .pill {
@@ -7458,7 +9033,7 @@ function renderDashboardHtml(): string {
     .wv-bv-card .wv-photo-grid { margin-top: 10px; }
     .wv-bv-card .wv-photo-grid img.photo {
       display: block; max-width: min(48%, 280px); max-height: 220px; object-fit: cover;
-      border-radius: 8px; border: 1px solid var(--border); background: #000;
+      border-radius: 8px; border: 1px solid var(--border); background: #0a1a3a;
     }
     .wv-bv-card .actions { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
     .wv-bv-card .verif-log { margin-top: 10px; font-size: 0.78rem; color: var(--muted); border-top: 1px dashed var(--border); padding-top: 8px; }
@@ -7626,7 +9201,7 @@ function renderDashboardHtml(): string {
     .mel-chart .bar.below { stroke: rgba(255,90,99,0.5); stroke-width: 1; }
     .mel-chart .mc-line { fill: none; stroke: var(--accent); stroke-width: 2; }
     .mel-chart .mc-dot  { fill: var(--accent); }
-    .mel-chart .hover-band { fill: rgba(94,194,255,0.08); pointer-events: none; }
+    .mel-chart .hover-band { fill: rgba(0,58,140,0.08); pointer-events: none; }
     /* The SVG <text> elements carry the .x-tick / .y-tick classes directly,
      * not as descendants — so target the text itself. Without this rule SVG
      * falls back to its default fill (black) and the labels disappear into
@@ -7638,7 +9213,7 @@ function renderDashboardHtml(): string {
       font-variant-numeric: tabular-nums;
     }
     .mel-chart text.y-tick { font-size: 10px; }
-    .mel-chart .mc-band { fill: rgba(94,194,255,0.06); }
+    .mel-chart .mc-band { fill: rgba(0,58,140,0.06); }
 
     /* --- Compare bar --- */
     .mel-compare-bar {
@@ -7698,13 +9273,13 @@ function renderDashboardHtml(): string {
       transition: border-color 0.15s, transform 0.05s;
     }
     .mel-card:hover { border-color: var(--accent); }
-    .mel-card.active { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(94,194,255,0.15); }
+    .mel-card.active { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(0,58,140,0.15); }
     .mel-card[data-status="below"] { box-shadow: inset 3px 0 0 var(--danger); }
     .mel-card[data-status="at"]    { box-shadow: inset 3px 0 0 var(--warn); }
     .mel-card[data-status="above"] { box-shadow: inset 3px 0 0 var(--success); }
-    .mel-card.active[data-status="below"] { box-shadow: inset 3px 0 0 var(--danger), 0 0 0 2px rgba(94,194,255,0.15); }
-    .mel-card.active[data-status="at"]    { box-shadow: inset 3px 0 0 var(--warn), 0 0 0 2px rgba(94,194,255,0.15); }
-    .mel-card.active[data-status="above"] { box-shadow: inset 3px 0 0 var(--success), 0 0 0 2px rgba(94,194,255,0.15); }
+    .mel-card.active[data-status="below"] { box-shadow: inset 3px 0 0 var(--danger), 0 0 0 2px rgba(0,58,140,0.15); }
+    .mel-card.active[data-status="at"]    { box-shadow: inset 3px 0 0 var(--warn), 0 0 0 2px rgba(0,58,140,0.15); }
+    .mel-card.active[data-status="above"] { box-shadow: inset 3px 0 0 var(--success), 0 0 0 2px rgba(0,58,140,0.15); }
     .mel-card-head { display: flex; align-items: center; gap: 8px; }
     .mel-key {
       font-family: var(--mono);
@@ -7719,7 +9294,7 @@ function renderDashboardHtml(): string {
     .mel-pill.at     { background: rgba(255,194,77,0.12); color: var(--warn); }
     .mel-pill.above  { background: rgba(94,227,151,0.12); color: var(--success); }
     .mel-pill.unknown{ background: var(--bg1); color: var(--muted); }
-    .mel-pill.recall { background: rgba(94,194,255,0.10); color: var(--accent); }
+    .mel-pill.recall { background: rgba(0,58,140,0.10); color: var(--accent); }
     .mel-card-meta { font-size: 0.78rem; color: var(--muted); display: flex; flex-wrap: wrap; gap: 6px 12px; }
     .mel-card-meta .b { color: var(--text-dim); }
     .mel-counts {
@@ -7818,7 +9393,7 @@ function renderDashboardHtml(): string {
       color: var(--text); cursor: pointer;
       transition: border-color 0.15s, transform 0.05s, background 0.15s;
     }
-    .mel-wo-row:hover { border-color: var(--accent); background: rgba(94,194,255,0.04); }
+    .mel-wo-row:hover { border-color: var(--accent); background: rgba(0,58,140,0.04); }
     .mel-wo-row.tier-below { box-shadow: inset 3px 0 0 var(--danger); }
     .mel-wo-row.tier-at    { box-shadow: inset 3px 0 0 var(--warn); }
     .mel-wo-row.tier-above { box-shadow: inset 3px 0 0 var(--success); }
@@ -7838,13 +9413,13 @@ function renderDashboardHtml(): string {
     .mel-wo-chips .wo-chip {
       font-size: 0.62rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
       padding: 2px 8px; border-radius: 999px;
-      background: var(--bg2, rgba(255,255,255,0.04)); color: var(--text-dim);
+      background: var(--bg2, rgba(15,30,60,0.05)); color: var(--text-dim);
     }
     .mel-wo-chips .wo-chip.stale { background: rgba(255,90,99,0.16); color: var(--danger); }
     .mel-wo-chips .wo-chip.warn  { background: rgba(255,194,77,0.16); color: var(--warn); }
     .mel-wo-remarks {
       font-size: 0.78rem; color: var(--text-dim); line-height: 1.4;
-      background: rgba(255,255,255,0.02); border-radius: 6px; padding: 6px 8px;
+      background: rgba(15,30,60,0.03); border-radius: 6px; padding: 6px 8px;
       margin-top: 2px;
     }
 
@@ -7859,7 +9434,7 @@ function renderDashboardHtml(): string {
     .mel-cl-head {
       display: flex; align-items: center; gap: 10px;
       padding: 8px 12px;
-      background: rgba(255,255,255,0.02);
+      background: rgba(15,30,60,0.03);
       border-bottom: 1px solid var(--border);
     }
     .mel-cl-head .d { font-variant-numeric: tabular-nums; font-weight: 700; font-size: 0.88rem; color: var(--text); letter-spacing: 0.02em; }
@@ -7878,13 +9453,13 @@ function renderDashboardHtml(): string {
       display: grid; grid-template-columns: 110px 1fr;
       gap: 12px; align-items: baseline;
       padding: 6px 12px;
-      border-top: 1px solid rgba(255,255,255,0.03);
+      border-top: 1px solid rgba(15,30,60,0.04);
     }
     .mel-cl-item:first-child { border-top: 0; }
     @media (max-width: 600px) { .mel-cl-item { grid-template-columns: 1fr; gap: 2px; } }
     .mel-cl-item .f { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
     .mel-cl-item .v del { color: var(--subtle); text-decoration: line-through; margin-right: 6px; }
-    .mel-cl-item .v ins { color: var(--text); text-decoration: none; background: rgba(94,194,255,0.08); padding: 1px 6px; border-radius: 3px; }
+    .mel-cl-item .v ins { color: var(--text); text-decoration: none; background: rgba(0,58,140,0.08); padding: 1px 6px; border-radius: 3px; }
     .mel-cl-item .v .arrow { color: var(--subtle); margin: 0 6px; }
     .mel-cl-item.bad  .v ins { background: rgba(255,90,99,0.15); color: #ffb4b8; }
     .mel-cl-item.good .v ins { background: rgba(94,227,151,0.15); color: #aef0c4; }
@@ -7998,8 +9573,8 @@ function renderDashboardHtml(): string {
       margin: 8px 0 12px;
       padding: 12px 14px;
       border-radius: 10px;
-      background: rgba(138,180,255,0.06);
-      border: 1px solid rgba(138,180,255,0.2);
+      background: rgba(0,58,140,0.06);
+      border: 1px solid rgba(0,58,140,0.2);
       color: var(--text);
       font-size: 0.88rem;
       font-variant-numeric: tabular-nums;
@@ -8016,31 +9591,31 @@ function renderDashboardHtml(): string {
     button.primary {
       background: var(--accent);
       border: 1px solid var(--accent);
-      color: #0b1220;
+      color: #ffffff;
       font-weight: 600;
-      padding: 10px 16px;
-      border-radius: 10px;
+      padding: 9px 16px;
+      border-radius: 6px;
       cursor: pointer;
       font-size: 0.9rem;
     }
     button.primary[disabled] { opacity: 0.45; cursor: not-allowed; }
-    button.primary:not([disabled]):hover { filter: brightness(1.08); }
+    button.primary:not([disabled]):hover { background: var(--accent-strong); border-color: var(--accent-strong); }
     button.ghost {
-      background: transparent;
+      background: var(--surface);
       border: 1px solid var(--border-strong);
       color: var(--text);
-      padding: 9px 14px;
-      border-radius: 10px;
+      padding: 8px 14px;
+      border-radius: 6px;
       cursor: pointer;
       font-size: 0.85rem;
     }
-    button.ghost:hover { border-color: var(--accent); }
+    button.ghost:hover { border-color: var(--accent); color: var(--accent); }
     button.danger {
-      background: rgba(255,138,138,0.12);
-      border: 1px solid rgba(255,138,138,0.35);
+      background: rgba(176,0,32,0.06);
+      border: 1px solid rgba(176,0,32,0.35);
       color: var(--danger);
-      padding: 9px 14px;
-      border-radius: 10px;
+      padding: 8px 14px;
+      border-radius: 6px;
       cursor: pointer;
       font-size: 0.85rem;
       font-weight: 600;
@@ -8179,8 +9754,8 @@ function renderDashboardHtml(): string {
       font-family: inherit;
       transition: border-color 140ms, background 140ms;
     }
-    .mq-item:hover { background: rgba(255,255,255,0.02); border-color: var(--border); }
-    .mq-item.active { background: rgba(138,180,255,0.08); border-color: rgba(138,180,255,0.3); }
+    .mq-item:hover { background: rgba(15,30,60,0.03); border-color: var(--border); }
+    .mq-item.active { background: rgba(0,58,140,0.08); border-color: rgba(0,58,140,0.3); }
     .mq-dot {
       width: 8px; height: 8px; border-radius: 50%;
       background: var(--muted);
@@ -8194,7 +9769,7 @@ function renderDashboardHtml(): string {
     .mq-tier {
       font-size: 0.62rem; padding: 1px 6px; border-radius: 999px;
       text-transform: uppercase; letter-spacing: 0.06em;
-      background: rgba(255,255,255,0.05); color: var(--muted);
+      background: rgba(15,30,60,0.06); color: var(--muted);
     }
     .mq-tier.below { background: rgba(255,138,138,0.14); color: var(--danger); }
     .mq-tier.at { background: rgba(245,199,84,0.14); color: var(--warn); }
@@ -8216,7 +9791,7 @@ function renderDashboardHtml(): string {
     }
     .mf-id { font-size: 1.2rem; font-weight: 700; color: var(--text); font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
     .mf-sub { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 6px; font-size: 0.78rem; color: var(--muted); }
-    .mf-sub .tag { padding: 2px 8px; border-radius: 999px; background: rgba(255,255,255,0.04); color: var(--text-dim); font-size: 0.72rem; }
+    .mf-sub .tag { padding: 2px 8px; border-radius: 999px; background: rgba(15,30,60,0.05); color: var(--text-dim); font-size: 0.72rem; }
     .mf-remarks {
       margin-top: 10px;
       font-size: 0.8rem;
@@ -8248,14 +9823,14 @@ function renderDashboardHtml(): string {
       overflow-y: auto;
       padding-right: 6px;
       scrollbar-width: thin;
-      scrollbar-color: rgba(255,255,255,0.18) transparent;
+      scrollbar-color: rgba(15,30,60,0.28) transparent;
     }
     .mf-tl-list::-webkit-scrollbar { width: 8px; }
     .mf-tl-list::-webkit-scrollbar-track { background: transparent; }
     .mf-tl-list::-webkit-scrollbar-thumb {
-      background: rgba(255,255,255,0.18); border-radius: 4px;
+      background: rgba(15,30,60,0.28); border-radius: 4px;
     }
-    .mf-tl-list::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.3); }
+    .mf-tl-list::-webkit-scrollbar-thumb:hover { background: rgba(15,30,60,0.40); }
     .mf-tl-row {
       display: grid;
       grid-template-columns: 76px 70px 1fr;
@@ -8263,16 +9838,16 @@ function renderDashboardHtml(): string {
       align-items: baseline;
       padding: 5px 8px;
       border-radius: 6px;
-      background: rgba(255,255,255,0.02);
-      border-left: 2px solid rgba(255,255,255,0.12);
+      background: rgba(15,30,60,0.03);
+      border-left: 2px solid rgba(15,30,60,0.18);
       font-size: 0.78rem;
       line-height: 1.35;
     }
     .mf-tl-row.mfl-slip    { border-left-color: var(--danger); background: rgba(255,138,138,0.05); }
     .mf-tl-row.mfl-remarks { border-left-color: var(--warn);   background: rgba(245,199,84,0.04); }
-    .mf-tl-row.mfl-mel     { border-left-color: var(--text);   background: rgba(255,255,255,0.03); }
+    .mf-tl-row.mfl-mel     { border-left-color: var(--text);   background: rgba(15,30,60,0.04); }
     .mf-tl-row.mfl-parts   { border-left-color: var(--success);background: rgba(94,227,151,0.04); }
-    .mf-tl-row.mfl-initial { border-left-color: rgba(255,255,255,0.18); color: var(--muted); }
+    .mf-tl-row.mfl-initial { border-left-color: rgba(15,30,60,0.28); color: var(--muted); }
     .mf-tl-date { font-weight: 600; font-variant-numeric: tabular-nums; color: var(--text-dim); }
     .mf-tl-kind {
       font-size: 0.66rem;
@@ -8310,7 +9885,7 @@ function renderDashboardHtml(): string {
     }
     .status-pill:hover { border-color: var(--accent); color: var(--text); }
     .status-pill.active[data-status="covered"] { background: rgba(94,227,151,0.14); border-color: var(--success); color: var(--success); }
-    .status-pill.active[data-status="deferred"] { background: rgba(138,180,255,0.14); border-color: var(--accent); color: var(--accent); }
+    .status-pill.active[data-status="deferred"] { background: rgba(0,58,140,0.14); border-color: var(--accent); color: var(--accent); }
     .status-pill.active[data-status="skipped"] { background: rgba(138,143,155,0.14); border-color: var(--subtle); color: var(--muted); }
     .status-pill.active[data-status="pending"] { background: rgba(245,199,84,0.14); border-color: var(--warn); color: var(--warn); }
     .meeting-focus-footer {
@@ -8373,7 +9948,7 @@ function renderDashboardHtml(): string {
       grid-template-columns: 1fr auto auto;
       align-items: center;
       gap: 28px;
-      border-bottom: 1px solid rgba(255,255,255,0.08);
+      border-bottom: 1px solid rgba(255,255,255,0.10);
       padding-bottom: 18px;
     }
     .presenter-meeting-title {
@@ -8391,7 +9966,7 @@ function renderDashboardHtml(): string {
       padding: 8px 22px;
       border-radius: 16px;
       background: rgba(255,255,255,0.04);
-      border: 1px solid rgba(255,255,255,0.08);
+      border: 1px solid rgba(255,255,255,0.10);
       min-width: 220px;
     }
     .presenter-clock-time {
@@ -8438,7 +10013,7 @@ function renderDashboardHtml(): string {
       padding: 28px 32px;
       border-radius: 22px;
       background: rgba(22,25,34,0.85);
-      border: 1px solid rgba(255,255,255,0.08);
+      border: 1px solid rgba(255,255,255,0.10);
       box-shadow: 0 30px 80px rgba(0,0,0,0.45);
       overflow-y: auto;
     }
@@ -8468,7 +10043,7 @@ function renderDashboardHtml(): string {
       font-size: clamp(0.95rem, 1.1vw, 1.15rem);
       text-transform: uppercase;
       letter-spacing: 0.08em;
-      border: 1px solid rgba(255,255,255,0.12);
+      border: 1px solid rgba(255,255,255,0.15);
     }
     .presenter-card-tier[data-tier="below"] { background: rgba(255,138,138,0.18); color: #ffb4b4; border-color: rgba(255,138,138,0.55); }
     .presenter-card-tier[data-tier="at"]    { background: rgba(245,199,84,0.16);  color: #f5d885; border-color: rgba(245,199,84,0.45); }
@@ -8526,7 +10101,7 @@ function renderDashboardHtml(): string {
       padding: 4px 10px;
       border-radius: 999px;
       background: rgba(255,255,255,0.05);
-      border: 1px solid rgba(255,255,255,0.08);
+      border: 1px solid rgba(255,255,255,0.10);
       font-size: clamp(0.78rem, 0.95vw, 0.95rem);
       color: rgba(241,244,251,0.85);
     }
@@ -8554,7 +10129,7 @@ function renderDashboardHtml(): string {
       padding: 16px 18px;
       border-radius: 14px;
       background: rgba(255,255,255,0.04);
-      border: 1px solid rgba(255,255,255,0.07);
+      border: 1px solid rgba(255,255,255,0.08);
       min-height: 92px;
     }
     .p-tile .lbl {
@@ -8624,15 +10199,15 @@ function renderDashboardHtml(): string {
       overflow-y: auto;
       padding-right: 10px;
       scrollbar-width: thin;
-      scrollbar-color: rgba(255,255,255,0.25) transparent;
+      scrollbar-color: rgba(255,255,255,0.30) transparent;
       scroll-behavior: smooth;
     }
     .p-timeline::-webkit-scrollbar { width: 12px; }
     .p-timeline::-webkit-scrollbar-track { background: transparent; }
     .p-timeline::-webkit-scrollbar-thumb {
-      background: rgba(255,255,255,0.25); border-radius: 6px;
+      background: rgba(255,255,255,0.30); border-radius: 6px;
     }
-    .p-timeline::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.4); }
+    .p-timeline::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.40); }
     .p-tl-row {
       display: grid;
       grid-template-columns: 130px 130px 1fr;
@@ -8640,15 +10215,15 @@ function renderDashboardHtml(): string {
       align-items: baseline;
       padding: 8px 10px;
       border-radius: 10px;
-      background: rgba(255,255,255,0.025);
-      border-left: 3px solid rgba(255,255,255,0.15);
+      background: rgba(255,255,255,0.03);
+      border-left: 3px solid rgba(255,255,255,0.18);
       font-size: clamp(0.95rem, 1.15vw, 1.2rem);
     }
     .p-tl-row.tl-slip    { border-left-color: var(--danger); background: rgba(255,138,138,0.06); }
     .p-tl-row.tl-remarks { border-left-color: var(--warn);   background: rgba(245,199,84,0.05); }
     .p-tl-row.tl-mel     { border-left-color: var(--text);   background: rgba(255,255,255,0.04); }
     .p-tl-row.tl-parts   { border-left-color: var(--success);background: rgba(94,227,151,0.05); }
-    .p-tl-row.tl-initial { border-left-color: rgba(255,255,255,0.2); color: rgba(241,244,251,0.65); }
+    .p-tl-row.tl-initial { border-left-color: rgba(255,255,255,0.25); color: rgba(241,244,251,0.65); }
     .p-tl-date { font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: 0.02em; }
     .p-tl-kind {
       font-size: clamp(0.75rem, 0.85vw, 0.9rem);
@@ -8713,10 +10288,10 @@ function renderDashboardHtml(): string {
       width: 52px;
       height: 52px;
       border-radius: 50%;
-      border: 1px solid rgba(255,255,255,0.12);
-      background: linear-gradient(135deg, #4f7cff, #7a4dff);
+      border: 1px solid var(--accent-strong);
+      background: var(--accent);
       color: #fff;
-      box-shadow: 0 12px 36px rgba(79,124,255,0.45), 0 4px 12px rgba(0,0,0,0.3);
+      box-shadow: 0 6px 18px rgba(0,58,140,0.30), 0 2px 6px rgba(15,30,60,0.12);
       cursor: pointer;
       display: inline-flex;
       align-items: center;
@@ -8724,7 +10299,7 @@ function renderDashboardHtml(): string {
       z-index: 90;
       transition: transform 0.18s ease, box-shadow 0.18s ease;
     }
-    .ask-fab:hover { transform: translateY(-2px) scale(1.04); box-shadow: 0 18px 44px rgba(79,124,255,0.55), 0 6px 14px rgba(0,0,0,0.35); }
+    .ask-fab:hover { background: var(--accent-strong); transform: translateY(-2px) scale(1.04); box-shadow: 0 10px 26px rgba(0,58,140,0.40), 0 3px 8px rgba(15,30,60,0.18); }
     .ask-fab:active { transform: translateY(0) scale(0.98); }
     .ask-fab.hidden { display: none; }
 
@@ -8734,10 +10309,10 @@ function renderDashboardHtml(): string {
       bottom: 22px;
       width: min(420px, calc(100vw - 32px));
       height: min(640px, calc(100vh - 60px));
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 18px;
-      box-shadow: 0 30px 70px rgba(0,0,0,0.55), 0 10px 24px rgba(0,0,0,0.35);
+      background: var(--surface);
+      border: 1px solid var(--border-strong);
+      border-radius: 12px;
+      box-shadow: var(--shadow-lg);
       display: flex;
       flex-direction: column;
       overflow: hidden;
@@ -8756,7 +10331,7 @@ function renderDashboardHtml(): string {
       gap: 10px;
       padding: 14px 16px;
       border-bottom: 1px solid var(--border);
-      background: linear-gradient(135deg, rgba(79,124,255,0.18), rgba(122,77,255,0.12));
+      background: var(--accent-soft);
     }
     .ask-dock-title {
       font-weight: 700;
@@ -8773,7 +10348,7 @@ function renderDashboardHtml(): string {
       padding: 4px 8px;
       border-radius: 6px;
     }
-    .ask-dock-close:hover { background: rgba(255,255,255,0.06); color: var(--text); }
+    .ask-dock-close:hover { background: rgba(15,30,60,0.08); color: var(--text); }
 
     /* Reusable "Ask AI" pill that lives next to charts. Compact so it can sit
      * inline with section headings without throwing off the layout. */
@@ -8782,8 +10357,8 @@ function renderDashboardHtml(): string {
       padding: 4px 10px;
       font-size: 0.72rem; font-weight: 600; letter-spacing: 0.04em;
       color: var(--text);
-      background: linear-gradient(135deg, rgba(79,124,255,0.16), rgba(94,194,255,0.10));
-      border: 1px solid rgba(79,124,255,0.45);
+      background: var(--accent-soft);
+      border: 1px solid var(--accent-dim);
       border-radius: 999px;
       cursor: pointer;
       transition: transform 0.05s, border-color 0.15s, background 0.15s;
@@ -8794,8 +10369,8 @@ function renderDashboardHtml(): string {
       font-size: 0.85em;
     }
     .ai-ask-btn:hover {
-      border-color: rgba(94,194,255,0.85);
-      background: linear-gradient(135deg, rgba(79,124,255,0.28), rgba(94,194,255,0.18));
+      border-color: var(--accent);
+      background: rgba(0,58,140,0.14);
     }
     .ai-ask-btn:active { transform: scale(0.97); }
 
@@ -8803,9 +10378,9 @@ function renderDashboardHtml(): string {
     .ask-ctx-card {
       margin: 0 0 12px;
       padding: 10px 12px;
-      border: 1px solid rgba(94,194,255,0.35);
+      border: 1px solid rgba(0,58,140,0.35);
       border-radius: 10px;
-      background: linear-gradient(135deg, rgba(79,124,255,0.10), rgba(94,194,255,0.05));
+      background: linear-gradient(135deg, rgba(0,58,140,0.10), rgba(0,58,140,0.05));
     }
     .ask-ctx-head {
       display: flex; align-items: center; gap: 8px;
@@ -8823,7 +10398,7 @@ function renderDashboardHtml(): string {
       background: transparent; border: 0; color: var(--muted);
       font-size: 0.95rem; cursor: pointer; padding: 2px 6px; border-radius: 4px;
     }
-    .ask-ctx-clear:hover { background: rgba(255,255,255,0.06); color: var(--text); }
+    .ask-ctx-clear:hover { background: rgba(15,30,60,0.08); color: var(--text); }
     .ask-ctx-summary {
       margin-top: 6px; font-size: 0.78rem; color: var(--text-dim);
       line-height: 1.45;
@@ -8833,13 +10408,13 @@ function renderDashboardHtml(): string {
     }
     .ask-ctx-chip {
       padding: 4px 10px; font-size: 0.72rem;
-      background: rgba(255,255,255,0.04); color: var(--text-dim);
+      background: rgba(15,30,60,0.05); color: var(--text-dim);
       border: 1px solid var(--border); border-radius: 999px; cursor: pointer;
       transition: color 0.15s, border-color 0.15s, background 0.15s;
     }
     .ask-ctx-chip:hover {
-      color: var(--text); border-color: rgba(79,124,255,0.5);
-      background: rgba(79,124,255,0.10);
+      color: var(--text); border-color: rgba(0,58,140,0.5);
+      background: rgba(0,58,140,0.10);
     }
 
     .ask-suggestions {
@@ -8848,10 +10423,10 @@ function renderDashboardHtml(): string {
       gap: 6px;
       padding: 10px 14px;
       border-bottom: 1px solid var(--border);
-      background: rgba(255,255,255,0.02);
+      background: rgba(15,30,60,0.03);
     }
     .ask-chip {
-      background: var(--card-2, rgba(255,255,255,0.04));
+      background: var(--card-2, rgba(15,30,60,0.05));
       border: 1px solid var(--border);
       color: var(--text-dim);
       padding: 6px 11px;
@@ -8861,7 +10436,7 @@ function renderDashboardHtml(): string {
       transition: all 0.15s ease;
       white-space: nowrap;
     }
-    .ask-chip:hover { color: var(--text); border-color: rgba(79,124,255,0.5); background: rgba(79,124,255,0.1); }
+    .ask-chip:hover { color: var(--text); border-color: rgba(0,58,140,0.5); background: rgba(0,58,140,0.1); }
 
     .ask-log {
       flex: 1;
@@ -8888,26 +10463,26 @@ function renderDashboardHtml(): string {
       overflow-wrap: anywhere;
     }
     .ask-msg.user .ask-bubble {
-      background: linear-gradient(135deg, #4f7cff, #6a5dff);
+      background: linear-gradient(135deg, #003a8c, #00276b);
       color: #fff;
       border-bottom-right-radius: 4px;
     }
     .ask-msg.assistant .ask-bubble {
-      background: var(--card-2, rgba(255,255,255,0.04));
+      background: var(--card-2, rgba(15,30,60,0.05));
       border: 1px solid var(--border);
       color: var(--text);
       border-bottom-left-radius: 4px;
     }
     .ask-bubble p { margin: 0 0 8px; }
     .ask-bubble p:last-child { margin-bottom: 0; }
-    .ask-bubble code { font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 0.82em; background: rgba(255,255,255,0.08); padding: 1px 5px; border-radius: 4px; }
+    .ask-bubble code { font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 0.82em; background: rgba(15,30,60,0.12); padding: 1px 5px; border-radius: 4px; }
     .ask-bubble pre { background: rgba(0,0,0,0.3); padding: 10px; border-radius: 8px; overflow-x: auto; font-size: 0.78rem; margin: 6px 0; }
     .ask-bubble pre code { background: transparent; padding: 0; }
     .ask-bubble ul, .ask-bubble ol { margin: 6px 0 8px 22px; padding: 0; }
     .ask-bubble li { margin: 2px 0; }
     .ask-bubble table { border-collapse: collapse; margin: 8px 0; font-size: 0.82rem; }
     .ask-bubble th, .ask-bubble td { border: 1px solid var(--border); padding: 4px 8px; text-align: left; }
-    .ask-bubble th { background: rgba(255,255,255,0.04); font-weight: 600; }
+    .ask-bubble th { background: rgba(15,30,60,0.05); font-weight: 600; }
     .ask-bubble strong { color: var(--text); font-weight: 600; }
     .ask-bubble a { color: #82a4ff; }
     .ask-trace {
@@ -8943,14 +10518,14 @@ function renderDashboardHtml(): string {
       gap: 8px;
       padding: 12px 14px;
       border-top: 1px solid var(--border);
-      background: rgba(255,255,255,0.02);
+      background: rgba(15,30,60,0.03);
     }
     .ask-input-row textarea {
       flex: 1;
       resize: none;
       max-height: 160px;
       min-height: 38px;
-      background: var(--card-2, rgba(255,255,255,0.04));
+      background: var(--card-2, rgba(15,30,60,0.05));
       color: var(--text);
       border: 1px solid var(--border);
       border-radius: 10px;
@@ -8961,9 +10536,9 @@ function renderDashboardHtml(): string {
       outline: none;
       transition: border-color 0.15s ease;
     }
-    .ask-input-row textarea:focus { border-color: rgba(79,124,255,0.6); }
+    .ask-input-row textarea:focus { border-color: rgba(0,58,140,0.6); }
     .ask-input-row button {
-      background: linear-gradient(135deg, #4f7cff, #7a4dff);
+      background: linear-gradient(135deg, #003a8c, #00276b);
       color: #fff;
       border: none;
       border-radius: 10px;
@@ -8974,6 +10549,69 @@ function renderDashboardHtml(): string {
     }
     .ask-input-row button:hover { transform: translateY(-1px); }
     .ask-input-row button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+
+    .sr-only {
+      position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
+      clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+    }
+    .smx-header {
+      display: flex; justify-content: space-between; align-items: flex-start; gap: 16px;
+      flex-wrap: wrap; margin-bottom: 16px;
+    }
+    .smx-title { margin: 0 0 6px; font-size: 1.35rem; }
+    .smx-sub { margin: 0; color: var(--muted); font-size: 0.9rem; line-height: 1.45; max-width: 860px; }
+    .nce-inline { font-weight: 800; color: var(--accent); }
+    .smx-asof-pill {
+      font-size: 0.72rem; font-weight: 700; padding: 6px 12px; border-radius: 999px;
+      background: rgba(0,58,140,0.12); color: var(--accent); border: 1px solid rgba(0,58,140,0.3);
+    }
+    .smx-stats { display: flex; flex-wrap: wrap; gap: 10px 14px; margin-bottom: 14px; }
+    .smx-stat {
+      background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+      padding: 10px 14px; min-width: 118px;
+    }
+    .smx-stat .lbl { display: block; font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+    .smx-stat .v { font-size: 1.28rem; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.2; }
+    .smx-stat.bad .v { color: var(--danger); }
+    .smx-stat.warn .v { color: var(--warn); }
+    .smx-stat.crit .v { color: #7a1020; }
+    .smx-toolbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 12px; }
+    .smx-search input {
+      min-width: 220px; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border);
+      background: var(--bg); font: inherit;
+    }
+    .smx-filters { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .smx-filter-btn {
+      padding: 6px 12px; border-radius: 999px; border: 1px solid var(--border);
+      background: var(--bg1); font: inherit; font-size: 0.82rem; cursor: pointer;
+    }
+    .smx-filter-btn.active {
+      border-color: var(--accent); background: rgba(0,58,140,0.08); color: var(--accent); font-weight: 700;
+    }
+    .smx-n { opacity: 0.8; font-weight: 600; margin-left: 4px; font-variant-numeric: tabular-nums; }
+    .smx-table-wrap {
+      overflow: auto; border: 1px solid var(--border); border-radius: 10px;
+      max-height: min(70vh, 720px);
+    }
+    .smx-table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+    .smx-table th {
+      text-align: left; padding: 10px 12px; background: var(--bg2); position: sticky; top: 0; z-index: 1;
+      font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted);
+    }
+    .smx-table td { padding: 10px 12px; border-top: 1px solid var(--border); vertical-align: top; }
+    .smx-table tr.smx-row-nce-crit td { box-shadow: inset 3px 0 0 #8b1538; }
+    .smx-table tr.smx-row-nce-crit { background: rgba(176,0,32,0.09); }
+    .smx-table tr.smx-row-overdue { background: rgba(176,0,32,0.04); }
+    .smx-table .asset-mono { font-family: var(--font-mono); font-weight: 700; }
+    .smx-pill {
+      display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 0.72rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.04em;
+    }
+    .smx-pill.overdue { background: rgba(176,0,32,0.16); color: var(--danger); }
+    .smx-pill.due_soon { background: rgba(245,199,84,0.22); color: #8a5a00; }
+    .smx-pill.missing { background: rgba(160,103,10,0.15); color: var(--warn); }
+    .smx-pill.ok { background: rgba(34,160,90,0.12); color: var(--success); }
+    .smx-pill.no_due { background: rgba(15,30,60,0.06); color: var(--muted); }
 
     /* Full-tab "Ask AI" view — same components, more breathing room. */
     .ask-tab {
@@ -9007,14 +10645,18 @@ function renderDashboardHtml(): string {
   <div class="app">
     <header class="top">
       <div class="brand">
-        <h1>${escapedTitle}</h1>
-        <p id="brand-sub">Fleet readiness at a glance.</p>
+        <div class="brand-mark" aria-hidden="true">USAF</div>
+        <div class="brand-text">
+          <h1>${escapedTitle}</h1>
+          <p id="brand-sub">Fleet readiness at a glance.</p>
+        </div>
       </div>
     </header>
 
     <nav class="main-nav" id="main-nav" aria-label="Main sections">
       <button type="button" id="tab-snapshot" class="active">Snapshot</button>
       <button type="button" id="tab-work-orders">Work orders</button>
+      <button type="button" id="tab-schedule-mx">Schedule Mx</button>
       <button type="button" id="tab-mel">MEL</button>
       <button type="button" id="tab-meeting">ETIC Meeting</button>
       <button type="button" id="tab-yard">Yard Check</button>
@@ -9041,7 +10683,6 @@ function renderDashboardHtml(): string {
           <div class="hero-inner">
             <div class="hero-date"><span class="dot" aria-hidden="true"></span> <span id="hero-kicker">Report</span></div>
             <h2 id="hero-title">—</h2>
-            <p class="hero-file" id="hero-file"></p>
           </div>
         </section>
 
@@ -9142,13 +10783,9 @@ function renderDashboardHtml(): string {
           <h3>Downloads</h3>
           <div class="dl-row">
             <button type="button" class="btn-etic" id="btn-download-etic">Vehicle ETIC (.xlsx)</button>
-            <button type="button" class="btn-etic" id="btn-yard-check">Yard check export</button>
           </div>
           <p class="status" id="etic-dl-status" role="status"></p>
-          <p class="status" id="yard-status" role="status"></p>
         </section>
-
-        <p class="ingest-footer" id="ingest-footer"></p>
       </div>
 
       <div id="panel-work-orders" class="hidden">
@@ -9192,25 +10829,38 @@ function renderDashboardHtml(): string {
 
           <section class="wo-detail-pane">
             <div id="wo-detail-empty" class="wo-empty">Select a work order from the list to see its full state, remarks, and change timeline.</div>
-            <div id="wo-detail" class="hidden">
-              <div class="wo-hero" id="wo-hero"></div>
-              <div class="wo-kpis" id="wo-kpis"></div>
+            <div id="wo-detail" class="hidden wo-detail-inner">
+              <section class="wo-detail-overview" aria-label="Work order summary">
+                <div class="wo-hero" id="wo-hero"></div>
+                <div class="wo-kpis" id="wo-kpis"></div>
+              </section>
               <div id="wo-stale-banner" class="wo-stale-banner hidden"></div>
 
-              <div class="wo-remarks-card">
+              <section class="wo-detail-block wo-remarks-card" aria-labelledby="wo-remarks-heading">
                 <div class="wo-remarks-head">
-                  <span class="t">Latest remarks</span>
+                  <h3 class="wo-detail-block-title" id="wo-remarks-heading">Latest remarks</h3>
                   <span class="when" id="wo-remarks-when"></span>
                 </div>
                 <div class="wo-remarks-body" id="wo-remarks-text"></div>
-              </div>
+              </section>
 
-              <dl class="wo-facts" id="wo-facts"></dl>
+              <details class="wo-detail-block wo-yard-details" id="wo-yard-details" hidden>
+                <summary class="wo-detail-block-title">Yard check — notes &amp; discrepancies</summary>
+                <p class="hint" style="margin:0 0 10px">Walker data for this asset (same as Yard Check app). Shown on the <strong>Change timeline</strong> below by date.</p>
+                <div id="wo-yard-details-body" class="wo-yard-details-body"></div>
+              </details>
+
+              <section class="wo-detail-block" id="wo-facts-wrap" aria-labelledby="wo-facts-heading">
+                <h3 class="wo-detail-block-title" id="wo-facts-heading">Details</h3>
+                <div class="wo-facts" id="wo-facts"></div>
+              </section>
 
               <details class="wo-action-card" id="wo-action-card">
                 <summary class="wo-action-summary">
-                  <span class="wo-action-title">Log FM&amp;A action</span>
-                  <span class="wo-action-hint">Record what you just did so the change shows in the timeline and we can check the next ETIC.</span>
+                  <span class="wo-action-summary-text">
+                    <span class="wo-action-title">Log FM&amp;A action</span>
+                    <span class="wo-action-hint">Record what you did so it appears on the timeline and the next ETIC can verify it.</span>
+                  </span>
                   <span class="wo-action-chev" aria-hidden="true">▾</span>
                 </summary>
                 <form class="wo-action-form" id="wo-action-form">
@@ -9242,7 +10892,7 @@ function renderDashboardHtml(): string {
               </details>
 
               <div class="wo-timeline-head">
-                <h4 class="wo-section-title" style="margin:0">Change timeline</h4>
+                <h3 class="wo-section-title" id="wo-timeline-heading">Change timeline</h3>
                 <button type="button" class="linkish" id="watch-rebuild">Rebuild history</button>
               </div>
               <div class="wo-timeline" id="wo-timeline"><div class="wo-timeline-empty">Loading…</div></div>
@@ -9250,6 +10900,44 @@ function renderDashboardHtml(): string {
               <p class="status" id="wo-lookup-status" style="margin-top:10px"></p>
             </div>
           </section>
+        </div>
+      </div>
+
+      <div id="panel-schedule-mx" class="hidden">
+        <div class="smx-header">
+          <div>
+            <h2 class="smx-title">Schedule Maintenance Status</h2>
+            <p class="smx-sub">Per-asset schedule maintenance from the Fleet (P&amp;A) sheet on the ETIC workbook (all fleet assets). <strong>Overdue</strong> uses the <strong>Schedule Mx Slicer</strong> cell only—scheduled/call-in dates are for planning, not overdue unless the slicer says overdue. Open work-order counts are shown when present for that snapshot date. Same snapshot date as <strong>Work orders</strong>. Overdue on <span class="nce-inline">NCE</span> is treated as critical.</p>
+          </div>
+          <span class="smx-asof-pill" id="smx-asof-pill" title="Matches latest ETIC snapshot">Latest</span>
+        </div>
+        <div class="smx-stats" id="smx-stats" role="status">Loading…</div>
+        <div class="smx-toolbar">
+          <label class="smx-search"><span class="sr-only">Filter rows</span>
+            <input type="text" id="smx-query" placeholder="Filter asset, mgmt, status…" autocomplete="off" />
+          </label>
+          <div class="smx-filters" id="smx-filters" role="tablist" aria-label="Schedule maintenance filters">
+            <button type="button" class="smx-filter-btn active" data-smx-filter="all">All <span class="smx-n" data-smx-c="all">0</span></button>
+            <button type="button" class="smx-filter-btn" data-smx-filter="nce_critical"><span class="nce-inline">NCE</span> overdue <span class="smx-n" data-smx-c="nce_critical">0</span></button>
+            <button type="button" class="smx-filter-btn" data-smx-filter="overdue">Overdue <span class="smx-n" data-smx-c="overdue">0</span></button>
+            <button type="button" class="smx-filter-btn" data-smx-filter="due_soon">Due soon <span class="smx-n" data-smx-c="due_soon">0</span></button>
+            <button type="button" class="smx-filter-btn" data-smx-filter="missing">Missing data <span class="smx-n" data-smx-c="missing">0</span></button>
+          </div>
+        </div>
+        <div class="smx-table-wrap">
+          <table class="smx-table" aria-label="Schedule maintenance by asset">
+            <thead>
+              <tr>
+                <th>Asset</th>
+                <th>NCE</th>
+                <th>Schedule Mx status</th>
+                <th>Due</th>
+                <th>Overdue by</th>
+                <th>State</th>
+              </tr>
+            </thead>
+            <tbody id="smx-tbody"><tr><td colspan="6">Loading…</td></tr></tbody>
+          </table>
         </div>
       </div>
 
@@ -9350,7 +11038,10 @@ function renderDashboardHtml(): string {
         </div>
 
         <div class="mel-slide hidden" id="mel-slide">
-          <div class="mel-slide-meta" id="mel-slide-meta">Loading…</div>
+          <div class="mel-slide-bar">
+            <div class="mel-slide-meta" id="mel-slide-meta">Loading…</div>
+            <button type="button" class="ghost mel-slide-export" id="mel-slide-export" title="Download the visible rows as an Excel file">Export to Excel</button>
+          </div>
           <div class="mel-slide-body" id="mel-slide-body"></div>
         </div>
       </div>
@@ -9532,14 +11223,14 @@ function renderDashboardHtml(): string {
           <header class="yard-head" style="padding:16px 20px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
             <div style="flex:1 1 auto;min-width:0;">
               <h2 style="margin:0">Yard check</h2>
-              <p class="hint" style="margin:4px 0 0">FM&amp;A follow-up queue. Walkers tag in the field; you triage the misses, unlisted finds, and discrepancies here.</p>
+              <p class="hint" style="margin:4px 0 0">FM&amp;A follow-up for walker-flagged issues. Vehicles not yet checked appear on <strong>Fleet list</strong> (due / never checked), not here.</p>
             </div>
             <div style="display:flex;gap:8px;align-items:center;">
               <a class="ghost" href="/yard?desktop=1" target="_blank" rel="noopener" style="text-decoration:none;padding:8px 14px;border-radius:8px;background:var(--bg2);color:var(--text);border:1px solid var(--border);">Open walker app \u2197</a>
             </div>
           </header>
           <nav class="yard-subnav" id="yard-subnav" style="padding:0 20px;display:flex;gap:6px;border-bottom:1px solid var(--border);">
-            <button type="button" class="yard-subtab active" data-yard-sub="roster">Roster</button>
+            <button type="button" class="yard-subtab active" data-yard-sub="roster">Fleet list</button>
             <button type="button" class="yard-subtab" data-yard-sub="findings">
               Findings <span class="yard-subbadge" id="yard-sub-findings-count">0</span>
             </button>
@@ -9550,7 +11241,6 @@ function renderDashboardHtml(): string {
             <div class="yard-findings-controls" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px;">
               <div class="yard-findings-chips" id="yard-findings-chips" style="display:flex;gap:6px;flex-wrap:wrap;">
                 <button type="button" class="yard-findings-chip active" data-finding-kind="all">All <span class="count" id="ff-all">0</span></button>
-                <button type="button" class="yard-findings-chip" data-finding-kind="missing">Not seen <span class="count" id="ff-missing">0</span></button>
                 <button type="button" class="yard-findings-chip" data-finding-kind="unlisted">Unlisted <span class="count" id="ff-unlisted">0</span></button>
                 <button type="button" class="yard-findings-chip" data-finding-kind="discrepancy">Discrepancies <span class="count" id="ff-discrepancy">0</span></button>
               </div>
@@ -9565,7 +11255,7 @@ function renderDashboardHtml(): string {
           </div>
 
           <div id="yard-sub-roster" class="yard-subpanel" style="padding:0;">
-            <iframe id="yard-frame" src="about:blank" title="Yard roster"
+            <iframe id="yard-frame" src="about:blank" title="Yard walker — fleet list"
                     style="display:block;width:100%;height:calc(100vh - 240px);min-height:600px;border:0;background:var(--bg);"></iframe>
           </div>
 
@@ -9622,7 +11312,7 @@ function renderDashboardHtml(): string {
         <div class="waivers-wrap">
           <div class="waivers-strap">
             <h2 class="waivers-strap-title">Waiver desk</h2>
-            <p class="waivers-strap-desc">Approve mechanic submissions, look up any asset, and print the in-cab waiver card.</p>
+            <p class="waivers-strap-desc">Pending review is the approval queue. By vehicle is for lookup, history, and printing the in-cab waiver card.</p>
           </div>
           <header class="waivers-head">
             <nav class="waivers-subnav" id="waivers-subnav" aria-label="Waiver views">
@@ -10223,11 +11913,13 @@ function renderDashboardHtml(): string {
         (force ? "&_=" + Date.now() : ""),
         force ? { cache: "no-store" } : undefined,
       );
-      if (!res.ok) return { entries: [], actions: [] };
+      if (!res.ok) return { entries: [], actions: [], meetingNotes: [], yardWalks: [] };
       const data = await res.json();
       const payload = {
         entries: Array.isArray(data.entries) ? data.entries : [],
         actions: Array.isArray(data.actions) ? data.actions : [],
+        meetingNotes: Array.isArray(data.meetingNotes) ? data.meetingNotes : [],
+        yardWalks: Array.isArray(data.yardWalks) ? data.yardWalks : [],
       };
       changelogCache.set(woId, payload);
       return payload;
@@ -10805,17 +12497,9 @@ function renderDashboardHtml(): string {
       }).join("");
     }
 
-    /* --- Ingest footer (was a whole card) -------------------------------- */
-    function renderIngestFooter(analysis) {
-      const el = document.getElementById("ingest-footer");
-      const recv = analysis.receivedAtIso ? fmtKeyShort(analysis.receivedAtIso) : "—";
-      const size = typeof analysis.workbookBytes === "number"
-        ? (analysis.workbookBytes / 1024 / 1024).toFixed(2) + " MB"
-        : "—";
-      el.innerHTML =
-        "Ingested <strong>" + esc(recv) + "</strong> · from <strong>" + esc(analysis.from || "—") + "</strong>" +
-        " · workbook <strong>" + esc(analysis.workbookFileName || "—") + "</strong> (" + esc(size) + ")";
-    }
+    /* Ingest footer + workbook caption removed by request — uploader/file
+       name are not surfaced on the snapshot tab anymore. */
+    function renderIngestFooter(_analysis) {}
 
     function tierClass(t) {
       if (t === "below") return "tier-below";
@@ -10836,6 +12520,7 @@ function renderDashboardHtml(): string {
     function setMainTab(which) {
       const snapBtn = document.getElementById("tab-snapshot");
       const woBtn = document.getElementById("tab-work-orders");
+      const smxBtn = document.getElementById("tab-schedule-mx");
       const melBtn = document.getElementById("tab-mel");
       const meetBtn = document.getElementById("tab-meeting");
       const yardBtn = document.getElementById("tab-yard");
@@ -10844,6 +12529,7 @@ function renderDashboardHtml(): string {
       const setBtn = document.getElementById("tab-settings");
       const panelSnap = document.getElementById("panel-snapshot");
       const panelWo = document.getElementById("panel-work-orders");
+      const panelSmx = document.getElementById("panel-schedule-mx");
       const panelMel = document.getElementById("panel-mel");
       const panelMeet = document.getElementById("panel-meeting");
       const panelYard = document.getElementById("panel-yard");
@@ -10853,15 +12539,17 @@ function renderDashboardHtml(): string {
       const brandSub = document.getElementById("brand-sub");
       const fab = document.getElementById("ask-fab");
       const isWo = which === "wo";
+      const isSmx = which === "smx";
       const isMel = which === "mel";
       const isMeet = which === "meeting";
       const isYard = which === "yard";
       const isWv = which === "waivers";
       const isAsk = which === "ask";
       const isSet = which === "settings";
-      const isSnap = !isWo && !isMel && !isMeet && !isYard && !isWv && !isAsk && !isSet;
+      const isSnap = !isWo && !isSmx && !isMel && !isMeet && !isYard && !isWv && !isAsk && !isSet;
       snapBtn.classList.toggle("active", isSnap);
       woBtn.classList.toggle("active", isWo);
+      if (smxBtn) smxBtn.classList.toggle("active", isSmx);
       if (melBtn) melBtn.classList.toggle("active", isMel);
       if (meetBtn) meetBtn.classList.toggle("active", isMeet);
       if (yardBtn) yardBtn.classList.toggle("active", isYard);
@@ -10870,6 +12558,7 @@ function renderDashboardHtml(): string {
       if (setBtn) setBtn.classList.toggle("active", isSet);
       panelSnap.classList.toggle("hidden", !isSnap);
       panelWo.classList.toggle("hidden", !isWo);
+      if (panelSmx) panelSmx.classList.toggle("hidden", !isSmx);
       if (panelMel) panelMel.classList.toggle("hidden", !isMel);
       if (panelMeet) panelMeet.classList.toggle("hidden", !isMeet);
       if (panelYard) panelYard.classList.toggle("hidden", !isYard);
@@ -10879,6 +12568,8 @@ function renderDashboardHtml(): string {
       if (fab) fab.classList.toggle("hidden", isAsk);
       brandSub.textContent = isWo
         ? "Browse, filter, and inspect work orders. Select one to see its change timeline."
+        : isSmx
+        ? "Fleet schedule maintenance from ETIC — overdue NCE rows are highest priority."
         : isMel
         ? "Per-MEL-key status, recall loans, and history. NMC ≥ MEL required = below."
         : isMeet
@@ -10895,6 +12586,8 @@ function renderDashboardHtml(): string {
       if (isWo) {
         const asOf = woAsOfDate();
         if (asOf) loadAndRenderWoList(asOf, { force: true });
+      } else if (isSmx) {
+        loadScheduleMxTab();
       } else if (isMel) {
         onEnterMelTab();
       } else if (isMeet) {
@@ -10909,6 +12602,132 @@ function renderDashboardHtml(): string {
       } else if (isSet) {
         onEnterSettingsTab();
       }
+    }
+
+    var smxRows = [];
+    var smxStats = null;
+    var smxFilter = "all";
+
+    async function loadScheduleMxTab() {
+      const pill = document.getElementById("smx-asof-pill");
+      const dk = woAsOfDate();
+      if (pill) pill.textContent = dk ? fmtKeyLong(dk) : "—";
+      const statsEl = document.getElementById("smx-stats");
+      const tbody = document.getElementById("smx-tbody");
+      if (statsEl) {
+        statsEl.innerHTML = "<span class='smx-stat'><span class='lbl'>Loading</span><span class='v'>…</span></span>";
+      }
+      if (tbody) tbody.innerHTML = "<tr><td colspan='6'>Loading…</td></tr>";
+      if (!dk) {
+        if (statsEl) statsEl.textContent = "No snapshot date — ingest an ETIC workbook first.";
+        if (tbody) tbody.innerHTML = "<tr><td colspan='6'>No data.</td></tr>";
+        return;
+      }
+      try {
+        const r = await fetch("/api/schedule-mx?date=" + encodeURIComponent(dk), { cache: "no-store" });
+        const j = await r.json();
+        smxRows = Array.isArray(j.rows) ? j.rows : [];
+        smxStats = j.stats || null;
+        renderScheduleMxStats();
+        renderScheduleMxTable();
+      } catch (e) {
+        if (statsEl) statsEl.textContent = "Could not load schedule maintenance.";
+        if (tbody) tbody.innerHTML = "<tr><td colspan='6'>Could not load.</td></tr>";
+      }
+    }
+
+    function smxMatchesFilter(row, f) {
+      if (f === "all") return true;
+      if (f === "nce_critical") return row.scheduleMxNceCritical;
+      if (f === "overdue") return row.scheduleMxBucket === "overdue";
+      if (f === "due_soon") return row.scheduleMxBucket === "due_soon";
+      if (f === "missing") return row.scheduleMxBucket === "missing";
+      return true;
+    }
+
+    function smxMatchesQuery(row, q) {
+      if (!q) return true;
+      const ql = q.toLowerCase();
+      return (
+        (row.assetId || "").toLowerCase().indexOf(ql) !== -1 ||
+        (row.mgmtCd || "").toLowerCase().indexOf(ql) !== -1 ||
+        (row.makeModel || "").toLowerCase().indexOf(ql) !== -1 ||
+        (row.scheduleMxStatus || "").toLowerCase().indexOf(ql) !== -1
+      );
+    }
+
+    function renderScheduleMxStats() {
+      const box = document.getElementById("smx-stats");
+      if (!box || !smxStats) return;
+      function pill(k, label, cls) {
+        return (
+          "<div class='smx-stat " + cls + "'>" +
+            "<span class='lbl'>" + esc(label) + "</span>" +
+            "<span class='v'>" + esc(String(smxStats[k] ?? 0)) + "</span>" +
+          "</div>"
+        );
+      }
+      box.innerHTML =
+        pill("assets", "Assets", "") +
+        pill("nceCritical", "NCE overdue (critical)", "crit") +
+        pill("overdue", "Overdue", "bad") +
+        pill("dueSoon", "Due soon (≤30d)", "warn") +
+        pill("missing", "Missing sched data", "warn") +
+        pill("ok", "OK / current", "");
+    }
+
+    function smxPillLabel(bucket) {
+      if (bucket === "due_soon") return "Due soon";
+      if (bucket === "no_due") return "No due date";
+      if (bucket === "missing") return "Missing";
+      return bucket || "—";
+    }
+
+    function renderScheduleMxTable() {
+      const tbody = document.getElementById("smx-tbody");
+      if (!tbody) return;
+      const qel = document.getElementById("smx-query");
+      const q = (qel && qel.value) ? qel.value.trim() : "";
+      const filtered = smxRows.filter(function (row) {
+        return smxMatchesFilter(row, smxFilter) && smxMatchesQuery(row, q);
+      });
+      document.querySelectorAll("#smx-filters .smx-n").forEach(function (el) {
+        const k = el.getAttribute("data-smx-c");
+        if (!k) return;
+        const n = smxRows.filter(function (row) { return smxMatchesFilter(row, k); }).length;
+        el.textContent = n;
+      });
+      if (!filtered.length) {
+        tbody.innerHTML = "<tr><td colspan='6'>No rows match.</td></tr>";
+        return;
+      }
+      tbody.innerHTML = filtered.map(function (row) {
+        const nce = row.nce
+          ? ("<span class='nce-inline' title='" + esc(row.nceStatus || "NCE") + "'>NCE</span>")
+          : "—";
+        const due = row.scheduleMxDueIso ? fmtKeyShort(row.scheduleMxDueIso) : "—";
+        const ov = row.scheduleMxOverdueByDays != null ? row.scheduleMxOverdueByDays + " d" : "—";
+        const pillCls = row.scheduleMxBucket || "";
+        let trCls = "";
+        if (row.scheduleMxNceCritical) trCls = "smx-row-nce-crit";
+        else if (row.scheduleMxBucket === "overdue") trCls = "smx-row-overdue";
+        const mgmtLine = row.mgmtCd
+          ? ("Mgmt " + esc(row.mgmtCd) + " · " + row.workOrderCount + " WO")
+          : (String(row.workOrderCount) + " WO");
+        return (
+          "<tr" + (trCls ? " class='" + esc(trCls) + "'" : "") + ">" +
+            "<td><span class='asset-mono'>" + esc(row.assetId) + "</span>" +
+              (row.makeModel ? "<div class='remark-snippet'>" + esc(row.makeModel) + "</div>" : "") +
+              "<div class='remark-snippet'>" + mgmtLine + "</div>" +
+            "</td>" +
+            "<td>" + nce + "</td>" +
+            "<td>" + esc(row.scheduleMxStatus || "—") + "</td>" +
+            "<td>" + esc(due) + "</td>" +
+            "<td>" + esc(ov) + "</td>" +
+            "<td><span class='smx-pill " + esc(pillCls) + "'>" + esc(smxPillLabel(row.scheduleMxBucket)) + "</span></td>" +
+          "</tr>"
+        );
+      }).join("");
     }
 
     /* --- Work Orders list + filters -------------------------------------- */
@@ -11110,6 +12929,16 @@ function renderDashboardHtml(): string {
           : "";
         const tierBadge = "<span class='badge-tier " + tierClass(r.melTier) + "'>" + esc(r.melTier) + "</span>";
         const nceChip = r.nce ? "<span class='chip nce' title='Nuclear Certified Equipment" + (r.nceStatus ? " · " + esc(r.nceStatus) : "") + "'>NCE</span>" : "";
+        var smxChips = "";
+        if (r.scheduleMxNeedsEntry) {
+          smxChips += "<span class='chip smx-missing' title='Add Schedule Mx columns on Fleet (P&A)'>Sched Mx: add</span>";
+        } else if (r.scheduleMxBucket === "overdue") {
+          var od = r.scheduleMxOverdueByDays != null ? " · " + r.scheduleMxOverdueByDays + "d" : "";
+          smxChips += "<span class='chip smx-overdue" + (r.nce ? " smx-nce-critical" : "") +
+            "' title='Scheduled maintenance overdue'>Sched Mx overdue" + od + (r.nce ? " · NCE" : "") + "</span>";
+        } else if (r.scheduleMxBucket === "due_soon") {
+          smxChips += "<span class='chip smx-soon' title='Due within ~30 days'>Sched Mx due soon</span>";
+        }
         const reasonChip = r.woReason ? "<div class='wo-reason'><span class='lbl'>Reason</span>" + esc(r.woReason) + "</div>" : "";
         const openedLine = r.establishedDateIso ? "<span class='wo-opened'>Opened " + esc(fmtKeyShort(r.establishedDateIso)) + "</span>" : (r.establishedDate ? "<span class='wo-opened'>Opened " + esc(fmtMaybeDate(r.establishedDate)) + "</span>" : "");
         const dsc = r.daysSinceRemarkChange == null
@@ -11135,10 +12964,10 @@ function renderDashboardHtml(): string {
           "<button type='button' class='wo-card" + (isActive ? " active" : "") + "' data-wo='" + esc(r.workOrderId) + "' data-tier='" + esc(r.melTier || "unknown") + "' data-nce='" + (r.nce ? "1" : "0") + "'>" +
           "<div class='top-line'>" +
           "<span class='wo-id'>" + esc(r.workOrderId) + "</span>" +
-          "<span class='badges'>" + nceChip + tierBadge + staleChip + "</span>" +
+          "<span class='badges'>" + nceChip + smxChips + tierBadge + staleChip + "</span>" +
           "</div>" +
-          "<div class='top-line'><span class='asset'>" + esc(r.assetId || "—") + "</span>" +
-          (r.partsStatus ? "<span class='asset'>" + esc(r.partsStatus) + "</span>" : "<span></span>") +
+          "<div class='top-line wo-card-asset-row'><span class='asset'>" + esc(r.assetId || "—") + "</span>" +
+          (r.partsStatus ? "<span class='asset parts-inline'>" + esc(r.partsStatus) + "</span>" : "<span></span>") +
           "</div>" +
           // Sighting + waiver pills ride the same wrap-friendly meta row as
           // "Opened ..." — keeping them off the asset/parts row prevents the
@@ -11230,6 +13059,12 @@ function renderDashboardHtml(): string {
       // Same format as fmtKeyLong — the user wants one consistent date style.
       return fmtKeyLong(k);
     }
+    /** Pair key for changelog dedupe: matches what the timeline shows for ETIC / ETIC slip rows. */
+    function eticChangelogPairKey(oldVal, newVal) {
+      const o = oldVal ? fmtKeyShort(oldVal) : "—";
+      const n = newVal ? fmtKeyShort(newVal) : "—";
+      return o + "\0" + n;
+    }
     // Workbook cells sometimes come through as ISO datetimes ("2026-04-17T00:00:00.000Z")
     // or "2026-04-17 00:00:00". Auto-format any such value to "17 APR 26"; leave
     // anything else (codes, freeform text) untouched.
@@ -11261,41 +13096,36 @@ function renderDashboardHtml(): string {
       chips.push("<span class='wo-chip " + tierClass(r.melTier) + "'>" + esc(r.melTier || "unknown") + "</span>");
       if (r.remarkStale) chips.push("<span class='wo-chip stale'>Stale</span>");
       else chips.push("<span class='wo-chip ok'>On cadence</span>");
-      const subParts = [];
-      // Asset id leads the sub line — the dispatcher cares about which truck
-      // we're talking about more than the snapshot file we pulled it from.
-      // Mono + brighter color makes it visually echo the WO id above.
+      const primaryParts = [];
       if (r.assetId) {
-        subParts.push(
+        primaryParts.push(
           "<span class='wo-hero-asset'>" + esc(r.assetId) + "</span>" +
           " " + renderSightingBadge(r.assetId) +
           " " + renderWaiverBadge(r.assetId)
         );
       }
+      const metaParts = [];
       const openedTxt = r.establishedDateIso ? fmtKeyShort(r.establishedDateIso) : fmtMaybeDate(r.establishedDate || "");
-      if (openedTxt) subParts.push("Opened " + esc(openedTxt));
-      // Only surface workbook absence (WO dropped from latest snapshot) — the
-      // common case "snapshot is the latest" was just noise on the hero.
-      // Reword to make it clear this is workbook-presence, not yard-sighting.
+      if (openedTxt) metaParts.push("Opened " + esc(openedTxt));
       if (r.lastSnapshotDate && r.lastSnapshotDate !== asOf) {
-        subParts.push("Off latest workbook · last in " + esc(fmtKeyShort(r.lastSnapshotDate)));
+        metaParts.push("Off latest workbook · last in " + esc(fmtKeyShort(r.lastSnapshotDate)));
       }
-      // Reason rides the same sub line as a small inline chip instead of its
-      // own padded box — it's usually a 4-letter code and the dedicated row
-      // looked top-heavy on short reasons.
       if (r.woReason) {
-        subParts.push(
+        metaParts.push(
           "<span class='wo-hero-reason-chip'><span class='lbl'>Reason</span>" + esc(r.woReason) + "</span>"
         );
       }
-      const reasonHtml = "";
       el.innerHTML =
         "<div class='wo-hero-row'>" +
         "<div class='wo-hero-id'>" + esc(r.workOrderId) + "</div>" +
         chips.join("") +
         "</div>" +
-        "<div class='wo-hero-sub'>" + subParts.join("<span class='dot'>·</span>") + "</div>" +
-        reasonHtml;
+        (primaryParts.length
+          ? "<div class='wo-hero-sub wo-hero-sub-primary'>" + primaryParts.join(" ") + "</div>"
+          : "") +
+        (metaParts.length
+          ? "<div class='wo-hero-sub wo-hero-sub-meta'>" + metaParts.join("<span class='dot'>·</span>") + "</div>"
+          : "");
     }
 
     function renderWoKpis(r, asOf) {
@@ -11401,36 +13231,69 @@ function renderDashboardHtml(): string {
 
     function renderWoFacts(r) {
       const el = document.getElementById("wo-facts");
-      const rows = [];
-      if (r.nce) rows.push({ dt: "NCE", dd: "<span class='nce-badge'>Yes</span>" + (r.nceStatus ? " <span class='facts-sub'>" + esc(r.nceStatus) + "</span>" : "") });
-      if (r.owningUnit) rows.push({ dt: "Unit", dd: esc(r.owningUnit) });
-      if (r.shop) rows.push({ dt: "Shop", dd: esc(r.shop) });
-      if (r.melKey) rows.push({ dt: "MEL key", dd: esc(r.melKey) });
-      if (r.mgmtCd) rows.push({ dt: "Mgmt Cd", dd: esc(r.mgmtCd) });
-      if (r.makeModel) rows.push({ dt: "Make/Model", dd: esc(r.makeModel) });
-      if (r.vehNomen) rows.push({ dt: "Veh Nomen", dd: esc(r.vehNomen) });
-      if (r.woReason) rows.push({ dt: "Reason", dd: esc(r.woReason) });
-      if (r.establishedDateIso) rows.push({ dt: "Opened", dd: esc(fmtKeyLong(r.establishedDateIso)) });
-      else if (r.establishedDate) rows.push({ dt: "Opened", dd: esc(fmtMaybeDate(r.establishedDate)) });
-      rows.push({ dt: "Parts status", dd: esc(r.partsStatus || "—") });
+      const wrap = document.getElementById("wo-facts-wrap");
+      const org = [];
+      const veh = [];
+      const wo = [];
+      const track = [];
+      if (r.nce) org.push({ dt: "NCE", dd: "<span class='nce-badge'>Yes</span>" + (r.nceStatus ? " <span class='facts-sub'>" + esc(r.nceStatus) + "</span>" : "") });
+      const smxFacts = [];
+      if (r.scheduleMxStatus || r.scheduleMxDueIso || r.scheduleMxBucket) {
+        smxFacts.push({ dt: "Sched Mx status", dd: esc(r.scheduleMxStatus || "—") });
+        smxFacts.push({
+          dt: "Sched Mx due",
+          dd: r.scheduleMxDueIso ? esc(fmtKeyShort(r.scheduleMxDueIso)) : "—",
+        });
+        smxFacts.push({
+          dt: "Sched Mx health",
+          dd: esc(String(r.scheduleMxBucket || "—")) + (r.scheduleMxNeedsEntry ? " · add Fleet (P&A) fields" : ""),
+        });
+      }
+      if (r.owningUnit) org.push({ dt: "Unit", dd: esc(r.owningUnit) });
+      if (r.shop) org.push({ dt: "Shop", dd: esc(r.shop) });
+      if (r.melKey) org.push({ dt: "MEL key", dd: esc(r.melKey) });
+      if (r.mgmtCd) org.push({ dt: "Mgmt Cd", dd: esc(r.mgmtCd) });
+      if (r.makeModel) veh.push({ dt: "Make/Model", dd: esc(r.makeModel) });
+      if (r.vehNomen) veh.push({ dt: "Veh Nomen", dd: esc(r.vehNomen) });
+      if (r.woReason) wo.push({ dt: "Reason", dd: esc(r.woReason) });
+      if (r.establishedDateIso) wo.push({ dt: "Opened", dd: esc(fmtKeyLong(r.establishedDateIso)) });
+      else if (r.establishedDate) wo.push({ dt: "Opened", dd: esc(fmtMaybeDate(r.establishedDate)) });
+      wo.push({ dt: "Parts status", dd: esc(r.partsStatus || "—") });
       if (r.eticRaw && String(r.eticRaw).trim() && r.eticRaw !== r.eticDate) {
         const pretty = fmtMaybeDate(r.eticRaw);
-        // Only show the row if the prettified form is meaningfully different
-        // from the parsed eticDate we already rendered above.
         if (pretty !== fmtKeyShort(r.eticDate)) {
           const rawTrim = pretty.length > 40 ? pretty.slice(0, 40) + "…" : pretty;
-          rows.push({ dt: "ETIC (raw cell)", dd: esc(rawTrim) });
+          track.push({ dt: "ETIC (raw cell)", dd: esc(rawTrim) });
         }
       }
       if (r.firstEticDate || r.lastEticDate) {
         const first = r.firstEticDate ? fmtKeyShort(r.firstEticDate) : "—";
         const last = r.lastEticDate ? fmtKeyShort(r.lastEticDate) : "—";
-        if (first !== last) rows.push({ dt: "ETIC drift", dd: esc(first) + " → " + esc(last) });
+        if (first !== last) track.push({ dt: "ETIC drift", dd: esc(first) + " → " + esc(last) });
       }
-      if (!rows.length) { el.innerHTML = ""; return; }
-      el.innerHTML = rows.map(function (x) {
-        return "<div><dt>" + x.dt + "</dt><dd>" + x.dd + "</dd></div>";
-      }).join("");
+      function factPair(x) {
+        return "<div class='wo-facts-pair'><dt>" + esc(x.dt) + "</dt><dd>" + x.dd + "</dd></div>";
+      }
+      function factGroup(title, rows) {
+        if (!rows.length) return "";
+        return (
+          "<section class='wo-facts-group' aria-label='" + esc(title) + "'>" +
+          "<h4 class='wo-facts-group-h'>" + esc(title) + "</h4>" +
+          "<dl class='wo-facts-dl'>" + rows.map(factPair).join("") + "</dl>" +
+          "</section>"
+        );
+      }
+      const html =
+        factGroup("Organization", org) +
+        factGroup("Vehicle", veh) +
+        factGroup("Schedule maintenance", smxFacts) +
+        factGroup("Work order", wo) +
+        factGroup("ETIC tracking", track);
+      el.innerHTML = html;
+      if (wrap) {
+        if (!html.trim()) wrap.classList.add("hidden");
+        else wrap.classList.remove("hidden");
+      }
     }
 
     function actionTypeLabel(t) {
@@ -11444,12 +13307,67 @@ function renderDashboardHtml(): string {
       }
     }
 
+    function renderYardSnapshotPanel(payload) {
+      const det = document.getElementById("wo-yard-details");
+      const body = document.getElementById("wo-yard-details-body");
+      if (!det || !body) return;
+      const walks = (payload && Array.isArray(payload.yardWalks)) ? payload.yardWalks : [];
+      if (!walks.length) {
+        det.hidden = true;
+        body.innerHTML = "";
+        return;
+      }
+      det.hidden = false;
+      body.innerHTML = walks.map(function (y) {
+        const when = (y.checkedAtIso || "").slice(0, 10);
+        const whenL = when ? fmtKeyLong(when) : "—";
+        const disc = (y.discrepancies || "").trim();
+        const loc = (y.location || "").trim();
+        return (
+          "<article class='wo-yard-snap-row'>" +
+          "<div class='wo-yard-snap-meta'>" + esc(whenL) + " · " + esc(y.checkedBy || "—") + "</div>" +
+          (loc ? "<div><strong>Location</strong> " + esc(loc) + "</div>" : "") +
+          (disc
+            ? "<div><strong>Discrepancies</strong><div class='wo-yard-disc'>" + esc(disc) + "</div></div>"
+            : "<div class='muted' style='font-size:0.88rem'>No discrepancies on this walk.</div>") +
+          "</article>"
+        );
+      }).join("");
+    }
+
     function renderTimeline(payload, woRow) {
       const el = document.getElementById("wo-timeline");
+      function timelineSortKey(it) {
+        if (it.kind === "opened") return (it.ev.date || "") + "T00:00:00";
+        if (it.kind === "action") return it.ev.createdAtIso || "";
+        if (it.kind === "system") return it.ev.changed_at_iso || ((it.ev.snapshot_date_key || "") + "T12:00:00");
+        if (it.kind === "meeting") return it.ev.updatedAtIso || "";
+        if (it.kind === "yard") return it.ev.checkedAtIso || "";
+        return "";
+      }
+      /** Omit generic ETIC rows when etic_date_slip logs the same change. Slip uses parsed
+       *  dates; ETIC uses raw cell text — compare using fmtKeyShort like the timeline body. */
+      function dedupeEticTimelineGroup(grp) {
+        const slipKeys = new Set();
+        grp.forEach(function (item) {
+          if (item.kind !== "system") return;
+          const ev = item.ev;
+          if ((ev.field || "").toLowerCase() !== "etic_date_slip") return;
+          slipKeys.add(eticChangelogPairKey(ev.old_value, ev.new_value));
+        });
+        return grp.filter(function (item) {
+          if (item.kind !== "system") return true;
+          const ev = item.ev;
+          if ((ev.field || "").toLowerCase() !== "etic") return true;
+          return !slipKeys.has(eticChangelogPairKey(ev.old_value, ev.new_value));
+        });
+      }
       // Backwards-compat: older callers passed just an array of changelog entries.
       const entries = Array.isArray(payload) ? payload : ((payload && payload.entries) || []);
       const actions = (payload && Array.isArray(payload.actions)) ? payload.actions : [];
-      if (!entries.length && !actions.length && !(woRow && woRow.establishedDateIso)) {
+      const meetingNotes = (payload && Array.isArray(payload.meetingNotes)) ? payload.meetingNotes : [];
+      const yardWalks = (payload && Array.isArray(payload.yardWalks)) ? payload.yardWalks : [];
+      if (!entries.length && !actions.length && !(woRow && woRow.establishedDateIso) && !meetingNotes.length && !yardWalks.length) {
         el.innerHTML = "<div class='wo-timeline-empty'>No changes recorded yet.</div>";
         return;
       }
@@ -11466,6 +13384,18 @@ function renderDashboardHtml(): string {
         if (!byKey.has(k)) byKey.set(k, []);
         byKey.get(k).push({ kind: "action", ev: a });
       });
+      meetingNotes.forEach(function (m) {
+        const k = (m.updatedAtIso || "").slice(0, 10);
+        if (!k) return;
+        if (!byKey.has(k)) byKey.set(k, []);
+        byKey.get(k).push({ kind: "meeting", ev: m });
+      });
+      yardWalks.forEach(function (y) {
+        const k = (y.checkedAtIso || "").slice(0, 10);
+        if (!k) return;
+        if (!byKey.has(k)) byKey.set(k, []);
+        byKey.get(k).push({ kind: "yard", ev: y });
+      });
       // Inject a synthetic "Opened" pin from the workbook's Estbd Dt/Time so
       // we don't mis-label our earliest snapshot as the work order's open date.
       if (woRow && woRow.establishedDateIso) {
@@ -11478,6 +13408,7 @@ function renderDashboardHtml(): string {
 
       const days = keys.map(function (k) {
         const grp = byKey.get(k);
+        grp.sort(function (a, b) { return timelineSortKey(a).localeCompare(timelineSortKey(b)); });
         // Determine day class by most important event type
         const priority = ["etic_date_slip", "remarks", "mel_tier", "etic", "parts_status", "initial"];
         let dayCls = "";
@@ -11495,10 +13426,13 @@ function renderDashboardHtml(): string {
         if (!dayCls && grp.some(function (g) { return g.kind === "action"; })) {
           dayCls = "has-mel";
         }
+        if (!dayCls && grp.some(function (g) { return g.kind === "meeting"; })) dayCls = "has-meeting";
+        if (!dayCls && grp.some(function (g) { return g.kind === "yard"; })) dayCls = "has-yard";
         const ago = daysBetweenKeys(today, k);
         const agoLabel = ago == null ? "" : (ago === 0 ? "today" : ago === 1 ? "1 day ago" : ago + " days ago");
 
-        const evs = grp.map(function (item) {
+        const grpDisplay = dedupeEticTimelineGroup(grp);
+        const evs = grpDisplay.map(function (item) {
           if (item.kind === "opened") {
             const rawPretty = fmtMaybeDate(item.ev.raw);
             const raw = rawPretty && rawPretty !== fmtKeyShort(item.ev.date) ? " <span style='color:var(--subtle);font-size:0.74rem'>" + esc(rawPretty) + "</span>" : "";
@@ -11528,6 +13462,47 @@ function renderDashboardHtml(): string {
             return (
               "<div class='wo-tl-event fma-action'>" +
               "<span class='ev-label'>" + esc(actionTypeLabel(a.actionType)) + "</span>" +
+              "<div class='ev-body'>" + body + "</div>" +
+              "</div>"
+            );
+          }
+          if (item.kind === "meeting") {
+            const m = item.ev;
+            const title = (m.meetingTitle || "ETIC meeting").trim();
+            let body = "";
+            if ((m.notes || "").trim()) {
+              body += "<div class='ev-meet-block'><strong>Notes</strong><div class='ev-meet-text'>" + esc(m.notes.trim()) + "</div></div>";
+            }
+            if ((m.dueOuts || "").trim()) {
+              body += "<div class='ev-meet-block'><strong>Due-outs</strong><pre class='ev-meet-dueouts'>" + esc(m.dueOuts.trim()) + "</pre></div>";
+            }
+            const sub = (m.startedAtIso || "").slice(0, 10);
+            return (
+              "<div class='wo-tl-event meeting-entry'>" +
+              "<span class='ev-label'>ETIC meeting</span>" +
+              "<div class='ev-body'>" +
+              "<div class='ev-meet-head'><span class='ev-meet-title'>" + esc(title) + "</span>" +
+              (sub ? "<span class='muted tiny'>" + esc(fmtKeyLong(sub)) + "</span>" : "") + "</div>" +
+              body +
+              "</div></div>"
+            );
+          }
+          if (item.kind === "yard") {
+            const y = item.ev;
+            const disc = (y.discrepancies || "").trim();
+            const loc = (y.location || "").trim();
+            let body = "";
+            if (loc) body += "<div><strong>Location</strong> " + esc(loc) + "</div>";
+            if (disc) {
+              body += "<div><strong>Discrepancies</strong><div class='yard-disc-tl'>" + esc(disc) + "</div></div>";
+            } else {
+              body += "<div class='muted' style='font-size:0.86rem'>(no discrepancies)</div>";
+            }
+            body += "<div class='muted tiny' style='margin-top:6px'>Walker " + esc(y.checkedBy || "—") + " · " + esc(y.status || "—") +
+              (y.sourceDateKey ? " · snapshot " + esc(fmtKeyLong(y.sourceDateKey)) : "") + "</div>";
+            return (
+              "<div class='wo-tl-event yard-walk'>" +
+              "<span class='ev-label'>Yard check</span>" +
               "<div class='ev-body'>" + body + "</div>" +
               "</div>"
             );
@@ -11608,6 +13583,8 @@ function renderDashboardHtml(): string {
       const r = data.row;
       empty.classList.add("hidden");
       wrap.classList.remove("hidden");
+      const ydPre = document.getElementById("wo-yard-details");
+      if (ydPre) ydPre.hidden = true;
       st.className = "status";
       st.textContent = "";
       renderWoHero(r, data.asOfDateKey);
@@ -11628,7 +13605,11 @@ function renderDashboardHtml(): string {
         ban.textContent = "";
       }
       timelineEl.innerHTML = "<div class='wo-timeline-empty'>Loading timeline…</div>";
-      loadChangelog(r.workOrderId).then(function (payload) { renderTimeline(payload, r); }).catch(function () {
+      loadChangelog(r.workOrderId).then(function (payload) {
+        renderYardSnapshotPanel(payload);
+        renderTimeline(payload, r);
+      }).catch(function () {
+        renderYardSnapshotPanel({ yardWalks: [] });
         timelineEl.innerHTML = "<div class='wo-timeline-empty'>Could not load timeline.</div>";
       });
     }
@@ -11666,9 +13647,6 @@ function renderDashboardHtml(): string {
       const rel = relDate(analysis.dateKey);
       const dow = dayOfWeekShort(analysis.dateKey);
       kicker.textContent = (dow ? dow + " · " : "") + (rel || "report");
-      document.getElementById("hero-file").innerHTML =
-        "Workbook <strong>" + esc(analysis.workbookFileName) + "</strong>";
-
       const sorted = [...snapshotRows].sort((a, b) => b.dateKey.localeCompare(a.dateKey));
       const idx = sorted.findIndex(function (r) { return r.dateKey === analysis.dateKey; });
       const prev = idx >= 0 ? sorted[idx + 1] : null;
@@ -11693,7 +13671,8 @@ function renderDashboardHtml(): string {
         const analysis = await loadAnalysis(dateKey);
         renderDetails(analysis);
       } catch (e) {
-        document.getElementById("ingest-footer").textContent = "Could not load snapshot: " + (e.message || e);
+        const es = document.getElementById("etic-dl-status");
+        if (es) { es.textContent = "Could not load snapshot: " + (e.message || e); es.className = "status err"; }
       }
     }
 
@@ -12352,6 +14331,22 @@ function renderDashboardHtml(): string {
         setMainTab("wo");
         if (selectedWoId) setHashWorkOrder(selectedWoId);
       });
+      const smxTabBtn = document.getElementById("tab-schedule-mx");
+      if (smxTabBtn) smxTabBtn.addEventListener("click", function () { setMainTab("smx"); });
+      const smxFilt = document.getElementById("smx-filters");
+      if (smxFilt) {
+        smxFilt.addEventListener("click", function (e) {
+          const b = e.target.closest("[data-smx-filter]");
+          if (!b) return;
+          smxFilter = b.getAttribute("data-smx-filter") || "all";
+          smxFilt.querySelectorAll(".smx-filter-btn").forEach(function (x) {
+            x.classList.toggle("active", x === b);
+          });
+          renderScheduleMxTable();
+        });
+      }
+      const smxQ = document.getElementById("smx-query");
+      if (smxQ) smxQ.addEventListener("input", function () { renderScheduleMxTable(); });
       const melTabBtn = document.getElementById("tab-mel");
       if (melTabBtn) melTabBtn.addEventListener("click", function () { setMainTab("mel"); });
       const meetTabBtn = document.getElementById("tab-meeting");
@@ -12367,7 +14362,6 @@ function renderDashboardHtml(): string {
 
       askInit();
 
-      document.getElementById("btn-yard-check").addEventListener("click", downloadYardCheck);
       document.getElementById("btn-download-etic").addEventListener("click", downloadEticWorkbook);
 
       const askBd = document.getElementById("ai-ask-bd");
@@ -12758,6 +14752,12 @@ function renderDashboardHtml(): string {
         });
         btn.dataset.wired = "1";
       });
+
+      const exportBtn = document.getElementById("mel-slide-export");
+      if (exportBtn && !exportBtn.dataset.wired) {
+        exportBtn.addEventListener("click", exportMelSlideToCsv);
+        exportBtn.dataset.wired = "1";
+      }
 
       const askMelTrend = document.getElementById("ai-ask-mel-trend");
       if (askMelTrend && !askMelTrend.dataset.wired) {
@@ -13547,34 +15547,37 @@ function renderDashboardHtml(): string {
       }
     }
 
-    /** Critical-slide view: dense table grouped by unit, mirroring the
-     *  printed slide format. Uses the current scope/filter so the same chips
-     *  work in both views. Critical-only is implied unless the user explicitly
-     *  switches to a different status/critical filter. */
+    /** Critical-slide view: one big dense table grouped by unit, with a
+     *  unit-section row spanning all columns so every section's columns
+     *  stay perfectly aligned. The chip row drives the filter:
+     *    All       → every MEL row in scope (no implicit critical-only)
+     *    Below     → only rows where mel_status = below
+     *    At        → only at-MEL rows
+     *    Above     → only above-MEL rows
+     *    Critical  → only the keys flagged as critical in Settings
+     *  Click a row to expand the underlying open work orders for that
+     *  MEL key + unit. */
     function renderMelSlide() {
       const body = document.getElementById("mel-slide-body");
       const meta = document.getElementById("mel-slide-meta");
       if (!body) return;
 
       const scoped = melState.rows.filter(melMatchesScope);
-      // If the user hasn't narrowed via filter, default to critical-only on
-      // the slide so it's actually a "critical slide". Other status filters
-      // still apply when chosen.
-      const useCritical = melState.filter === "all" || melState.filter === "critical";
-      const filtered = scoped.filter(function (r) {
-        if (useCritical) return melIsCritical(r);
-        return r.mel_status === melState.filter;
-      });
+      const filtered = melFilterForSlide(scoped);
 
       if (meta) {
-        meta.textContent = filtered.length + " critical row" + (filtered.length === 1 ? "" : "s") +
-          " · " + (melState.asOfDate ? fmtKeyLong(melState.asOfDate) : "—") +
-          (useCritical ? "" : " · filter: " + melState.filter);
+        const labelByFilter = {
+          all: "MEL row", below: "Below-MEL row", at: "At-MEL row",
+          above: "Above-MEL row", critical: "critical row",
+        };
+        const noun = labelByFilter[melState.filter] || "row";
+        meta.textContent = filtered.length + " " + noun + (filtered.length === 1 ? "" : "s") +
+          " · " + (melState.asOfDate ? fmtKeyLong(melState.asOfDate) : "—");
       }
 
       if (!filtered.length) {
-        body.innerHTML = "<div class='mel-empty' style='padding:30px 0'>" +
-          (useCritical
+        body.innerHTML = "<div class='mel-empty' style='padding:30px 0;text-align:center;'>" +
+          (melState.filter === "critical"
             ? "No critical MEL keys flagged yet. Star a row in Detail list, or open Settings to manage."
             : "Nothing matches your filter.") +
           "</div>";
@@ -13590,7 +15593,29 @@ function renderDashboardHtml(): string {
       });
       const units = Array.from(byUnit.keys()).sort();
 
-      const html = units.map(function (u) {
+      const cols = [
+        { w: "24%", k: "type",  lbl: "Type" },
+        { w: "8%",  k: "unit",  lbl: "Unit" },
+        { w: "8%",  k: "mgmt",  lbl: "Mgmt" },
+        { w: "12%", k: "key",   lbl: "MEL Key" },
+        { w: "7%",  k: "asgnd", lbl: "Asgnd",  num: true },
+        { w: "6%",  k: "fmc",   lbl: "FMC",    num: true },
+        { w: "6%",  k: "nmc",   lbl: "NMC",    num: true },
+        { w: "6%",  k: "mel",   lbl: "MEL",    num: true },
+        { w: "8%",  k: "gap",   lbl: "Need",   num: true },
+        { w: "5%",  k: "acc",   lbl: "Acc",    num: true },
+        { w: "5%",  k: "abus",  lbl: "Abus",   num: true },
+      ];
+      const colgroup = "<colgroup>" +
+        cols.map(function (c) { return "<col style='width:" + c.w + "'>"; }).join("") +
+        "</colgroup>";
+      const thead = "<thead><tr>" +
+        cols.map(function (c) {
+          return "<th" + (c.num ? " class='num'" : "") + ">" + esc(c.lbl) + "</th>";
+        }).join("") +
+        "</tr></thead>";
+
+      const sections = units.map(function (u) {
         const rows = byUnit.get(u);
         rows.sort(function (a, b) {
           const oa = (a.config && a.config.displayOrder) || 0;
@@ -13598,28 +15623,32 @@ function renderDashboardHtml(): string {
           if (oa !== ob) return oa - ob;
           return a.mel_key.localeCompare(b.mel_key);
         });
-        const trs = [];
+        const trs = ["<tr class='slide-unit-row'><td colspan='" + cols.length + "'>" + esc(u) + "</td></tr>"];
         rows.forEach(function (r) {
           trs.push(buildSlideRow(r, false));
           (r.subdivisions || []).forEach(function (s) {
             trs.push(buildSlideSubRow(r, s));
           });
         });
-        return (
-          "<div class='slide-unit'>" +
-            "<div class='slide-unit-bar'>" + esc(u) + "</div>" +
-            "<table class='slide-table'>" +
-              "<thead><tr>" +
-                "<th>TYPE</th><th>UNIT</th><th>MGMT</th><th>MEL Key</th>" +
-                "<th>Asgnd</th><th>FMC</th><th>NMC</th><th>MEL</th>" +
-                "<th>Acc</th><th>Abus</th>" +
-              "</tr></thead>" +
-              "<tbody>" + trs.join("") + "</tbody>" +
-            "</table>" +
-          "</div>"
-        );
+        return trs.join("");
       }).join("");
-      body.innerHTML = html;
+
+      body.innerHTML =
+        "<table class='slide-table'>" + colgroup + thead +
+        "<tbody>" + sections + "</tbody></table>";
+
+      wireSlideExpand();
+    }
+
+    /** Returns the rows that match the chip filter on the slide.
+     *  "all" means literally all rows in scope — no implicit critical-only. */
+    function melFilterForSlide(scoped) {
+      const f = melState.filter;
+      if (f === "critical") return scoped.filter(melIsCritical);
+      if (f === "below" || f === "at" || f === "above") {
+        return scoped.filter(function (r) { return r.mel_status === f; });
+      }
+      return scoped;
     }
 
     function buildSlideRow(r, isSub) {
@@ -13628,23 +15657,32 @@ function renderDashboardHtml(): string {
       const need = r.mel_required || 0;
       const mgmt = melMgmtCodeOf(r);
       const typeLabel = melTypeLabelOf(r);
-      // Cell highlighting mirrors the printed slide: red/amber/green per status,
-      // red NMC chip when below MEL.
+      // FMC = Fully Mission Capable, always a "good" number (green when >0).
+      // NMC = down vehicles, amber whenever there are any.
+      // MEL is the target; Need = how many more FMC vehicles to hit it.
       const statusCls = "slide-row " + (r.mel_status || "");
-      const fmcCls = (need > 0 && fmc < need) ? "cell-bad" : "cell-good";
+      const fmcCls = fmc > 0 ? "cell-good" : "";
       const nmcCls = nmc > 0 ? "cell-warn" : "";
+      const melCls = (need > 0 && fmc < need) ? "cell-bad" : "";
+      const gap = Math.max(0, need - fmc);
+      const gapCell = gap > 0
+        ? "<td class='num cell-bad' title='Need " + gap + " more FMC to reach MEL " + need + "'>+" + gap + "</td>"
+        : (need > 0 ? "<td class='num cell-good' title='At or above MEL'>\u2713</td>" : "<td class='num'>—</td>");
       return (
-        "<tr class='" + statusCls + (isSub ? " sub" : "") + "'>" +
-          "<td class='td-type'>" + esc(typeLabel || "—") + "</td>" +
+        "<tr class='" + statusCls + (isSub ? " sub" : "") +
+            "' data-mel-key='" + esc(r.mel_key || "") +
+            "' data-unit='" + esc(r.unit || "") + "'>" +
+          "<td class='td-type' title='" + esc(typeLabel || "") + "'>" + esc(typeLabel || "—") + "</td>" +
           "<td>" + esc(r.unit || "—") + "</td>" +
           "<td>" + esc(mgmt || "—") + "</td>" +
           "<td class='td-key'>" + esc(r.mel_key || "—") + "</td>" +
-          "<td>" + (r.mel_assigned_total || 0) + "</td>" +
-          "<td class='" + fmcCls + "'>" + fmc + "</td>" +
-          "<td class='" + nmcCls + "'>" + nmc + "</td>" +
-          "<td>" + need + "</td>" +
-          "<td>" + (r.acc_abus || 0) + "</td>" +
-          "<td>—</td>" +
+          "<td class='num'>" + (r.mel_assigned_total || 0) + "</td>" +
+          "<td class='num " + fmcCls + "'>" + fmc + "</td>" +
+          "<td class='num " + nmcCls + "'>" + nmc + "</td>" +
+          "<td class='num " + melCls + "'>" + need + "</td>" +
+          gapCell +
+          "<td class='num'>" + (r.acc_abus || 0) + "</td>" +
+          "<td class='num'>—</td>" +
         "</tr>"
       );
     }
@@ -13653,22 +15691,231 @@ function renderDashboardHtml(): string {
       const fmc = sub.fmc || 0;
       const nmc = sub.nmc || 0;
       const need = sub.mel_required || 0;
-      const fmcCls = (need > 0 && fmc < need) ? "cell-bad" : "cell-good";
+      const fmcCls = fmc > 0 ? "cell-good" : "";
       const nmcCls = nmc > 0 ? "cell-warn" : "";
+      const melCls = (need > 0 && fmc < need) ? "cell-bad" : "";
+      const gap = Math.max(0, need - fmc);
+      const gapCell = gap > 0
+        ? "<td class='num cell-bad' title='Need " + gap + " more FMC to reach MEL " + need + "'>+" + gap + "</td>"
+        : (need > 0 ? "<td class='num cell-good' title='At or above MEL'>\u2713</td>" : "<td class='num'>—</td>");
       return (
-        "<tr class='slide-row sub'>" +
-          "<td class='td-type sub'>↳ " + esc(sub.type_label || "—") + "</td>" +
+        "<tr class='slide-row sub' data-mel-key='" + esc(parent.mel_key || "") +
+            "' data-unit='" + esc(parent.unit || "") + "'>" +
+          "<td class='td-type sub' title='" + esc(sub.type_label || "") + "'>\u21B3 " + esc(sub.type_label || "—") + "</td>" +
           "<td>" + esc(parent.unit || "—") + "</td>" +
           "<td>" + esc(sub.mgmt_code || "—") + "</td>" +
           "<td class='td-key'>" + esc(parent.mel_key || "—") + "</td>" +
-          "<td>" + (sub.assigned || 0) + "</td>" +
-          "<td class='" + fmcCls + "'>" + fmc + "</td>" +
-          "<td class='" + nmcCls + "'>" + nmc + "</td>" +
-          "<td>" + need + "</td>" +
-          "<td>" + (sub.accidents || 0) + "</td>" +
-          "<td>" + (sub.abuses || 0) + "</td>" +
+          "<td class='num'>" + (sub.assigned || 0) + "</td>" +
+          "<td class='num " + fmcCls + "'>" + fmc + "</td>" +
+          "<td class='num " + nmcCls + "'>" + nmc + "</td>" +
+          "<td class='num " + melCls + "'>" + need + "</td>" +
+          gapCell +
+          "<td class='num'>" + (sub.accidents || 0) + "</td>" +
+          "<td class='num'>" + (sub.abuses || 0) + "</td>" +
         "</tr>"
       );
+    }
+
+    /** Wires click → expand on every .slide-row inside the slide table.
+     *  Inserts a sibling <tr.slide-wo-row> with the open work orders for that
+     *  MEL key + unit; clicking again collapses it. Work orders come from the
+     *  /api/watch rows already cached for the as-of date so it's instant. */
+    function wireSlideExpand() {
+      const tbl = document.querySelector("#mel-slide-body table.slide-table");
+      if (!tbl || tbl.dataset.expandWired === "1") return;
+      tbl.dataset.expandWired = "1";
+      tbl.addEventListener("click", function (ev) {
+        const tr = ev.target.closest("tr.slide-row");
+        if (!tr) return;
+        const melKey = tr.getAttribute("data-mel-key");
+        const unit = tr.getAttribute("data-unit");
+        if (!melKey) return;
+        const next = tr.nextElementSibling;
+        if (next && next.classList.contains("slide-wo-row") && next.dataset.for === melKey + "::" + unit) {
+          next.remove();
+          tr.classList.remove("expanded");
+          return;
+        }
+        // Collapse any other open expansion so the table stays tidy.
+        tbl.querySelectorAll("tr.slide-wo-row").forEach(function (n) { n.remove(); });
+        tbl.querySelectorAll("tr.slide-row.expanded").forEach(function (n) { n.classList.remove("expanded"); });
+        tr.classList.add("expanded");
+        const colspan = tr.children.length;
+        const woRow = document.createElement("tr");
+        woRow.className = "slide-wo-row";
+        woRow.dataset.for = melKey + "::" + unit;
+        woRow.innerHTML = "<td colspan='" + colspan + "'>" +
+          "<div class='slide-wo-wrap'>" +
+            "<div class='slide-wo-head'><span>Open work orders</span><span id='slide-wo-count'>loading\u2026</span></div>" +
+            "<div id='slide-wo-list'>Loading\u2026</div>" +
+          "</div></td>";
+        tr.parentNode.insertBefore(woRow, tr.nextSibling);
+        renderSlideWosFor(melKey, unit, woRow);
+      });
+    }
+
+    /** Render the open work orders for one MEL row inside its expansion.
+     *  Grouped by asset, because one NMC vehicle can have several open WOs
+     *  (so "13 WOs / 7 NMC" actually means 7 assets × ~2 WOs each). The
+     *  asset header row makes that math obvious at a glance. */
+    async function renderSlideWosFor(melKey, unit, woRow) {
+      const listEl = woRow.querySelector("#slide-wo-list");
+      const countEl = woRow.querySelector("#slide-wo-count");
+      try {
+        const asOf = melState.asOfDate || latestSnapshotDate();
+        const rows = await loadWatchForDate(asOf);
+        const matches = rows.filter(function (w) {
+          return (w.melKey || "") === melKey && (!unit || (w.owningUnit || "") === unit);
+        });
+        // Group by asset; preserve a "worst-tier" per asset for sorting.
+        const byAsset = new Map();
+        const tierRank = function (t) { return t === "below" ? 0 : t === "at" ? 1 : t === "above" ? 2 : 3; };
+        matches.forEach(function (w) {
+          const aid = w.assetId || "—";
+          let g = byAsset.get(aid);
+          if (!g) {
+            g = { assetId: aid, wos: [], worstTier: 9, slipMax: 0 };
+            byAsset.set(aid, g);
+          }
+          g.wos.push(w);
+          g.worstTier = Math.min(g.worstTier, tierRank(w.melTier));
+          g.slipMax = Math.max(g.slipMax, w.cumulativeEticSlipDays || 0);
+        });
+        const assets = Array.from(byAsset.values()).sort(function (a, b) {
+          if (a.worstTier !== b.worstTier) return a.worstTier - b.worstTier;
+          return b.slipMax - a.slipMax;
+        });
+        const totalWos = matches.length;
+        const assetCount = assets.length;
+        countEl.textContent = totalWos + " open WO" + (totalWos === 1 ? "" : "s") +
+          " · " + assetCount + " asset" + (assetCount === 1 ? "" : "s");
+        if (!totalWos) {
+          listEl.innerHTML = "<div class='slide-wo-empty'>No open work orders for " + esc(melKey) +
+            (unit ? " in " + esc(unit) : "") + ".</div>";
+          return;
+        }
+        // Stable sort each asset's WOs: tier first then stalest ETIC slip.
+        assets.forEach(function (g) {
+          g.wos.sort(function (a, b) {
+            const ta = tierRank(a.melTier), tb = tierRank(b.melTier);
+            if (ta !== tb) return ta - tb;
+            return (b.cumulativeEticSlipDays || 0) - (a.cumulativeEticSlipDays || 0);
+          });
+        });
+        const trs = assets.map(function (g) {
+          var w0 = g.wos[0];
+          var mm = w0 ? String(w0.makeModel || "").trim() : "";
+          var mg = w0 ? String(w0.mgmtCd || "").trim() : "";
+          var vehHtml = "";
+          if (mm || mg) {
+            vehHtml = " <span class='wo-asset-veh'>";
+            if (mm) vehHtml += "<span class='wo-asset-make'>" + esc(mm) + "</span>";
+            if (mm && mg) vehHtml += " · ";
+            if (mg) vehHtml += "<span class='wo-asset-mgmt'>" + esc(mg) + "</span>";
+            vehHtml += "</span>";
+          }
+          const header = "<tr class='wo-asset-row'>" +
+            "<td colspan='7'>" +
+              "<span class='wo-asset-id'>" + esc(g.assetId) + "</span>" +
+              vehHtml +
+              "<span class='wo-asset-meta'>" + g.wos.length + " open WO" + (g.wos.length === 1 ? "" : "s") + "</span>" +
+            "</td>" +
+          "</tr>";
+          const lines = g.wos.map(function (w) {
+            const eticTxt = w.eticRaw ? fmtMaybeDate(w.eticRaw) : "—";
+            const tierCls = w.melTier === "below" ? "wo-tier-below" : "";
+            const remark = (w.remarks || "").trim();
+            var smxCell = "—";
+            if (w.scheduleMxNeedsEntry) smxCell = "<span class='wo-tier-below'>Add sched Mx</span>";
+            else if (w.scheduleMxBucket === "overdue") {
+              smxCell = "<span class='wo-tier-below'>" + esc("OVERDUE" + (w.scheduleMxOverdueByDays != null ? " " + w.scheduleMxOverdueByDays + "d" : "")) +
+                (w.nce ? " · NCE" : "") + "</span>";
+            } else if (w.scheduleMxStatus) {
+              smxCell = esc(w.scheduleMxStatus);
+            }
+            return "<tr class='wo-line'>" +
+              "<td><a class='wo-id' href='#wo=" + encodeURIComponent(w.workOrderId) + "'>" + esc(w.workOrderId || "—") + "</a></td>" +
+              "<td>" + esc(w.melKey || "—") + "</td>" +
+              "<td class='" + tierCls + "'>" + esc((w.melTier || "—").toUpperCase()) + "</td>" +
+              "<td>" + esc(w.partsStatus || "—") + "</td>" +
+              "<td>" + esc(eticTxt) + "</td>" +
+              "<td class='wo-remark'>" + smxCell + "</td>" +
+              "<td class='wo-remark'>" + esc(remark || "—") + "</td>" +
+              "</tr>";
+          }).join("");
+          return header + lines;
+        }).join("");
+        listEl.innerHTML =
+          "<table class='slide-wo-table'>" +
+            "<thead><tr>" +
+              "<th style='width:12%'>WO #</th>" +
+              "<th style='width:10%'>MEL</th>" +
+              "<th style='width:8%'>Tier</th>" +
+              "<th style='width:12%'>Parts</th>" +
+              "<th style='width:10%'>ETIC</th>" +
+              "<th style='width:14%'>Schedule Mx</th>" +
+              "<th>Remark</th>" +
+            "</tr></thead><tbody>" + trs + "</tbody></table>";
+      } catch (e) {
+        countEl.textContent = "error";
+        listEl.innerHTML = "<div class='slide-wo-empty'>Could not load work orders.</div>";
+      }
+    }
+
+    /** Build a CSV from the currently visible slide rows and trigger a download
+     *  with a .csv extension — Excel opens these natively. We use CSV so the
+     *  client doesn't need an xlsx library bundled into the worker HTML. */
+    function exportMelSlideToCsv() {
+      const scoped = melState.rows.filter(melMatchesScope);
+      const filtered = melFilterForSlide(scoped);
+      const headers = ["Type","Unit","Mgmt","MEL Key","Asgnd","FMC","NMC","MEL","Need","Acc","Abus","Status","Critical"];
+      const lines = [headers.join(",")];
+      const csvField = function (v) {
+        const s = v == null ? "" : String(v);
+        return /[",\\n\\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+      };
+      const byUnit = new Map();
+      filtered.forEach(function (r) {
+        const u = r.unit || "—";
+        const list = byUnit.get(u) || [];
+        list.push(r); byUnit.set(u, list);
+      });
+      Array.from(byUnit.keys()).sort().forEach(function (u) {
+        byUnit.get(u).slice().sort(function (a, b) {
+          return (a.mel_key || "").localeCompare(b.mel_key || "");
+        }).forEach(function (r) {
+          const mgmt = melMgmtCodeOf(r);
+          const typeLabel = melTypeLabelOf(r);
+          const need = r.mel_required || 0;
+          const fmc = r.fmc_count || 0;
+          const gap = Math.max(0, need - fmc);
+          lines.push([
+            typeLabel || "", r.unit || "", mgmt || "", r.mel_key || "",
+            r.mel_assigned_total || 0, fmc, r.nmc_count || 0,
+            need, gap, r.acc_abus || 0, "",
+            r.mel_status || "", melIsCritical(r) ? "yes" : "",
+          ].map(csvField).join(","));
+          (r.subdivisions || []).forEach(function (s) {
+            const sNeed = s.mel_required || 0;
+            const sFmc = s.fmc || 0;
+            const sGap = Math.max(0, sNeed - sFmc);
+            lines.push([
+              "↳ " + (s.type_label || ""), r.unit || "", s.mgmt_code || "", r.mel_key || "",
+              s.assigned || 0, sFmc, s.nmc || 0,
+              sNeed, sGap, s.accidents || 0, s.abuses || 0,
+              "", "",
+            ].map(csvField).join(","));
+          });
+        });
+      });
+      const csv = lines.join("\\r\\n");
+      const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+      const u = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      const stamp = (melState.asOfDate || "").replace(/-/g, "");
+      a.href = u; a.download = "mel-" + (melState.filter || "all") + (stamp ? "-" + stamp : "") + ".csv";
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(u);
     }
 
     function melStatusLabel(s) {
@@ -14326,10 +16573,21 @@ function renderDashboardHtml(): string {
       wired: false,
       subTab: "pending",          // "pending" | "byvehicle"
       pending: [],
-      bv: { assetId: "", waivers: [], verifications: {} },
+      bv: { assetId: "", waivers: [], removed: [], verifications: {} },
       /** Sorted asset ids from last /api/waivers/counts (By vehicle list). */
       bvAssetKeys: [],
     };
+
+    function waiversSetSubTab(which) {
+      waiversState.subTab = which;
+      document.querySelectorAll(".waivers-sub").forEach(function (b) {
+        b.classList.toggle("active", b.getAttribute("data-wv-sub") === which);
+      });
+      const pending = document.getElementById("wv-view-pending");
+      const bv = document.getElementById("wv-view-byvehicle");
+      if (pending) pending.hidden = which !== "pending";
+      if (bv) bv.hidden = which !== "byvehicle";
+    }
 
     function waiversWireOnce() {
       if (waiversState.wired) return;
@@ -14339,12 +16597,7 @@ function renderDashboardHtml(): string {
         const t = e.target.closest("[data-wv-sub]");
         if (!t) return;
         const which = t.getAttribute("data-wv-sub");
-        waiversState.subTab = which;
-        document.querySelectorAll(".waivers-sub").forEach(function (b) {
-          b.classList.toggle("active", b.getAttribute("data-wv-sub") === which);
-        });
-        document.getElementById("wv-view-pending").hidden = which !== "pending";
-        document.getElementById("wv-view-byvehicle").hidden = which !== "byvehicle";
+        waiversSetSubTab(which);
         if (which === "pending") loadWaiverPending();
         if (which === "byvehicle") loadWaiverAssetBrowser();
       });
@@ -14455,15 +16708,21 @@ function renderDashboardHtml(): string {
 
     function onEnterWaiversTab() {
       waiversWireOnce();
+      waiversSetSubTab(waiversState.subTab || "pending");
       // Always pull pending so the badge count on the subnav is current,
-      // even if the user lands on the byvehicle tab first.
+      // even if the user lands on the by vehicle tab first.
       loadWaiverPending();
+      if ((waiversState.subTab || "pending") === "byvehicle") {
+        loadWaiverAssetBrowser();
+        if (waiversState.bv.assetId) loadWaiverByVehicle(waiversState.bv.assetId);
+      }
     }
 
     async function loadWaiverPending() {
       const list = document.getElementById("wv-pending-list");
       const empty = document.getElementById("wv-pending-empty");
       const countEl = document.getElementById("wv-pending-count");
+      if (empty) empty.hidden = true;
       list.innerHTML = "<div class='hint' style='color:var(--muted);padding:14px'>Loading…</div>";
       try {
         const r = await fetch("/api/waivers/pending", { cache: "no-store" });
@@ -14473,13 +16732,14 @@ function renderDashboardHtml(): string {
         countEl.textContent = ws.length ? String(ws.length) : "";
         if (!ws.length) {
           list.innerHTML = "";
-          empty.hidden = false;
+          if (empty) empty.hidden = false;
           return;
         }
-        empty.hidden = true;
+        if (empty) empty.hidden = true;
         list.innerHTML = ws.map(renderPendingCard).join("");
         wirePendingCardActions();
       } catch (e) {
+        if (empty) empty.hidden = true;
         list.innerHTML = "<div class='wv-empty'>Could not load pending waivers.</div>";
       }
     }
@@ -14578,10 +16838,14 @@ function renderDashboardHtml(): string {
         const r = await fetch("/api/waivers/asset/" + encodeURIComponent(assetId), { cache: "no-store" });
         const j = await r.json();
         const ws = (j && j.waivers) || [];
+        const removed = (j && j.removed) || [];
         waiversState.bv.waivers = ws;
+        waiversState.bv.removed = removed;
         // Pull verification logs in parallel for any approved waivers so the
         // manager can see a full audit trail without an extra click.
-        const approved = ws.filter(function (w) { return w.status === "approved"; });
+        const approved = ws.filter(function (w) { return w.status === "approved"; }).concat(
+          removed.filter(function (w) { return w.status === "approved"; }),
+        );
         const verifs = await Promise.all(approved.map(function (w) {
           return fetch("/api/waivers/" + w.id, { cache: "no-store" })
             .then(function (rr) { return rr.json(); })
@@ -14620,7 +16884,14 @@ function renderDashboardHtml(): string {
       const list = ws.length
         ? "<div class='wv-bv-list'>" + ws.map(renderBvCard).join("") + "</div>"
         : "<div class='wv-empty'>No waivers (approved or pending) on file for this vehicle.</div>";
-      wrap.innerHTML = head + list;
+      const removed = waiversState.bv.removed || [];
+      const removedBlock = removed.length
+        ? "<details class='wv-removed-wrap'>" +
+            "<summary class='wv-removed-summary'>Removed from card (" + removed.length + ") — audit only, not on print</summary>" +
+            "<div class='wv-bv-list'>" + removed.map(renderBvRemovedCard).join("") + "</div>" +
+          "</details>"
+        : "";
+      wrap.innerHTML = head + list + removedBlock;
       const pb = wrap.querySelector("[data-print]");
       if (pb) pb.addEventListener("click", function () {
         window.open(pb.getAttribute("data-print"), "_blank", "noopener");
@@ -14672,7 +16943,7 @@ function renderDashboardHtml(): string {
             ? "<button type='button' class='btn-approve' data-verify='" + w.id + "'>Verify now</button>"
             : "") +
           "<button type='button' class='ghost' data-delete='" + w.id + "' " +
-            "title='Permanently delete this waiver (admin)'>Delete</button>" +
+            "title='Remove from printed card; record kept (your name required)'>Remove from card</button>" +
         "</div>";
       return (
         "<article class='wv-bv-card " + stateCls + "'>" +
@@ -14685,6 +16956,52 @@ function renderDashboardHtml(): string {
           meta +
           verifsHtml +
           actions +
+        "</article>"
+      );
+    }
+
+    function renderBvRemovedCard(w) {
+      const status = w.status;
+      const stateCls = status === "approved" ? (w.verifyState || "fresh")
+                     : status === "pending" ? "pending" : "rejected";
+      const pillTxt = status === "pending" ? "Pending (removed)"
+                    : status === "rejected" ? "Rejected (removed)"
+                    : w.verifyState === "overdue" ? "Removed · verify was overdue"
+                    : w.verifyState === "dueSoon" ? "Removed · verify due soon"
+                    : "Removed from card";
+      const photo = waiverDefectPhotosHtml(w);
+      const desc = w.description ? "<div class='desc'>" + esc(w.description) + "</div>" : "";
+      const removedWhen = (w.deletedAtIso || "").slice(0, 10);
+      const meta =
+        "<div class='meta'>" +
+          "<span>Removed " + fmtKeyShort(removedWhen) + " by " + esc(w.deletedBy || "") + "</span>" +
+          "<span>Submitted " + fmtKeyShort(w.submittedAtIso.slice(0,10)) + " by " + esc(w.submittedBy) + "</span>" +
+          (w.reviewedAtIso ? "<span>Review " + fmtKeyShort(w.reviewedAtIso.slice(0,10)) + " by " + esc(w.reviewedBy) + "</span>" : "") +
+        "</div>";
+      const verifs = waiversState.bv.verifications[w.id] || [];
+      const verifsHtml = verifs.length
+        ? "<div class='verif-log'>" +
+            verifs.map(function (v) {
+              var ph = (v.hasPhoto && v.photoUrl)
+                ? " <a class='verif-photo-link' href='" + esc(v.photoUrl) + "' target='_blank' rel='noopener'>Photo</a>"
+                : "";
+              return "<div class='v'>" +
+                       "<span class='when'>" + fmtKeyShort(v.verifiedAtIso.slice(0,10)) + "</span>" +
+                       "<span>" + esc(v.kind) + " — " + esc(v.verifiedBy) + (v.note ? " · " + esc(v.note) : "") + ph + "</span>" +
+                     "</div>";
+            }).join("") +
+          "</div>"
+        : "";
+      return (
+        "<article class='wv-bv-card removed-record " + stateCls + "'>" +
+          "<div class='row1'>" +
+            "<div class='title'>" + esc(w.title) + "</div>" +
+            "<span class='pill removed'>" + esc(pillTxt) + "</span>" +
+          "</div>" +
+          desc +
+          photo +
+          meta +
+          verifsHtml +
         "</article>"
       );
     }
@@ -14715,14 +17032,28 @@ function renderDashboardHtml(): string {
     async function promptDelete(id) {
       const w = waiversState.bv.waivers.find(function (x) { return x.id === id; });
       if (!w) return;
-      if (!window.confirm("Permanently delete waiver \\"" + w.title + "\\"? This cannot be undone.")) return;
+      const cachedName = localStorage.getItem("waiver.reviewerName") || "";
+      const deletedBy = window.prompt(
+        "Remove \\"" + w.title + "\\" from the printed waiver card. Your name (required, stored in audit):",
+        cachedName,
+      );
+      if (!deletedBy || !deletedBy.trim()) return;
+      localStorage.setItem("waiver.reviewerName", deletedBy.trim());
+      if (!window.confirm(
+        "Remove this waiver from the card? It will not appear on print. Expand 'Removed from card' below to view the audit record.",
+      )) return;
       try {
-        const r = await fetch("/api/waivers/" + id, { method: "DELETE" });
-        if (!r.ok) throw new Error("HTTP " + r.status);
+        const r = await fetch("/api/waivers/" + id, {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ deletedBy: deletedBy.trim() }),
+        });
+        const j = await r.json().catch(function () { return {}; });
+        if (!r.ok) throw new Error((j && j.error) || ("HTTP " + r.status));
         loadWaiverByVehicle(waiversState.bv.assetId);
         loadWaiverCounts(true);
       } catch (e) {
-        alert("Delete failed: " + (e.message || e));
+        alert("Remove failed: " + (e.message || e));
       }
     }
 
@@ -14733,9 +17064,8 @@ function renderDashboardHtml(): string {
        ====================================================================== */
     const yardFmState = {
       wired: false,
-      // Default to Roster — that's the immediate operational view (the walker
-      // app embedded). Findings is for triage and is empty until walkers
-      // tag stuff, so showing it first feels broken.
+      // Default to Fleet list — embedded walker app. Findings triages
+      // unlisted/discrepancies only (not "not checked"; that's on the list).
       subTab: "roster",
       findings: [],
       totals: { total: 0, missing: 0, unlisted: 0, discrepancy: 0, unknown: 0, acknowledged: 0 },
@@ -14744,11 +17074,8 @@ function renderDashboardHtml(): string {
       activity: [],
       resolveTarget: null, // { assetId, kind, checkId, asset }
     };
-    // "Missing" is shown as "Not seen" in the UI to make it clear it's an
-    // absence-derived flag (no walker has confirmed this asset in N days), not
-    // something the walker actively declared. The internal kind is still
-    // 'missing' for back-compat with action rows. 'unknown' kept for legacy
-    // history rendering only — walker no longer produces these.
+    // Kinds: unlisted / discrepancy / unknown (legacy). Absence-derived
+    // "missing" is no longer listed in the queue — see Fleet list instead.
     const FINDING_LABELS = {
       missing: "Not seen",
       unlisted: "Unlisted",
@@ -14866,7 +17193,6 @@ function renderDashboardHtml(): string {
       const t = yardFmState.totals || {};
       const set = function(id, v) { const el = document.getElementById(id); if (el) el.textContent = String(v ?? 0); };
       set("ff-all", t.total);
-      set("ff-missing", t.missing);
       set("ff-unlisted", t.unlisted);
       set("ff-discrepancy", t.discrepancy);
       set("ff-unknown", t.unknown);
@@ -14894,10 +17220,10 @@ function renderDashboardHtml(): string {
               '<div style="font-size:18px;color:var(--text);font-weight:600;margin-bottom:8px;">No yard checks yet</div>' +
               '<p style="margin:0 0 12px;">Walkers tag what they actually see. Findings appear here automatically. Each one is:</p>' +
               '<ul style="text-align:left;display:inline-block;line-height:1.7;">' +
-                '<li><b>Not seen</b> \u2014 asset is on the latest ETIC but no walker has confirmed it in roughly two check cycles. (Absence-derived, no walker action required.)</li>' +
                 '<li><b>Unlisted</b> \u2014 walker logged an asset that isn\u2019t on the latest ETIC (floor-to-book reconciliation).</li>' +
-                '<li><b>Discrepancy</b> \u2014 walker noted something (flat tire, windows down, etc).</li>' +
+                '<li><b>Discrepancy</b> \u2014 walker noted something (flat tire, windows down, etc.).</li>' +
               '</ul>' +
+              '<p style="margin:12px 0 0;font-size:13px;color:var(--muted);">Vehicles waiting for a yard walk (due / never checked) appear on the <b>Fleet list</b> tab, not here.</p>' +
               '<p style="margin:16px 0 0;"><a href="/yard?desktop=1" target="_blank" rel="noopener">Open the walker app \u2197</a> ' +
               'to start tagging, or scan the QR on a phone.</p>' +
             '</div>';
@@ -15245,7 +17571,7 @@ function renderDashboardHtml(): string {
       const sv = document.getElementById("yard-session-view");
       sv.classList.remove("hidden");
       const list = document.getElementById("yard-asset-list");
-      if (list) list.innerHTML = "<div class='yard-empty-state'>Loading roster…</div>";
+      if (list) list.innerHTML = "<div class='yard-empty-state'>Loading fleet…</div>";
       const nameEl = document.getElementById("yard-session-name");
       if (nameEl) nameEl.textContent = "Session #" + sessionId;
       try {
@@ -15274,7 +17600,7 @@ function renderDashboardHtml(): string {
         const bits = [];
         bits.push("Started " + fmtIsoShort(s.createdAtIso));
         if (s.createdBy) bits.push("by " + s.createdBy);
-        if (s.sourceDateKey) bits.push("roster " + fmtKeyShort(s.sourceDateKey));
+        if (s.sourceDateKey) bits.push("ETIC " + fmtKeyShort(s.sourceDateKey));
         if (s.status === "closed" && s.closedAtIso) bits.push("closed " + fmtIsoShort(s.closedAtIso));
         subEl.textContent = bits.join(" · ");
       }
@@ -15345,7 +17671,7 @@ function renderDashboardHtml(): string {
       const dlHtml = "<datalist id='yard-loc-options'>" + dlOpts + "</datalist>";
 
       if (!yardState.assets.length) {
-        root.innerHTML = dlHtml + "<div class='yard-empty-state'><strong>No assets in roster.</strong><br/>The latest snapshot may have no work-order rows.</div>";
+        root.innerHTML = dlHtml + "<div class='yard-empty-state'><strong>No assets in this snapshot.</strong><br/>The latest ETIC import may have no work-order rows.</div>";
         yardRenderProgress();
         return;
       }

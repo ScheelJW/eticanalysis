@@ -264,8 +264,10 @@ The walker UI **does not** mark assets "missing." Walkers don't know what
 *should* be on the lot, only what they see in front of them. Therefore:
 
 - A walker tap *only ever* records `status='present'` for "I see it here."
+  **Non-empty `location` is required** for `present` (API and `/yard` UI);
+  you cannot mark checked without saying where the vehicle was parked.
   The legacy `missing` / `unknown` statuses still exist in the schema and in
-  old rows, but new code never creates them.
+  old rows, but new walker flows do not create them.
 - "**Missing**" findings in the FM&A queue are **absence-derived**: the
   rolling roster knows every asset that should exist. If the most recent
   `present` check for an asset is older than `2 × intervalDays`, it shows
@@ -302,7 +304,9 @@ useful ones:
 | `GET /api/yard/sightings` | `{assetId → {location, at, by}}` map | `getLatestSightings` |
 | `GET /api/yard/findings` | Live FM&A queue | `listOpenFindings` |
 | `POST /api/yard/findings/resolve` | Log an FM&A action | `resolveFinding` |
-| `POST /api/yard/check` | Walker records a sighting | `recordCheck` |
+| `POST /api/yard/check` | Walker records a check; `present` requires `location` | `recordCheck` |
+| `PATCH /api/yard/check` | Correct a check (`checkId`, `editedBy`, …); `present` requires `location` unless no-op; logs `yard_check_edit` | `updateYardCheck` |
+| `DELETE /api/yard/check` | Remove a check (`checkId`, `deletedBy` JSON body); cascades `yard_check_edit` | `deleteCheck` |
 | `GET /api/waivers/asset/:id` | Waivers for one truck (approved + pending) | `listWaiversForAsset` |
 | `GET /api/waivers/pending` | Management approval queue | `listPendingWaivers` |
 | `GET /api/waivers/counts` | `{assetId → {approved,pending,overdueVerify}}` for badges | `getWaiverCounts` |
