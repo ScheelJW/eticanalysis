@@ -519,13 +519,22 @@ export default {
       });
     }
 
+    // Mobile landing — pick Waiver Card vs Yard Check before entering either app.
+    if (url.pathname === "/go" || url.pathname === "/go/") {
+      return new Response(renderMobileAppPickerHtml(), {
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "private, no-store, no-cache, must-revalidate, max-age=0",
+        },
+      });
+    }
+
     if (url.pathname === "/" || url.pathname === "/index.html") {
-      // Phones / tablets: redirect to the focused yard app unless an explicit
-      // ?desktop=1 escape hatch is present (or they came from /yard already).
+      // Phones / tablets: app picker unless ?desktop=1 (full dashboard).
       const ua = request.headers.get("user-agent") || "";
       const isMobile = /Mobile|Android|iPhone|iPad|iPod/i.test(ua);
       if (isMobile && !url.searchParams.has("desktop")) {
-        return Response.redirect(new URL("/yard", url).toString(), 302);
+        return Response.redirect(new URL("/go", url).toString(), 302);
       }
       return new Response(renderDashboardHtml(), {
         headers: {
@@ -1695,6 +1704,12 @@ function renderWaiverAppHtml(): string {
     body.detail .h-back { display: inline-flex; }
     .h-title { font-weight: 600; font-size: 1.05rem; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .h-sub { font-size: 0.78rem; color: var(--muted); margin-top: 2px; }
+    .h-switch {
+      flex: 0 0 auto; font-size: 0.72rem; font-weight: 600; color: var(--muted);
+      text-decoration: none; padding: 8px 10px; border-radius: 10px;
+      border: 1px solid var(--border); background: var(--bg2);
+    }
+    .h-switch:active { background: var(--bg3); color: var(--text); }
     main { padding: 14px 16px 24px; max-width: 720px; margin: 0 auto; }
     .lookup {
       display: flex; gap: 8px; margin-top: 4px;
@@ -1845,6 +1860,7 @@ function renderWaiverAppHtml(): string {
         <div class="h-title" id="h-title">Waiver Card</div>
         <div class="h-sub" id="h-sub">Pull up an asset to view or request waivers.</div>
       </div>
+      <a class="h-switch" href="/go">Apps</a>
     </div>
   </header>
 
@@ -2194,6 +2210,96 @@ function renderWaiverAppHtml(): string {
   if (deep) { $("asset-input").value = deep; openAsset(); }
 })();
 </script>
+</body>
+</html>`;
+}
+
+/**
+ * Minimal mobile splash — choose Waiver Card or Yard Check. Linked from `/`
+ * on phone user-agents (`?desktop=1` on `/` skips this and loads the dashboard).
+ */
+function renderMobileAppPickerHtml(): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0a0a0d" />
+  <title>Vehicle ETIC</title>
+  <style>
+    :root {
+      --bg: #0a0a0d;
+      --bg1: #14141b;
+      --border: #2f2f3c;
+      --text: #f4f4f7;
+      --muted: #9b9bab;
+      --accent: #6aa9ff;
+      --accent-fg: #0a0a0d;
+      --ok: #4ade80;
+      --safe-top: env(safe-area-inset-top, 0px);
+      --safe-bottom: env(safe-area-inset-bottom, 0px);
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    .shell {
+      min-height: 100dvh; padding: calc(var(--safe-top) + 20px) 18px calc(var(--safe-bottom) + 24px);
+      max-width: 440px; margin: 0 auto;
+      display: flex; flex-direction: column; gap: 22px;
+    }
+    header h1 { margin: 0; font-size: 1.45rem; font-weight: 700; letter-spacing: -0.02em; }
+    header p { margin: 8px 0 0; color: var(--muted); font-size: 0.95rem; line-height: 1.45; }
+    .choices { display: flex; flex-direction: column; gap: 12px; }
+    .choice {
+      display: flex; align-items: center; gap: 14px;
+      padding: 18px 16px; border-radius: 16px; border: 1px solid var(--border);
+      background: var(--bg1); color: inherit; text-decoration: none;
+      transition: border-color 0.15s, transform 0.12s;
+    }
+    .choice:active { transform: scale(0.99); }
+    .choice:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .choice-icon {
+      flex: 0 0 auto; width: 48px; height: 48px; border-radius: 14px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 1.35rem; background: rgba(106,169,255,0.12); border: 1px solid rgba(106,169,255,0.25);
+    }
+    .choice-yard .choice-icon { background: rgba(74,222,128,0.12); border-color: rgba(74,222,128,0.28); }
+    .choice-text { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+    .choice-title { font-weight: 700; font-size: 1.05rem; }
+    .choice-sub { font-size: 0.82rem; color: var(--muted); line-height: 1.35; }
+    .choice-go { flex: 0 0 auto; color: var(--muted); font-size: 1.2rem; font-weight: 600; }
+    footer { margin-top: auto; text-align: center; padding-top: 8px; }
+    footer a { color: var(--accent); font-size: 0.88rem; }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <h1>Vehicle ETIC</h1>
+      <p>Pick the tool you need. You can switch apps anytime from the <strong>Apps</strong> link inside each screen.</p>
+    </header>
+    <nav class="choices" aria-label="Choose app">
+      <a class="choice choice-waivers" href="/waivers">
+        <span class="choice-icon" aria-hidden="true">📋</span>
+        <span class="choice-text">
+          <span class="choice-title">Waiver card</span>
+          <span class="choice-sub">Look up a vehicle, verify waivers, or submit a new waiver request.</span>
+        </span>
+        <span class="choice-go" aria-hidden="true">→</span>
+      </a>
+      <a class="choice choice-yard" href="/yard">
+        <span class="choice-icon" aria-hidden="true">📍</span>
+        <span class="choice-text">
+          <span class="choice-title">Yard check</span>
+          <span class="choice-sub">Walk the yard — confirm assets, photos, and findings.</span>
+        </span>
+        <span class="choice-go" aria-hidden="true">→</span>
+      </a>
+    </nav>
+    <footer>
+      <a href="/?desktop=1">Open full desktop dashboard instead</a>
+    </footer>
+  </div>
 </body>
 </html>`;
 }
@@ -3514,7 +3620,13 @@ function renderYardAppHtml(): string {
     }
     .topbar-row { display: flex; align-items: center; gap: 10px; min-height: 30px; }
     .brand { font-weight: 700; font-size: 17px; letter-spacing: 0.2px; }
-    .stats { margin-left: auto; font-size: 12px; color: var(--muted); display: flex; gap: 6px; }
+    .topbar-apps {
+      margin-left: auto; font-size: 12px; font-weight: 600; color: var(--muted);
+      text-decoration: none; padding: 6px 10px; border-radius: 9px;
+      border: 1px solid var(--border); background: var(--bg2);
+    }
+    .topbar-apps:active { background: var(--bg3); color: var(--text); }
+    .stats { margin-left: 8px; font-size: 12px; color: var(--muted); display: flex; gap: 6px; }
     .stat-pill { padding: 3px 9px; border-radius: 999px; background: var(--bg2); border: 1px solid var(--border); }
     .stat-pill b { color: var(--text); font-weight: 700; }
 
@@ -3769,6 +3881,7 @@ function renderYardAppHtml(): string {
     <header class="topbar" id="topbar">
       <div class="topbar-row">
         <div class="brand">Yard Check</div>
+        <a class="topbar-apps" href="/go">Apps</a>
         <div class="stats">
           <span class="stat-pill"><b id="t-due">0</b> due</span>
           <span class="stat-pill"><b id="t-today">0</b> today</span>
@@ -6864,10 +6977,13 @@ function renderDashboardHtml(): string {
 
     /* ---- Waivers tab ---- */
     #panel-waivers .hidden { display: none; }
-    .waivers-wrap { display: flex; flex-direction: column; gap: 14px; max-width: 1200px; margin: 0 auto; }
+    .waivers-wrap { display: flex; flex-direction: column; gap: 16px; max-width: 1320px; margin: 0 auto; }
+    .waivers-strap { padding-bottom: 2px; }
+    .waivers-strap-title { margin: 0; font-size: 1.35rem; font-weight: 600; letter-spacing: -0.02em; }
+    .waivers-strap-desc { margin: 8px 0 0; color: var(--muted); font-size: 0.9rem; line-height: 1.45; max-width: 52rem; }
     .waivers-head {
       display: flex; align-items: center; gap: 14px; justify-content: space-between;
-      border-bottom: 1px solid var(--border);
+      flex-wrap: wrap; border-bottom: 1px solid var(--border);
     }
     .waivers-subnav { display: flex; gap: 0; }
     .waivers-sub {
@@ -6890,7 +7006,20 @@ function renderDashboardHtml(): string {
       padding: 28px; text-align: center; color: var(--muted);
       background: var(--surface); border: 1px dashed var(--border); border-radius: 12px;
     }
-    .wv-pending-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 14px; }
+    .wv-pending-zero {
+      display: flex; flex-direction: column; align-items: center; gap: 10px;
+      padding: 40px 28px; border-style: solid; border-color: var(--border);
+      background: linear-gradient(180deg, rgba(94,227,151,0.06), var(--surface));
+    }
+    .wv-pending-zero strong { font-size: 1.08rem; color: var(--text); font-weight: 600; }
+    .wv-zero-msg { font-size: 0.88rem; max-width: 26rem; line-height: 1.45; }
+    .wv-zero-icon {
+      width: 52px; height: 52px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 1.35rem; font-weight: 700;
+      background: rgba(94,227,151,0.14); color: var(--success); border: 1px solid rgba(94,227,151,0.35);
+    }
+    .wv-pending-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 16px; }
     .wv-pcard {
       background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
       overflow: hidden; display: flex; flex-direction: column;
@@ -6926,29 +7055,52 @@ function renderDashboardHtml(): string {
     .wv-pcard .review-block { padding: 0 12px 10px; display: flex; flex-direction: column; gap: 6px; }
     .wv-pcard .review-block label { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
 
-    .wv-bv-bar { display: flex; gap: 8px; margin-bottom: 14px; }
-    .wv-bv-bar input {
-      flex: 1; max-width: 320px;
-      background: var(--surface); color: var(--text); border: 1px solid var(--border);
-      border-radius: 10px; padding: 10px 12px; font-size: 1rem;
-      font-variant-numeric: tabular-nums;
+    .wv-byvehicle-layout {
+      display: grid; grid-template-columns: minmax(300px, 400px) minmax(0, 1fr);
+      gap: 22px; align-items: start;
+    }
+    @media (max-width: 980px) {
+      .wv-byvehicle-layout { grid-template-columns: 1fr; }
+    }
+    .wv-byvehicle-side { display: flex; flex-direction: column; gap: 16px; }
+    .wv-hero-card {
+      padding: 20px 20px 18px;
+      border-radius: 16px; border: 1px solid var(--border);
+      background: linear-gradient(155deg, rgba(106,169,255,0.1), var(--surface) 55%);
+    }
+    .wv-hero-title { margin: 0 0 6px; font-size: 1.12rem; font-weight: 600; letter-spacing: -0.02em; }
+    .wv-hero-lead { margin: 0 0 16px; color: var(--muted); font-size: 0.86rem; line-height: 1.45; }
+    .wv-hero-form { display: flex; flex-direction: column; gap: 10px; }
+    .wv-hero-form input {
+      width: 100%; background: var(--bg0, var(--bg)); color: var(--text);
+      border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px;
+      font-size: 1.02rem; font-variant-numeric: tabular-nums;
+    }
+    .wv-hero-form input:focus { outline: 2px solid rgba(106,169,255,0.35); outline-offset: 0; }
+    .wv-hero-form .primary { width: 100%; justify-content: center; min-height: 44px; }
+    @media (min-width: 480px) {
+      .wv-hero-form { flex-direction: row; align-items: stretch; }
+      .wv-hero-form input { flex: 1 1 auto; }
+      .wv-hero-form .primary { width: auto; min-width: 128px; flex: 0 0 auto; }
     }
     .wv-asset-browser {
-      margin-bottom: 16px; padding: 14px 16px; background: var(--surface);
-      border: 1px solid var(--border); border-radius: 12px;
+      padding: 16px 16px 14px; background: var(--surface);
+      border: 1px solid var(--border); border-radius: 14px;
     }
     .wv-asset-browser-head {
-      display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px;
+      display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; margin-bottom: 12px;
     }
-    .wv-asset-browser-title { font-weight: 600; font-size: 0.95rem; }
-    .wv-asset-browser-head .hint { margin: 0; }
+    .wv-ab-titles { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 200px; }
+    .wv-asset-browser-title { font-weight: 600; font-size: 1rem; letter-spacing: -0.01em; }
+    .wv-asset-browser-meta { font-size: 0.8rem; color: var(--muted); }
     .wv-asset-filter {
-      margin-left: auto; min-width: 140px; max-width: 220px; flex: 1;
+      min-width: 160px; max-width: 100%; flex: 1 1 200px;
       background: var(--bg0, var(--bg)); color: var(--text); border: 1px solid var(--border);
-      border-radius: 8px; padding: 8px 10px; font-size: 0.88rem;
+      border-radius: 10px; padding: 9px 11px; font-size: 0.88rem;
     }
+    .wv-chip-hint { margin: 0; font-size: 0.82rem; line-height: 1.4; }
     .wv-asset-chip-wrap {
-      max-height: 220px; overflow-y: auto; padding: 4px 2px 2px;
+      max-height: min(42vh, 320px); overflow-y: auto; padding: 4px 2px 2px;
     }
     .wv-asset-chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: flex-start; }
     .wv-asset-chip {
@@ -6961,9 +7113,21 @@ function renderDashboardHtml(): string {
     .wv-asset-chip.active {
       border-color: var(--accent); background: rgba(94, 154, 255, 0.12);
     }
+    .wv-byvehicle-main .wv-bv-result {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 16px;
+      padding: 18px 20px 20px; min-height: 220px;
+    }
+    .wv-bv-placeholder {
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      text-align: center; gap: 10px; padding: 36px 20px; color: var(--muted);
+      min-height: 180px;
+    }
+    .wv-bv-placeholder strong { color: var(--text); font-size: 1.02rem; }
+    .wv-bv-placeholder span:last-child { font-size: 0.88rem; max-width: 22rem; line-height: 1.45; }
+    .wv-bv-placeholder-icon { font-size: 2rem; opacity: 0.85; }
     .wv-bv-result .vehicle-head {
       display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
-      padding-bottom: 10px; border-bottom: 1px solid var(--border); margin-bottom: 14px;
+      padding-bottom: 12px; border-bottom: 1px solid var(--border); margin-bottom: 16px;
     }
     .wv-bv-result .vehicle-head .asset {
       font-family: var(--font-mono); font-weight: 700; font-size: 1.5rem; letter-spacing: -0.01em;
@@ -9157,40 +9321,65 @@ function renderDashboardHtml(): string {
            swap views). The mobile mechanic UI lives at /waivers. -->
       <div id="panel-waivers" class="hidden">
         <div class="waivers-wrap">
+          <div class="waivers-strap">
+            <h2 class="waivers-strap-title">Waiver desk</h2>
+            <p class="waivers-strap-desc">Approve mechanic submissions, look up any asset, and print the in-cab waiver card.</p>
+          </div>
           <header class="waivers-head">
             <nav class="waivers-subnav" id="waivers-subnav" aria-label="Waiver views">
               <button type="button" class="waivers-sub active" data-wv-sub="pending">Pending review <span class="wv-count" id="wv-pending-count"></span></button>
               <button type="button" class="waivers-sub" data-wv-sub="byvehicle">By vehicle</button>
             </nav>
             <div class="waivers-actions">
-              <a class="ghost" href="/waivers" target="_blank" rel="noopener" title="Open the mobile waiver app in a new tab">Open mobile app ↗</a>
+              <a class="ghost" href="/waivers" target="_blank" rel="noopener" title="Open the mobile waiver app in a new tab">Mechanic app ↗</a>
               <button type="button" class="ghost" id="wv-refresh">Refresh</button>
             </div>
           </header>
 
           <section id="wv-view-pending" class="wv-view">
-            <div class="wv-empty" id="wv-pending-empty" hidden>No waivers waiting for review.</div>
+            <div class="wv-empty wv-pending-zero" id="wv-pending-empty" hidden>
+              <span class="wv-zero-icon" aria-hidden="true">✓</span>
+              <strong>All caught up</strong>
+              <span class="wv-zero-msg">No waiver requests are waiting for approval.</span>
+            </div>
             <div class="wv-pending-list" id="wv-pending-list"></div>
           </section>
 
           <section id="wv-view-byvehicle" class="wv-view" hidden>
-            <div class="wv-bv-bar">
-              <input type="text" id="wv-bv-input" placeholder="Asset ID (e.g. AF00C00488)"
-                     autocomplete="off" autocapitalize="characters" spellcheck="false" />
-              <button type="button" class="ghost" id="wv-bv-go">Look up</button>
-            </div>
-            <div class="wv-asset-browser" id="wv-asset-browser">
-              <div class="wv-asset-browser-head">
-                <span class="wv-asset-browser-title">Assets with waivers</span>
-                <span class="hint" id="wv-asset-browser-count"></span>
-                <input type="search" id="wv-asset-filter" class="wv-asset-filter" placeholder="Filter IDs…" autocomplete="off" spellcheck="false" />
+            <div class="wv-byvehicle-layout">
+              <div class="wv-byvehicle-side">
+                <div class="wv-hero-card">
+                  <h3 class="wv-hero-title">Look up a vehicle</h3>
+                  <p class="wv-hero-lead">Enter an asset id to load waivers, verification history, and print the driver card.</p>
+                  <div class="wv-hero-form">
+                    <input type="text" id="wv-bv-input" placeholder="e.g. AF00C00488"
+                           autocomplete="off" autocapitalize="characters" spellcheck="false" />
+                    <button type="button" class="primary" id="wv-bv-go">Look up</button>
+                  </div>
+                </div>
+                <div class="wv-asset-browser" id="wv-asset-browser">
+                  <div class="wv-asset-browser-head">
+                    <div class="wv-ab-titles">
+                      <span class="wv-asset-browser-title">Fleet list</span>
+                      <span class="wv-asset-browser-meta hint" id="wv-asset-browser-count"></span>
+                    </div>
+                    <input type="search" id="wv-asset-filter" class="wv-asset-filter"
+                           placeholder="Filter by asset id…" autocomplete="off" spellcheck="false" />
+                  </div>
+                  <div class="wv-asset-chip-wrap" id="wv-asset-chip-wrap">
+                    <p class="wv-chip-hint hint">Open this tab and hit Refresh to load every asset that has a waiver. Tap an id to load it.</p>
+                  </div>
+                </div>
               </div>
-              <div class="wv-asset-chip-wrap" id="wv-asset-chip-wrap">
-                <p class="hint" style="margin:0;color:var(--muted)">Open this tab to load every asset id that has an approved or pending waiver.</p>
+              <div class="wv-byvehicle-main">
+                <div class="wv-bv-result" id="wv-bv-result">
+                  <div class="wv-bv-placeholder">
+                    <span class="wv-bv-placeholder-icon" aria-hidden="true">📋</span>
+                    <strong>No vehicle selected</strong>
+                    <span>Type an asset id and choose Look up, or tap a fleet id on the left.</span>
+                  </div>
+                </div>
               </div>
-            </div>
-            <div class="wv-bv-result" id="wv-bv-result">
-              <p class="hint" style="color:var(--muted)">Pick an asset from the list above or type an asset id, then look up to view its waiver card and verification history.</p>
             </div>
           </section>
         </div>
@@ -13903,7 +14092,11 @@ function renderDashboardHtml(): string {
           return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
         });
         waiversState.bvAssetKeys = keys;
-        if (meta) meta.textContent = keys.length ? "(" + keys.length + " total)" : "(0)";
+        if (meta) {
+          meta.textContent = keys.length
+            ? keys.length + " vehicle" + (keys.length === 1 ? "" : "s") + " with waivers"
+            : "No vehicles in list yet";
+        }
         renderWaiverAssetChipList();
       } catch (e) {
         wrap.innerHTML = "<div class='wv-empty'>Could not load the asset list.</div>";
@@ -14067,7 +14260,8 @@ function renderDashboardHtml(): string {
     async function loadWaiverByVehicle(assetId) {
       waiversState.bv.assetId = assetId;
       const wrap = document.getElementById("wv-bv-result");
-      wrap.innerHTML = "<div class='hint' style='color:var(--muted)'>Loading waivers for " + esc(assetId) + "…</div>";
+      if (!wrap) return;
+      wrap.innerHTML = "<div class='hint' style='color:var(--muted);padding:8px 0'>Loading waivers for " + esc(assetId) + "…</div>";
       try {
         const r = await fetch("/api/waivers/asset/" + encodeURIComponent(assetId), { cache: "no-store" });
         const j = await r.json();
@@ -14093,6 +14287,7 @@ function renderDashboardHtml(): string {
 
     function renderWaiverByVehicle() {
       const wrap = document.getElementById("wv-bv-result");
+      if (!wrap) return;
       const ws = waiversState.bv.waivers;
       const assetId = waiversState.bv.assetId;
       const approved = ws.filter(function (w) { return w.status === "approved"; });
