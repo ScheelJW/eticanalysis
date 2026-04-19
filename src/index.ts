@@ -2345,7 +2345,6 @@ function renderWaiverPrintCardHtml(assetId: string, waivers: Waiver[]): string {
   </div>
   <div class="lead">
     These defects are formally waived — they do <strong>not</strong> require repair on routine maintenance.
-    Use the ETIC / waiver app for annual re-verification and for any change in condition.
   </div>
   ${rows}
   ${empty}
