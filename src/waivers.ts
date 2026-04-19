@@ -26,6 +26,7 @@
 type Env = { ETIC_SNAPSHOTS: D1Database; ETIC_BUCKET: R2Bucket };
 
 export const WAIVER_PHOTO_PREFIX = "waiver-photos/";
+export const WAIVER_VERIFY_PHOTO_PREFIX = "waiver-verify-photos/";
 
 /** ms in a year, used to bucket "verification overdue" badges. */
 export const WAIVER_VERIFY_INTERVAL_MS = 365 * 24 * 60 * 60 * 1000;
@@ -71,6 +72,9 @@ export type WaiverVerification = {
   verifiedAtIso: string;
   note: string;
   kind: "initial" | "annual" | "adhoc";
+  /** Present when mechanic attached a photo during verify. */
+  hasPhoto: boolean;
+  photoUrl: string;
 };
 
 export type SubmitWaiverInput = {
@@ -108,6 +112,8 @@ type VerificationRow = {
   verified_at_iso: string;
   note: string | null;
   kind: "initial" | "annual" | "adhoc";
+  photo_r2_key: string | null;
+  photo_content_type: string | null;
 };
 
 const SELECT_WAIVER_COLS =
@@ -192,6 +198,7 @@ function rowToWaiver(r: WaiverRow): Waiver {
 }
 
 function rowToVerification(r: VerificationRow): WaiverVerification {
+  const hasPhoto = !!r.photo_r2_key;
   return {
     id: r.id,
     waiverId: r.waiver_id,
@@ -199,6 +206,8 @@ function rowToVerification(r: VerificationRow): WaiverVerification {
     verifiedAtIso: r.verified_at_iso,
     note: r.note ?? "",
     kind: r.kind,
+    hasPhoto,
+    photoUrl: hasPhoto ? `/api/waivers/verification/${r.id}/photo` : "",
   };
 }
 
@@ -388,6 +397,7 @@ export async function verifyWaiver(
   verifiedBy: string,
   note?: string,
   kind: "annual" | "adhoc" = "annual",
+  photo?: { body: ArrayBuffer; contentType: string },
 ): Promise<Waiver> {
   const by = (verifiedBy ?? "").trim();
   if (!by) throw new Error("verifiedBy required");
@@ -401,12 +411,29 @@ export async function verifyWaiver(
   if (!cur) throw new Error("waiver not found");
   if (cur.status !== "approved") throw new Error("only approved waivers can be verified");
 
-  await env.ETIC_SNAPSHOTS.prepare(
-    `INSERT INTO waiver_verification (waiver_id, verified_by, verified_at_iso, note, kind)
-     VALUES (?, ?, ?, ?, ?)`,
+  const inserted = await env.ETIC_SNAPSHOTS.prepare(
+    `INSERT INTO waiver_verification (waiver_id, verified_by, verified_at_iso, note, kind, photo_r2_key, photo_content_type)
+     VALUES (?, ?, ?, ?, ?, NULL, NULL)
+     RETURNING id`,
   )
     .bind(id, by, nowIso, (note ?? "").trim() || null, kind)
-    .run();
+    .first<{ id: number }>();
+  if (!inserted?.id) throw new Error("failed to record verification");
+
+  if (photo && photo.body.byteLength > 0) {
+    const ct = photo.contentType || "image/jpeg";
+    const ext = extensionForContentType(ct);
+    const r2Key = `${WAIVER_VERIFY_PHOTO_PREFIX}${inserted.id}/${Date.now()}-${randomHex()}.${ext}`;
+    await env.ETIC_BUCKET.put(r2Key, photo.body, {
+      httpMetadata: { contentType: ct },
+    });
+    await env.ETIC_SNAPSHOTS.prepare(
+      `UPDATE waiver_verification SET photo_r2_key = ?, photo_content_type = ? WHERE id = ?`,
+    )
+      .bind(r2Key, ct, inserted.id)
+      .run();
+  }
+
   const updated = await env.ETIC_SNAPSHOTS.prepare(
     `UPDATE waiver
         SET last_verified_by = ?, last_verified_at_iso = ?
@@ -421,7 +448,8 @@ export async function verifyWaiver(
 
 export async function listVerifications(env: Env, waiverId: number): Promise<WaiverVerification[]> {
   const r = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT id, waiver_id, verified_by, verified_at_iso, note, kind
+    `SELECT id, waiver_id, verified_by, verified_at_iso, note, kind,
+            photo_r2_key, photo_content_type
        FROM waiver_verification
       WHERE waiver_id = ?
       ORDER BY verified_at_iso DESC`,
@@ -429,6 +457,21 @@ export async function listVerifications(env: Env, waiverId: number): Promise<Wai
     .bind(waiverId)
     .all<VerificationRow>();
   return (r.results ?? []).map(rowToVerification);
+}
+
+export async function getVerificationPhoto(env: Env, verificationId: number): Promise<{
+  body: ReadableStream;
+  contentType: string;
+} | null> {
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT photo_r2_key, photo_content_type FROM waiver_verification WHERE id = ?`,
+  )
+    .bind(verificationId)
+    .first<{ photo_r2_key: string | null; photo_content_type: string | null }>();
+  if (!r?.photo_r2_key) return null;
+  const obj = await env.ETIC_BUCKET.get(r.photo_r2_key);
+  if (!obj) return null;
+  return { body: obj.body, contentType: r.photo_content_type ?? "image/jpeg" };
 }
 
 // ---------------------------------------------------------------------------

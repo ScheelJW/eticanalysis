@@ -61,6 +61,7 @@ import {
   deleteWaiver,
   getWaiverById,
   getWaiverCounts,
+  getVerificationPhoto,
   getWaiverPhoto,
   listPendingWaivers,
   listVerifications as listWaiverVerifications,
@@ -416,6 +417,12 @@ export default {
     }
     if (url.pathname === "/api/waivers/counts") {
       return handleWaiverCountsApi(env);
+    }
+    const waiverVerifyPhotoMatch = url.pathname.match(/^\/api\/waivers\/verification\/(\d+)\/photo$/);
+    if (waiverVerifyPhotoMatch) {
+      const verId = Number.parseInt(waiverVerifyPhotoMatch[1] ?? "", 10);
+      if (!Number.isFinite(verId)) return new Response("Invalid verification id", { status: 400 });
+      return handleWaiverVerificationPhotoApi(env, verId);
     }
     const waiverAssetMatch = url.pathname.match(/^\/api\/waivers\/asset\/([^/]+)$/);
     if (waiverAssetMatch) {
@@ -1947,6 +1954,13 @@ function renderWaiverAppHtml(): string {
       <input id="verify-name" type="text" placeholder="First Last" />
       <label for="verify-note">Optional note</label>
       <textarea id="verify-note" maxlength="500" placeholder="e.g. Re-checked during PMI, still applies"></textarea>
+      <label>Photo at verification (optional)</label>
+      <div class="file-row">
+        <label class="file-btn" for="verify-photo">📷 Take / choose photo</label>
+        <input id="verify-photo" type="file" accept="image/*" capture="environment" />
+        <span id="verify-photo-name" style="font-size:0.85rem;color:var(--muted);"></span>
+      </div>
+      <img id="verify-preview" class="preview" hidden alt="" />
       <div id="verify-err" class="err" hidden></div>
       <div class="btn-row">
         <button type="button" class="btn secondary" id="verify-cancel">Cancel</button>
@@ -2312,11 +2326,28 @@ function renderWaiverAppHtml(): string {
     $("verify-line").textContent = w ? ('"' + w.title + '"') : "";
     $("verify-name").value = readName();
     $("verify-note").value = "";
+    $("verify-photo").value = "";
+    $("verify-photo-name").textContent = "";
+    $("verify-preview").hidden = true;
     $("verify-err").hidden = true;
     $("verify-modal").classList.add("open");
   }
-  function closeVerifyModal() { $("verify-modal").classList.remove("open"); state.pendingActionId = null; }
+  function closeVerifyModal() {
+    $("verify-modal").classList.remove("open");
+    state.pendingActionId = null;
+    $("verify-photo").value = "";
+    $("verify-photo-name").textContent = "";
+    $("verify-preview").hidden = true;
+  }
   $("verify-cancel").addEventListener("click", closeVerifyModal);
+  $("verify-photo").addEventListener("change", function () {
+    var f = $("verify-photo").files && $("verify-photo").files[0];
+    if (!f) { $("verify-preview").hidden = true; $("verify-photo-name").textContent = ""; return; }
+    $("verify-photo-name").textContent = f.name + " (" + Math.round(f.size / 1024) + " KB)";
+    var url = URL.createObjectURL(f);
+    $("verify-preview").src = url;
+    $("verify-preview").hidden = false;
+  });
   $("verify-confirm").addEventListener("click", async function () {
     var name = $("verify-name").value.trim();
     if (!name) { $("verify-err").textContent = "Name is required."; $("verify-err").hidden = false; return; }
@@ -2325,11 +2356,13 @@ function renderWaiverAppHtml(): string {
     if (!id) return;
     $("verify-confirm").disabled = true;
     try {
-      var r = await fetch("/api/waivers/" + id + "/verify", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ by: name, note: $("verify-note").value.trim(), kind: "annual" }),
-      });
+      var fd = new FormData();
+      fd.append("by", name);
+      fd.append("note", $("verify-note").value.trim());
+      fd.append("kind", "annual");
+      var vf = $("verify-photo").files && $("verify-photo").files[0];
+      if (vf) fd.append("photo", vf);
+      var r = await fetch("/api/waivers/" + id + "/verify", { method: "POST", body: fd });
       var j = await r.json();
       if (!r.ok) throw new Error((j && j.error) || ("HTTP " + r.status));
       closeVerifyModal();
@@ -2735,28 +2768,69 @@ async function handleWaiverActionApi(
     return Response.json({ ok }, { headers: cacheHeaders() });
   }
   if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
-  const body = (await readJsonBody<{
-    by?: string;
-    note?: string;
-    reason?: string;
-    kind?: "annual" | "adhoc";
-  }>(request)) ?? {};
   try {
     let waiver: Waiver;
     if (action === "approve") {
+      const body = (await readJsonBody<{ by?: string; note?: string; reason?: string }>(request)) ?? {};
       waiver = await approveWaiver(env, id, body.by ?? "", body.note);
     } else if (action === "reject") {
+      const body = (await readJsonBody<{ by?: string; note?: string; reason?: string }>(request)) ?? {};
       waiver = await rejectWaiver(env, id, body.by ?? "", body.reason ?? "");
     } else {
-      waiver = await verifyWaiver(env, id, body.by ?? "", body.note, body.kind ?? "annual");
+      const ct = request.headers.get("content-type") || "";
+      let verifiedBy = "";
+      let note = "";
+      let kind: "annual" | "adhoc" = "annual";
+      let photo: { body: ArrayBuffer; contentType: string } | undefined;
+      if (ct.startsWith("multipart/form-data")) {
+        let form: FormData;
+        try {
+          form = await request.formData();
+        } catch (e) {
+          return Response.json(
+            { error: "could not parse form: " + (e instanceof Error ? e.message : String(e)) },
+            { status: 400, headers: cacheHeaders() },
+          );
+        }
+        verifiedBy = String(form.get("by") ?? "").trim();
+        note = String(form.get("note") ?? "").trim();
+        const k = String(form.get("kind") ?? "annual");
+        if (k === "adhoc") kind = "adhoc";
+        const file = form.get("photo");
+        if (file instanceof File && file.size > 0) {
+          const MAX_BYTES = 10 * 1024 * 1024;
+          if (file.size > MAX_BYTES) {
+            return Response.json({ error: "photo too large (max 10MB)" }, { status: 413, headers: cacheHeaders() });
+          }
+          photo = { body: await file.arrayBuffer(), contentType: file.type || "image/jpeg" };
+        }
+      } else {
+        const body = (await readJsonBody<{ by?: string; note?: string; kind?: "annual" | "adhoc" }>(request)) ?? {};
+        verifiedBy = body.by ?? "";
+        note = body.note ?? "";
+        if (body.kind === "adhoc") kind = "adhoc";
+      }
+      waiver = await verifyWaiver(env, id, verifiedBy, note, kind, photo);
     }
     return Response.json({ waiver }, { headers: cacheHeaders() });
   } catch (e) {
-    return Response.json(
-      { error: e instanceof Error ? e.message : String(e) },
-      { status: 400, headers: cacheHeaders() },
-    );
+    const msg = e instanceof Error ? e.message : String(e);
+    const status = msg.includes("too large") ? 413 : 400;
+    return Response.json({ error: msg }, { status, headers: cacheHeaders() });
   }
+}
+
+/** GET /api/waivers/verification/:verId/photo — verification snapshot from R2. */
+async function handleWaiverVerificationPhotoApi(env: Env, verificationId: number): Promise<Response> {
+  const got = await getVerificationPhoto(env, verificationId);
+  if (!got) return new Response("Not Found", { status: 404 });
+  return new Response(got.body, {
+    headers: {
+      "Content-Type": got.contentType,
+      "Cache-Control": "public, max-age=86400, immutable",
+      "Content-Disposition": `inline; filename="waiver-verify-${verificationId}"`,
+    },
+  });
 }
 
 /** GET /api/waivers/:id/photo — stream from R2. */
@@ -7335,6 +7409,7 @@ function renderDashboardHtml(): string {
     .wv-bv-card .verif-log { margin-top: 10px; font-size: 0.78rem; color: var(--muted); border-top: 1px dashed var(--border); padding-top: 8px; }
     .wv-bv-card .verif-log .v { display: flex; gap: 12px; padding: 2px 0; }
     .wv-bv-card .verif-log .v .when { font-variant-numeric: tabular-nums; }
+    .wv-bv-card .verif-photo-link { color: var(--accent); font-weight: 600; margin-left: 4px; white-space: nowrap; }
 
     /* Asset-id badge for waiver counts (rides next to sighting badge). */
     .waiver-badge {
@@ -14515,9 +14590,12 @@ function renderDashboardHtml(): string {
       const verifsHtml = verifs.length
         ? "<div class='verif-log'>" +
             verifs.map(function (v) {
+              var ph = (v.hasPhoto && v.photoUrl)
+                ? " <a class='verif-photo-link' href='" + esc(v.photoUrl) + "' target='_blank' rel='noopener'>Photo</a>"
+                : "";
               return "<div class='v'>" +
                        "<span class='when'>" + fmtKeyShort(v.verifiedAtIso.slice(0,10)) + "</span>" +
-                       "<span>" + esc(v.kind) + " — " + esc(v.verifiedBy) + (v.note ? " · " + esc(v.note) : "") + "</span>" +
+                       "<span>" + esc(v.kind) + " — " + esc(v.verifiedBy) + (v.note ? " · " + esc(v.note) : "") + ph + "</span>" +
                      "</div>";
             }).join("") +
           "</div>"
