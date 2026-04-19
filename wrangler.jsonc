@@ -1,0 +1,35 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "etic-email-automation",
+  "account_id": "b549ea6423fc2b6ea1bb920e1f248d94",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-04-17",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "r2_buckets": [
+    {
+      "binding": "ETIC_BUCKET",
+      "bucket_name": "eticanalysis"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "ETIC_SNAPSHOTS",
+      "database_name": "etic-snapshots",
+      "database_id": "96fb4604-fef8-4d58-b129-38cca37bb3ce",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "routes": [
+    { "pattern": "minot.2t3.app", "custom_domain": true }
+  ],
+  "vars": {
+    "EXPECTED_ATTACHMENT_NAME": "Vehicle ETIC.xlsx",
+    "ALLOWED_SENDERS": "*",
+    "MAX_ATTACHMENT_BYTES": "20000000"
+  }
+}

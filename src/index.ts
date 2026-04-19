@@ -1,0 +1,15006 @@
+import PostalMime from "postal-mime";
+import type { Attachment } from "postal-mime";
+import ExcelJS from "exceljs";
+import {
+  debugScrapeWorkbook,
+  extractRawWorkOrdersFromBinary,
+  extractYardCheckSource,
+  generateYardCheckWorkbookBuffer,
+} from "./yardCheck";
+import {
+  backfillTypedColumnsFromJson,
+  deleteWorkOrderAction,
+  getChangelog,
+  getWatchRowById,
+  getWatchRowByIdForDate,
+  getWatchRowsForDate,
+  getWatchRowsLatest,
+  getWorkOrderActions,
+  getWorkOrderTimeline,
+  ingestWorkOrderSnapshot,
+  logWorkOrderAction,
+  type WorkOrderActionType,
+} from "./workOrderWatch";
+import {
+  addWorkOrdersToMeeting,
+  createMeeting,
+  deleteMeeting,
+  endMeeting,
+  getMeetingWithNotes,
+  listMeetings,
+  renderMeetingMinutesMarkdown,
+  setMeetingCursor,
+  setMeetingTimelineScroll,
+  upsertMeetingNote,
+  type CreateMeetingInput,
+  type MeetingNoteStatus,
+  type SeedWorkOrder,
+  type UpsertNoteInput,
+} from "./meeting";
+import { handleAskApi } from "./ai";
+import {
+  addPhoto as addYardPhoto,
+  deletePhoto as deleteYardPhoto,
+  getAssetDetail as getYardAssetDetail,
+  getPhoto as getYardPhoto,
+  getLatestSightings as getYardLatestSightings,
+  getRecentActivity as getYardRecentActivity,
+  getRollingRoster,
+  getYardRosterForDate,
+  listOpenFindings as listYardOpenFindings,
+  listPhotosForAsset as listYardPhotosForAsset,
+  recordCheck as recordYardCheck,
+  reopenFinding as reopenYardFinding,
+  resolveFinding as resolveYardFinding,
+  type FindingKind,
+  type FindingResolution,
+  type YardEntryStatus,
+} from "./yardSession";
+import {
+  deleteMelConfig,
+  deleteMelSubdivision,
+  extractMelRowsFromBinary,
+  getAllAppConfig,
+  getAllMelConfig,
+  getMelChangelogForKey,
+  getMelForDate,
+  getMelHistoryForKey,
+  getMelLatest,
+  getMelRollup,
+  getMelSnapshotDates,
+  getMelSubdivisions,
+  getStalenessThresholds,
+  ingestMelSnapshot,
+  setAppConfig,
+  upsertMelConfig,
+  upsertMelSubdivision,
+} from "./melWatch";
+
+const DEFAULT_MAX_ATTACHMENT_BYTES = 30 * 1024 * 1024;
+const SITE_TITLE = "Minot Vehicle ETIC";
+
+type SheetSummary = {
+  name: string;
+  state: "visible" | "hidden" | "veryHidden";
+  rowCount: number;
+  columnCountEstimate: number;
+  sampleHeaders: string[];
+  nonEmptyCellCountEstimate: number;
+  melMentions: number;
+};
+
+/** KPIs from worksheet "Asset Manager" row 2: F2–J2 (MC rate, fleet total, FMC, NMC, surplus). */
+type AssetManagerKpis = {
+  sheetFound: boolean;
+  mcRatePercent: number | null;
+  fleetTotal: number | null;
+  fmc: number | null;
+  nmc: number | null;
+  surplus: number | null;
+};
+
+/** Per-row breakdown from the Asset Manager sheet — one row per unit/category
+ *  (label is column A, numeric columns reuse the same F–J layout as the totals
+ *  row). NCE = "Nuclear Certified Equipment" rows are flagged so the UI can group them. */
+type AssetManagerBreakdownRow = {
+  label: string;
+  mcRatePercent: number | null;
+  fleetTotal: number | null;
+  fmc: number | null;
+  nmc: number | null;
+  surplus: number | null;
+  isNce: boolean;
+  isTotal: boolean;
+};
+
+type AnalysisResult = {
+  workbookFileName: string;
+  receivedAtIso: string;
+  dateKey: string;
+  from: string;
+  to: string;
+  subject: string;
+  workbookBytes: number;
+  assetManager: AssetManagerKpis;
+  assetManagerBreakdown?: AssetManagerBreakdownRow[];
+  sheetSummaries: SheetSummary[];
+  totalVisibleSheets: number;
+  totalHiddenSheets: number;
+  totalRowsAcrossSheets: number;
+  melMentionsBySheet: Record<string, number>;
+  melMentionsTotal: number;
+};
+
+type HistoryEntryDiff = {
+  previousDateKey: string | null;
+  deltaTotalRows: number | null;
+  deltaMelMentionsTotal: number | null;
+  deltaSheetsVisible: number | null;
+};
+
+type HistoryEntry = {
+  dateKey: string;
+  receivedAtIso: string;
+  workbookFileName: string;
+  workbookKey: string;
+  analysisKey: string;
+  totalVisibleSheets: number;
+  totalHiddenSheets: number;
+  totalRowsAcrossSheets: number;
+  melMentionsTotal: number;
+  diff: HistoryEntryDiff;
+};
+
+type HistoryIndex = {
+  updatedAtIso: string;
+  entries: HistoryEntry[];
+};
+
+export default {
+  async email(message: ForwardableEmailMessage, env: Env, _ctx: ExecutionContext): Promise<void> {
+    if (!isAuthorizedSender(message.from, env)) {
+      message.setReject("Unauthorized sender");
+      return;
+    }
+
+    const parsed = await PostalMime.parse(message.raw, { attachmentEncoding: "arraybuffer" });
+    const workbookAttachment = pickWorkbookAttachment(parsed.attachments, env.EXPECTED_ATTACHMENT_NAME);
+    if (!workbookAttachment) {
+      console.warn(
+        JSON.stringify({
+          level: "warn",
+          message: "No .xlsx attachment found on inbound email",
+          from: message.from,
+          to: message.to,
+          subject: parsed.subject ?? "",
+        }),
+      );
+      return;
+    }
+
+    const workbookBytes = normalizeAttachmentBinary(workbookAttachment.content);
+    if (workbookBytes.byteLength > parseMaxAttachmentBytes(env.MAX_ATTACHMENT_BYTES)) {
+      message.setReject("Attachment too large");
+      return;
+    }
+
+    const now = new Date();
+    const subject = parsed.subject ?? "";
+    const dateKey = resolveAnalysisDateKey(subject, now);
+    const safeName = sanitizeFileName(workbookAttachment.filename ?? "vehicle-etic.xlsx");
+    const workbookKey = `workbooks/${dateKey}/${safeName}`;
+    const analysisKey = `analyses/${dateKey}.json`;
+
+    await env.ETIC_BUCKET.put(workbookKey, workbookBytes, {
+      httpMetadata: {
+        contentType:
+          workbookAttachment.mimeType ||
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      },
+      customMetadata: {
+        from: message.from,
+        to: message.to,
+        subject,
+      },
+    });
+
+    const analysis = await analyzeWorkbook({
+      binary: workbookBytes,
+      fileName: safeName,
+      receivedAtIso: now.toISOString(),
+      dateKey,
+      from: message.from,
+      to: message.to,
+      subject,
+    });
+
+    await env.ETIC_BUCKET.put(analysisKey, JSON.stringify(analysis, null, 2), {
+      httpMetadata: { contentType: "application/json; charset=utf-8" },
+    });
+
+    await upsertSnapshotRow(env, analysis, workbookKey);
+
+    const rawWos = await extractRawWorkOrdersFromBinary(workbookBytes);
+    await ingestWorkOrderSnapshot(env, dateKey, rawWos, now.toISOString());
+
+    const melRows = await extractMelRowsFromBinary(workbookBytes);
+    await ingestMelSnapshot(env, dateKey, melRows, now.toISOString());
+
+    const history = await loadHistory(env);
+    const upsertedHistory = upsertHistoryEntry(history, analysis, workbookKey, analysisKey);
+    await env.ETIC_BUCKET.put(
+      "history/index.json",
+      JSON.stringify(upsertedHistory, null, 2),
+      {
+        httpMetadata: { contentType: "application/json; charset=utf-8" },
+      },
+    );
+    await env.ETIC_BUCKET.put(
+      "analyses/latest.json",
+      JSON.stringify(analysis, null, 2),
+      {
+        httpMetadata: { contentType: "application/json; charset=utf-8" },
+      },
+    );
+  },
+
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/healthz") {
+      return Response.json({ ok: true, service: "etic-email-automation" });
+    }
+
+    if (url.pathname === "/api/history") {
+      const history = await loadHistory(env);
+      return Response.json(history, { headers: cacheHeaders() });
+    }
+
+    if (url.pathname === "/api/snapshots") {
+      const sync = url.searchParams.get("sync");
+      if (request.method === "POST" && sync === "1") {
+        ctx.waitUntil(backfillSnapshotsFromHistory(env));
+        return Response.json(
+          { ok: true, message: "Rebuilding snapshot index from R2 (runs in background)." },
+          { headers: cacheHeaders() },
+        );
+      }
+      const relabelFrom = url.searchParams.get("relabel");
+      const relabelTo = url.searchParams.get("to");
+      if (request.method === "POST" && relabelFrom && relabelTo) {
+        return handleRelabelSnapshot(env, relabelFrom, relabelTo);
+      }
+      return handleSnapshotsList(env);
+    }
+
+    if (url.pathname === "/api/latest") {
+      let analysis = await readJson<AnalysisResult>(env, "analyses/latest.json");
+      if (!analysis) return new Response("Not Found", { status: 404 });
+      analysis = await enrichAnalysisAssetManagerFromR2(env, analysis);
+      return Response.json(analysis, { headers: cacheHeaders() });
+    }
+
+    if (url.pathname.startsWith("/api/analysis/")) {
+      const dateKey = url.pathname.slice("/api/analysis/".length);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) {
+        return new Response("Invalid date key", { status: 400 });
+      }
+      let analysis = await readJson<AnalysisResult>(env, `analyses/${dateKey}.json`);
+      if (!analysis) return new Response("Not Found", { status: 404 });
+      analysis = await enrichAnalysisAssetManagerFromR2(env, analysis);
+      return Response.json(analysis, { headers: cacheHeaders() });
+    }
+
+    if (url.pathname === "/api/workbook.xlsx") {
+      return handleWorkbookDownload(env, request);
+    }
+
+    if (url.pathname === "/api/watch") {
+      return handleWatchApi(env, request, ctx);
+    }
+
+    if (url.pathname === "/api/work-order-changelog") {
+      return handleWorkOrderChangelogApi(env, request);
+    }
+
+    if (url.pathname === "/api/work-order-timeline") {
+      return handleWorkOrderTimelineApi(env, request);
+    }
+
+    if (url.pathname === "/api/wo-action") {
+      return handleWoActionApi(env, request);
+    }
+
+    if (url.pathname === "/api/yard-check.xlsx") {
+      return handleYardCheckDownload(env, request);
+    }
+
+    if (url.pathname === "/api/yard-check-meta") {
+      return handleYardCheckMeta(env, request);
+    }
+
+    if (url.pathname === "/api/ask") {
+      return handleAskApi(env, request);
+    }
+
+    if (url.pathname === "/api/debug/scrape") {
+      return handleDebugScrape(env, request);
+    }
+
+    if (url.pathname === "/api/debug/watch-counts") {
+      return handleDebugWatchCounts(env);
+    }
+
+    if (url.pathname === "/api/debug/mel-headers") {
+      return handleDebugMelHeaders(env, url);
+    }
+
+    if (url.pathname === "/api/mel") {
+      return handleMelApi(env, url);
+    }
+    if (url.pathname === "/api/mel-history") {
+      return handleMelHistoryApi(env, url);
+    }
+    if (url.pathname === "/api/mel-rollup") {
+      return handleMelRollupApi(env);
+    }
+    if (url.pathname === "/api/mel-config") {
+      return handleMelConfigApi(env, request);
+    }
+    if (url.pathname === "/api/mel-subdivision") {
+      return handleMelSubdivisionApi(env, request);
+    }
+    if (url.pathname === "/api/app-config") {
+      return handleAppConfigApi(env, request);
+    }
+
+    if (url.pathname === "/api/yard/roster") {
+      return handleYardRosterApi(env);
+    }
+    if (url.pathname === "/api/yard/sightings") {
+      return handleYardSightingsApi(env);
+    }
+    if (url.pathname === "/api/yard/findings") {
+      return handleYardFindingsApi(env);
+    }
+    if (url.pathname === "/api/yard/findings/resolve") {
+      return handleYardFindingResolveApi(env, request);
+    }
+    if (url.pathname === "/api/yard/findings/reopen") {
+      return handleYardFindingReopenApi(env, request);
+    }
+    if (url.pathname === "/api/yard/activity") {
+      return handleYardActivityApi(env, url);
+    }
+    if (url.pathname === "/api/yard/check") {
+      return handleYardCheckApi(env, request);
+    }
+    if (url.pathname === "/api/yard/photo") {
+      return handleYardPhotoUploadApi(env, request);
+    }
+    if (url.pathname === "/api/yard/photos") {
+      return handleYardPhotoListApi(env, url);
+    }
+    const yardPhotoMatch = url.pathname.match(/^\/api\/yard\/photo\/(\d+)$/);
+    if (yardPhotoMatch) {
+      const id = Number.parseInt(yardPhotoMatch[1] ?? "", 10);
+      if (!Number.isFinite(id)) return new Response("Invalid photo id", { status: 400 });
+      return handleYardPhotoFetchApi(env, request, id);
+    }
+    const yardAssetMatch = url.pathname.match(/^\/api\/yard\/asset\/([^/]+)$/);
+    if (yardAssetMatch) {
+      const assetId = decodeURIComponent(yardAssetMatch[1] ?? "");
+      return handleYardAssetDetailApi(env, assetId);
+    }
+
+    if (url.pathname === "/api/meetings") {
+      return handleMeetingsListApi(env, request);
+    }
+    if (url.pathname === "/api/meeting") {
+      return handleMeetingCreateApi(env, request);
+    }
+    const meetingMatch = url.pathname.match(/^\/api\/meeting\/(\d+)(?:\/(notes|end|add|cursor))?$/);
+    if (meetingMatch) {
+      const id = Number.parseInt(meetingMatch[1] ?? "", 10);
+      const action = meetingMatch[2] ?? "";
+      if (!Number.isFinite(id)) return new Response("Invalid meeting id", { status: 400 });
+      if (action === "notes") return handleMeetingNoteUpsertApi(env, request, id);
+      if (action === "end") return handleMeetingEndApi(env, request, id);
+      if (action === "add") return handleMeetingAddWosApi(env, request, id);
+      if (action === "cursor") return handleMeetingCursorApi(env, request, id);
+      return handleMeetingGetApi(env, request, id);
+    }
+
+    // Standalone mobile yard-check app — full-screen, no other tabs.
+    if (url.pathname === "/yard") {
+      return new Response(renderYardAppHtml(), {
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "private, no-store, no-cache, must-revalidate, max-age=0",
+        },
+      });
+    }
+    if (url.pathname === "/yard/manifest.webmanifest") {
+      return Response.json({
+        name: "Yard Check",
+        short_name: "YardCheck",
+        start_url: "/yard",
+        display: "standalone",
+        background_color: "#0a0a0d",
+        theme_color: "#0a0a0d",
+        orientation: "portrait",
+        icons: [],
+      }, {
+        headers: { "Content-Type": "application/manifest+json", "Cache-Control": "public, max-age=300" },
+      });
+    }
+
+    if (url.pathname === "/" || url.pathname === "/index.html") {
+      // Phones / tablets: redirect to the focused yard app unless an explicit
+      // ?desktop=1 escape hatch is present (or they came from /yard already).
+      const ua = request.headers.get("user-agent") || "";
+      const isMobile = /Mobile|Android|iPhone|iPad|iPod/i.test(ua);
+      if (isMobile && !url.searchParams.has("desktop")) {
+        return Response.redirect(new URL("/yard", url).toString(), 302);
+      }
+      return new Response(renderDashboardHtml(), {
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "private, no-store, no-cache, must-revalidate, max-age=0",
+          Pragma: "no-cache",
+          Expires: "0",
+          "CDN-Cache-Control": "no-store",
+          "Vary": "*",
+        },
+      });
+    }
+
+    return new Response("Not Found", { status: 404 });
+  },
+} satisfies ExportedHandler<Env>;
+
+function parseYardCheckDateParam(request: Request): string | null {
+  const url = new URL(request.url);
+  const d = url.searchParams.get("date");
+  return d && /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : null;
+}
+
+async function resolveYardCheckWorkbook(
+  env: Env,
+  dateKey: string | null,
+): Promise<
+  | { ok: true; workbookKey: string; sourceFileName: string; sourceDateKey: string }
+  | { ok: false; error: string }
+> {
+  const history = await loadHistory(env);
+  const latest = await readJson<AnalysisResult>(env, "analyses/latest.json");
+
+  if (dateKey) {
+    const entry = history.entries.find((e) => e.dateKey === dateKey);
+    if (entry) {
+      return {
+        ok: true,
+        workbookKey: entry.workbookKey,
+        sourceFileName: entry.workbookFileName,
+        sourceDateKey: entry.dateKey,
+      };
+    }
+    return {
+      ok: false,
+      error: `No ETIC snapshot for ${dateKey}. Pick another date or ingest that workbook.`,
+    };
+  }
+
+  const latestEntry = history.entries.length
+    ? [...history.entries].sort((a, b) => a.dateKey.localeCompare(b.dateKey)).pop() ?? null
+    : null;
+  const workbookKey = latestEntry?.workbookKey ?? null;
+  const sourceFileName = latestEntry?.workbookFileName ?? latest?.workbookFileName ?? "vehicle-etic.xlsx";
+  const sourceDateKey = latestEntry?.dateKey ?? latest?.dateKey ?? "latest";
+
+  if (!workbookKey) {
+    return { ok: false, error: "No source workbook found yet. Send the ETIC email to ingest first." };
+  }
+
+  return { ok: true, workbookKey, sourceFileName, sourceDateKey };
+}
+
+async function handleYardCheckDownload(env: Env, request: Request): Promise<Response> {
+  const paramDate = parseYardCheckDateParam(request);
+  const resolved = await resolveYardCheckWorkbook(env, paramDate);
+  if (!resolved.ok) {
+    return Response.json({ ok: false, error: resolved.error }, { status: 404 });
+  }
+  const { workbookKey, sourceFileName, sourceDateKey } = resolved;
+
+  const object = await env.ETIC_BUCKET.get(workbookKey);
+  if (!object) {
+    return Response.json(
+      { ok: false, error: `Source workbook not found in R2: ${workbookKey}` },
+      { status: 404 },
+    );
+  }
+
+  const workbookBytes = await object.arrayBuffer();
+  const source = await extractYardCheckSource(workbookBytes);
+  if (!source) {
+    return Response.json(
+      {
+        ok: false,
+        error: "Could not locate a Work Orders sheet in the latest workbook.",
+      },
+      { status: 422 },
+    );
+  }
+
+  const generatedAtIso = new Date().toISOString();
+  const buffer = await generateYardCheckWorkbookBuffer(source, {
+    sourceWorkbookFileName: sourceFileName,
+    sourceDateKey,
+    generatedAtIso,
+  });
+
+  const downloadName = `yard-check_${sourceDateKey}_${generatedAtIso.replace(/[:.]/g, "-")}.xlsx`;
+  return new Response(buffer, {
+    headers: {
+      "Content-Type":
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "Content-Disposition": `attachment; filename="${downloadName}"`,
+      "Cache-Control": "no-store",
+      "X-Source-Workbook": workbookKey,
+      "X-Source-Date": sourceDateKey,
+      "X-Work-Order-Sheet": source.workOrderSheet ?? "",
+      "X-Fleet-Sheet": source.fleetSheet ?? "",
+      "X-Total-Assets": String(source.totalAssets),
+      "X-Total-Work-Orders": String(source.totalWorkOrders),
+    },
+  });
+}
+
+type YardCheckMetaOk = {
+  ok: true;
+  sourceDateKey: string;
+  sourceFileName: string;
+  workbookKey: string;
+};
+
+type YardCheckMetaErr = { ok: false; error: string };
+
+async function handleYardCheckMeta(env: Env, request: Request): Promise<Response> {
+  const meta = await buildYardCheckMeta(env, request);
+  const status = meta.ok ? 200 : 404;
+  return Response.json(meta, { status, headers: cacheHeaders() });
+}
+
+async function buildYardCheckMeta(env: Env, request: Request): Promise<YardCheckMetaOk | YardCheckMetaErr> {
+  const paramDate = parseYardCheckDateParam(request);
+  const resolved = await resolveYardCheckWorkbook(env, paramDate);
+  if (!resolved.ok) {
+    return { ok: false, error: resolved.error };
+  }
+  const { workbookKey, sourceFileName, sourceDateKey } = resolved;
+
+  const object = await env.ETIC_BUCKET.get(workbookKey);
+  if (!object) {
+    return { ok: false, error: `Source workbook not found in R2: ${workbookKey}` };
+  }
+
+  return {
+    ok: true,
+    sourceDateKey,
+    sourceFileName,
+    workbookKey,
+  };
+}
+
+function cacheHeaders(): HeadersInit {
+  return {
+    "Cache-Control": "no-store",
+  };
+}
+
+function assetManagerFromAnalysis(analysis: AnalysisResult): AssetManagerKpis {
+  const am = analysis.assetManager;
+  if (am && typeof am === "object") return am;
+  return {
+    sheetFound: false,
+    mcRatePercent: null,
+    fleetTotal: null,
+    fmc: null,
+    nmc: null,
+    surplus: null,
+  };
+}
+
+async function upsertSnapshotRow(env: Env, analysis: AnalysisResult, workbookKey: string): Promise<void> {
+  const am = assetManagerFromAnalysis(analysis);
+  const breakdown = Array.isArray(analysis.assetManagerBreakdown)
+    ? analysis.assetManagerBreakdown
+    : [];
+  const breakdownJson = breakdown.length ? JSON.stringify(breakdown) : "";
+  const now = new Date().toISOString();
+  await env.ETIC_SNAPSHOTS.prepare(
+    `INSERT INTO etic_snapshots (
+      date_key, workbook_key, workbook_file_name, received_at_iso,
+      mc_rate, fleet_total, fmc, nmc, surplus, asset_manager_ok,
+      total_rows, mel_total, visible_sheets, hidden_sheets, updated_at_iso,
+      asset_manager_breakdown
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(date_key) DO UPDATE SET
+      workbook_key = excluded.workbook_key,
+      workbook_file_name = excluded.workbook_file_name,
+      received_at_iso = excluded.received_at_iso,
+      mc_rate = excluded.mc_rate,
+      fleet_total = excluded.fleet_total,
+      fmc = excluded.fmc,
+      nmc = excluded.nmc,
+      surplus = excluded.surplus,
+      asset_manager_ok = excluded.asset_manager_ok,
+      total_rows = excluded.total_rows,
+      mel_total = excluded.mel_total,
+      visible_sheets = excluded.visible_sheets,
+      hidden_sheets = excluded.hidden_sheets,
+      updated_at_iso = excluded.updated_at_iso,
+      asset_manager_breakdown = CASE
+        WHEN excluded.asset_manager_breakdown <> '' THEN excluded.asset_manager_breakdown
+        ELSE etic_snapshots.asset_manager_breakdown
+      END`,
+  )
+    .bind(
+      analysis.dateKey,
+      workbookKey,
+      analysis.workbookFileName,
+      analysis.receivedAtIso,
+      am.mcRatePercent,
+      am.fleetTotal,
+      am.fmc,
+      am.nmc,
+      am.surplus,
+      am.sheetFound ? 1 : 0,
+      analysis.totalRowsAcrossSheets,
+      analysis.melMentionsTotal,
+      analysis.totalVisibleSheets,
+      analysis.totalHiddenSheets,
+      now,
+      breakdownJson,
+    )
+    .run();
+}
+
+type SnapshotListRow = {
+  dateKey: string;
+  workbookFileName: string;
+  workbookKey: string;
+  receivedAtIso: string;
+  mcRatePercent: number | null;
+  fleetTotal: number | null;
+  fmc: number | null;
+  nmc: number | null;
+  surplus: number | null;
+  assetManagerOk: boolean;
+  totalRows: number | null;
+  melTotal: number | null;
+  visibleSheets: number | null;
+  hiddenSheets: number | null;
+  updatedAtIso: string;
+};
+
+/**
+ * Relabel an existing snapshot from one date_key to another. Used when the
+ * upload pipeline tagged a workbook with the receipt date instead of the true
+ * report date (e.g. file emailed late evening UTC rolls to "tomorrow").
+ *
+ * Moves: R2 workbook + analysis JSON, history/index.json entry,
+ * etic_snapshots row, all per-date rows in work_order_snapshot,
+ * work_order_changelog, work_order_state, meeting, and work_order_action.
+ */
+async function handleRelabelSnapshot(env: Env, fromKey: string, toKey: string): Promise<Response> {
+  const isoRe = /^\d{4}-\d{2}-\d{2}$/;
+  if (!isoRe.test(fromKey) || !isoRe.test(toKey)) {
+    return Response.json({ error: "from/to must be YYYY-MM-DD" }, { status: 400, headers: cacheHeaders() });
+  }
+  if (fromKey === toKey) {
+    return Response.json({ error: "from and to are identical" }, { status: 400, headers: cacheHeaders() });
+  }
+
+  const history = await loadHistory(env);
+  const fromEntry = history.entries.find((e) => e.dateKey === fromKey);
+  if (!fromEntry) {
+    return Response.json({ error: `No snapshot found for ${fromKey}` }, { status: 404, headers: cacheHeaders() });
+  }
+  if (history.entries.some((e) => e.dateKey === toKey)) {
+    return Response.json({ error: `A snapshot already exists for ${toKey}` }, { status: 409, headers: cacheHeaders() });
+  }
+
+  const oldWorkbookKey = fromEntry.workbookKey;
+  const fileNameOnly = oldWorkbookKey.split("/").slice(-1)[0] ?? fromEntry.workbookFileName;
+  const newWorkbookKey = `workbooks/${toKey}/${fileNameOnly}`;
+  const oldAnalysisKey = `analyses/${fromKey}.json`;
+  const newAnalysisKey = `analyses/${toKey}.json`;
+
+  // Copy workbook (.xlsx) to new R2 key, then delete the old one.
+  const wbObj = await env.ETIC_BUCKET.get(oldWorkbookKey);
+  if (!wbObj) {
+    return Response.json({ error: `Workbook missing in R2 at ${oldWorkbookKey}` }, { status: 500, headers: cacheHeaders() });
+  }
+  const wbBytes = await wbObj.arrayBuffer();
+  await env.ETIC_BUCKET.put(newWorkbookKey, wbBytes, {
+    httpMetadata: { contentType: wbObj.httpMetadata?.contentType ?? "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" },
+  });
+
+  // Rewrite analysis JSON with the new dateKey embedded.
+  const analysis = await readJson<AnalysisResult>(env, oldAnalysisKey);
+  if (analysis) {
+    const updatedAnalysis: AnalysisResult = { ...analysis, dateKey: toKey };
+    await env.ETIC_BUCKET.put(newAnalysisKey, JSON.stringify(updatedAnalysis, null, 2), {
+      httpMetadata: { contentType: "application/json; charset=utf-8" },
+    });
+    const latest = await readJson<AnalysisResult>(env, "analyses/latest.json");
+    if (latest?.dateKey === fromKey) {
+      await env.ETIC_BUCKET.put("analyses/latest.json", JSON.stringify(updatedAnalysis, null, 2), {
+        httpMetadata: { contentType: "application/json; charset=utf-8" },
+      });
+    }
+  }
+
+  // Update D1: snapshot index + every per-date table.
+  await env.ETIC_SNAPSHOTS.batch([
+    env.ETIC_SNAPSHOTS.prepare(
+      `UPDATE etic_snapshots SET date_key = ?, workbook_key = ?, updated_at_iso = ? WHERE date_key = ?`,
+    ).bind(toKey, newWorkbookKey, new Date().toISOString(), fromKey),
+    env.ETIC_SNAPSHOTS.prepare(
+      `UPDATE work_order_snapshot SET snapshot_date_key = ? WHERE snapshot_date_key = ?`,
+    ).bind(toKey, fromKey),
+    env.ETIC_SNAPSHOTS.prepare(
+      `UPDATE work_order_changelog SET snapshot_date_key = ? WHERE snapshot_date_key = ?`,
+    ).bind(toKey, fromKey),
+    env.ETIC_SNAPSHOTS.prepare(
+      `UPDATE work_order_state SET last_snapshot_date = ? WHERE last_snapshot_date = ?`,
+    ).bind(toKey, fromKey),
+    env.ETIC_SNAPSHOTS.prepare(
+      `UPDATE work_order_state SET last_remark_change_date = ? WHERE last_remark_change_date = ?`,
+    ).bind(toKey, fromKey),
+    env.ETIC_SNAPSHOTS.prepare(
+      `UPDATE work_order_state SET first_etic_date = ? WHERE first_etic_date = ?`,
+    ).bind(toKey, fromKey),
+    env.ETIC_SNAPSHOTS.prepare(
+      `UPDATE work_order_state SET last_etic_date = ? WHERE last_etic_date = ?`,
+    ).bind(toKey, fromKey),
+    env.ETIC_SNAPSHOTS.prepare(
+      `UPDATE work_order_snapshot SET last_remark_change_date = ? WHERE last_remark_change_date = ?`,
+    ).bind(toKey, fromKey),
+    env.ETIC_SNAPSHOTS.prepare(
+      `UPDATE work_order_snapshot SET first_etic_date = ? WHERE first_etic_date = ?`,
+    ).bind(toKey, fromKey),
+    env.ETIC_SNAPSHOTS.prepare(
+      `UPDATE work_order_snapshot SET last_etic_date = ? WHERE last_etic_date = ?`,
+    ).bind(toKey, fromKey),
+    env.ETIC_SNAPSHOTS.prepare(
+      `UPDATE meeting SET snapshot_date_key = ? WHERE snapshot_date_key = ?`,
+    ).bind(toKey, fromKey),
+    env.ETIC_SNAPSHOTS.prepare(
+      `UPDATE work_order_action SET verified_in_snapshot = ? WHERE verified_in_snapshot = ?`,
+    ).bind(toKey, fromKey),
+    env.ETIC_SNAPSHOTS.prepare(
+      `UPDATE mel_snapshot SET snapshot_date_key = ? WHERE snapshot_date_key = ?`,
+    ).bind(toKey, fromKey),
+    env.ETIC_SNAPSHOTS.prepare(
+      `UPDATE mel_changelog SET snapshot_date_key = ? WHERE snapshot_date_key = ?`,
+    ).bind(toKey, fromKey),
+    env.ETIC_SNAPSHOTS.prepare(
+      `UPDATE mel_state SET last_snapshot_date = ? WHERE last_snapshot_date = ?`,
+    ).bind(toKey, fromKey),
+  ]);
+
+  // Update R2 history index file.
+  const newEntries = history.entries
+    .filter((e) => e.dateKey !== fromKey)
+    .concat([
+      {
+        ...fromEntry,
+        dateKey: toKey,
+        workbookKey: newWorkbookKey,
+        analysisKey: newAnalysisKey,
+      },
+    ])
+    .sort((a, b) => a.dateKey.localeCompare(b.dateKey));
+  await env.ETIC_BUCKET.put(
+    "history/index.json",
+    JSON.stringify({ updatedAtIso: new Date().toISOString(), entries: newEntries }, null, 2),
+    { httpMetadata: { contentType: "application/json; charset=utf-8" } },
+  );
+
+  // Drop the old R2 objects last so a mid-run failure leaves us with both copies.
+  await env.ETIC_BUCKET.delete(oldWorkbookKey);
+  await env.ETIC_BUCKET.delete(oldAnalysisKey);
+
+  return Response.json(
+    {
+      ok: true,
+      from: fromKey,
+      to: toKey,
+      workbookKey: newWorkbookKey,
+      analysisKey: newAnalysisKey,
+    },
+    { headers: cacheHeaders() },
+  );
+}
+
+async function handleSnapshotsList(env: Env): Promise<Response> {
+  const result = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT date_key, workbook_key, workbook_file_name, received_at_iso,
+            mc_rate, fleet_total, fmc, nmc, surplus, asset_manager_ok,
+            total_rows, mel_total, visible_sheets, hidden_sheets, updated_at_iso
+     FROM etic_snapshots ORDER BY date_key DESC`,
+  ).all<{
+    date_key: string;
+    workbook_key: string;
+    workbook_file_name: string;
+    received_at_iso: string;
+    mc_rate: number | null;
+    fleet_total: number | null;
+    fmc: number | null;
+    nmc: number | null;
+    surplus: number | null;
+    asset_manager_ok: number;
+    total_rows: number | null;
+    mel_total: number | null;
+    visible_sheets: number | null;
+    hidden_sheets: number | null;
+    updated_at_iso: string;
+  }>();
+
+  const rows: SnapshotListRow[] = (result.results ?? []).map((r) => ({
+    dateKey: r.date_key,
+    workbookKey: r.workbook_key,
+    workbookFileName: r.workbook_file_name,
+    receivedAtIso: r.received_at_iso,
+    mcRatePercent: r.mc_rate,
+    fleetTotal: r.fleet_total,
+    fmc: r.fmc,
+    nmc: r.nmc,
+    surplus: r.surplus,
+    assetManagerOk: Boolean(r.asset_manager_ok),
+    totalRows: r.total_rows,
+    melTotal: r.mel_total,
+    visibleSheets: r.visible_sheets,
+    hiddenSheets: r.hidden_sheets,
+    updatedAtIso: r.updated_at_iso,
+  }));
+
+  return Response.json({ updatedAtIso: new Date().toISOString(), snapshots: rows }, { headers: cacheHeaders() });
+}
+
+async function persistAnalysisIfChanged(env: Env, analysis: AnalysisResult): Promise<void> {
+  await env.ETIC_BUCKET.put(
+    `analyses/${analysis.dateKey}.json`,
+    JSON.stringify(analysis, null, 2),
+    { httpMetadata: { contentType: "application/json; charset=utf-8" } },
+  );
+  const history = await loadHistory(env);
+  const entry = history.entries.find((e) => e.dateKey === analysis.dateKey);
+  if (entry) {
+    await upsertSnapshotRow(env, analysis, entry.workbookKey);
+  }
+  const latest = await readJson<AnalysisResult>(env, "analyses/latest.json");
+  if (latest?.dateKey === analysis.dateKey) {
+    await env.ETIC_BUCKET.put("analyses/latest.json", JSON.stringify(analysis, null, 2), {
+      httpMetadata: { contentType: "application/json; charset=utf-8" },
+    });
+  }
+}
+
+async function enrichAnalysisAssetManagerFromR2(env: Env, analysis: AnalysisResult): Promise<AnalysisResult> {
+  let am = assetManagerFromAnalysis(analysis);
+
+  // The DB row is authoritative for the per-Unit breakdown — earlier versions
+  // of the extractor wrote a different (asset-level) shape into the cached
+  // analyses/<date>.json, so we ignore the JSON copy when the DB column is
+  // empty and re-extract from R2.
+  const dbRow = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT mc_rate, fleet_total, fmc, nmc, surplus, asset_manager_ok, asset_manager_breakdown
+       FROM etic_snapshots WHERE date_key = ?`,
+  )
+    .bind(analysis.dateKey)
+    .first<{
+      mc_rate: number | null;
+      fleet_total: number | null;
+      fmc: number | null;
+      nmc: number | null;
+      surplus: number | null;
+      asset_manager_ok: number;
+      asset_manager_breakdown: string;
+    }>();
+  if (!am.sheetFound && dbRow && dbRow.asset_manager_ok) {
+    am = {
+      sheetFound: true,
+      mcRatePercent: dbRow.mc_rate,
+      fleetTotal: dbRow.fleet_total,
+      fmc: dbRow.fmc,
+      nmc: dbRow.nmc,
+      surplus: dbRow.surplus,
+    };
+  }
+
+  let breakdown: AssetManagerBreakdownRow[] = [];
+  if (dbRow && dbRow.asset_manager_breakdown) {
+    try {
+      const parsed = JSON.parse(dbRow.asset_manager_breakdown);
+      if (Array.isArray(parsed)) breakdown = parsed as AssetManagerBreakdownRow[];
+    } catch (_e) { /* corrupt JSON — re-extract below */ }
+  }
+
+  // If the DB doesn't have it yet (or KPI sheet is missing), re-parse from R2.
+  if (!am.sheetFound || !breakdown.length) {
+    const history = await loadHistory(env);
+    const entry = history.entries.find((e) => e.dateKey === analysis.dateKey);
+    if (entry) {
+      const obj = await env.ETIC_BUCKET.get(entry.workbookKey);
+      if (obj) {
+        const bytes = await obj.arrayBuffer();
+        const workbook = new ExcelJS.Workbook();
+        await workbook.xlsx.load(bytes);
+        if (!am.sheetFound) am = extractAssetManagerKpis(workbook);
+        if (!breakdown.length) breakdown = extractAssetManagerBreakdown(workbook);
+      }
+    }
+  }
+
+  const merged: AnalysisResult = { ...analysis, assetManager: am, assetManagerBreakdown: breakdown };
+  const beforeJson = JSON.stringify({
+    am: analysis.assetManager,
+    bd: analysis.assetManagerBreakdown ?? [],
+  });
+  const afterJson = JSON.stringify({ am, bd: breakdown });
+  if ((am.sheetFound || breakdown.length) && beforeJson !== afterJson) {
+    await persistAnalysisIfChanged(env, merged);
+  }
+  return merged;
+}
+
+async function backfillSnapshotsFromHistory(env: Env): Promise<void> {
+  const history = await loadHistory(env);
+  for (const entry of history.entries) {
+    let analysis = await readJson<AnalysisResult>(env, entry.analysisKey);
+    if (!analysis) continue;
+    analysis = await enrichAnalysisAssetManagerFromR2(env, analysis);
+    await upsertSnapshotRow(env, analysis, entry.workbookKey);
+  }
+}
+
+/** Replay a single snapshot into the watch tables (used by chunked rebuilds). */
+async function replayWorkOrderWatchForDate(env: Env, dateKey: string): Promise<number> {
+  const history = await loadHistory(env);
+  const entry = history.entries.find((e) => e.dateKey === dateKey);
+  if (!entry) return 0;
+  const obj = await env.ETIC_BUCKET.get(entry.workbookKey);
+  if (!obj) return 0;
+  const bytes = await obj.arrayBuffer();
+  const raw = await extractRawWorkOrdersFromBinary(bytes);
+  await ingestWorkOrderSnapshot(env, dateKey, raw, new Date().toISOString());
+  const melRows = await extractMelRowsFromBinary(bytes);
+  await ingestMelSnapshot(env, dateKey, melRows, new Date().toISOString());
+  return raw.length;
+}
+
+/** Replay all workbooks in date order so changelog + ETIC push counts are correct. */
+async function rebuildWorkOrderWatchFromHistory(env: Env): Promise<void> {
+  await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM work_order_changelog`).run();
+  await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM work_order_state`).run();
+  await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM work_order_snapshot`).run();
+  await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM mel_changelog`).run();
+  await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM mel_state`).run();
+  await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM mel_snapshot`).run();
+  const history = await loadHistory(env);
+  const sorted = [...history.entries].sort((a, b) => a.dateKey.localeCompare(b.dateKey));
+  const nowIso = new Date().toISOString();
+  for (const entry of sorted) {
+    const obj = await env.ETIC_BUCKET.get(entry.workbookKey);
+    if (!obj) continue;
+    const bytes = await obj.arrayBuffer();
+    const raw = await extractRawWorkOrdersFromBinary(bytes);
+    await ingestWorkOrderSnapshot(env, entry.dateKey, raw, nowIso);
+    const melRows = await extractMelRowsFromBinary(bytes);
+    await ingestMelSnapshot(env, entry.dateKey, melRows, nowIso);
+  }
+}
+
+async function handleDebugWatchCounts(env: Env): Promise<Response> {
+  const stateCount = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT COUNT(*) AS c FROM work_order_state`,
+  ).first<{ c: number }>();
+  const changelogCount = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT COUNT(*) AS c FROM work_order_changelog`,
+  ).first<{ c: number }>();
+  const latest = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT last_snapshot_date, COUNT(*) AS c FROM work_order_state GROUP BY last_snapshot_date ORDER BY last_snapshot_date DESC LIMIT 10`,
+  ).all<{ last_snapshot_date: string; c: number }>();
+  const melBreakdown = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT mel_tier, COUNT(*) AS c FROM work_order_state GROUP BY mel_tier ORDER BY c DESC`,
+  ).all<{ mel_tier: string; c: number }>();
+  const eticSample = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT work_order_id, asset_id, mel_tier, etic_raw, etic_date FROM work_order_state WHERE etic_date IS NOT NULL ORDER BY last_snapshot_date DESC LIMIT 10`,
+  ).all();
+  return Response.json(
+    {
+      totalState: stateCount?.c ?? 0,
+      totalChangelog: changelogCount?.c ?? 0,
+      rowsByLastSnapshotDate: latest.results ?? [],
+      melBreakdown: melBreakdown.results ?? [],
+      eticSample: eticSample.results ?? [],
+    },
+    { headers: cacheHeaders() },
+  );
+}
+
+async function handleDebugScrape(env: Env, request: Request): Promise<Response> {
+  const url = new URL(request.url);
+  const dateParam = url.searchParams.get("date");
+  const history = await loadHistory(env);
+  const entries = [...history.entries].sort((a, b) => b.dateKey.localeCompare(a.dateKey));
+  const entry = dateParam
+    ? entries.find((e) => e.dateKey === dateParam)
+    : entries[0];
+  if (!entry) {
+    return Response.json(
+      { error: "No such snapshot", requestedDate: dateParam, available: entries.map((e) => e.dateKey) },
+      { status: 404, headers: cacheHeaders() },
+    );
+  }
+  const obj = await env.ETIC_BUCKET.get(entry.workbookKey);
+  if (!obj) {
+    return Response.json(
+      { error: "Workbook object missing in R2", workbookKey: entry.workbookKey },
+      { status: 404, headers: cacheHeaders() },
+    );
+  }
+  const bytes = await obj.arrayBuffer();
+  const report = await debugScrapeWorkbook(bytes);
+  return Response.json(
+    {
+      dateKey: entry.dateKey,
+      workbookFileName: entry.workbookFileName,
+      workbookKey: entry.workbookKey,
+      workbookBytes: bytes.byteLength,
+      ...report,
+    },
+    { headers: cacheHeaders() },
+  );
+}
+
+/** Debug: dump headers + sample rows from MEL Calculator sheet so we can
+ *  confirm exact column names before writing the parser. */
+async function handleDebugMelHeaders(env: Env, url: URL): Promise<Response> {
+  const dateParam = url.searchParams.get("date");
+  const history = await loadHistory(env);
+  const entries = [...history.entries].sort((a, b) => b.dateKey.localeCompare(a.dateKey));
+  const entry = dateParam ? entries.find((e) => e.dateKey === dateParam) : entries[0];
+  if (!entry) {
+    return Response.json(
+      { error: "No such snapshot", requestedDate: dateParam, available: entries.map((e) => e.dateKey) },
+      { status: 404, headers: cacheHeaders() },
+    );
+  }
+  const obj = await env.ETIC_BUCKET.get(entry.workbookKey);
+  if (!obj) {
+    return Response.json({ error: "Workbook missing" }, { status: 404, headers: cacheHeaders() });
+  }
+  const bytes = await obj.arrayBuffer();
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(bytes);
+  const sheet = wb.worksheets.find((ws) => /mel\s*calc/i.test(ws.name));
+  if (!sheet) {
+    return Response.json(
+      { error: "MEL Calculator sheet not found", sheets: wb.worksheets.map((w) => w.name) },
+      { status: 404, headers: cacheHeaders() },
+    );
+  }
+  // Find first row with > 4 non-empty cells — that's our header row.
+  let headerRowIdx = -1;
+  for (let r = 1; r <= 12; r++) {
+    const row = sheet.getRow(r);
+    let count = 0;
+    row.eachCell({ includeEmpty: false }, () => { count += 1; });
+    if (count >= 4) { headerRowIdx = r; break; }
+  }
+  const headers: { col: number; text: string }[] = [];
+  if (headerRowIdx > 0) {
+    sheet.getRow(headerRowIdx).eachCell({ includeEmpty: false }, (cell, col) => {
+      headers.push({ col, text: readCellText(cell) });
+    });
+  }
+  const samples: Array<Record<string, string>> = [];
+  if (headerRowIdx > 0) {
+    const lastRow = Math.min(headerRowIdx + 5, sheet.actualRowCount || sheet.rowCount || 0);
+    for (let r = headerRowIdx + 1; r <= lastRow; r++) {
+      const row = sheet.getRow(r);
+      const obj: Record<string, string> = {};
+      headers.forEach((h) => { obj[h.text] = readCellText(row.getCell(h.col)); });
+      samples.push(obj);
+    }
+  }
+  const total = sheet.actualRowCount || sheet.rowCount || 0;
+  return Response.json(
+    {
+      dateKey: entry.dateKey,
+      sheet: sheet.name,
+      headerRow: headerRowIdx,
+      totalRows: total,
+      dataRowsApprox: headerRowIdx > 0 ? Math.max(0, total - headerRowIdx) : 0,
+      headers,
+      samples,
+    },
+    { headers: cacheHeaders() },
+  );
+}
+
+/* -------------------- MEL endpoints -------------------- */
+
+/** Latest (or for-a-given-date) per-key MEL state plus rollup. */
+async function handleMelApi(env: Env, url: URL): Promise<Response> {
+  const dateParam = url.searchParams.get("date");
+  const [rows, dates, configs, subdivisions] = await Promise.all([
+    dateParam ? getMelForDate(env, dateParam) : getMelLatest(env),
+    getMelSnapshotDates(env),
+    getAllMelConfig(env),
+    getMelSubdivisions(env),
+  ]);
+  const latestDate = dates[0] ?? null;
+  const configByKey = new Map(configs.map((c) => [c.mel_key, c]));
+  const subsByKey = new Map<string, typeof subdivisions>();
+  for (const s of subdivisions) {
+    const list = subsByKey.get(s.mel_key) ?? [];
+    list.push(s);
+    subsByKey.set(s.mel_key, list);
+  }
+  const enriched = rows.map((r) => {
+    const cfg = configByKey.get(r.mel_key) ?? null;
+    const subs = subsByKey.get(r.mel_key) ?? [];
+    return {
+      ...r,
+      config: cfg
+        ? {
+            isCritical: cfg.is_critical === 1,
+            typeLabel: cfg.type_label,
+            displayOrder: cfg.display_order,
+            notes: cfg.notes,
+          }
+        : null,
+      subdivisions: subs,
+    };
+  });
+  let below = 0, at = 0, above = 0, totalNmc = 0, totalFmc = 0, totalRecall = 0;
+  for (const r of rows) {
+    if (r.mel_status === "below") below += 1;
+    else if (r.mel_status === "at") at += 1;
+    else if (r.mel_status === "above") above += 1;
+    totalNmc += r.nmc_count || 0;
+    totalFmc += r.fmc_count || 0;
+    totalRecall += r.recall_delta || 0;
+  }
+  return Response.json(
+    {
+      asOfDate: dateParam ?? latestDate,
+      latestDate,
+      availableDates: dates,
+      totals: {
+        keys: rows.length,
+        below, at, above,
+        nmc: totalNmc,
+        fmc: totalFmc,
+        recall: totalRecall,
+        mcRatePercent: totalNmc + totalFmc > 0 ? (totalFmc / (totalNmc + totalFmc)) * 100 : null,
+      },
+      rows: enriched,
+    },
+    { headers: cacheHeaders() },
+  );
+}
+
+/** Per-MEL-key history + changelog. */
+async function handleMelHistoryApi(env: Env, url: URL): Promise<Response> {
+  const melKey = url.searchParams.get("melKey");
+  if (!melKey) {
+    return Response.json({ error: "melKey is required" }, { status: 400, headers: cacheHeaders() });
+  }
+  const [history, changelog] = await Promise.all([
+    getMelHistoryForKey(env, melKey),
+    getMelChangelogForKey(env, melKey),
+  ]);
+  return Response.json({ melKey, history, changelog }, { headers: cacheHeaders() });
+}
+
+/** Daily totals across the entire MEL set, for the trend chart. */
+async function handleMelRollupApi(env: Env): Promise<Response> {
+  const rollup = await getMelRollup(env);
+  return Response.json({ rollup }, { headers: cacheHeaders() });
+}
+
+/** /api/mel-config — GET lists all configs, POST upserts one, DELETE removes one. */
+async function handleMelConfigApi(env: Env, request: Request): Promise<Response> {
+  if (request.method === "GET") {
+    const configs = await getAllMelConfig(env);
+    return Response.json({ configs }, { headers: cacheHeaders() });
+  }
+  if (request.method === "POST") {
+    const body = await readJsonBody<{
+      melKey?: string;
+      isCritical?: boolean;
+      typeLabel?: string;
+      displayOrder?: number;
+      notes?: string;
+    }>(request);
+    if (!body?.melKey) {
+      return Response.json({ error: "melKey is required" }, { status: 400, headers: cacheHeaders() });
+    }
+    const row = await upsertMelConfig(env, body.melKey, body, new Date().toISOString());
+    return Response.json({ config: row }, { headers: cacheHeaders() });
+  }
+  if (request.method === "DELETE") {
+    const url = new URL(request.url);
+    const melKey = url.searchParams.get("melKey");
+    if (!melKey) {
+      return Response.json({ error: "melKey is required" }, { status: 400, headers: cacheHeaders() });
+    }
+    await deleteMelConfig(env, melKey);
+    return Response.json({ ok: true }, { headers: cacheHeaders() });
+  }
+  return new Response("Method not allowed", { status: 405 });
+}
+
+/** /api/mel-subdivision — GET lists (optionally filtered), POST upserts, DELETE by id. */
+async function handleMelSubdivisionApi(env: Env, request: Request): Promise<Response> {
+  const url = new URL(request.url);
+  if (request.method === "GET") {
+    const melKey = url.searchParams.get("melKey") ?? undefined;
+    const subs = await getMelSubdivisions(env, melKey);
+    return Response.json({ subdivisions: subs }, { headers: cacheHeaders() });
+  }
+  if (request.method === "POST") {
+    const body = await readJsonBody<{
+      id?: number;
+      melKey?: string;
+      typeLabel?: string;
+      mgmtCode?: string;
+      melRequired?: number;
+      assigned?: number;
+      fmc?: number;
+      nmc?: number;
+      accidents?: number;
+      abuses?: number;
+      displayOrder?: number;
+    }>(request);
+    if (!body?.melKey || !body?.typeLabel) {
+      return Response.json({ error: "melKey and typeLabel are required" }, { status: 400, headers: cacheHeaders() });
+    }
+    const row = await upsertMelSubdivision(
+      env,
+      {
+        id: body.id,
+        melKey: body.melKey,
+        typeLabel: body.typeLabel,
+        mgmtCode: body.mgmtCode,
+        melRequired: body.melRequired,
+        assigned: body.assigned,
+        fmc: body.fmc,
+        nmc: body.nmc,
+        accidents: body.accidents,
+        abuses: body.abuses,
+        displayOrder: body.displayOrder,
+      },
+      new Date().toISOString(),
+    );
+    return Response.json({ subdivision: row }, { headers: cacheHeaders() });
+  }
+  if (request.method === "DELETE") {
+    const idStr = url.searchParams.get("id");
+    const id = idStr ? Number.parseInt(idStr, 10) : NaN;
+    if (!Number.isFinite(id)) {
+      return Response.json({ error: "id is required" }, { status: 400, headers: cacheHeaders() });
+    }
+    await deleteMelSubdivision(env, id);
+    return Response.json({ ok: true }, { headers: cacheHeaders() });
+  }
+  return new Response("Method not allowed", { status: 405 });
+}
+
+/** /api/app-config — generic key-value JSON store. GET returns everything plus
+ *  resolved staleness defaults; POST sets one key. */
+async function handleAppConfigApi(env: Env, request: Request): Promise<Response> {
+  if (request.method === "GET") {
+    const all = await getAllAppConfig(env);
+    const staleness = await getStalenessThresholds(env);
+    return Response.json({ config: all, staleness }, { headers: cacheHeaders() });
+  }
+  if (request.method === "POST") {
+    const body = await readJsonBody<{ key?: string; value?: unknown }>(request);
+    if (!body?.key) {
+      return Response.json({ error: "key is required" }, { status: 400, headers: cacheHeaders() });
+    }
+    await setAppConfig(env, body.key, body.value, new Date().toISOString());
+    const staleness = await getStalenessThresholds(env);
+    return Response.json({ ok: true, staleness }, { headers: cacheHeaders() });
+  }
+  return new Response("Method not allowed", { status: 405 });
+}
+
+/* -------------------- Yard check (rolling) endpoints --------------------
+ * The yard check is a rolling cadence — every asset must be physically
+ * sighted at least once per `intervalDays` (default 7). Each visit is one
+ * row in `yard_check`. Photos go to R2; metadata in `yard_photo`.
+ */
+
+/** GET — full rolling roster + totals + locations + interval. */
+async function handleYardRosterApi(env: Env): Promise<Response> {
+  const roster = await getRollingRoster(env);
+  return Response.json(roster, { headers: cacheHeaders() });
+}
+
+/**
+ * GET /api/yard/sightings
+ * Tiny JSON map of every asset that's been seen in the yard with `status='present'`,
+ * keyed by asset_id → { location, at (ISO), by }. Consumed by Work Orders, MEL,
+ * ETIC Meeting, and Presenter so the most-recent location and how-long-ago show
+ * next to the asset id. Single-fetch lookup is intentional: ~390 rows max,
+ * gzips to a few KB, cached client-side per tab visit.
+ */
+async function handleYardSightingsApi(env: Env): Promise<Response> {
+  const sightings = await getYardLatestSightings(env);
+  const out: Record<string, { location: string; at: string; by: string }> = {};
+  for (const [assetId, s] of sightings) out[assetId] = s;
+  return Response.json(
+    { generatedAtIso: new Date().toISOString(), sightings: out },
+    { headers: cacheHeaders() },
+  );
+}
+
+/** GET — FM&A follow-up queue (computed live from latest checks + actions). */
+async function handleYardFindingsApi(env: Env): Promise<Response> {
+  const result = await listYardOpenFindings(env);
+  return Response.json(result, { headers: cacheHeaders() });
+}
+
+/** POST — record an FM&A action against a finding. */
+async function handleYardFindingResolveApi(env: Env, request: Request): Promise<Response> {
+  if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+  const body = await readJsonBody<{
+    assetId?: string;
+    kind?: string;
+    checkId?: number | null;
+    resolution?: string;
+    woOpened?: string;
+    note?: string;
+    resolvedBy?: string;
+  }>(request);
+  if (!body?.assetId) {
+    return Response.json({ error: "assetId required" }, { status: 400, headers: cacheHeaders() });
+  }
+  if (!body.kind) {
+    return Response.json({ error: "kind required" }, { status: 400, headers: cacheHeaders() });
+  }
+  try {
+    const action = await resolveYardFinding(env, {
+      assetId: body.assetId,
+      kind: body.kind as FindingKind,
+      checkId: body.checkId ?? null,
+      resolution: (body.resolution || "resolved") as FindingResolution,
+      woOpened: body.woOpened,
+      note: body.note,
+      resolvedBy: body.resolvedBy,
+    });
+    return Response.json({ action }, { headers: cacheHeaders() });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "resolve failed";
+    return Response.json({ error: msg }, { status: 400, headers: cacheHeaders() });
+  }
+}
+
+/** POST — undo the most-recent action for (asset, kind) so the finding re-opens. */
+async function handleYardFindingReopenApi(env: Env, request: Request): Promise<Response> {
+  if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+  const body = await readJsonBody<{ assetId?: string; kind?: string }>(request);
+  if (!body?.assetId || !body?.kind) {
+    return Response.json({ error: "assetId and kind required" }, { status: 400, headers: cacheHeaders() });
+  }
+  try {
+    const ok = await reopenYardFinding(env, body.assetId, body.kind as FindingKind);
+    return Response.json({ ok }, { headers: cacheHeaders() });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "reopen failed";
+    return Response.json({ error: msg }, { status: 400, headers: cacheHeaders() });
+  }
+}
+
+/** GET — interleaved feed of recent checks + actions. */
+async function handleYardActivityApi(env: Env, url: URL): Promise<Response> {
+  const limit = Math.min(500, Math.max(1, Number.parseInt(url.searchParams.get("limit") ?? "100", 10)));
+  const items = await getYardRecentActivity(env, limit);
+  return Response.json({ items }, { headers: cacheHeaders() });
+}
+
+/** POST — record a yard check for one asset. */
+async function handleYardCheckApi(env: Env, request: Request): Promise<Response> {
+  if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+  const body = await readJsonBody<{
+    assetId?: string;
+    location?: string;
+    discrepancies?: string;
+    status?: string;
+    checkedBy?: string;
+    sourceDateKey?: string;
+  }>(request);
+  if (!body?.assetId) {
+    return Response.json({ error: "assetId is required" }, { status: 400, headers: cacheHeaders() });
+  }
+  try {
+    const check = await recordYardCheck(env, {
+      assetId: body.assetId,
+      location: body.location,
+      discrepancies: body.discrepancies,
+      status: body.status as YardEntryStatus | undefined,
+      checkedBy: body.checkedBy,
+      sourceDateKey: body.sourceDateKey,
+    });
+    return Response.json({ check }, { headers: cacheHeaders() });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "record failed";
+    return Response.json({ error: msg }, { status: 400, headers: cacheHeaders() });
+  }
+}
+
+/** GET — full asset history: roster slice + last 50 checks + photos. */
+async function handleYardAssetDetailApi(env: Env, assetId: string): Promise<Response> {
+  if (!assetId) return Response.json({ error: "assetId required" }, { status: 400, headers: cacheHeaders() });
+  const detail = await getYardAssetDetail(env, assetId);
+  return Response.json(detail, { headers: cacheHeaders() });
+}
+
+/**
+ * POST /api/yard/photo — multipart/form-data with fields:
+ *   assetId    (required)
+ *   photo      (file, required)
+ *   uploadedBy (optional)
+ *   caption    (optional)
+ *   checkId    (optional, integer)
+ *
+ * Stores the binary in R2 under yard-photos/<assetId>/... and a metadata row
+ * in `yard_photo` so we can list and serve it back.
+ */
+async function handleYardPhotoUploadApi(env: Env, request: Request): Promise<Response> {
+  if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+  const ct = request.headers.get("content-type") || "";
+  if (!ct.startsWith("multipart/form-data")) {
+    return Response.json({ error: "expected multipart/form-data" }, { status: 415, headers: cacheHeaders() });
+  }
+  let form: FormData;
+  try {
+    form = await request.formData();
+  } catch (e) {
+    return Response.json(
+      { error: "could not parse form: " + (e instanceof Error ? e.message : String(e)) },
+      { status: 400, headers: cacheHeaders() },
+    );
+  }
+  const assetId = String(form.get("assetId") ?? "").trim();
+  if (!assetId) {
+    return Response.json({ error: "assetId is required" }, { status: 400, headers: cacheHeaders() });
+  }
+  const file = form.get("photo");
+  if (!(file instanceof File)) {
+    return Response.json({ error: "photo file is required" }, { status: 400, headers: cacheHeaders() });
+  }
+  // Cap upload size — phones throw out big HEICs even at "medium" quality.
+  const MAX_BYTES = 10 * 1024 * 1024;
+  if (file.size > MAX_BYTES) {
+    return Response.json({ error: "photo too large (max 10MB)" }, { status: 413, headers: cacheHeaders() });
+  }
+  const buf = await file.arrayBuffer();
+  const checkIdRaw = form.get("checkId");
+  const checkId = checkIdRaw ? Number.parseInt(String(checkIdRaw), 10) : null;
+  const photo = await addYardPhoto(env, {
+    assetId,
+    body: buf,
+    contentType: file.type || "image/jpeg",
+    sizeBytes: buf.byteLength,
+    uploadedBy: String(form.get("uploadedBy") ?? ""),
+    caption: String(form.get("caption") ?? ""),
+    checkId: Number.isFinite(checkId) ? checkId : null,
+  });
+  return Response.json({ photo }, { headers: cacheHeaders() });
+}
+
+/** GET /api/yard/photos?assetId=… — list photos for one asset. */
+async function handleYardPhotoListApi(env: Env, url: URL): Promise<Response> {
+  const assetId = url.searchParams.get("assetId") ?? "";
+  if (!assetId) {
+    return Response.json({ error: "assetId is required" }, { status: 400, headers: cacheHeaders() });
+  }
+  const photos = await listYardPhotosForAsset(env, assetId);
+  return Response.json({ photos }, { headers: cacheHeaders() });
+}
+
+/** GET /api/yard/photo/:id — stream the actual image bytes from R2. */
+async function handleYardPhotoFetchApi(env: Env, request: Request, id: number): Promise<Response> {
+  if (request.method === "DELETE") {
+    const ok = await deleteYardPhoto(env, id);
+    return Response.json({ ok }, { headers: cacheHeaders() });
+  }
+  if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
+  const got = await getYardPhoto(env, id);
+  if (!got) return new Response("Not found", { status: 404 });
+  return new Response(got.body, {
+    headers: {
+      "Content-Type": got.meta.contentType,
+      "Cache-Control": "public, max-age=86400, immutable",
+      "Content-Disposition": "inline; filename=\"" + got.meta.assetId + "-" + id + "\"",
+    },
+  });
+}
+
+/* -------------------- ETIC live-meeting endpoints -------------------- */
+
+function isValidNoteStatus(s: unknown): s is MeetingNoteStatus {
+  return s === "pending" || s === "covered" || s === "skipped" || s === "deferred";
+}
+
+async function readJsonBody<T = unknown>(request: Request): Promise<T | null> {
+  try {
+    return (await request.json()) as T;
+  } catch {
+    return null;
+  }
+}
+
+async function handleMeetingsListApi(env: Env, request: Request): Promise<Response> {
+  if (request.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
+  const url = new URL(request.url);
+  const limit = Number.parseInt(url.searchParams.get("limit") ?? "100", 10) || 100;
+  const rows = await listMeetings(env, limit);
+  return Response.json({ meetings: rows }, { headers: cacheHeaders() });
+}
+
+async function handleMeetingCreateApi(env: Env, request: Request): Promise<Response> {
+  if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+  const body = await readJsonBody<Partial<CreateMeetingInput>>(request);
+  if (!body || !Array.isArray(body.workOrders)) {
+    return Response.json(
+      { error: "Body must be JSON with workOrders: SeedWorkOrder[]" },
+      { status: 400, headers: cacheHeaders() },
+    );
+  }
+  const seed = body.workOrders
+    .filter((w): w is SeedWorkOrder => !!w && typeof w.workOrderId === "string" && w.workOrderId.trim().length > 0)
+    .map((w) => ({
+      workOrderId: w.workOrderId.trim(),
+      assetId: (w.assetId ?? "").toString(),
+      owningUnit: (w.owningUnit ?? "").toString(),
+      melKey: (w.melKey ?? "").toString(),
+      melTier: (w.melTier ?? "").toString(),
+      shop: (w.shop ?? "").toString(),
+      mgmtCd: (w.mgmtCd ?? "").toString(),
+      makeModel: (w.makeModel ?? "").toString(),
+      vehNomen: (w.vehNomen ?? "").toString(),
+      eticDate: w.eticDate ?? null,
+    }));
+  const meeting = await createMeeting(env, {
+    title: (body.title ?? "").toString(),
+    attendees: (body.attendees ?? "").toString(),
+    filterSummary: (body.filterSummary ?? "").toString(),
+    targetMinutes: Number(body.targetMinutes ?? 30),
+    snapshotDateKey: (body.snapshotDateKey ?? "").toString(),
+    workOrders: seed,
+  });
+  return Response.json({ meeting, seeded: seed.length }, { headers: cacheHeaders() });
+}
+
+async function handleMeetingGetApi(env: Env, request: Request, id: number): Promise<Response> {
+  if (request.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
+  const payload = await getMeetingWithNotes(env, id);
+  if (!payload) return Response.json({ error: "Not found" }, { status: 404, headers: cacheHeaders() });
+  return Response.json(payload, { headers: cacheHeaders() });
+}
+
+async function handleMeetingNoteUpsertApi(env: Env, request: Request, id: number): Promise<Response> {
+  if (request.method !== "PATCH" && request.method !== "POST") {
+    return new Response("Method Not Allowed", { status: 405 });
+  }
+  const body = await readJsonBody<{ workOrderId?: string } & UpsertNoteInput & { status?: unknown }>(request);
+  if (!body || !body.workOrderId) {
+    return Response.json(
+      { error: "Body must include workOrderId + patch fields" },
+      { status: 400, headers: cacheHeaders() },
+    );
+  }
+  const patch: UpsertNoteInput = {};
+  if (body.status !== undefined) {
+    if (!isValidNoteStatus(body.status)) {
+      return Response.json(
+        { error: "status must be pending|covered|skipped|deferred" },
+        { status: 400, headers: cacheHeaders() },
+      );
+    }
+    patch.status = body.status;
+  }
+  if (body.notes !== undefined) patch.notes = String(body.notes);
+  if (body.dueOuts !== undefined) patch.dueOuts = String(body.dueOuts);
+  const note = await upsertMeetingNote(env, id, body.workOrderId, patch);
+  if (!note) return Response.json({ error: "Note not found" }, { status: 404, headers: cacheHeaders() });
+  return Response.json({ note }, { headers: cacheHeaders() });
+}
+
+async function handleMeetingAddWosApi(env: Env, request: Request, id: number): Promise<Response> {
+  if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+  const body = await readJsonBody<{ workOrders?: SeedWorkOrder[] }>(request);
+  if (!body || !Array.isArray(body.workOrders)) {
+    return Response.json(
+      { error: "Body must include workOrders: SeedWorkOrder[]" },
+      { status: 400, headers: cacheHeaders() },
+    );
+  }
+  const added = await addWorkOrdersToMeeting(env, id, body.workOrders);
+  return Response.json({ added }, { headers: cacheHeaders() });
+}
+
+async function handleMeetingEndApi(env: Env, request: Request, id: number): Promise<Response> {
+  if (request.method === "DELETE") {
+    await deleteMeeting(env, id);
+    return Response.json({ ok: true, deleted: id }, { headers: cacheHeaders() });
+  }
+  if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+  const data = await getMeetingWithNotes(env, id);
+  if (!data) return Response.json({ error: "Not found" }, { status: 404, headers: cacheHeaders() });
+  const minutes = renderMeetingMinutesMarkdown(data.meeting, data.notes);
+  const updated = await endMeeting(env, id, minutes);
+  return Response.json({ meeting: updated, notes_md: minutes }, { headers: cacheHeaders() });
+}
+
+/**
+ * Move the conference-room screen to a different work order. The controller
+ * (laptop) hits this; the projector view polls and follows along.
+ */
+async function handleMeetingCursorApi(env: Env, request: Request, id: number): Promise<Response> {
+  if (request.method !== "POST" && request.method !== "PATCH") {
+    return new Response("Method Not Allowed", { status: 405 });
+  }
+  const body = await readJsonBody<{ workOrderId?: string; timelineScroll?: number }>(request);
+  if (!body) {
+    return Response.json(
+      { error: "Body must be JSON with workOrderId or timelineScroll" },
+      { status: 400, headers: cacheHeaders() },
+    );
+  }
+  const hasWid = typeof body.workOrderId === "string";
+  const hasScroll = typeof body.timelineScroll === "number" && Number.isFinite(body.timelineScroll);
+  if (!hasWid && !hasScroll) {
+    return Response.json(
+      { error: "Body must include workOrderId: string and/or timelineScroll: number" },
+      { status: 400, headers: cacheHeaders() },
+    );
+  }
+  // Scroll-only update is the high-frequency path (controller is dragging) —
+  // skip the bigger UPDATE that also touches current_wid.
+  if (!hasWid && hasScroll) {
+    await setMeetingTimelineScroll(env, id, body.timelineScroll as number);
+    return Response.json({ ok: true }, { headers: cacheHeaders() });
+  }
+  const updated = await setMeetingCursor(
+    env,
+    id,
+    body.workOrderId as string,
+    hasScroll ? (body.timelineScroll as number) : null,
+  );
+  if (!updated) return Response.json({ error: "Not found" }, { status: 404, headers: cacheHeaders() });
+  return Response.json({ meeting: updated }, { headers: cacheHeaders() });
+}
+
+async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext): Promise<Response> {
+  if (request.method === "POST") {
+    const url = new URL(request.url);
+    if (url.searchParams.get("reset") === "1") {
+      await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM work_order_changelog`).run();
+      await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM work_order_state`).run();
+      await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM work_order_snapshot`).run();
+      return Response.json({ ok: true, message: "Cleared work_order_state, work_order_snapshot, and work_order_changelog." }, { headers: cacheHeaders() });
+    }
+    const replayDate = url.searchParams.get("replay");
+    if (replayDate) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(replayDate)) {
+        return new Response("Invalid date", { status: 400 });
+      }
+      const count = await replayWorkOrderWatchForDate(env, replayDate);
+      return Response.json({ ok: true, dateKey: replayDate, rowsIngested: count }, { headers: cacheHeaders() });
+    }
+    if (url.searchParams.get("rebuild") === "1") {
+      ctx.waitUntil(rebuildWorkOrderWatchFromHistory(env));
+      return Response.json(
+        {
+          ok: true,
+          message:
+            "Work order watch is rebuilding from R2 in chronological order (clears prior changelog). Takes a few minutes for large history.",
+        },
+        { headers: cacheHeaders() },
+      );
+    }
+    if (url.searchParams.get("backfill-from-json") === "1") {
+      const overwrite = url.searchParams.get("overwrite") === "1";
+      const tableParam = (url.searchParams.get("table") ?? "both").toLowerCase();
+      const tables: Array<"work_order_state" | "work_order_snapshot"> =
+        tableParam === "state" ? ["work_order_state"]
+        : tableParam === "snapshot" ? ["work_order_snapshot"]
+        : ["work_order_state", "work_order_snapshot"];
+      const reports = [];
+      for (const table of tables) {
+        reports.push(await backfillTypedColumnsFromJson(env, { table, overwrite }));
+      }
+      return Response.json({ ok: true, overwrite, reports }, { headers: cacheHeaders() });
+    }
+    return new Response("Use POST /api/watch?rebuild=1 | ?replay=YYYY-MM-DD | ?reset=1 | ?backfill-from-json=1[&overwrite=1][&table=state|snapshot|both]", { status: 400 });
+  }
+
+  const url = new URL(request.url);
+  const woLookup = url.searchParams.get("workOrderId")?.trim();
+  let asOf = url.searchParams.get("date");
+  if (asOf && !/^\d{4}-\d{2}-\d{2}$/.test(asOf)) {
+    return new Response("Invalid date", { status: 400 });
+  }
+  if (!asOf) {
+    const history = await loadHistory(env);
+    const latest = history.entries.length
+      ? [...history.entries].sort((a, b) => b.dateKey.localeCompare(a.dateKey))[0]
+      : null;
+    asOf = latest?.dateKey ?? null;
+  }
+  if (!asOf) {
+    return Response.json(
+      { asOfDateKey: null, rows: [], staleCount: 0, row: null, found: false },
+      { headers: cacheHeaders() },
+    );
+  }
+
+  if (woLookup) {
+    const scopedRow = await getWatchRowByIdForDate(env, woLookup, asOf);
+    const row = scopedRow ?? (await getWatchRowById(env, woLookup, asOf));
+    return Response.json(
+      {
+        asOfDateKey: asOf,
+        workOrderId: woLookup,
+        found: row !== null,
+        inSnapshot: scopedRow !== null,
+        row: row ?? null,
+      },
+      { headers: cacheHeaders() },
+    );
+  }
+
+  const scope = (url.searchParams.get("scope") ?? "snapshot").toLowerCase();
+  let rows = scope === "all"
+    ? await getWatchRowsLatest(env, asOf)
+    : await getWatchRowsForDate(env, asOf);
+  // Self-heal: if scope=snapshot returned 0 rows for a date that does have a
+  // workbook in R2 (e.g. ingest never wrote per-row history for that date),
+  // replay it on the fly and re-query. Cheap one-shot, idempotent.
+  let healed = false;
+  if (scope !== "all" && rows.length === 0) {
+    const history = await loadHistory(env);
+    const entry = history.entries.find((e) => e.dateKey === asOf);
+    if (entry) {
+      const replayed = await replayWorkOrderWatchForDate(env, asOf);
+      if (replayed > 0) {
+        rows = await getWatchRowsForDate(env, asOf);
+        healed = true;
+      }
+    }
+  }
+  const staleOnly = url.searchParams.get("stale") === "1";
+  const filtered = staleOnly ? rows.filter((r) => r.remarkStale) : rows;
+  const staleCount = rows.filter((r) => r.remarkStale).length;
+  return Response.json(
+    { asOfDateKey: asOf, scope, staleCount, total: rows.length, rows: filtered, healed },
+    { headers: cacheHeaders() },
+  );
+}
+
+async function handleWorkOrderTimelineApi(env: Env, request: Request): Promise<Response> {
+  const url = new URL(request.url);
+  const wo = url.searchParams.get("workOrderId")?.trim();
+  if (!wo) {
+    return Response.json({ ok: false, error: "Missing workOrderId query parameter." }, { status: 400 });
+  }
+  const rows = await getWorkOrderTimeline(env, wo);
+  return Response.json({ workOrderId: wo, total: rows.length, rows }, { headers: cacheHeaders() });
+}
+
+async function handleWorkOrderChangelogApi(env: Env, request: Request): Promise<Response> {
+  const url = new URL(request.url);
+  const wo = url.searchParams.get("workOrderId")?.trim();
+  if (!wo) {
+    return Response.json({ ok: false, error: "Missing workOrderId query parameter." }, { status: 400 });
+  }
+  const [entries, actions] = await Promise.all([
+    getChangelog(env, wo, 500),
+    getWorkOrderActions(env, wo, 200),
+  ]);
+  return Response.json({ workOrderId: wo, entries, actions }, { headers: cacheHeaders() });
+}
+
+const VALID_ACTION_TYPES: ReadonlySet<WorkOrderActionType> = new Set([
+  "remarks_update",
+  "etic_update",
+  "parts_update",
+  "shop_update",
+  "other",
+]);
+
+/**
+ * GET  /api/wo-action?workOrderId=...        -> list actions for a WO
+ * POST /api/wo-action  body: { workOrderId, actionType, actorName?, note? }
+ *                                            -> log a new action
+ * DELETE /api/wo-action?id=NN                -> remove an action (typo'd entry)
+ */
+async function handleWoActionApi(env: Env, request: Request): Promise<Response> {
+  const url = new URL(request.url);
+
+  if (request.method === "GET") {
+    const wo = url.searchParams.get("workOrderId")?.trim();
+    if (!wo) return Response.json({ error: "Missing workOrderId" }, { status: 400, headers: cacheHeaders() });
+    const actions = await getWorkOrderActions(env, wo, 200);
+    return Response.json({ workOrderId: wo, actions }, { headers: cacheHeaders() });
+  }
+
+  if (request.method === "POST") {
+    let body: Record<string, unknown>;
+    try {
+      body = await request.json() as Record<string, unknown>;
+    } catch {
+      return Response.json({ error: "Invalid JSON" }, { status: 400, headers: cacheHeaders() });
+    }
+    const wid = String(body.workOrderId ?? "").trim();
+    const actionType = String(body.actionType ?? "").trim() as WorkOrderActionType;
+    if (!wid) return Response.json({ error: "Missing workOrderId" }, { status: 400, headers: cacheHeaders() });
+    if (!VALID_ACTION_TYPES.has(actionType)) {
+      return Response.json({ error: "Invalid actionType" }, { status: 400, headers: cacheHeaders() });
+    }
+    const action = await logWorkOrderAction(env, {
+      workOrderId: wid,
+      actionType,
+      actorName: typeof body.actorName === "string" ? body.actorName : "",
+      note: typeof body.note === "string" ? body.note : "",
+    });
+    return Response.json({ action }, { headers: cacheHeaders() });
+  }
+
+  if (request.method === "DELETE") {
+    const idStr = url.searchParams.get("id");
+    const id = idStr ? Number.parseInt(idStr, 10) : NaN;
+    if (!Number.isFinite(id) || id <= 0) {
+      return Response.json({ error: "Missing or invalid id" }, { status: 400, headers: cacheHeaders() });
+    }
+    const ok = await deleteWorkOrderAction(env, id);
+    return Response.json({ ok }, { headers: cacheHeaders() });
+  }
+
+  return new Response("Method Not Allowed", { status: 405 });
+}
+
+async function handleWorkbookDownload(env: Env, request: Request): Promise<Response> {
+  const paramDate = parseYardCheckDateParam(request);
+  const resolved = await resolveYardCheckWorkbook(env, paramDate);
+  if (!resolved.ok) {
+    return Response.json({ ok: false, error: resolved.error }, { status: 404 });
+  }
+  const { workbookKey, sourceFileName, sourceDateKey } = resolved;
+  const object = await env.ETIC_BUCKET.get(workbookKey);
+  if (!object) {
+    return Response.json({ ok: false, error: `Workbook not found: ${workbookKey}` }, { status: 404 });
+  }
+  const body = await object.arrayBuffer();
+  const safe = sourceFileName.replace(/[^A-Za-z0-9._-]/g, "_") || "Vehicle_ETIC.xlsx";
+  const downloadName = `etic_${sourceDateKey}_${safe}`;
+  return new Response(body, {
+    headers: {
+      "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "Content-Disposition": `attachment; filename="${downloadName}"`,
+      "Cache-Control": "no-store",
+      "X-Source-Date": sourceDateKey,
+      "X-Source-Key": workbookKey,
+    },
+  });
+}
+
+async function readJson<T>(env: Env, key: string): Promise<T | null> {
+  const object = await env.ETIC_BUCKET.get(key);
+  if (!object) return null;
+  try {
+    const text = await object.text();
+    return JSON.parse(text) as T;
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        level: "error",
+        message: "Failed to parse R2 JSON object",
+        key,
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    );
+    return null;
+  }
+}
+
+async function loadHistory(env: Env): Promise<HistoryIndex> {
+  const existing = await readJson<HistoryIndex>(env, "history/index.json");
+  if (existing && Array.isArray(existing.entries)) {
+    return existing;
+  }
+  return { updatedAtIso: new Date().toISOString(), entries: [] };
+}
+
+function upsertHistoryEntry(
+  history: HistoryIndex,
+  analysis: AnalysisResult,
+  workbookKey: string,
+  analysisKey: string,
+): HistoryIndex {
+  const filtered = history.entries.filter((entry) => entry.dateKey !== analysis.dateKey);
+  const sortedPrevious = [...filtered].sort((a, b) => a.dateKey.localeCompare(b.dateKey));
+  const previous = sortedPrevious.length > 0 ? sortedPrevious[sortedPrevious.length - 1] : null;
+
+  const diff: HistoryEntryDiff = {
+    previousDateKey: previous ? previous.dateKey : null,
+    deltaTotalRows: previous ? analysis.totalRowsAcrossSheets - previous.totalRowsAcrossSheets : null,
+    deltaMelMentionsTotal: previous
+      ? analysis.melMentionsTotal - previous.melMentionsTotal
+      : null,
+    deltaSheetsVisible: previous
+      ? analysis.totalVisibleSheets - previous.totalVisibleSheets
+      : null,
+  };
+
+  const entry: HistoryEntry = {
+    dateKey: analysis.dateKey,
+    receivedAtIso: analysis.receivedAtIso,
+    workbookFileName: analysis.workbookFileName,
+    workbookKey,
+    analysisKey,
+    totalVisibleSheets: analysis.totalVisibleSheets,
+    totalHiddenSheets: analysis.totalHiddenSheets,
+    totalRowsAcrossSheets: analysis.totalRowsAcrossSheets,
+    melMentionsTotal: analysis.melMentionsTotal,
+    diff,
+  };
+
+  const merged = [...filtered, entry].sort((a, b) => a.dateKey.localeCompare(b.dateKey));
+  return {
+    updatedAtIso: new Date().toISOString(),
+    entries: merged,
+  };
+}
+
+function isAuthorizedSender(sender: string, env: Env): boolean {
+  const configured = env.ALLOWED_SENDERS?.trim();
+  if (!configured) return true;
+  if (configured === "*") return true;
+  const normalizedSender = normalizeEmailAddress(sender);
+  const allowed = configured
+    .split(",")
+    .map((part) => normalizeEmailAddress(part))
+    .filter(Boolean);
+  return allowed.includes(normalizedSender);
+}
+
+function pickWorkbookAttachment(
+  attachments: Attachment[],
+  expectedAttachmentName?: string,
+): Attachment | undefined {
+  const expected = expectedAttachmentName?.trim().toLowerCase();
+  if (expected) {
+    const exact = attachments.find(
+      (attachment) => (attachment.filename?.trim().toLowerCase() ?? "") === expected,
+    );
+    if (exact) return exact;
+  }
+
+  return attachments.find((attachment) => {
+    const filename = attachment.filename?.toLowerCase() ?? "";
+    return filename.endsWith(".xlsx");
+  });
+}
+
+function normalizeAttachmentBinary(content: Attachment["content"]): ArrayBuffer {
+  if (content instanceof ArrayBuffer) return content;
+  if (content instanceof Uint8Array) return cloneToArrayBuffer(content);
+  const encoded = new TextEncoder().encode(content);
+  return cloneToArrayBuffer(encoded);
+}
+
+function cloneToArrayBuffer(view: ArrayBufferView): ArrayBuffer {
+  const clone = new Uint8Array(view.byteLength);
+  clone.set(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
+  return clone.buffer;
+}
+
+function sanitizeFileName(fileName: string): string {
+  return fileName.replace(/[^A-Za-z0-9._-]/g, "_");
+}
+
+function normalizeEmailAddress(email: string): string {
+  return email.replace(/[<>]/g, "").trim().toLowerCase();
+}
+
+function parseMaxAttachmentBytes(raw: string | undefined): number {
+  if (!raw) return DEFAULT_MAX_ATTACHMENT_BYTES;
+  const value = Number.parseInt(raw, 10);
+  return Number.isFinite(value) && value > 0 ? value : DEFAULT_MAX_ATTACHMENT_BYTES;
+}
+
+function isoDateKey(date: Date): string {
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${date.getUTCFullYear()}-${p(date.getUTCMonth() + 1)}-${p(date.getUTCDate())}`;
+}
+
+const MONTH_TOKEN: Record<string, number> = {
+  jan: 1,
+  feb: 2,
+  mar: 3,
+  apr: 4,
+  may: 5,
+  jun: 6,
+  jul: 7,
+  aug: 8,
+  sep: 9,
+  oct: 10,
+  nov: 11,
+  dec: 12,
+};
+
+/** Last DD-MMM-YY (or DD-MMM-YYYY) token in the subject → YYYY-MM-DD for R2 paths. */
+function parseReportDateKeyFromSubject(subject: string): string | null {
+  const s = subject.trim();
+  let reportDateKey: string | null = null;
+  const dateRe = /\b(\d{1,2})-([A-Za-z]{3})\.?-(\d{2,4})\b/g;
+  let dm: RegExpExecArray | null;
+  while ((dm = dateRe.exec(s)) !== null) {
+    const day = Number.parseInt(dm[1] ?? "", 10);
+    const monToken = (dm[2] ?? "").toLowerCase().replace(/\.$/, "").slice(0, 3);
+    const month = MONTH_TOKEN[monToken];
+    if (!month || !Number.isFinite(day) || day < 1 || day > 31) continue;
+    const yRaw = dm[3] ?? "";
+    const yNum = Number.parseInt(yRaw, 10);
+    if (!Number.isFinite(yNum)) continue;
+    const year = yRaw.length <= 2 ? (yNum >= 70 ? 1900 + yNum : 2000 + yNum) : yNum;
+    reportDateKey = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  }
+  return reportDateKey;
+}
+
+/** Prefer report date from subject (forwarded ETICs); else UTC day of receipt. */
+function resolveAnalysisDateKey(subject: string, receivedAt: Date): string {
+  return parseReportDateKeyFromSubject(subject) ?? isoDateKey(receivedAt);
+}
+
+async function analyzeWorkbook(input: {
+  binary: ArrayBuffer;
+  fileName: string;
+  receivedAtIso: string;
+  dateKey: string;
+  from: string;
+  to: string;
+  subject: string;
+}): Promise<AnalysisResult> {
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(input.binary);
+
+  const sheetSummaries = workbook.worksheets.map((sheet): SheetSummary => {
+    const state = normalizeSheetState(sheet.state);
+    const rowCount = estimateRowCount(sheet);
+    const columnCountEstimate = estimateColumnCount(sheet);
+    const sampleHeaders = collectHeaders(sheet);
+    const nonEmptyCellCountEstimate = countNonEmptyCells(sheet);
+    const melMentions = countMelMentions(sheet);
+
+    return {
+      name: sheet.name,
+      state,
+      rowCount,
+      columnCountEstimate,
+      sampleHeaders,
+      nonEmptyCellCountEstimate,
+      melMentions,
+    };
+  });
+
+  const totalVisibleSheets = sheetSummaries.filter((s) => s.state === "visible").length;
+  const totalHiddenSheets = sheetSummaries.filter((s) => s.state !== "visible").length;
+  const totalRowsAcrossSheets = sheetSummaries.reduce((sum, s) => sum + s.rowCount, 0);
+  const melMentionsBySheet = Object.fromEntries(sheetSummaries.map((s) => [s.name, s.melMentions]));
+  const melMentionsTotal = sheetSummaries.reduce((sum, s) => sum + s.melMentions, 0);
+  const assetManager = extractAssetManagerKpis(workbook);
+  const assetManagerBreakdown = extractAssetManagerBreakdown(workbook);
+
+  return {
+    workbookFileName: input.fileName,
+    receivedAtIso: input.receivedAtIso,
+    dateKey: input.dateKey,
+    from: input.from,
+    to: input.to,
+    subject: input.subject,
+    workbookBytes: input.binary.byteLength,
+    assetManager,
+    assetManagerBreakdown,
+    sheetSummaries,
+    totalVisibleSheets,
+    totalHiddenSheets,
+    totalRowsAcrossSheets,
+    melMentionsBySheet,
+    melMentionsTotal,
+  };
+}
+
+function normalizeWorkbookSheetName(name: string): string {
+  return name.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function findAssetManagerSheet(workbook: ExcelJS.Workbook): ExcelJS.Worksheet | undefined {
+  const target = "asset manager";
+  return workbook.worksheets.find((ws) => normalizeWorkbookSheetName(ws.name) === target);
+}
+
+function parseCellNumber(cell: ExcelJS.Cell): number | null {
+  const raw = readCellText(cell).trim();
+  if (!raw) return null;
+  const cleaned = raw.replace(/,/g, "").replace(/%/g, "").trim();
+  const n = Number.parseFloat(cleaned);
+  if (!Number.isFinite(n)) return null;
+  return n;
+}
+
+function parseMcRatePercent(cell: ExcelJS.Cell): number | null {
+  const raw = readCellText(cell).trim();
+  if (!raw) return null;
+  const hasPercent = raw.includes("%");
+  const n = parseCellNumber(cell);
+  if (n === null) return null;
+  if (hasPercent) return n;
+  if (n > 0 && n <= 1) return n * 100;
+  return n;
+}
+
+function parseIntegerCell(cell: ExcelJS.Cell): number | null {
+  const n = parseCellNumber(cell);
+  if (n === null) return null;
+  return Math.round(n);
+}
+
+function extractAssetManagerKpis(workbook: ExcelJS.Workbook): AssetManagerKpis {
+  const empty: AssetManagerKpis = {
+    sheetFound: false,
+    mcRatePercent: null,
+    fleetTotal: null,
+    fmc: null,
+    nmc: null,
+    surplus: null,
+  };
+  const sheet = findAssetManagerSheet(workbook);
+  if (!sheet) return empty;
+
+  const row = sheet.getRow(2);
+  const mcRatePercent = parseMcRatePercent(row.getCell(6));
+  const fleetTotal = parseIntegerCell(row.getCell(7));
+  const fmc = parseIntegerCell(row.getCell(8));
+  const nmc = parseIntegerCell(row.getCell(9));
+  const surplus = parseIntegerCell(row.getCell(10));
+
+  const any =
+    mcRatePercent !== null ||
+    fleetTotal !== null ||
+    fmc !== null ||
+    nmc !== null ||
+    surplus !== null;
+
+  return {
+    sheetFound: any,
+    mcRatePercent,
+    fleetTotal,
+    fmc,
+    nmc,
+    surplus,
+  };
+}
+
+/**
+ * Per-Unit (and NCE) MC-rate breakdown. The Asset Manager sheet has only a
+ * totals row, so we use the MEL Calculator sheet which has one row per asset
+ * with FMC Count, NMC Count, and Unit columns. We aggregate by Unit, and we
+ * also produce a synthetic "NCE" group from any row whose label/management-
+ * code mentions NCE so leadership can see NCE health at a glance.
+ *
+ * MC% per unit = FMC / (FMC + NMC) * 100.
+ */
+function extractAssetManagerBreakdown(workbook: ExcelJS.Workbook): AssetManagerBreakdownRow[] {
+  const sheet = workbook.worksheets.find((ws) => /mel\s*calc/i.test(ws.name));
+  if (!sheet) return [];
+
+  // Find header row + the columns we need.
+  const headerRowIndex = findHeaderRowFor(sheet, ["mel key", "fmc count", "nmc count", "unit"]);
+  if (headerRowIndex < 1) return [];
+  const headers = sheet.getRow(headerRowIndex);
+  let unitCol = -1;
+  let fmcCol = -1;
+  let nmcCol = -1;
+  let nceFlagCol = -1;
+  let mgmtCol = -1;
+  headers.eachCell({ includeEmpty: false }, (cell, col) => {
+    const h = readCellText(cell).trim().toLowerCase().replace(/\s+/g, " ");
+    if (h === "unit" || h === "user/unit" || h === "owning unit") {
+      // Prefer "Unit" exactly when both exist.
+      if (unitCol === -1 || h === "unit") unitCol = col;
+    } else if (/fmc.*count|fmc\b/.test(h) && fmcCol === -1) {
+      fmcCol = col;
+    } else if (/nmc.*count|nmc\b/.test(h) && nmcCol === -1) {
+      nmcCol = col;
+    } else if (/\bnce\b/.test(h)) {
+      nceFlagCol = col;
+    } else if (/mgmt|mgmt code|mgmt cd|mgmtcode/.test(h) && mgmtCol === -1) {
+      mgmtCol = col;
+    }
+  });
+  if (unitCol < 1 || fmcCol < 1 || nmcCol < 1) return [];
+
+  // Aggregate per-unit from MEL Calculator. Each row is per-MEL-key with
+  // FMC / NMC counts already aggregated for that key.
+  type Agg = { fmc: number; nmc: number };
+  const byUnit = new Map<string, Agg>();
+
+  const lastRow = sheet.actualRowCount || sheet.rowCount || 0;
+  for (let r = headerRowIndex + 1; r <= lastRow; r++) {
+    const row = sheet.getRow(r);
+    const unit = readCellText(row.getCell(unitCol)).trim();
+    const fmc = parseIntegerCell(row.getCell(fmcCol));
+    const nmc = parseIntegerCell(row.getCell(nmcCol));
+    if (!unit && fmc === null && nmc === null) continue;
+    if (!unit) continue;
+    const cur = byUnit.get(unit) ?? { fmc: 0, nmc: 0 };
+    cur.fmc += fmc ?? 0;
+    cur.nmc += nmc ?? 0;
+    byUnit.set(unit, cur);
+  }
+
+  // NCE comes from Fleet (P&A): every asset whose "NCE Vehicle Listing.Status"
+  // cell has any value is an NCE asset. We cross-reference the asset's FMC/NMC
+  // status from the same sheet when a status column is present.
+  const nce = extractNceFromFleetSheet(workbook);
+
+  const out: AssetManagerBreakdownRow[] = [];
+  for (const [unit, agg] of byUnit) {
+    const total = agg.fmc + agg.nmc;
+    out.push({
+      label: unit,
+      mcRatePercent: total > 0 ? (agg.fmc / total) * 100 : null,
+      fleetTotal: total > 0 ? total : null,
+      fmc: agg.fmc,
+      nmc: agg.nmc,
+      surplus: null,
+      isNce: false,
+      isTotal: false,
+    });
+  }
+  if (nce.assetCount > 0) {
+    const fleetTotal = nce.assetCount;
+    out.push({
+      label: "NCE (Nuclear Certified Equipment)",
+      mcRatePercent:
+        nce.fmc !== null && nce.nmc !== null && nce.fmc + nce.nmc > 0
+          ? (nce.fmc / (nce.fmc + nce.nmc)) * 100
+          : null,
+      fleetTotal,
+      fmc: nce.fmc,
+      nmc: nce.nmc,
+      surplus: null,
+      isNce: true,
+      isTotal: false,
+    });
+  }
+  // Hint: silence "unused" warnings if fields are not currently consumed.
+  void nceFlagCol;
+  void mgmtCol;
+  return out;
+}
+
+/** Reads Fleet (P&A) and returns:
+ *   - assetCount: how many assets have a non-empty "NCE Vehicle Listing.Status"
+ *   - fmc / nmc:  if a status column is present on Fleet (P&A) (e.g. "MC
+ *                 Status", "FMC/NMC", "Operational Status"), how many NCE
+ *                 assets are FMC vs NMC. Otherwise null/null. */
+function extractNceFromFleetSheet(workbook: ExcelJS.Workbook): {
+  assetCount: number;
+  fmc: number | null;
+  nmc: number | null;
+} {
+  const sheet = workbook.worksheets.find((ws) => /^fleet/i.test(ws.name));
+  if (!sheet) return { assetCount: 0, fmc: null, nmc: null };
+  const headerRow = findHeaderRowFor(sheet, ["asset id"]);
+  if (headerRow < 1) return { assetCount: 0, fmc: null, nmc: null };
+  const headers = sheet.getRow(headerRow);
+  let nceCol = -1;
+  let statusCol = -1;
+  // Two passes so the NCE column is identified first (it can also match the
+  // status regex via the substring "status").
+  headers.eachCell({ includeEmpty: false }, (cell, col) => {
+    const h = readCellText(cell).trim().toLowerCase().replace(/\s+/g, " ");
+    if (nceCol === -1 && /nce.*vehicle.*listing|\bnce\b/.test(h)) nceCol = col;
+  });
+  headers.eachCell({ includeEmpty: false }, (cell, col) => {
+    if (col === nceCol) return;
+    const h = readCellText(cell).trim().toLowerCase().replace(/\s+/g, " ");
+    // "MC Status2" / "MC Status" / "Vehicle MC Status" / "FMC NMC" — accept
+    // any header that contains "mc status" optionally followed by digits, but
+    // skip headers from the WO Inquiry block (those are per-WO, not per-asset).
+    if (statusCol === -1 && !/wo\s*inquiry/.test(h) && /\bmc\s*status\d*\b/.test(h)) {
+      statusCol = col;
+    }
+  });
+  if (nceCol < 1) return { assetCount: 0, fmc: null, nmc: null };
+
+  let count = 0;
+  let fmc = 0;
+  let nmc = 0;
+  let sawStatus = false;
+  const lastRow = sheet.actualRowCount || sheet.rowCount || 0;
+  for (let r = headerRow + 1; r <= lastRow; r++) {
+    const row = sheet.getRow(r);
+    const nceVal = readCellText(row.getCell(nceCol)).trim();
+    if (!nceVal) continue;
+    count++;
+    if (statusCol > 0) {
+      const s = readCellText(row.getCell(statusCol)).trim().toUpperCase();
+      if (s) {
+        sawStatus = true;
+        if (/^FMC\b/.test(s) || s === "MC" || s === "M/C" || s === "OPERATIONAL") fmc++;
+        else if (/^NMC\b/.test(s) || s === "NOT MC" || s === "DOWN") nmc++;
+      }
+    }
+  }
+  return { assetCount: count, fmc: sawStatus ? fmc : null, nmc: sawStatus ? nmc : null };
+}
+
+/** Walks the first ~10 rows looking for the row whose cells include all of
+ *  the given lowercased substrings. Returns 1-based row index, or -1. */
+function findHeaderRowFor(sheet: ExcelJS.Worksheet, needed: string[]): number {
+  const max = Math.min(15, sheet.actualRowCount || sheet.rowCount || 0);
+  const wanted = needed.map((s) => s.toLowerCase());
+  for (let r = 1; r <= max; r++) {
+    const row = sheet.getRow(r);
+    const cells: string[] = [];
+    row.eachCell({ includeEmpty: false }, (c) => {
+      cells.push(readCellText(c).trim().toLowerCase().replace(/\s+/g, " "));
+    });
+    const blob = cells.join("||");
+    if (wanted.every((w) => blob.includes(w))) return r;
+  }
+  return -1;
+}
+
+function normalizeSheetState(state: ExcelJS.WorksheetState | undefined): SheetSummary["state"] {
+  if (state === "hidden") return "hidden";
+  if (state === "veryHidden") return "veryHidden";
+  return "visible";
+}
+
+function estimateRowCount(sheet: ExcelJS.Worksheet): number {
+  let rows = 0;
+  sheet.eachRow({ includeEmpty: false }, () => {
+    rows += 1;
+  });
+  return rows;
+}
+
+function estimateColumnCount(sheet: ExcelJS.Worksheet): number {
+  let max = 0;
+  sheet.eachRow({ includeEmpty: false }, (row) => {
+    const actual = row.actualCellCount;
+    if (actual > max) max = actual;
+  });
+  return max;
+}
+
+function collectHeaders(sheet: ExcelJS.Worksheet): string[] {
+  const firstRow = sheet.getRow(1);
+  const headers: string[] = [];
+  firstRow.eachCell({ includeEmpty: false }, (cell) => {
+    const value = readCellText(cell).trim();
+    if (value) headers.push(value);
+  });
+  return headers.slice(0, 12);
+}
+
+function countNonEmptyCells(sheet: ExcelJS.Worksheet): number {
+  let count = 0;
+  sheet.eachRow({ includeEmpty: false }, (row) => {
+    row.eachCell({ includeEmpty: false }, () => {
+      count += 1;
+    });
+  });
+  return count;
+}
+
+function countMelMentions(sheet: ExcelJS.Worksheet): number {
+  let count = 0;
+  sheet.eachRow({ includeEmpty: false }, (row) => {
+    row.eachCell({ includeEmpty: false }, (cell) => {
+      const text = readCellText(cell).toLowerCase();
+      if (text.includes("mel")) count += 1;
+    });
+  });
+  return count;
+}
+
+function readCellText(cell: ExcelJS.Cell): string {
+  const value = cell.value;
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  if (value instanceof Date) return value.toISOString();
+  if (Array.isArray(value)) return value.map((part) => String(part ?? "")).join("");
+
+  if (typeof value === "object") {
+    const anyValue = value as unknown as Record<string, unknown>;
+    const richText = anyValue.richText;
+    if (Array.isArray(richText)) {
+      return richText
+        .map((part) =>
+          part && typeof part === "object" ? String((part as { text?: unknown }).text ?? "") : "",
+        )
+        .join("");
+    }
+    if (typeof anyValue.text === "string") return anyValue.text;
+    if (anyValue.result !== null && anyValue.result !== undefined) return String(anyValue.result);
+    if (typeof anyValue.formula === "string") return anyValue.formula;
+    if (typeof anyValue.hyperlink === "string") return anyValue.hyperlink;
+    if (typeof anyValue.error === "string") return anyValue.error;
+  }
+
+  try {
+    return String(value);
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Standalone mobile-first yard-check app served at /yard.
+ *
+ * Designed to feel like a native app:
+ * - Full-bleed dark UI, no other tabs, no nav clutter.
+ * - Sticky top header with current cadence stats.
+ * - Sticky filter chips below the header.
+ * - Tap an asset row → full-screen detail sheet with status, location,
+ *   discrepancy chips, photos (camera capture), and a big "Mark checked".
+ * - Auto-saves the walker name to localStorage.
+ * - Polls the roster every 30s so newly added ETIC assets appear.
+ * - "Add to home screen" via /yard/manifest.webmanifest.
+ *
+ * NOTE: This is a standalone HTML document. Keep all JS/CSS inline so the
+ * file works without any build step on Workers.
+ */
+function renderYardAppHtml(): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="theme-color" content="#0a0a0d" />
+  <link rel="manifest" href="/yard/manifest.webmanifest" />
+  <title>Yard Check</title>
+  <style>
+    :root {
+      --bg: #0a0a0d;
+      --bg1: #14141b;
+      --bg2: #1c1c25;
+      --bg3: #262631;
+      --border: #2f2f3c;
+      --text: #f4f4f7;
+      --muted: #9b9bab;
+      --muted2: #6f6f80;
+      --accent: #6aa9ff;
+      --accent-fg: #0a0a0d;
+      --ok: #4ade80;
+      --warn: #facc15;
+      --danger: #ef4444;
+      --due: #fb923c;
+      --never: #c084fc;
+      --safe-top: env(safe-area-inset-top, 0px);
+      --safe-bottom: env(safe-area-inset-bottom, 0px);
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--text); }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      font-size: 16px; line-height: 1.4;
+      overscroll-behavior-y: none;
+      -webkit-font-smoothing: antialiased;
+    }
+    button, input, textarea, select { font: inherit; color: inherit; }
+    button { background: none; border: none; cursor: pointer; padding: 0; }
+    input, textarea, select {
+      background: var(--bg2); border: 1px solid var(--border); color: var(--text);
+      border-radius: 10px; padding: 12px 14px; width: 100%; font-size: 16px;
+    }
+    input:focus, textarea:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+    textarea { resize: vertical; min-height: 84px; }
+    a { color: var(--accent); }
+
+    /* App shell */
+    #app { display: flex; flex-direction: column; min-height: 100dvh; }
+    /* Sticky stack: topbar (with search) -> chiprow. Both stay pinned so the
+       walker can search and re-filter without scrolling back to the top. */
+    .topbar {
+      position: sticky; top: 0; z-index: 30;
+      padding: calc(var(--safe-top) + 8px) 12px 10px;
+      background: rgba(10,10,13,0.96);
+      backdrop-filter: blur(8px);
+      border-bottom: 1px solid var(--border);
+    }
+    .topbar-row { display: flex; align-items: center; gap: 10px; min-height: 30px; }
+    .brand { font-weight: 700; font-size: 17px; letter-spacing: 0.2px; }
+    .stats { margin-left: auto; font-size: 12px; color: var(--muted); display: flex; gap: 6px; }
+    .stat-pill { padding: 3px 9px; border-radius: 999px; background: var(--bg2); border: 1px solid var(--border); }
+    .stat-pill b { color: var(--text); font-weight: 700; }
+
+    .topbar .search-row { margin-top: 8px; padding: 0; }
+    .search-row { position: relative; }
+    .search-row input {
+      padding-left: 38px; padding-right: 84px; height: 42px; padding-top: 0; padding-bottom: 0;
+      background-image:
+        url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='18' height='18' viewBox='0 0 24 24' fill='none' stroke='%239b9bab' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><circle cx='11' cy='11' r='7'/><path d='m20 20-3-3'/></svg>");
+      background-repeat: no-repeat; background-position: 12px center;
+    }
+    /* "+ Find" button lives inside the search row to save vertical space */
+    .find-btn {
+      position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+      padding: 7px 12px; border-radius: 9px;
+      background: var(--accent); color: var(--accent-fg);
+      font-size: 13px; font-weight: 700; line-height: 1;
+    }
+
+    .walker-row { margin-top: 6px; display: flex; gap: 8px; align-items: center; font-size: 12px; color: var(--muted); }
+    .walker-row.input { display: block; }
+    .walker-row.input input { height: 36px; }
+    .walker-row b { color: var(--text); }
+    .walker-row a { font-size: 12px; }
+
+    .chiprow {
+      display: flex; gap: 6px; padding: 8px 12px; overflow-x: auto;
+      -webkit-overflow-scrolling: touch; scrollbar-width: none;
+      position: sticky; z-index: 25;
+      /* Will be set by JS once topbar height is measured. */
+      top: calc(var(--safe-top) + 110px);
+      background: var(--bg);
+      border-bottom: 1px solid var(--border);
+    }
+    .chiprow::-webkit-scrollbar { display: none; }
+    .chip {
+      flex: 0 0 auto; padding: 7px 13px; border-radius: 999px;
+      background: var(--bg2); border: 1px solid var(--border);
+      color: var(--text); font-size: 13px; white-space: nowrap;
+    }
+    .chip.active { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 600; }
+    .chip .count { opacity: 0.7; margin-left: 6px; font-size: 11px; }
+    .chip.active .count { opacity: 0.85; }
+
+    /* Asset list */
+    .list { flex: 1 1 auto; padding: 4px 10px 120px; }
+    .row {
+      display: flex; align-items: center; gap: 12px; padding: 14px 14px;
+      background: var(--bg1); border: 1px solid var(--border);
+      border-radius: 14px; margin-bottom: 8px; cursor: pointer;
+    }
+    .row:active { background: var(--bg2); }
+    .row .id { font-weight: 700; font-size: 17px; }
+    .row .meta { color: var(--muted); font-size: 13px; margin-top: 2px; }
+    .row .body { flex: 1 1 auto; min-width: 0; }
+    .row .body .meta { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .row .right { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; flex: 0 0 auto; }
+    .badges { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
+    .badge {
+      font-size: 10px; font-weight: 700; letter-spacing: 0.4px;
+      padding: 3px 7px; border-radius: 5px; text-transform: uppercase;
+      background: var(--bg3); color: var(--text); border: 1px solid var(--border);
+    }
+    .badge.fresh { background: #15321f; color: var(--ok); border-color: #1f5232; }
+    .badge.due { background: #3a230f; color: var(--due); border-color: #5a3819; }
+    .badge.overdue { background: #3b1416; color: var(--danger); border-color: #6b2024; }
+    .badge.never { background: #2a1a3a; color: var(--never); border-color: #3e2756; }
+    .badge.nce { background: #1a2438; color: #93c5fd; border-color: #2a3a5a; }
+    .badge.below-mel { background: #3b1416; color: var(--danger); border-color: #6b2024; }
+    .badge.new { background: #15321f; color: var(--ok); border-color: #1f5232; }
+    .badge.unlisted { background: #3a2a05; color: var(--warn); border-color: #5a4308; }
+    .badge.photos { background: var(--bg2); color: var(--muted); border-color: var(--border); }
+    .badge.shop { background: var(--bg2); color: var(--muted); border-color: var(--border); }
+
+    .age { font-size: 13px; color: var(--ok); white-space: nowrap; font-weight: 600; }
+    .age.due { color: var(--due); font-weight: 700; }
+    .age.overdue { color: var(--danger); font-weight: 700; }
+    .age.never { color: var(--never); font-weight: 700; }
+
+    .empty {
+      text-align: center; padding: 60px 20px; color: var(--muted);
+    }
+    .empty .big { font-size: 48px; margin-bottom: 8px; }
+
+    /* Detail sheet */
+    .sheet {
+      position: fixed; inset: 0; z-index: 60;
+      background: var(--bg);
+      display: flex; flex-direction: column;
+      transform: translateY(100%); transition: transform 220ms ease;
+    }
+    .sheet.open { transform: translateY(0); }
+    .sheet-top {
+      position: sticky; top: 0; padding: calc(var(--safe-top) + 10px) 12px 10px;
+      display: flex; align-items: center; gap: 6px;
+      background: var(--bg); border-bottom: 1px solid var(--border);
+      z-index: 5;
+    }
+    .iconbtn {
+      width: 40px; height: 40px; display: inline-flex; align-items: center; justify-content: center;
+      border-radius: 10px; background: var(--bg2); color: var(--text); font-size: 18px;
+    }
+    .iconbtn:active { background: var(--bg3); }
+    .sheet-title { flex: 1 1 auto; font-weight: 700; font-size: 17px; min-width: 0;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    .sheet-body { flex: 1 1 auto; overflow-y: auto; padding: 12px 14px 140px; }
+    .card {
+      background: var(--bg1); border: 1px solid var(--border);
+      border-radius: 14px; padding: 14px; margin-bottom: 12px;
+    }
+    .card h4 { margin: 0 0 8px; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+    .kv { display: grid; grid-template-columns: 110px 1fr; gap: 6px 12px; font-size: 14px; }
+    .kv dt { color: var(--muted); }
+    .kv dd { margin: 0; color: var(--text); word-break: break-word; }
+
+    .status-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .status-btn {
+      padding: 14px 8px; border-radius: 12px; text-align: center;
+      background: var(--bg2); border: 1px solid var(--border);
+      font-weight: 600; font-size: 14px;
+    }
+    .status-btn .icon { display: block; font-size: 22px; margin-bottom: 4px; }
+    .status-btn.active.present { background: #15321f; color: var(--ok); border-color: var(--ok); }
+    .status-btn.active.missing { background: #3b1416; color: var(--danger); border-color: var(--danger); }
+    .status-btn.active.unknown { background: #2a1a3a; color: var(--never); border-color: var(--never); }
+
+    .chip-pick { display: flex; flex-wrap: wrap; gap: 6px; }
+    .chip-pick .chip { font-size: 13px; padding: 7px 12px; }
+    .chip-pick .chip.on { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+
+    .photos { display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 8px; margin-top: 8px; }
+    .photo {
+      position: relative; aspect-ratio: 1 / 1; border-radius: 10px; overflow: hidden;
+      background: var(--bg2); border: 1px solid var(--border);
+    }
+    .photo img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .photo .meta { position: absolute; bottom: 0; left: 0; right: 0; padding: 4px 6px; font-size: 10px;
+      color: white; background: linear-gradient(180deg, transparent, rgba(0,0,0,0.7)); }
+    .photo .x {
+      position: absolute; top: 4px; right: 4px;
+      width: 24px; height: 24px; border-radius: 50%;
+      background: rgba(0,0,0,0.7); color: white; font-size: 14px;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .photo-add {
+      display: flex; align-items: center; justify-content: center;
+      aspect-ratio: 1 / 1; border-radius: 10px;
+      background: var(--bg2); border: 1px dashed var(--border);
+      color: var(--muted); flex-direction: column; gap: 4px;
+      font-size: 12px; cursor: pointer;
+    }
+    .photo-add svg { width: 28px; height: 28px; }
+    .photo-add input { display: none; }
+
+    .history { font-size: 13px; padding: 0; margin: 0; }
+    .history li { padding: 8px 0; border-top: 1px solid var(--border); list-style: none; color: var(--muted); }
+    .history li:first-child { border-top: none; }
+    .history li b { color: var(--text); }
+
+    /* Open WO panel inside the asset detail */
+    .wo {
+      padding: 10px 0; border-top: 1px solid var(--border);
+    }
+    .wo:first-child { border-top: none; padding-top: 0; }
+    .wo-head {
+      display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 13px;
+      margin-bottom: 4px;
+    }
+    .wo-head .id { font-weight: 700; font-family: ui-monospace, monospace; color: var(--text); }
+    .wo-head .pill {
+      font-size: 11px; padding: 2px 7px; border-radius: 5px;
+      background: var(--bg2); border: 1px solid var(--border); color: var(--muted);
+    }
+    .wo-head .pill.below { background: #3b1416; color: var(--danger); border-color: #6b2024; }
+    .wo-head .pill.at { background: #3a230f; color: var(--due); border-color: #5a3819; }
+    .wo-head .pill.above { background: #15321f; color: var(--ok); border-color: #1f5232; }
+    .wo-remark {
+      font-size: 13px; color: var(--text); white-space: pre-wrap; word-break: break-word;
+      margin-top: 2px;
+    }
+    .wo-meta { font-size: 11px; color: var(--muted2); margin-top: 4px; }
+
+    .unlisted-banner {
+      background: #3a2a05; border: 1px solid #5a4308; border-radius: 12px;
+      padding: 12px 14px; margin-bottom: 12px; color: var(--warn); font-size: 13px;
+    }
+    .unlisted-banner b { display: block; color: var(--text); font-size: 14px; margin-bottom: 4px; }
+
+    /* Find / floor-to-book modal */
+    .modal-overlay {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+      z-index: 70; display: none; align-items: center; justify-content: center;
+      padding: 20px;
+    }
+    .modal-overlay.open { display: flex; }
+    .modal {
+      background: var(--bg1); border: 1px solid var(--border); border-radius: 16px;
+      padding: 18px; width: 100%; max-width: 460px;
+    }
+    .modal h3 { margin: 0 0 4px; font-size: 17px; }
+    .modal p.hint { margin: 0 0 12px; color: var(--muted); font-size: 13px; }
+    .modal label { display: block; margin-top: 10px; font-size: 12px; color: var(--muted); }
+    .modal label input, .modal label textarea, .modal label select { margin-top: 4px; }
+    .modal-actions { display: flex; gap: 8px; margin-top: 16px; }
+    .modal-actions .grow { flex: 1 1 auto; }
+    .modal-actions .secondary {
+      background: var(--bg2); border: 1px solid var(--border); color: var(--text);
+      padding: 12px; border-radius: 10px; flex: 0 0 auto;
+    }
+    .modal-actions .primary {
+      background: var(--accent); color: var(--accent-fg); padding: 12px 16px;
+      border-radius: 10px; font-weight: 700; flex: 1 1 auto;
+    }
+
+    .save-bar {
+      position: fixed; left: 0; right: 0; bottom: 0;
+      padding: 12px 14px calc(var(--safe-bottom) + 12px);
+      background: linear-gradient(0deg, var(--bg), rgba(10,10,13,0.92));
+      border-top: 1px solid var(--border);
+      z-index: 65;
+    }
+    .save-btn {
+      width: 100%; padding: 16px; border-radius: 14px;
+      background: var(--accent); color: var(--accent-fg);
+      font-weight: 700; font-size: 16px;
+      box-shadow: 0 6px 24px rgba(106,169,255,0.25);
+    }
+    .save-btn:disabled { background: var(--bg3); color: var(--muted); box-shadow: none; }
+    .save-btn.saving { opacity: 0.7; }
+
+    .toast {
+      position: fixed; bottom: calc(var(--safe-bottom) + 80px); left: 50%; transform: translateX(-50%);
+      background: var(--ok); color: var(--accent-fg); padding: 10px 18px;
+      border-radius: 999px; font-weight: 600; font-size: 14px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.4); z-index: 100;
+      opacity: 0; transition: opacity 200ms ease;
+      pointer-events: none;
+    }
+    .toast.show { opacity: 1; }
+    .toast.err { background: var(--danger); color: white; }
+
+    @media (min-width: 720px) {
+      #app { max-width: 600px; margin: 0 auto; box-shadow: 0 0 0 1px var(--border); }
+      .sheet { max-width: 600px; left: 50%; transform: translate(-50%, 100%); }
+      .sheet.open { transform: translate(-50%, 0); }
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <header class="topbar" id="topbar">
+      <div class="topbar-row">
+        <div class="brand">Yard Check</div>
+        <div class="stats">
+          <span class="stat-pill"><b id="t-due">0</b> due</span>
+          <span class="stat-pill"><b id="t-today">0</b> today</span>
+        </div>
+      </div>
+      <div class="search-row">
+        <input id="search" type="search" inputmode="search" placeholder="Search asset, VIN, shop, location…" autocomplete="off" />
+        <button class="find-btn" id="find-btn" aria-label="Found unlisted asset">+ Find</button>
+      </div>
+      <div id="walker" class="walker-row"></div>
+    </header>
+
+    <nav class="chiprow" id="filters">
+      <button class="chip active" data-filter="all">All <span class="count" id="c-all">0</span></button>
+      <button class="chip" data-filter="due">Due now <span class="count" id="c-due">0</span></button>
+      <button class="chip" data-filter="overdue">Overdue <span class="count" id="c-overdue">0</span></button>
+      <button class="chip" data-filter="never">Never checked <span class="count" id="c-never">0</span></button>
+      <button class="chip" data-filter="fresh">Done <span class="count" id="c-fresh">0</span></button>
+      <button class="chip" data-filter="unlisted">Unlisted <span class="count" id="c-unlisted">0</span></button>
+      <button class="chip" data-filter="nce">NCE <span class="count" id="c-nce">0</span></button>
+      <button class="chip" data-filter="below">Below MEL <span class="count" id="c-below">0</span></button>
+    </nav>
+
+    <main class="list" id="list">
+      <div class="empty"><div class="big">⏳</div>Loading roster…</div>
+    </main>
+  </div>
+
+  <div id="sheet" class="sheet" aria-hidden="true">
+    <div class="sheet-top">
+      <button class="iconbtn" id="sheet-back" aria-label="Back">←</button>
+      <div class="sheet-title" id="sheet-title">Asset</div>
+    </div>
+    <div class="sheet-body" id="sheet-body"></div>
+    <div class="save-bar">
+      <button class="save-btn" id="save-btn">✓ Mark checked</button>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <div class="modal-overlay" id="find-modal" aria-hidden="true">
+    <div class="modal" role="dialog" aria-labelledby="find-title">
+      <h3 id="find-title">Found unlisted asset</h3>
+      <p class="hint">Floor-to-book: log a vehicle you found in the yard that doesn't show up in the latest ETIC. It'll show as "Unlisted" until a fleet manager reconciles it.</p>
+      <label>Asset / tail / bumper number
+        <input id="find-asset-id" type="text" inputmode="text" autocapitalize="characters" placeholder="e.g. L-3157" />
+      </label>
+      <label>Location
+        <input id="find-location" type="text" list="loc-options" placeholder="Where is it?" />
+      </label>
+      <label>Notes (optional)
+        <textarea id="find-notes" rows="2" placeholder="Anything notable about it?"></textarea>
+      </label>
+      <div class="modal-actions">
+        <button type="button" class="secondary" id="find-cancel">Cancel</button>
+        <button type="button" class="primary" id="find-save">Log it</button>
+      </div>
+    </div>
+  </div>
+
+  <datalist id="loc-options"></datalist>
+
+  <script>
+  (function(){
+    var QUICK_CHIPS = [
+      "Windows down","Door unlocked","Flat tire","Fluid leak",
+      "Lights on","Wrong spot","Damaged","Missing fuel cap",
+      "Battery dead","Needs cleaning","No keys","Unsecured cargo"
+    ];
+    // Walker only ever logs what they actually see. "Not here" used to be a
+    // button, but the walker has no way of knowing what *should* be parked in
+    // any given lot, so asking them to declare absence was busy-work and
+    // produced bad findings. Absence is now derived on the FM&A side from
+    // "asset is on the ETIC roster but no walker has confirmed it in N days."
+    // If the walker isn't sure about an asset, they leave it untagged.
+    var STATUS = [
+      { id: "present", label: "Found it", icon: "\u2713" }
+    ];
+
+    var state = {
+      roster: null,
+      assets: [],
+      locations: [],
+      filter: "all",
+      search: "",
+      walker: localStorage.getItem("yard.walker") || "",
+      openId: null,
+      detail: null,
+      draft: { status: "present", location: "", discrepancies: "" },
+      saving: false,
+      photoCache: {} // assetId -> photos[]
+    };
+
+    var $ = function(id){ return document.getElementById(id); };
+
+    function fmtAge(days, never){
+      if (never) return "Never";
+      if (days === 0) return "Today";
+      if (days === 1) return "1 day ago";
+      return days + " days ago";
+    }
+    function ageClass(a){
+      if (a.isNeverChecked) return "age never";
+      if (a.rollingState === "overdue") return "age overdue";
+      if (a.rollingState === "due") return "age due";
+      return "age";
+    }
+
+    function showToast(msg, isErr){
+      var t = $("toast");
+      t.textContent = msg;
+      t.className = "toast show" + (isErr ? " err" : "");
+      clearTimeout(t._h);
+      t._h = setTimeout(function(){ t.className = "toast"; }, 2200);
+    }
+
+    function renderWalker(){
+      var w = $("walker");
+      if (state.walker) {
+        w.className = "walker-row";
+        w.innerHTML = "Walking as <b>" + escapeHtml(state.walker) +
+          "</b> &middot; <a href='#' id='walker-edit'>change</a>";
+        $("walker-edit").addEventListener("click", function(e){
+          e.preventDefault();
+          state.walker = "";
+          renderWalker();
+          if (typeof syncChiprowOffset === "function") syncChiprowOffset();
+        });
+      } else {
+        w.className = "walker-row input";
+        w.innerHTML = '<input id="walker-input" placeholder="Your name (saved on this phone)" autocomplete="name" />';
+        var inp = $("walker-input");
+        inp.value = "";
+        inp.addEventListener("change", saveWalker);
+        inp.addEventListener("blur", saveWalker);
+        function saveWalker(){
+          var v = inp.value.trim();
+          if (!v) return;
+          state.walker = v;
+          localStorage.setItem("yard.walker", v);
+          renderWalker();
+          if (typeof syncChiprowOffset === "function") syncChiprowOffset();
+        }
+      }
+    }
+
+    function escapeHtml(s){
+      return String(s == null ? "" : s)
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    }
+
+    function applyFilter(){
+      var q = state.search.trim().toLowerCase();
+      var filt = state.filter;
+      return state.assets.filter(function(a){
+        if (filt === "due" && !(a.rollingState === "due" || a.rollingState === "overdue" || a.rollingState === "never")) return false;
+        if (filt === "overdue" && a.rollingState !== "overdue") return false;
+        if (filt === "never" && !a.isNeverChecked) return false;
+        if (filt === "fresh" && a.rollingState !== "fresh") return false;
+        if (filt === "unlisted" && !a.isUnlisted) return false;
+        if (filt === "nce" && !a.isNce) return false;
+        if (filt === "below" && !a.isBelowMel) return false;
+        if (!q) return true;
+        var hay = (a.assetId + " " + (a.vinSerial||"") + " " + (a.makeModel||"") + " " +
+          (a.owningUnit||"") + " " + (a.shop||"") + " " + (a.lastLocation||"")).toLowerCase();
+        return hay.indexOf(q) !== -1;
+      });
+    }
+
+    function refreshCounts(){
+      if (!state.roster) return;
+      var t = state.roster.totals || {};
+      $("t-due").textContent = (t.due||0) + (t.overdue||0) + (t.never||0);
+      $("t-today").textContent = t.checkedToday || 0;
+      $("c-all").textContent = state.assets.length;
+      $("c-due").textContent = (t.due||0) + (t.overdue||0) + (t.never||0);
+      $("c-overdue").textContent = t.overdue || 0;
+      $("c-never").textContent = t.never || 0;
+      $("c-fresh").textContent = t.fresh || 0;
+      $("c-unlisted").textContent = state.assets.filter(function(a){return a.isUnlisted;}).length;
+      $("c-nce").textContent = state.assets.filter(function(a){return a.isNce;}).length;
+      $("c-below").textContent = state.assets.filter(function(a){return a.isBelowMel;}).length;
+    }
+
+    function renderList(){
+      var rows = applyFilter();
+      var list = $("list");
+      if (!rows.length) {
+        list.innerHTML = '<div class="empty"><div class="big">\u2728</div>' +
+          (state.assets.length ? "No assets match." : "No assets in roster.") + '</div>';
+        return;
+      }
+      var html = "";
+      for (var i = 0; i < rows.length; i++) {
+        var a = rows[i];
+        var sub = [];
+        if (a.shop) sub.push("\uD83D\uDD27 " + escapeHtml(a.shop));
+        else if (a.owningUnit) sub.push(escapeHtml(a.owningUnit));
+        if (a.makeModel) sub.push(escapeHtml(a.makeModel));
+        if (a.lastLocation) sub.push("\uD83D\uDCCD " + escapeHtml(a.lastLocation));
+        // Badges = orthogonal flags only. The colored age line below already
+        // conveys never/due/overdue/done, so we don't repeat it here.
+        var badges = "";
+        if (a.isUnlisted) badges += '<span class="badge unlisted">Unlisted</span>';
+        if (a.isNewAsset) badges += '<span class="badge new">NEW</span>';
+        if (a.isNce) badges += '<span class="badge nce">NCE</span>';
+        if (a.isBelowMel) badges += '<span class="badge below-mel">Below MEL</span>';
+        if (a.photoCount > 0) badges += '<span class="badge photos">\uD83D\uDCF7 ' + a.photoCount + '</span>';
+        html += '<div class="row" data-id="' + escapeHtml(a.assetId) + '">' +
+          '<div class="body">' +
+            '<div class="id">' + escapeHtml(a.assetId) + '</div>' +
+            (sub.length ? '<div class="meta">' + sub.join(" \u00B7 ") + '</div>' : '') +
+          '</div>' +
+          '<div class="right">' +
+            '<div class="badges">' + badges + '</div>' +
+            '<div class="' + ageClass(a) + '">' + fmtAge(a.daysSinceLastCheck, a.isNeverChecked) + '</div>' +
+          '</div>' +
+        '</div>';
+      }
+      list.innerHTML = html;
+    }
+
+    function rebuildLocations(){
+      var dl = $("loc-options");
+      var parts = [];
+      for (var i = 0; i < state.locations.length; i++) {
+        parts.push('<option value="' + escapeHtml(state.locations[i]) + '"></option>');
+      }
+      dl.innerHTML = parts.join("");
+    }
+
+    /** Load the rolling roster from the API. */
+    function loadRoster(){
+      return fetch("/api/yard/roster", { cache: "no-store" })
+        .then(function(r){ return r.json(); })
+        .then(function(data){
+          state.roster = data;
+          state.assets = data.assets || [];
+          state.locations = data.locations || [];
+          rebuildLocations();
+          refreshCounts();
+          renderList();
+        })
+        .catch(function(err){
+          console.error("roster load failed", err);
+          showToast("Couldn't load roster", true);
+        });
+    }
+
+    function openSheet(assetId){
+      state.openId = assetId;
+      var asset = state.assets.find(function(a){ return a.assetId === assetId; });
+      state.detail = { asset: asset, photos: state.photoCache[assetId] || [], checks: [], openWorkOrders: [] };
+      state.draft = {
+        status: "present",
+        location: (asset && asset.lastLocation) || "",
+        discrepancies: ""
+      };
+      renderSheet();
+      $("sheet").classList.add("open");
+      $("sheet").setAttribute("aria-hidden", "false");
+      document.body.style.overflow = "hidden";
+      // Pull the live detail (history + photos) async.
+      fetch("/api/yard/asset/" + encodeURIComponent(assetId), { cache: "no-store" })
+        .then(function(r){ return r.json(); })
+        .then(function(d){
+          if (state.openId !== assetId) return;
+          state.detail = d;
+          state.photoCache[assetId] = d.photos || [];
+          renderSheet();
+        })
+        .catch(function(){});
+    }
+
+    function closeSheet(){
+      $("sheet").classList.remove("open");
+      $("sheet").setAttribute("aria-hidden", "true");
+      document.body.style.overflow = "";
+      state.openId = null;
+    }
+
+    function renderSheet(){
+      var d = state.detail;
+      if (!d || !d.asset) {
+        $("sheet-title").textContent = "Asset";
+        $("sheet-body").innerHTML = "<div class='empty'>Loading\u2026</div>";
+        return;
+      }
+      var a = d.asset;
+      $("sheet-title").textContent = a.assetId;
+
+      // Quick chips section
+      var chips = state.draft.discrepancies.split(/\\s*[;\\n]\\s*/).map(function(s){return s.trim();}).filter(Boolean);
+      var chipHtml = QUICK_CHIPS.map(function(c){
+        var on = chips.indexOf(c) !== -1;
+        return '<button class="chip ' + (on ? "on" : "") + '" data-chip="' + escapeHtml(c) + '">' + escapeHtml(c) + '</button>';
+      }).join("");
+
+      // STATUS is single-button now ("Found it") and isn't rendered as its
+      // own row anymore — the act of saving the sheet implies presence. We
+      // still send status:"present" on save so the API + downstream readers
+      // see a normal value. STATUS is kept around in case we ever need to
+      // reintroduce a per-asset state picker.
+      void STATUS;
+
+      var photos = d.photos || [];
+      var photoHtml = "";
+      for (var i = 0; i < photos.length; i++) {
+        var p = photos[i];
+        photoHtml += '<div class="photo" data-photo-id="' + p.id + '">' +
+          '<a href="' + p.url + '" target="_blank" rel="noopener">' +
+            '<img src="' + p.url + '" alt="" loading="lazy" />' +
+          '</a>' +
+          '<button class="x" data-del-photo="' + p.id + '" aria-label="Delete">\u00D7</button>' +
+          '<div class="meta">' + (p.uploadedBy ? escapeHtml(p.uploadedBy) + " \u00B7 " : "") + fmtRel(p.uploadedAtIso) + '</div>' +
+        '</div>';
+      }
+      photoHtml += '<label class="photo-add" id="photo-add">' +
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg>' +
+        '<span>Take photo</span>' +
+        '<input type="file" id="photo-input" accept="image/*" capture="environment" />' +
+      '</label>';
+
+      var checks = d.checks || [];
+      var historyHtml = "";
+      if (checks.length) {
+        historyHtml = '<ul class="history">';
+        for (var j = 0; j < Math.min(checks.length, 8); j++) {
+          var c = checks[j];
+          var det = [];
+          if (c.location) det.push("\uD83D\uDCCD " + escapeHtml(c.location));
+          if (c.status && c.status !== "present") det.push(escapeHtml(c.status));
+          if (c.discrepancies) det.push(escapeHtml(c.discrepancies));
+          historyHtml += '<li><b>' + fmtRel(c.checkedAtIso) + '</b>' +
+            (c.checkedBy ? " by " + escapeHtml(c.checkedBy) : "") +
+            (det.length ? "<br/>" + det.join(" \u00B7 ") : "") +
+          '</li>';
+        }
+        historyHtml += '</ul>';
+      } else {
+        historyHtml = '<div style="color:var(--muted);font-size:13px;">No previous checks.</div>';
+      }
+
+      var lastSeen = a.isNeverChecked ? "Never checked" :
+        (fmtAge(a.daysSinceLastCheck, false) + (a.lastCheckedBy ? " by " + escapeHtml(a.lastCheckedBy) : ""));
+
+      // Open work orders for this asset — the remarks fleet managers actually
+      // care about. Shows the most recently changed remark first.
+      var wos = d.openWorkOrders || [];
+      var wosHtml = "";
+      if (wos.length) {
+        for (var k = 0; k < wos.length; k++) {
+          var w = wos[k];
+          var tier = (w.melTier || "").toLowerCase();
+          var tierPill = tier ? '<span class="pill ' + escapeHtml(tier) + '">' + escapeHtml(tier.toUpperCase()) + ' MEL</span>' : '';
+          var partsPill = w.partsStatus ? '<span class="pill">Parts: ' + escapeHtml(w.partsStatus) + '</span>' : '';
+          var eticPill = w.eticRaw ? '<span class="pill">ETIC ' + escapeHtml(w.eticRaw) + '</span>' : '';
+          var pushPill = (w.eticPushCount || 0) > 0 ? '<span class="pill">' + w.eticPushCount + 'x pushed</span>' : '';
+          var remark = (w.remarks || "").trim();
+          var remarkAge = w.lastRemarkChangeDate ? "Remark updated " + fmtRel(w.lastRemarkChangeDate) : "";
+          wosHtml +=
+            '<div class="wo">' +
+              '<div class="wo-head">' +
+                '<span class="id">WO ' + escapeHtml(w.workOrderId) + '</span>' +
+                (w.shop ? '<span class="pill">' + escapeHtml(w.shop) + '</span>' : '') +
+                tierPill + partsPill + eticPill + pushPill +
+              '</div>' +
+              (remark
+                ? '<div class="wo-remark">' + escapeHtml(remark) + '</div>'
+                : '<div class="wo-remark" style="color:var(--muted2);font-style:italic;">(no remarks recorded)</div>') +
+              (remarkAge ? '<div class="wo-meta">' + remarkAge + '</div>' : '') +
+            '</div>';
+        }
+      }
+
+      var unlistedBanner = a.isUnlisted
+        ? '<div class="unlisted-banner">' +
+            '<b>Unlisted in latest ETIC</b>' +
+            'A walker logged this asset, but it doesn\u2019t appear in the most recent xlsx. ' +
+            'Have a fleet manager open a WO or retire the record.' +
+          '</div>'
+        : '';
+
+      // FM&A action banner — surface the most recent follow-up action so the
+      // walker knows whether someone is on it, and what they should do (e.g.
+      // "this missing report was already actioned, look again before re-flagging").
+      var actions = d.actions || [];
+      var fmaBanner = "";
+      if (actions.length) {
+        var act = actions[0];
+        var resLabels = {
+          resolved: "Resolved", in_progress: "In progress", dismissed: "Dismissed",
+          wo_opened: "WO opened", retired: "Retired", reassigned: "Reassigned"
+        };
+        var kindLabels = { missing: "Missing", unlisted: "Unlisted", discrepancy: "Discrepancy", unknown: "Unknown" };
+        var label = resLabels[act.resolution] || act.resolution;
+        var kindLbl = kindLabels[act.kind] || act.kind;
+        var woTxt = act.woOpened ? " (WO #" + escapeHtml(act.woOpened) + ")" : "";
+        var noteTxt = act.note ? '<div style="margin-top:4px;font-style:italic;">\u201C' + escapeHtml(act.note) + '\u201D</div>' : "";
+        fmaBanner =
+          '<div class="unlisted-banner" style="background:#15321f;border-color:#1e6b3a;color:#b6e8c5;">' +
+            '<b>FM&amp;A acknowledged</b>' +
+            kindLbl + ' \u2192 ' + escapeHtml(label) + woTxt +
+            ' \u00B7 by ' + escapeHtml(act.resolvedBy || "(unknown)") +
+            ' \u00B7 ' + fmtRel(act.resolvedAtIso) +
+            noteTxt +
+          '</div>';
+      }
+
+      $("sheet-body").innerHTML =
+        fmaBanner +
+        unlistedBanner +
+        '<div class="card">' +
+          '<h4>Asset</h4>' +
+          '<dl class="kv">' +
+            '<dt>Asset ID</dt><dd>' + escapeHtml(a.assetId) + '</dd>' +
+            (a.shop ? '<dt>Shop</dt><dd>' + escapeHtml(a.shop) + '</dd>' : '') +
+            (a.owningUnit ? '<dt>Unit</dt><dd>' + escapeHtml(a.owningUnit) + '</dd>' : '') +
+            (a.makeModel ? '<dt>Make/Model</dt><dd>' + escapeHtml(a.makeModel) + '</dd>' : '') +
+            (a.vehNomen ? '<dt>Nomen</dt><dd>' + escapeHtml(a.vehNomen) + '</dd>' : '') +
+            (a.vinSerial ? '<dt>VIN/Serial</dt><dd style="font-family:ui-monospace,monospace;">' + escapeHtml(a.vinSerial) + '</dd>' : '') +
+            (a.openWoCount ? '<dt>Open WOs</dt><dd>' + a.openWoCount + '</dd>' : '') +
+            '<dt>Last seen</dt><dd>' + lastSeen + '</dd>' +
+          '</dl>' +
+        '</div>' +
+        // Walker only logs assets they actually see. The "Status" row used to
+        // include a "Not here" button — see the comment above STATUS for why
+        // it was removed. The single "Found it" button now lives at the bottom
+        // (Save) implicitly: opening this sheet and tapping Save is the act of
+        // confirming presence.
+        '<div class="card">' +
+          '<h4>Location</h4>' +
+          '<input id="loc-input" list="loc-options" placeholder="Where is it parked?" value="' + escapeHtml(state.draft.location) + '" />' +
+        '</div>' +
+        '<div class="card">' +
+          '<h4>Discrepancies</h4>' +
+          '<div class="chip-pick" id="chip-pick">' + chipHtml + '</div>' +
+          '<textarea id="disc-input" placeholder="Tap chips above or type custom notes (use ; or new line to separate)\u2026" style="margin-top:8px;">' + escapeHtml(state.draft.discrepancies) + '</textarea>' +
+        '</div>' +
+        '<div class="card">' +
+          '<h4>Photos <span style="color:var(--muted2);font-weight:normal;">(' + photos.length + ')</span></h4>' +
+          '<div class="photos">' + photoHtml + '</div>' +
+        '</div>' +
+        (wos.length
+          ? ('<div class="card">' +
+              '<h4>Open work orders <span style="color:var(--muted2);font-weight:normal;">(' + wos.length + ')</span></h4>' +
+              wosHtml +
+             '</div>')
+          : '') +
+        '<div class="card">' +
+          '<h4>Check history</h4>' +
+          historyHtml +
+        '</div>';
+
+      bindSheetEvents();
+    }
+
+    function fmtRel(iso){
+      if (!iso) return "";
+      var d = new Date(iso);
+      if (isNaN(d.getTime())) return iso;
+      var diff = (Date.now() - d.getTime()) / 1000;
+      if (diff < 60) return "just now";
+      if (diff < 3600) return Math.floor(diff/60) + "m ago";
+      if (diff < 86400) return Math.floor(diff/3600) + "h ago";
+      var days = Math.floor(diff/86400);
+      if (days < 30) return days + "d ago";
+      return d.toLocaleDateString(undefined, { day: "2-digit", month: "short", year: "2-digit" });
+    }
+
+    function bindSheetEvents(){
+      // No status row anymore — see comment above STATUS. Walker only logs
+      // assets they actually see, and "presence" is implicit in saving.
+      var cp = $("chip-pick");
+      if (cp) cp.addEventListener("click", function(e){
+        var btn = e.target.closest("[data-chip]");
+        if (!btn) return;
+        var chip = btn.getAttribute("data-chip");
+        var parts = state.draft.discrepancies.split(/\\s*[;\\n]\\s*/).map(function(s){return s.trim();}).filter(Boolean);
+        var idx = parts.indexOf(chip);
+        if (idx === -1) parts.push(chip); else parts.splice(idx, 1);
+        state.draft.discrepancies = parts.join("; ");
+        renderSheet();
+      });
+      var loc = $("loc-input");
+      if (loc) loc.addEventListener("input", function(){ state.draft.location = loc.value; });
+      var disc = $("disc-input");
+      if (disc) disc.addEventListener("input", function(){ state.draft.discrepancies = disc.value; });
+      var pi = $("photo-input");
+      if (pi) pi.addEventListener("change", onPhotoPicked);
+      // Photo delete
+      $("sheet-body").addEventListener("click", function(e){
+        var del = e.target.closest("[data-del-photo]");
+        if (del) {
+          e.preventDefault();
+          var pid = del.getAttribute("data-del-photo");
+          if (!confirm("Delete this photo?")) return;
+          fetch("/api/yard/photo/" + pid, { method: "DELETE" })
+            .then(function(){
+              if (!state.detail) return;
+              state.detail.photos = (state.detail.photos || []).filter(function(p){ return String(p.id) !== String(pid); });
+              if (state.openId) state.photoCache[state.openId] = state.detail.photos;
+              renderSheet();
+              showToast("Photo deleted");
+            })
+            .catch(function(){ showToast("Delete failed", true); });
+        }
+      });
+    }
+
+    function onPhotoPicked(e){
+      var input = e.target;
+      var file = input.files && input.files[0];
+      if (!file || !state.openId) return;
+      var fd = new FormData();
+      fd.append("assetId", state.openId);
+      fd.append("photo", file, file.name || "photo.jpg");
+      if (state.walker) fd.append("uploadedBy", state.walker);
+      var btn = input.parentElement;
+      btn.style.opacity = "0.5";
+      fetch("/api/yard/photo", { method: "POST", body: fd })
+        .then(function(r){
+          if (!r.ok) return r.json().then(function(j){ throw new Error(j.error || "upload failed"); });
+          return r.json();
+        })
+        .then(function(j){
+          if (!state.detail) state.detail = { asset: null, photos: [], checks: [] };
+          state.detail.photos = state.detail.photos || [];
+          state.detail.photos.unshift(j.photo);
+          if (state.openId) state.photoCache[state.openId] = state.detail.photos;
+          // bump asset photoCount
+          var a = state.assets.find(function(x){ return x.assetId === state.openId; });
+          if (a) a.photoCount = (a.photoCount || 0) + 1;
+          renderSheet();
+          showToast("Photo uploaded");
+        })
+        .catch(function(err){
+          showToast(err.message || "Upload failed", true);
+        })
+        .finally(function(){
+          btn.style.opacity = "";
+          input.value = "";
+        });
+    }
+
+    function saveCheck(){
+      if (state.saving || !state.openId) return;
+      state.saving = true;
+      var btn = $("save-btn");
+      btn.classList.add("saving");
+      btn.textContent = "Saving…";
+      fetch("/api/yard/check", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          assetId: state.openId,
+          location: state.draft.location,
+          discrepancies: state.draft.discrepancies,
+          status: "present",
+          checkedBy: state.walker
+        })
+      })
+        .then(function(r){
+          if (!r.ok) return r.json().then(function(j){ throw new Error(j.error || "save failed"); });
+          return r.json();
+        })
+        .then(function(){
+          showToast("\u2713 Marked checked");
+          // Optimistic local update
+          var a = state.assets.find(function(x){ return x.assetId === state.openId; });
+          if (a) {
+            a.lastCheckedAtIso = new Date().toISOString();
+            a.lastCheckedBy = state.walker || a.lastCheckedBy;
+            a.daysSinceLastCheck = 0;
+            a.rollingState = "fresh";
+            a.isNeverChecked = false;
+            if (state.draft.location) a.lastLocation = state.draft.location;
+          }
+          // Update totals quickly
+          if (state.roster && state.roster.totals) {
+            state.roster.totals.checkedToday = (state.roster.totals.checkedToday || 0) + 1;
+          }
+          refreshCounts();
+          renderList();
+          closeSheet();
+          // Background full refresh to pull authoritative totals.
+          loadRoster();
+        })
+        .catch(function(err){
+          showToast(err.message || "Save failed", true);
+        })
+        .finally(function(){
+          state.saving = false;
+          btn.classList.remove("saving");
+          btn.textContent = "\u2713 Mark checked";
+        });
+    }
+
+    /* ----- find / floor-to-book modal ----- */
+    function openFindModal(){
+      var m = $("find-modal");
+      m.classList.add("open");
+      m.setAttribute("aria-hidden", "false");
+      $("find-asset-id").value = "";
+      $("find-location").value = "";
+      $("find-notes").value = "";
+      setTimeout(function(){ $("find-asset-id").focus(); }, 50);
+    }
+    function closeFindModal(){
+      var m = $("find-modal");
+      m.classList.remove("open");
+      m.setAttribute("aria-hidden", "true");
+    }
+    function saveFind(){
+      var id = ($("find-asset-id").value || "").trim();
+      if (!id) { showToast("Asset ID required", true); return; }
+      var loc = ($("find-location").value || "").trim();
+      var notes = ($("find-notes").value || "").trim();
+      var btn = $("find-save");
+      btn.disabled = true;
+      btn.textContent = "Saving\u2026";
+      fetch("/api/yard/check", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          assetId: id, location: loc, discrepancies: notes,
+          status: "present", checkedBy: state.walker
+        })
+      })
+        .then(function(r){
+          if (!r.ok) return r.json().then(function(j){ throw new Error(j.error || "save failed"); });
+          return r.json();
+        })
+        .then(function(){
+          showToast("Logged " + id);
+          closeFindModal();
+          loadRoster().then(function(){
+            // Drop the user straight into the asset's detail so they can add
+            // a photo / notes without searching for it.
+            openSheet(id);
+          });
+        })
+        .catch(function(err){
+          showToast(err.message || "Save failed", true);
+        })
+        .finally(function(){
+          btn.disabled = false;
+          btn.textContent = "Log it";
+        });
+    }
+
+    /* ----- wire-up ----- */
+    document.addEventListener("click", function(e){
+      var row = e.target.closest(".row[data-id]");
+      if (row) { openSheet(row.getAttribute("data-id")); return; }
+      var chip = e.target.closest("#filters .chip");
+      if (chip) {
+        document.querySelectorAll("#filters .chip").forEach(function(c){ c.classList.remove("active"); });
+        chip.classList.add("active");
+        state.filter = chip.getAttribute("data-filter") || "all";
+        renderList();
+        return;
+      }
+    });
+
+    $("sheet-back").addEventListener("click", closeSheet);
+    $("save-btn").addEventListener("click", saveCheck);
+    $("find-btn").addEventListener("click", openFindModal);
+    $("find-cancel").addEventListener("click", closeFindModal);
+    $("find-save").addEventListener("click", saveFind);
+    $("find-modal").addEventListener("click", function(e){
+      if (e.target === e.currentTarget) closeFindModal();
+    });
+
+    var searchTimer;
+    $("search").addEventListener("input", function(e){
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(function(){
+        state.search = e.target.value || "";
+        renderList();
+      }, 120);
+    });
+
+    // ESC key for desktop testing
+    document.addEventListener("keydown", function(e){
+      if (e.key === "Escape") {
+        if ($("find-modal").classList.contains("open")) { closeFindModal(); return; }
+        if (state.openId) closeSheet();
+      }
+    });
+
+    /**
+     * Pin the chiprow to the bottom of the topbar dynamically. The topbar's
+     * height changes when the walker name input collapses to a chip, so we
+     * can't hard-code it.
+     */
+    function syncChiprowOffset(){
+      var topbar = $("topbar");
+      var chiprow = document.querySelector(".chiprow");
+      if (!topbar || !chiprow) return;
+      var h = topbar.getBoundingClientRect().height;
+      chiprow.style.top = "calc(var(--safe-top) + " + Math.round(h) + "px)";
+    }
+    var ro = window.ResizeObserver ? new ResizeObserver(syncChiprowOffset) : null;
+    if (ro) ro.observe($("topbar"));
+    window.addEventListener("resize", syncChiprowOffset);
+
+    renderWalker();
+    loadRoster().then(syncChiprowOffset);
+    setInterval(loadRoster, 30000);
+  })();
+  </script>
+</body>
+</html>`;
+}
+
+function renderDashboardHtml(): string {
+  const escapedTitle = escapeHtml(SITE_TITLE);
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark light" />
+  <meta name="etic-ui" content="ia-rebuild-v4" />
+  <title>${escapedTitle}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      color-scheme: dark;
+      /* neutral warm-cool near-black palette */
+      --bg0: #0a0a0d;
+      --bg1: #0e0e12;
+      --surface: #131318;
+      --surface-elev: #17171d;
+      --surface-solid: #131318;
+      --border: rgba(255, 255, 255, 0.06);
+      --border-strong: rgba(255, 255, 255, 0.12);
+      --text: #f4f5f7;
+      --text-dim: #c8ccd4;
+      --muted: #8a8f9b;
+      --subtle: #5a5f6b;
+      --accent: #8ab4ff;
+      --accent-strong: #a7c4ff;
+      --accent-dim: #4f6fb8;
+      --accent-soft: rgba(138, 180, 255, 0.12);
+      --success: #5ee397;
+      --warn: #f5c754;
+      --danger: #ff8a8a;
+      --glow: rgba(138, 180, 255, 0.10);
+      --radius: 14px;
+      --radius-sm: 10px;
+      --radius-lg: 20px;
+      --shadow-sm: 0 1px 2px rgba(0,0,0,0.3), 0 1px 1px rgba(0,0,0,0.2);
+      --shadow-md: 0 4px 16px rgba(0,0,0,0.35), 0 1px 2px rgba(0,0,0,0.25);
+      --shadow-lg: 0 12px 40px rgba(0,0,0,0.45), 0 2px 6px rgba(0,0,0,0.25);
+      --font: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    * { box-sizing: border-box; }
+    html, body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: var(--font);
+      font-feature-settings: "cv11", "ss01", "ss03";
+      color: var(--text);
+      background:
+        radial-gradient(1200px 600px at 85% -10%, rgba(138,180,255,0.06), transparent 60%),
+        radial-gradient(900px 500px at 10% 100%, rgba(167,140,255,0.04), transparent 60%),
+        var(--bg0);
+      background-attachment: fixed;
+      letter-spacing: -0.005em;
+    }
+    .app {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 48px 32px 88px;
+    }
+    @media (max-width: 640px) { .app { padding: 28px 20px 56px; } }
+
+    /* --- Top brand row ---------------------------------------------------- */
+    .top {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 24px;
+      margin-bottom: 32px;
+    }
+    .brand h1 {
+      margin: 0 0 8px;
+      font-size: clamp(1.6rem, 2.6vw, 2rem);
+      font-weight: 700;
+      letter-spacing: -0.035em;
+      line-height: 1.1;
+      color: var(--text);
+    }
+    .brand p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.95rem;
+      max-width: 46ch;
+      line-height: 1.5;
+    }
+
+    /* --- Picker / select -------------------------------------------------- */
+    .picker-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      min-width: min(100%, 280px);
+    }
+    .picker-wrap label {
+      font-size: 0.7rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--muted);
+    }
+    select, select#etic-date {
+      appearance: none;
+      width: 100%;
+      padding: 12px 42px 12px 14px;
+      font-family: var(--font);
+      font-size: 0.95rem;
+      font-weight: 500;
+      color: var(--text);
+      background: var(--surface) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='18' height='18' viewBox='0 0 24 24' fill='none' stroke='%238a8f9b' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E") no-repeat right 14px center;
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+    select:hover { border-color: rgba(255,255,255,0.2); }
+    select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+    /* Make the native popup readable on Windows/Chromium dark mode. */
+    select { color-scheme: dark; }
+    select option,
+    select optgroup {
+      background-color: #161922;
+      color: #e8eaf0;
+    }
+    select option:checked,
+    select option:hover {
+      background-color: #2a3042;
+      color: #ffffff;
+    }
+
+    /* --- Segmented nav ---------------------------------------------------- */
+    .main-nav {
+      display: inline-flex;
+      gap: 4px;
+      padding: 4px;
+      margin-bottom: 40px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      box-shadow: var(--shadow-sm);
+    }
+    .main-nav button {
+      font-family: var(--font);
+      font-size: 0.88rem;
+      font-weight: 500;
+      padding: 9px 18px;
+      border-radius: 8px;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      transition: color 0.15s ease, background 0.15s ease;
+    }
+    .main-nav button:hover { color: var(--text); }
+    .main-nav button.active {
+      background: var(--surface-elev);
+      color: var(--text);
+      border-color: var(--border-strong);
+      box-shadow: 0 1px 2px rgba(0,0,0,0.3);
+    }
+
+    /* --- Hero page header ------------------------------------------------- */
+    .hero {
+      position: relative;
+      padding: 4px 0 28px;
+      margin-bottom: 32px;
+      border-bottom: 1px solid var(--border);
+      background: transparent;
+      border-radius: 0;
+      box-shadow: none;
+      overflow: visible;
+    }
+    .hero::before { content: none; }
+    .hero-inner { position: relative; z-index: 1; }
+    .hero-date {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: var(--accent);
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      margin-bottom: 14px;
+    }
+    .hero-date .dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 0 4px var(--accent-soft);
+    }
+    .hero h2 {
+      margin: 0 0 10px;
+      font-size: clamp(1.6rem, 3vw, 2.15rem);
+      font-weight: 700;
+      letter-spacing: -0.035em;
+      line-height: 1.1;
+    }
+    .hero-file {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.95rem;
+      line-height: 1.5;
+    }
+    .hero-file strong { color: var(--text-dim); font-weight: 500; }
+
+    /* --- KPI strip -------------------------------------------------------- */
+    .kpi-strip {
+      margin-bottom: 40px;
+      padding: 26px 28px 24px;
+      border-radius: var(--radius-lg);
+      background: linear-gradient(180deg, var(--surface-elev) 0%, var(--surface) 100%);
+      border: 1px solid var(--border);
+      box-shadow: var(--shadow-md);
+    }
+    .kpi-strip .kpi-head {
+      font-size: 0.68rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.14em;
+      color: var(--muted);
+      margin-bottom: 22px;
+    }
+    .kpi-row {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 20px;
+      align-items: end;
+    }
+    @media (max-width: 900px) { .kpi-row { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px 16px; } }
+    @media (max-width: 520px) { .kpi-row { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 14px; } }
+    .kpi-cell {
+      text-align: left;
+      padding: 0;
+      border-left: 1px solid var(--border);
+      padding-left: 18px;
+    }
+    .kpi-cell:first-child { border-left: 0; padding-left: 0; }
+    @media (max-width: 900px) {
+      .kpi-cell { border-left: 0; padding-left: 0; }
+    }
+    .kpi-cell .lbl {
+      font-size: 0.7rem;
+      font-weight: 600;
+      color: var(--muted);
+      line-height: 1.25;
+      margin-bottom: 10px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+    .kpi-cell .lbl small { display: block; font-size: 0.62rem; font-weight: 500; opacity: 0.8; text-transform: none; letter-spacing: 0; margin-top: 2px; }
+    .kpi-cell .val {
+      font-family: var(--font);
+      font-size: clamp(1.65rem, 3.5vw, 2.1rem);
+      font-weight: 700;
+      letter-spacing: -0.035em;
+      line-height: 1.05;
+      font-variant-numeric: tabular-nums;
+    }
+    .kpi-cell .val.em {
+      font-size: clamp(1.85rem, 4vw, 2.5rem);
+      font-weight: 800;
+    }
+    .kpi-val-mc {
+      background: linear-gradient(180deg, #ffffff 0%, #a7c4ff 55%, #6890e8 100%);
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+    }
+    .kpi-val-fleet { color: var(--text); }
+    .kpi-val-fmc { color: var(--success); }
+    .kpi-val-nmc { color: var(--danger); }
+    .kpi-val-surplus { color: var(--warn); }
+    .kpi-missing .val { color: var(--subtle); font-weight: 500; font-size: 1.1rem; }
+
+    /* --- Card primitive --------------------------------------------------- */
+    .card {
+      border-radius: var(--radius-lg);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      padding: 28px 30px;
+      box-shadow: var(--shadow-md);
+      margin-bottom: 24px;
+    }
+    .card:last-child { margin-bottom: 0; }
+    @media (max-width: 640px) { .card { padding: 22px 20px; } }
+    .card h3 {
+      margin: 0 0 18px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      color: var(--muted);
+    }
+
+    /* --- Snapshot detail rows -------------------------------------------- */
+    .detail-rows { display: flex; flex-direction: column; gap: 14px; }
+    .detail-row {
+      display: grid;
+      grid-template-columns: 140px 1fr;
+      gap: 16px;
+      font-size: 0.92rem;
+      align-items: start;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .detail-row:last-child { border-bottom: 0; padding-bottom: 0; }
+    @media (max-width: 520px) { .detail-row { grid-template-columns: 1fr; gap: 4px; } }
+    .detail-row dt { color: var(--muted); font-weight: 500; margin: 0; font-size: 0.85rem; }
+    .detail-row dd { margin: 0; color: var(--text-dim); line-height: 1.5; word-break: break-word; font-variant-numeric: tabular-nums; }
+
+    /* --- Collapsible card (used by Snapshot history) --------------------- */
+    .collapsible-card { padding: 0; }
+    .collapsible-card > .collapsible-summary {
+      list-style: none;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 18px 24px;
+      border-radius: var(--radius);
+      transition: background 0.12s ease;
+    }
+    .collapsible-card > .collapsible-summary::-webkit-details-marker { display: none; }
+    .collapsible-card > .collapsible-summary:hover { background: var(--accent-soft); }
+    .collapsible-card[open] > .collapsible-summary {
+      border-bottom: 1px solid var(--border);
+      border-radius: var(--radius) var(--radius) 0 0;
+    }
+    .collapsible-summary-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+    .collapsible-card > .collapsible-summary > .ai-ask-btn { flex-shrink: 0; }
+    .collapsible-summary-text h3 {
+      margin: 0;
+      font-size: 1rem;
+      font-weight: 600;
+      letter-spacing: -0.015em;
+      color: var(--text);
+    }
+    .collapsible-summary-text .hint { margin: 0; font-size: 0.82rem; color: var(--muted); }
+    .collapsible-chev {
+      font-size: 0.85rem;
+      color: var(--muted);
+      transition: transform 0.18s ease;
+      flex-shrink: 0;
+    }
+    .collapsible-card[open] > .collapsible-summary .collapsible-chev {
+      transform: rotate(180deg);
+    }
+    .collapsible-body { padding: 18px 24px 22px; }
+
+    /* --- Compare table ---------------------------------------------------- */
+    .compare-card { }
+    .compare-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 16px;
+    }
+    .compare-head .hint { font-size: 0.82rem; color: var(--muted); margin: 0; }
+    .table-wrap {
+      overflow-x: auto;
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      background: var(--bg1);
+    }
+    .compare-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.86rem;
+      min-width: 720px;
+      font-variant-numeric: tabular-nums;
+    }
+    .compare-table th, .compare-table td {
+      padding: 12px 16px;
+      text-align: right;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    .compare-table tbody tr:last-child td { border-bottom: 0; }
+    .compare-table th:first-child, .compare-table td:first-child {
+      text-align: left;
+      position: sticky;
+      left: 0;
+      background: var(--bg1);
+      z-index: 1;
+    }
+    .compare-table thead th {
+      background: var(--surface);
+      color: var(--muted);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-size: 0.68rem;
+      border-bottom: 1px solid var(--border-strong);
+    }
+    .compare-table tbody tr:nth-child(even) td { background: rgba(255,255,255,0.015); }
+    .compare-table tbody tr:nth-child(even) td:first-child { background: rgba(255,255,255,0.015); }
+    .compare-table tbody tr:hover td { background: var(--accent-soft); }
+    .compare-table tbody tr:hover td:first-child { background: var(--accent-soft); }
+    .compare-table .mc { color: var(--accent-strong); font-weight: 600; }
+    .compare-table .fmc { color: var(--success); }
+    .compare-table .nmc { color: var(--danger); }
+    .compare-table .surp { color: var(--warn); }
+    .compare-table tr[data-in-range="true"] td,
+    .compare-table tr[data-in-range="true"] td:first-child {
+      background: rgba(138,180,255,0.06);
+    }
+    .compare-table tr[data-selected="true"] td,
+    .compare-table tr[data-selected="true"] td:first-child {
+      background: var(--accent-soft);
+      box-shadow: inset 3px 0 0 var(--accent);
+    }
+
+    /* --- Downloads / yard card -------------------------------------------- */
+    .yard-card .yard-lead {
+      margin: 0 0 20px;
+      font-size: 0.95rem;
+      color: var(--muted);
+      line-height: 1.55;
+      max-width: 58ch;
+    }
+    .action-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    @media (max-width: 560px) { .action-row { grid-template-columns: 1fr; } }
+    .btn-etic {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      width: 100%;
+      padding: 14px 18px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border-strong);
+      background: var(--surface-elev);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 0.92rem;
+      font-weight: 500;
+      cursor: pointer;
+      transition: border-color 0.15s ease, background 0.15s ease, transform 0.08s ease;
+    }
+    .btn-etic:hover:not(:disabled) {
+      border-color: rgba(138,180,255,0.4);
+      background: rgba(138,180,255,0.06);
+    }
+    .btn-etic:active:not(:disabled) { transform: translateY(1px); }
+    .btn-etic:disabled { opacity: 0.45; cursor: not-allowed; }
+    .yard-export-btn {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      width: 100%;
+      margin: 0;
+      padding: 20px 22px;
+      border-radius: var(--radius);
+      border: 1px solid var(--border-strong);
+      background: var(--surface-elev);
+      box-shadow: var(--shadow-sm);
+      cursor: pointer;
+      font-family: var(--font);
+      text-align: left;
+      color: var(--text);
+      transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.08s ease;
+    }
+    .yard-export-btn:hover:not(:disabled) {
+      border-color: rgba(138,180,255,0.4);
+      box-shadow: var(--shadow-md);
+    }
+    .yard-export-btn:active:not(:disabled) { transform: translateY(1px); }
+    .yard-export-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .yard-export-btn .icon-wrap {
+      flex-shrink: 0;
+      width: 48px;
+      height: 48px;
+      border-radius: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--accent-soft);
+      border: 1px solid rgba(138,180,255,0.2);
+      color: var(--accent-strong);
+    }
+    .yard-export-btn .icon-wrap svg { width: 24px; height: 24px; }
+    .yard-export-btn .copy { flex: 1; min-width: 0; }
+    .yard-export-btn .title {
+      display: block;
+      font-size: 1.02rem;
+      font-weight: 600;
+      letter-spacing: -0.015em;
+      color: var(--text);
+      margin-bottom: 3px;
+    }
+    .yard-export-btn .sub {
+      display: block;
+      font-size: 0.82rem;
+      color: var(--muted);
+      font-weight: 400;
+    }
+    .yard-export-btn .chev { flex-shrink: 0; color: var(--muted); }
+    .yard-export-btn .chev svg { width: 20px; height: 20px; display: block; }
+
+    /* --- Work order lookup ------------------------------------------------ */
+    .wo-lookup-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: flex-end;
+      margin-bottom: 18px;
+    }
+    .wo-lookup-row label { font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); display: block; margin-bottom: 8px; }
+    .wo-field-grow { flex: 1; min-width: 220px; }
+    .wo-field-grow input {
+      width: 100%;
+      padding: 12px 14px;
+      font-family: var(--font);
+      font-size: 0.95rem;
+      font-weight: 500;
+      color: var(--text);
+      background: var(--surface);
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius-sm);
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+    .wo-field-grow input::placeholder { color: var(--subtle); }
+    .wo-field-grow input:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-soft);
+    }
+    .btn-primary {
+      font-family: var(--font);
+      font-weight: 600;
+      font-size: 0.9rem;
+      padding: 12px 22px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--accent-dim);
+      background: var(--accent);
+      color: #0a0a0d;
+      cursor: pointer;
+      transition: background 0.15s ease, transform 0.08s ease;
+    }
+    .btn-primary:hover { background: var(--accent-strong); }
+    .btn-primary:active { transform: translateY(1px); }
+    /* --- Detail pane: facts + remarks + stale banner --------------------- */
+    .wo-facts {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+      gap: 14px 24px;
+      margin: 22px 0 8px;
+      padding: 16px 20px;
+      background: var(--bg1);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+    }
+    .wo-facts dt { font-size: 0.64rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); margin: 0 0 5px; }
+    .wo-facts dd { margin: 0; font-size: 0.9rem; line-height: 1.4; word-break: break-word; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+    .wo-facts:empty { display: none; }
+
+    .wo-remarks-card {
+      margin-top: 18px;
+      padding: 16px 20px;
+      border-radius: var(--radius);
+      background: var(--bg1);
+      border: 1px solid var(--border);
+    }
+    .wo-remarks-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 10px;
+    }
+    .wo-remarks-head .t {
+      font-size: 0.7rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--muted);
+    }
+    .wo-remarks-head .when {
+      font-size: 0.76rem;
+      color: var(--subtle);
+      font-variant-numeric: tabular-nums;
+    }
+    .wo-remarks-body {
+      font-family: var(--font);
+      font-size: 0.9rem;
+      line-height: 1.55;
+      color: var(--text-dim);
+      word-break: break-word;
+    }
+    .wo-remarks-body .sep {
+      display: inline-block;
+      margin: 0 6px;
+      color: var(--subtle);
+    }
+    .wo-remarks-body .seg {
+      display: inline;
+    }
+
+    .wo-stale-banner {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      margin: 18px 0 0;
+      padding: 12px 16px;
+      border-radius: var(--radius-sm);
+      background: rgba(245, 199, 84, 0.08);
+      border: 1px solid rgba(245, 199, 84, 0.28);
+      color: var(--warn);
+      font-size: 0.88rem;
+      line-height: 1.45;
+    }
+    .wo-stale-banner::before {
+      content: "▲";
+      font-size: 0.8rem;
+      line-height: 1.4;
+      color: var(--warn);
+      flex-shrink: 0;
+    }
+
+    /* --- Watch table (work orders) --------------------------------------- */
+    .watch-card { }
+    .watch-toolbar { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; margin-bottom: 14px; }
+    .watch-toolbar label { font-size: 0.85rem; color: var(--muted); display: flex; align-items: center; gap: 8px; cursor: pointer; }
+    .watch-toolbar button.linkish {
+      background: none; border: none; color: var(--accent); font-family: var(--font); font-size: 0.85rem;
+      cursor: pointer; text-decoration: underline; text-underline-offset: 3px; padding: 0;
+    }
+    .watch-toolbar button.linkish:hover { color: var(--accent-strong); }
+    .watch-table { font-size: 0.82rem; min-width: 920px; font-variant-numeric: tabular-nums; }
+    .watch-table th, .watch-table td { padding: 10px 12px; }
+    .watch-table .stale { background: rgba(255, 138, 138, 0.08); }
+    .watch-table .badge-tier { font-size: 0.62rem; font-weight: 600; text-transform: uppercase; padding: 3px 8px; border-radius: 999px; letter-spacing: 0.04em; }
+    .tier-below { background: rgba(255, 138, 138, 0.14); color: var(--danger); }
+    .tier-at { background: rgba(245, 199, 84, 0.14); color: var(--warn); }
+    .tier-above { background: rgba(94, 227, 151, 0.14); color: var(--success); }
+    .tier-unknown { background: rgba(255, 255, 255, 0.06); color: var(--muted); }
+
+    /* --- Modal ------------------------------------------------------------ */
+    .modal-overlay {
+      position: fixed; inset: 0; background: rgba(6,6,10,0.68); backdrop-filter: blur(4px); z-index: 1000;
+      display: flex; align-items: center; justify-content: center; padding: 20px;
+    }
+    .modal {
+      background: var(--surface-elev); border: 1px solid var(--border-strong); border-radius: var(--radius-lg);
+      max-width: 680px; width: 100%; max-height: 85vh; overflow: hidden; display: flex; flex-direction: column;
+      box-shadow: var(--shadow-lg);
+    }
+    .modal header { padding: 18px 22px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+    .modal header h4 { margin: 0; font-size: 1rem; font-weight: 600; letter-spacing: -0.01em; }
+    .modal .body { padding: 14px 22px 18px; overflow-y: auto; font-size: 0.86rem; }
+    .modal .log-row { padding: 12px 0; border-bottom: 1px solid var(--border); }
+    .modal .log-row:last-child { border-bottom: 0; }
+    .modal .log-meta { color: var(--muted); font-size: 0.72rem; margin-bottom: 4px; letter-spacing: 0.02em; }
+    .modal-close { background: none; border: none; color: var(--muted); font-size: 1.3rem; cursor: pointer; line-height: 1; padding: 4px 8px; border-radius: 6px; transition: background 0.15s ease, color 0.15s ease; }
+    .modal-close:hover { background: rgba(255,255,255,0.05); color: var(--text); }
+
+    /* --- Utilities / misc ------------------------------------------------- */
+    .yard-status-wrap { margin-top: 14px; }
+    .status {
+      font-size: 0.88rem;
+      color: var(--muted);
+      min-height: 22px;
+      margin: 0;
+    }
+    .status.err { color: var(--danger); }
+    .status.ok { color: var(--success); }
+    .empty-state {
+      text-align: center;
+      padding: 72px 24px;
+      color: var(--muted);
+      font-size: 0.98rem;
+      line-height: 1.6;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow-sm);
+    }
+    .empty-state strong { color: var(--text); font-weight: 600; }
+    .hidden { display: none !important; }
+    ::selection { background: rgba(138, 180, 255, 0.28); color: var(--text); }
+
+    /* --- Date picker (snapshot screen) ----------------------------------- */
+    .date-picker {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 22px;
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--surface);
+    }
+    .date-picker .date-pick-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 7px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--surface-elev);
+      color: var(--text-dim);
+      font-family: var(--font);
+      font-size: 0.84rem;
+      font-weight: 500;
+      cursor: pointer;
+      transition: border-color 0.12s ease, color 0.12s ease, background 0.12s ease;
+    }
+    .date-picker .date-pick-btn:hover:not(:disabled) {
+      border-color: var(--accent);
+      color: var(--text);
+    }
+    .date-picker .date-pick-btn:disabled {
+      opacity: 0.35;
+      cursor: not-allowed;
+    }
+    .date-picker .date-pick-arrow {
+      padding: 7px 10px;
+      font-size: 0.95rem;
+      line-height: 1;
+    }
+    .date-picker .date-select {
+      flex: 1 1 220px;
+      min-width: 200px;
+      padding: 8px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--surface-elev);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 0.92rem;
+      font-variant-numeric: tabular-nums;
+      cursor: pointer;
+    }
+    .date-picker .date-select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+    .date-picker-meta {
+      flex: 0 0 auto;
+      margin-left: auto;
+      font-size: 0.78rem;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* --- Per-Unit / NCE breakdown card ----------------------------------- */
+    .breakdown-body { padding: 18px 24px 22px; }
+    .breakdown-controls {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      flex-wrap: wrap;
+      margin-bottom: 14px;
+    }
+    .breakdown-tabs { display: inline-flex; gap: 4px; }
+    .bd-compare-field {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.78rem;
+      color: var(--muted);
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      font-weight: 600;
+    }
+    .bd-compare-field select {
+      background: var(--surface);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 5px 10px;
+      font-size: 0.8rem;
+      font-family: var(--font);
+      font-weight: 500;
+      letter-spacing: normal;
+      text-transform: none;
+      cursor: pointer;
+    }
+    .bd-compare-field select option,
+    .bd-compare-field select optgroup {
+      background-color: var(--surface);
+      color: var(--text);
+    }
+    .bd-compare-summary {
+      font-size: 0.82rem;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+      margin-left: auto;
+    }
+    /* --- Preset chip strip (shared by all compare cards) ----------------- */
+    .preset-chips {
+      display: inline-flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 4px;
+    }
+    .preset-chips-label {
+      font-size: 0.72rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--muted);
+      font-weight: 600;
+      margin-right: 4px;
+    }
+    .preset-chip {
+      background: rgba(255,255,255,0.04);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      cursor: pointer;
+      transition: background 0.12s, border-color 0.12s, color 0.12s, opacity 0.12s;
+      font-family: var(--font);
+      line-height: 1.2;
+    }
+    .preset-chip:hover:not(:disabled) {
+      background: rgba(138,180,255,0.10);
+      border-color: rgba(138,180,255,0.35);
+      color: var(--accent);
+    }
+    .preset-chip:disabled {
+      opacity: 0.35;
+      cursor: not-allowed;
+    }
+    .preset-chip.active {
+      background: rgba(138,180,255,0.16);
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+    .cmp-preset-row {
+      margin: 6px 0 12px;
+      padding: 8px 12px;
+      background: rgba(255,255,255,0.02);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+    .bd-compare-summary .pp { font-weight: 600; }
+    .bd-compare-summary .pp.up { color: var(--success); }
+    .bd-compare-summary .pp.down { color: var(--danger); }
+    .bd-tile-delta {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 0.74rem;
+      font-weight: 600;
+      padding: 2px 7px;
+      border-radius: 999px;
+      margin-top: -2px;
+      letter-spacing: 0.02em;
+      font-variant-numeric: tabular-nums;
+    }
+    .bd-tile-delta.up { color: var(--success); background: rgba(94,227,151,0.12); }
+    .bd-tile-delta.down { color: var(--danger); background: rgba(255,138,138,0.12); }
+    .bd-tile-delta.flat { color: var(--muted); background: rgba(255,255,255,0.05); }
+    .bd-tile-delta.new { color: var(--accent); background: rgba(138,180,255,0.12); }
+    .bd-tile-delta-sub {
+      font-size: 0.68rem;
+      color: var(--muted);
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      font-weight: 600;
+      margin-top: -2px;
+    }
+    .bd-tab {
+      padding: 6px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--muted);
+      font-family: var(--font);
+      font-size: 0.78rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      cursor: pointer;
+      transition: border-color 0.12s ease, color 0.12s ease, background 0.12s ease;
+    }
+    .bd-tab:hover { color: var(--text); border-color: rgba(255,255,255,0.22); }
+    .bd-tab.active {
+      color: #0a0a0d;
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+    .breakdown-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 12px;
+    }
+    .bd-tile {
+      padding: 14px 16px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .bd-tile.is-nce { border-color: rgba(138,180,255,0.32); background: rgba(138,180,255,0.04); }
+    .bd-tile-label {
+      font-size: 0.74rem;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .bd-tile.is-nce .bd-tile-label { color: var(--accent); }
+    .bd-tile-mc {
+      font-size: 1.6rem;
+      font-weight: 700;
+      letter-spacing: -0.025em;
+      color: var(--text);
+      font-variant-numeric: tabular-nums;
+    }
+    .bd-tile-mc.warn { color: var(--warn); }
+    .bd-tile-mc.bad { color: var(--danger); }
+    .bd-tile-mc.ok { color: var(--success); }
+    .bd-tile-sub {
+      margin-top: -4px;
+      font-size: 0.7rem;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .bd-tile-stats {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px 14px;
+      font-size: 0.78rem;
+      color: var(--text-dim);
+      font-variant-numeric: tabular-nums;
+    }
+    .bd-tile-stats .stat .lbl {
+      color: var(--muted);
+      font-size: 0.68rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-right: 4px;
+    }
+    .bd-empty {
+      grid-column: 1 / -1;
+      text-align: center;
+      padding: 24px 8px;
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+
+    /* --- Snapshot-history compare panel ---------------------------------- */
+    .cmp-controls {
+      display: flex;
+      align-items: end;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 14px;
+    }
+    .cmp-field { display: flex; flex-direction: column; gap: 4px; }
+    .cmp-field span {
+      font-size: 0.7rem;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .cmp-field select {
+      padding: 7px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--surface-elev);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 0.88rem;
+      font-variant-numeric: tabular-nums;
+      cursor: pointer;
+      min-width: 160px;
+    }
+    .cmp-arrow { color: var(--muted); padding: 0 4px 8px; align-self: end; }
+    .cmp-clear {
+      align-self: end;
+      padding: 7px 14px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text-dim);
+      font-family: var(--font);
+      font-size: 0.82rem;
+      cursor: pointer;
+    }
+    .cmp-clear:hover { border-color: var(--accent); color: var(--text); }
+    .cmp-summary {
+      display: none;
+      padding: 14px 16px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--bg1);
+      margin-bottom: 14px;
+    }
+    .cmp-summary.active { display: block; }
+    .cmp-summary-head {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    .cmp-summary-head strong { font-weight: 600; color: var(--text); }
+    .cmp-summary-head .span {
+      font-size: 0.78rem;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+    .cmp-stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 12px;
+    }
+    .cmp-stat {
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface);
+    }
+    .cmp-stat .lbl {
+      font-size: 0.66rem;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .cmp-stat .val {
+      display: block;
+      margin-top: 4px;
+      font-size: 1.1rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--text);
+      font-variant-numeric: tabular-nums;
+    }
+    .cmp-stat .delta {
+      display: block;
+      margin-top: 2px;
+      font-size: 0.78rem;
+      font-variant-numeric: tabular-nums;
+    }
+    .cmp-stat .delta.up { color: var(--success); }
+    .cmp-stat .delta.down { color: var(--danger); }
+    .cmp-stat .delta.neg-up { color: var(--danger); }
+    .cmp-stat .delta.neg-down { color: var(--success); }
+    .cmp-stat .delta.flat { color: var(--subtle); }
+
+    /* --- WO tab "Latest only" pill --------------------------------------- */
+    .wo-asof-pill {
+      display: inline-flex;
+      align-items: center;
+      padding: 6px 12px;
+      border-radius: 999px;
+      font-size: 0.74rem;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--accent);
+      background: var(--accent-soft);
+      border: 1px solid rgba(138,180,255,0.24);
+      white-space: nowrap;
+    }
+    .wo-asof-pill::before {
+      content: "● ";
+      color: var(--accent);
+      margin-right: 4px;
+    }
+
+    /* --- KPI deltas ------------------------------------------------------- */
+    .kpi-strip .kpi-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .kpi-compare {
+      font-size: 0.68rem;
+      font-weight: 500;
+      color: var(--subtle);
+      text-transform: none;
+      letter-spacing: 0;
+    }
+    .kpi-compare strong { color: var(--muted); font-weight: 500; }
+    .kpi-cell .delta {
+      margin-top: 6px;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 0.74rem;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+      color: var(--muted);
+      letter-spacing: 0;
+      text-transform: none;
+    }
+    .kpi-cell .delta .arrow { font-size: 0.7rem; line-height: 1; }
+    .kpi-cell .delta.up { color: var(--success); }
+    .kpi-cell .delta.down { color: var(--danger); }
+    .kpi-cell .delta.flat { color: var(--muted); }
+    /* For metrics where "up" is bad (NMC) and "down" is bad (FMC, MC%) */
+    .kpi-cell .delta.neg-up { color: var(--danger); }
+    .kpi-cell .delta.neg-down { color: var(--success); }
+
+    /* --- Below-MEL problem panel ----------------------------------------- */
+    .problem-card { padding: 28px 30px; }
+    .problem-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 24px;
+      margin-bottom: 20px;
+    }
+    .problem-header h3 {
+      margin: 0 0 6px;
+      font-size: 1.05rem;
+      font-weight: 600;
+      letter-spacing: -0.015em;
+      text-transform: none;
+      color: var(--text);
+    }
+    .problem-header .hint {
+      margin: 0;
+      font-size: 0.86rem;
+      color: var(--muted);
+      line-height: 1.5;
+      max-width: 56ch;
+    }
+    .problem-stat {
+      flex-shrink: 0;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+    .problem-stat .big {
+      display: block;
+      font-size: 1.65rem;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      color: var(--danger);
+      line-height: 1;
+    }
+    .problem-stat .big.ok { color: var(--success); }
+    .problem-stat .sub {
+      display: block;
+      margin-top: 4px;
+      font-size: 0.72rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+    }
+    .problem-list { display: flex; flex-direction: column; }
+    .problem-row {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      align-items: center;
+      gap: 16px;
+      padding: 14px 4px;
+      border-top: 1px solid var(--border);
+      cursor: pointer;
+      transition: background 0.12s ease, padding 0.12s ease;
+      border-radius: 8px;
+      margin: 0 -8px;
+      padding-left: 12px;
+      padding-right: 12px;
+    }
+    .problem-row:first-child { border-top: 0; }
+    .problem-row:hover { background: var(--accent-soft); }
+    .problem-row .wo-ref {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 0;
+    }
+    .problem-row .wo-id {
+      font-family: var(--font-mono);
+      font-size: 0.88rem;
+      font-weight: 500;
+      color: var(--text);
+      letter-spacing: -0.01em;
+    }
+    .problem-row .wo-asset {
+      font-size: 0.76rem;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+    .problem-row .wo-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      font-size: 0.8rem;
+      color: var(--text-dim);
+      font-variant-numeric: tabular-nums;
+      min-width: 0;
+    }
+    .problem-row .wo-meta .item { display: inline-flex; align-items: center; gap: 6px; }
+    .problem-row .wo-meta .lbl { color: var(--muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; }
+    .problem-row .wo-meta .val { color: var(--text-dim); }
+    .problem-row .wo-meta .val.danger { color: var(--danger); font-weight: 600; }
+    .problem-row .wo-meta .val.warn { color: var(--warn); }
+    .problem-row .chev {
+      color: var(--subtle);
+      font-size: 1.1rem;
+      line-height: 1;
+    }
+    .problem-row:hover .chev { color: var(--accent); }
+    .problem-empty {
+      padding: 18px 4px;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+    @media (max-width: 640px) {
+      .problem-header { flex-direction: column; align-items: flex-start; }
+      .problem-stat { text-align: left; }
+      .problem-row { grid-template-columns: 1fr; gap: 6px; }
+      .problem-row .chev { display: none; }
+    }
+
+    /* --- Compare delta cell ----------------------------------------------- */
+    .compare-table .delta {
+      font-size: 0.78rem;
+      font-weight: 500;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+    .compare-table .delta.up { color: var(--success); }
+    .compare-table .delta.down { color: var(--danger); }
+    .compare-table .delta.neg-up { color: var(--danger); }
+    .compare-table .delta.neg-down { color: var(--success); }
+    .compare-table .delta.flat { color: var(--subtle); }
+
+    /* --- Downloads compact ------------------------------------------------ */
+    .downloads-row .dl-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    @media (max-width: 560px) { .downloads-row .dl-row { grid-template-columns: 1fr; } }
+
+    /* --- Ingest footer ---------------------------------------------------- */
+    .ingest-footer {
+      margin: 24px 0 0;
+      padding-top: 16px;
+      border-top: 1px solid var(--border);
+      font-size: 0.78rem;
+      color: var(--subtle);
+      font-variant-numeric: tabular-nums;
+      line-height: 1.5;
+    }
+    .ingest-footer strong { color: var(--muted); font-weight: 500; }
+
+    /* --- Work Orders split-pane layout ----------------------------------- */
+    .wo-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 420px) 1fr;
+      gap: 20px;
+      align-items: start;
+    }
+    @media (max-width: 960px) { .wo-layout { grid-template-columns: 1fr; } }
+
+    .wo-sidebar {
+      position: sticky;
+      top: 20px;
+      border-radius: var(--radius-lg);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      padding: 18px 18px 10px;
+      box-shadow: var(--shadow-md);
+      max-height: calc(100vh - 40px);
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+    @media (max-width: 960px) { .wo-sidebar { position: static; max-height: none; } }
+
+    .wo-searchbar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    .wo-searchbar input {
+      flex: 1 1 200px;
+      min-width: 0;
+      padding: 11px 14px;
+      font-family: var(--font);
+      font-size: 0.92rem;
+      font-weight: 500;
+      color: var(--text);
+      background: var(--bg1);
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius-sm);
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+    .wo-searchbar input::placeholder { color: var(--subtle); }
+    .wo-searchbar input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+    .wo-searchbar select { padding: 10px 38px 10px 12px; font-size: 0.86rem; background-color: var(--bg1); }
+
+    .wo-filters {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-bottom: 12px;
+    }
+    .wo-filter-btn {
+      font-family: var(--font);
+      font-size: 0.76rem;
+      font-weight: 500;
+      padding: 6px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--border-strong);
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      transition: color 0.12s ease, border-color 0.12s ease, background 0.12s ease;
+    }
+    .wo-filter-btn:hover { color: var(--text); border-color: rgba(255,255,255,0.2); }
+    .wo-filter-btn.active {
+      background: var(--accent-soft);
+      border-color: rgba(138,180,255,0.4);
+      color: var(--accent-strong);
+    }
+    .wo-filter-btn .count {
+      margin-left: 6px;
+      font-size: 0.7rem;
+      font-weight: 600;
+      color: var(--subtle);
+      font-variant-numeric: tabular-nums;
+    }
+    .wo-filter-btn.active .count { color: var(--accent-strong); }
+
+    .wo-refine {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 8px;
+      padding: 4px 0 10px;
+    }
+    @media (max-width: 700px) { .wo-refine { grid-template-columns: 1fr 1fr; } }
+    .wo-refine-sel {
+      font-size: 0.78rem;
+      padding: 8px 28px 8px 10px;
+      min-width: 0;
+      width: 100%;
+      border-radius: 10px;
+    }
+    .wo-refine-sel option { background: var(--surface); color: var(--text); }
+
+    .wo-card .meta-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px 6px;
+      margin-top: 2px;
+    }
+    .wo-card .meta-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 0.66rem;
+      font-weight: 500;
+      padding: 2px 7px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.04);
+      color: var(--text-dim);
+      letter-spacing: 0.01em;
+      font-variant-numeric: tabular-nums;
+    }
+    .wo-card .meta-chip .lbl {
+      color: var(--muted);
+      font-weight: 500;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      font-size: 0.6rem;
+    }
+
+    .wo-list-meta {
+      font-size: 0.74rem;
+      color: var(--muted);
+      padding: 4px 2px 10px;
+      border-bottom: 1px solid var(--border);
+      letter-spacing: 0.02em;
+    }
+    .wo-list {
+      overflow-y: auto;
+      margin: 0 -8px;
+      padding: 4px 8px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      flex: 1 1 auto;
+      min-height: 0;
+    }
+    .wo-list::-webkit-scrollbar { width: 6px; }
+    .wo-list::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 999px; }
+
+    .wo-card {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 12px 14px 12px 18px;
+      border-radius: 12px;
+      border: 1px solid transparent;
+      background: transparent;
+      cursor: pointer;
+      transition: background 0.12s ease, border-color 0.12s ease;
+      text-align: left;
+      font-family: var(--font);
+    }
+    .wo-card::before {
+      content: "";
+      position: absolute;
+      left: 6px;
+      top: 14px;
+      bottom: 14px;
+      width: 2px;
+      border-radius: 2px;
+      background: transparent;
+      transition: background 0.15s ease;
+    }
+    .wo-card[data-tier="below"]::before { background: var(--danger); }
+    .wo-card[data-tier="at"]::before { background: var(--warn); }
+    .wo-card[data-tier="above"]::before { background: var(--success); }
+    .wo-card:hover { background: var(--bg1); border-color: var(--border); }
+    .wo-card.active {
+      background: var(--accent-soft);
+      border-color: rgba(138,180,255,0.4);
+    }
+    .wo-card .top-line {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .wo-card .wo-id {
+      font-family: var(--font-mono);
+      font-size: 0.88rem;
+      font-weight: 500;
+      color: var(--text);
+      letter-spacing: -0.01em;
+    }
+    .wo-card .asset {
+      font-size: 0.76rem;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+    .wo-card .badges { display: inline-flex; gap: 6px; align-items: center; flex-shrink: 0; }
+    .wo-card .chip {
+      font-size: 0.62rem;
+      font-weight: 600;
+      padding: 2px 7px;
+      border-radius: 999px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .wo-card .chip.stale { background: rgba(255,138,138,0.14); color: var(--danger); }
+    .wo-card .chip.ok { background: rgba(94,227,151,0.12); color: var(--success); }
+    /* Last-sighting pill, reused everywhere an asset id renders. */
+    .sighting-badge {
+      display: inline-flex; align-items: center; gap: 4px;
+      font-size: 0.7rem; font-weight: 500;
+      padding: 1px 8px; border-radius: 999px;
+      border: 1px solid transparent;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap; line-height: 1.4;
+      vertical-align: baseline;
+    }
+    .sighting-badge .sighting-pin { font-size: 0.78em; opacity: 0.85; }
+    .sighting-badge.sighting-fresh { background: rgba(94,227,151,0.10); color: #8bd9ae; border-color: rgba(94,227,151,0.25); }
+    .sighting-badge.sighting-stale { background: rgba(245,199,84,0.12);  color: #e6c66d; border-color: rgba(245,199,84,0.30); }
+    .sighting-badge.sighting-old   { background: rgba(255,138,138,0.10); color: #e69b9b; border-color: rgba(255,138,138,0.30); }
+    .sighting-badge.sighting-never { background: rgba(255,255,255,0.04); color: var(--muted); border-color: rgba(255,255,255,0.08); }
+    .wo-card .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 14px;
+      font-size: 0.76rem;
+      color: var(--text-dim);
+      font-variant-numeric: tabular-nums;
+    }
+    .wo-card .meta .k { color: var(--muted); }
+    .wo-card .meta .v.danger { color: var(--danger); font-weight: 600; }
+    .wo-card .meta .v.warn { color: var(--warn); }
+    .wo-card .remark-snippet {
+      font-size: 0.78rem;
+      color: var(--muted);
+      line-height: 1.4;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      word-break: break-word;
+    }
+
+    /* NCE chip + WO open date + WO reason chips on cards */
+    .chip.nce {
+      background: rgba(138,180,255,0.15);
+      color: var(--accent);
+      border: 1px solid rgba(138,180,255,0.42);
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 0.66rem;
+    }
+    .wo-card[data-nce="1"] {
+      box-shadow: inset 3px 0 0 var(--accent);
+    }
+    .wo-meta-line {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 14px;
+      margin-top: 6px;
+      font-size: 0.74rem;
+      color: var(--muted);
+    }
+    .wo-opened {
+      font-variant-numeric: tabular-nums;
+    }
+    .wo-reason {
+      margin-top: 6px;
+      font-size: 0.78rem;
+      color: var(--text-dim);
+      line-height: 1.45;
+      background: rgba(138,180,255,0.04);
+      border-left: 2px solid rgba(138,180,255,0.32);
+      padding: 4px 10px;
+      border-radius: 4px;
+    }
+    .wo-reason .lbl {
+      display: inline-block;
+      margin-right: 8px;
+      font-size: 0.62rem;
+      letter-spacing: 0.10em;
+      text-transform: uppercase;
+      color: var(--subtle);
+      font-weight: 700;
+    }
+
+    /* --- WO detail pane --------------------------------------------------- */
+    .wo-detail-pane {
+      border-radius: var(--radius-lg);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      padding: 28px 30px;
+      box-shadow: var(--shadow-md);
+      min-height: 300px;
+    }
+    @media (max-width: 640px) { .wo-detail-pane { padding: 22px 20px; } }
+
+    .wo-empty {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 260px;
+      color: var(--muted);
+      font-size: 0.95rem;
+      text-align: center;
+      padding: 20px;
+      line-height: 1.55;
+    }
+
+    /* --- Detail pane: hero + kpis ---------------------------------------- */
+    .wo-hero {
+      padding: 2px 0 18px;
+      border-bottom: 1px solid var(--border);
+    }
+    .wo-hero-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .wo-hero-id {
+      font-family: var(--font-mono);
+      font-size: 1.18rem;
+      font-weight: 500;
+      color: var(--text);
+      letter-spacing: -0.015em;
+      line-height: 1.15;
+    }
+    .wo-chip {
+      font-size: 0.66rem;
+      font-weight: 600;
+      padding: 3px 9px;
+      border-radius: 999px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      border: 1px solid transparent;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      line-height: 1.3;
+    }
+    .wo-chip.stale { background: rgba(245,199,84,0.12); color: var(--warn); border-color: rgba(245,199,84,0.3); }
+    .wo-chip.ok { background: rgba(94,227,151,0.1); color: var(--success); border-color: rgba(94,227,151,0.28); }
+    .wo-chip.tier-below { background: rgba(255,138,138,0.14); color: var(--danger); border-color: rgba(255,138,138,0.3); }
+    .wo-chip.tier-at { background: rgba(245,199,84,0.14); color: var(--warn); border-color: rgba(245,199,84,0.3); }
+    .wo-chip.tier-above { background: rgba(94,227,151,0.14); color: var(--success); border-color: rgba(94,227,151,0.3); }
+    .wo-chip.tier-unknown { background: rgba(255,255,255,0.05); color: var(--muted); border-color: rgba(255,255,255,0.08); }
+    .wo-chip.nce {
+      background: rgba(138,180,255,0.14);
+      color: var(--accent);
+      border-color: rgba(138,180,255,0.42);
+      letter-spacing: 0.10em;
+      font-weight: 700;
+    }
+    .wo-hero-reason {
+      margin-top: 14px;
+      padding: 10px 14px;
+      background: rgba(138,180,255,0.05);
+      border-left: 3px solid rgba(138,180,255,0.38);
+      border-radius: 6px;
+      color: var(--text-dim);
+      font-size: 0.92rem;
+      line-height: 1.5;
+    }
+    .wo-hero-reason .lbl {
+      display: inline-block;
+      margin-right: 10px;
+      font-size: 0.62rem;
+      letter-spacing: 0.10em;
+      text-transform: uppercase;
+      color: var(--subtle);
+      font-weight: 700;
+    }
+    .wo-hero-sub {
+      margin-top: 6px;
+      font-size: 0.82rem;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+    .wo-hero-sub .dot {
+      margin: 0 8px;
+      color: var(--subtle);
+    }
+    /* Asset id should read as the second-most-important identity on the page
+       (after the WO id itself). Mono so it visually pairs, brighter than the
+       surrounding muted sub text, and a hair below WO id in size. */
+    .wo-hero-sub .wo-hero-asset {
+      font-family: var(--font-mono);
+      color: var(--text);
+      font-weight: 500;
+      font-size: 0.95rem;
+      letter-spacing: -0.005em;
+      margin-right: 2px;
+    }
+    /* Inline reason chip — same visual language as the meta-chips elsewhere,
+       lives on the sub line so it doesn't dominate as its own row. */
+    .wo-hero-sub .wo-hero-reason-chip {
+      display: inline-flex;
+      align-items: baseline;
+      gap: 6px;
+      padding: 1px 8px;
+      border-radius: 6px;
+      background: rgba(138,180,255,0.06);
+      border: 1px solid rgba(138,180,255,0.18);
+      color: var(--text-dim);
+      font-variant-numeric: normal;
+    }
+    .wo-hero-sub .wo-hero-reason-chip .lbl {
+      font-size: 0.62rem;
+      letter-spacing: 0.10em;
+      text-transform: uppercase;
+      color: var(--subtle);
+    }
+
+    .wo-kpis {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin: 18px 0 4px;
+      container-type: inline-size;
+      container-name: kpis;
+    }
+    @container kpis (max-width: 560px) {
+      .wo-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    .wo-kpi {
+      padding: 12px 14px;
+      background: var(--bg1);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      min-width: 0;
+    }
+    .wo-kpi .k-label {
+      font-size: 0.62rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .wo-kpi .k-value {
+      font-size: 1.15rem;
+      font-weight: 600;
+      letter-spacing: -0.03em;
+      color: var(--text);
+      font-variant-numeric: tabular-nums;
+      line-height: 1.15;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    @container kpis (min-width: 700px) {
+      .wo-kpi .k-value { font-size: 1.35rem; letter-spacing: -0.02em; }
+    }
+    .wo-kpi .k-sub {
+      font-size: 0.72rem;
+      color: var(--subtle);
+      font-variant-numeric: tabular-nums;
+      line-height: 1.3;
+    }
+    /* The "ETIC pushes" sub shows two dates joined by an arrow. Allow a wrap
+       only between the dates so each date stays intact on its own line. */
+    .wo-kpi .k-sub .arrow-sep {
+      display: inline-block;
+      margin: 0 4px;
+    }
+    .wo-kpi.warn .k-value { color: var(--warn); }
+    .wo-kpi.danger .k-value { color: var(--danger); }
+    .wo-kpi.dim .k-value { color: var(--text-dim); }
+
+    /* --- WO Timeline ------------------------------------------------------ */
+    .wo-timeline-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: 28px;
+    }
+    .wo-section-title {
+      margin: 0 0 12px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--muted);
+    }
+    .wo-timeline { position: relative; }
+    .wo-tl-day {
+      position: relative;
+      padding: 14px 0 12px 26px;
+      border-bottom: 1px solid var(--border);
+    }
+    .wo-tl-day:last-child { border-bottom: 0; }
+    .wo-tl-day::before {
+      content: "";
+      position: absolute;
+      left: 7px;
+      top: 10px;
+      bottom: 0;
+      width: 1px;
+      background: var(--border-strong);
+    }
+    .wo-tl-day:last-child::before { bottom: 16px; }
+    .wo-tl-date {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 0 0 8px -26px;
+      padding-left: 26px;
+      position: relative;
+      font-size: 0.82rem;
+      font-weight: 500;
+      color: var(--text-dim);
+      letter-spacing: -0.005em;
+      font-variant-numeric: tabular-nums;
+    }
+    .wo-tl-date::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 15px;
+      height: 15px;
+      border-radius: 50%;
+      background: var(--surface);
+      border: 2px solid var(--border-strong);
+      box-shadow: 0 0 0 3px var(--bg0);
+    }
+    .wo-tl-day.has-slip .wo-tl-date::before { border-color: var(--danger); }
+    .wo-tl-day.has-mel .wo-tl-date::before { border-color: var(--accent); }
+    .wo-tl-day.has-remarks .wo-tl-date::before { border-color: var(--accent-strong); }
+    .wo-tl-day.has-initial .wo-tl-date::before { border-color: var(--muted); background: var(--muted); }
+    .wo-tl-date .dow {
+      color: var(--subtle);
+      font-weight: 400;
+      font-size: 0.78rem;
+    }
+    .wo-tl-date .ago {
+      margin-left: auto;
+      font-size: 0.72rem;
+      color: var(--subtle);
+      font-weight: 400;
+    }
+    .wo-tl-events {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .wo-tl-event {
+      display: grid;
+      grid-template-columns: 110px 1fr;
+      gap: 14px;
+      align-items: baseline;
+      padding: 4px 0;
+    }
+    @media (max-width: 520px) { .wo-tl-event { grid-template-columns: 1fr; gap: 4px; } }
+    .wo-tl-event .ev-label {
+      font-size: 0.62rem;
+      font-weight: 600;
+      padding: 3px 8px;
+      border-radius: 999px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      background: rgba(255,255,255,0.04);
+      color: var(--text-dim);
+      justify-self: start;
+      line-height: 1.3;
+    }
+    .wo-tl-event.field-etic_date_slip .ev-label { background: rgba(255,138,138,0.12); color: var(--danger); }
+    .wo-tl-event.field-etic .ev-label { background: rgba(245,199,84,0.1); color: var(--warn); }
+    .wo-tl-event.field-mel_tier .ev-label { background: rgba(138,180,255,0.1); color: var(--accent); }
+    .wo-tl-event.field-remarks .ev-label { background: rgba(167,196,255,0.1); color: var(--accent-strong); }
+    .wo-tl-event.field-parts_status .ev-label { background: rgba(94,227,151,0.1); color: var(--success); }
+    .wo-tl-event.field-shop .ev-label { background: rgba(255,196,61,0.12); color: var(--warn); }
+    .wo-tl-event.field-initial .ev-label { background: rgba(138,143,155,0.1); color: var(--muted); }
+    /* FM&A hand-logged actions in the timeline */
+    .wo-tl-event.fma-action {
+      border-left: 2px solid rgba(167,196,255,0.45);
+      padding-left: 10px;
+    }
+    .wo-tl-event.fma-action .ev-label {
+      background: rgba(167,196,255,0.16);
+      color: var(--accent);
+    }
+    .wo-tl-event.fma-action .ev-body { font-size: 0.86rem; }
+    .fma-actor {
+      font-size: 0.74rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-right: 6px;
+    }
+    .fma-status {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 0.68rem;
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 999px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      margin-left: 8px;
+      vertical-align: 1px;
+    }
+    .fma-status.pending  { background: rgba(255,196,61,0.14); color: var(--warn); }
+    .fma-status.confirmed{ background: rgba(94,227,151,0.14); color: var(--success); }
+    .fma-status.missed   { background: rgba(255,138,138,0.14); color: var(--danger); }
+    .fma-note {
+      display: block;
+      margin-top: 4px;
+      color: var(--text-dim);
+      font-style: italic;
+    }
+    .fma-delete {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.68rem;
+      padding: 2px 8px;
+      border-radius: 999px;
+      cursor: pointer;
+      margin-left: 8px;
+    }
+    .fma-delete:hover { color: var(--danger); border-color: rgba(255,138,138,0.4); }
+
+    /* FM&A action input card (above timeline) */
+    .wo-action-card {
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 0;
+      margin: 18px 0 14px;
+      background: rgba(167,196,255,0.04);
+    }
+    .wo-action-summary {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 12px;
+      align-items: center;
+      padding: 14px 18px;
+      cursor: pointer;
+      list-style: none;
+    }
+    .wo-action-summary::-webkit-details-marker { display: none; }
+    .wo-action-title {
+      font-weight: 700;
+      font-size: 0.95rem;
+      color: var(--text);
+    }
+    .wo-action-hint {
+      font-size: 0.78rem;
+      color: var(--muted);
+    }
+    .wo-action-chev {
+      color: var(--muted);
+      transition: transform 0.18s ease;
+    }
+    .wo-action-card[open] .wo-action-chev { transform: rotate(180deg); }
+    .wo-action-form {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding: 0 18px 18px;
+    }
+    .wo-action-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    @media (max-width: 560px) { .wo-action-row { grid-template-columns: 1fr; } }
+    .wo-action-actions {
+      grid-template-columns: auto 1fr;
+      align-items: center;
+    }
+    .wo-action-field {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 0.72rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      font-weight: 600;
+    }
+    .wo-action-field input,
+    .wo-action-field select {
+      background: var(--surface);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 0.9rem;
+      font-family: var(--font);
+      font-weight: 500;
+      letter-spacing: normal;
+      text-transform: none;
+    }
+    .wo-action-field input:focus,
+    .wo-action-field select:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(138,180,255,0.18);
+    }
+    .wo-action-status {
+      font-size: 0.78rem;
+      color: var(--muted);
+      font-weight: 500;
+      letter-spacing: normal;
+      text-transform: none;
+    }
+    .wo-action-status.ok  { color: var(--success); }
+    .wo-action-status.err { color: var(--danger); }
+    .wo-action-status.busy { color: var(--accent); }
+    .wo-tl-event .ev-body {
+      font-size: 0.88rem;
+      color: var(--text-dim);
+      line-height: 1.5;
+      word-break: break-word;
+    }
+    .wo-tl-event .ev-body del {
+      color: var(--subtle);
+      text-decoration: line-through;
+      text-decoration-color: rgba(255,138,138,0.55);
+    }
+    .wo-tl-event .ev-body ins {
+      color: var(--text);
+      text-decoration: none;
+      background: rgba(94,227,151,0.12);
+      padding: 1px 4px;
+      border-radius: 4px;
+    }
+    .wo-tl-event .ev-body .arrow {
+      color: var(--subtle);
+      margin: 0 8px;
+      font-weight: 400;
+    }
+    .wo-tl-event .ev-body .slip {
+      margin-left: 8px;
+      font-size: 0.74rem;
+      color: var(--danger);
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+    .wo-tl-event .ev-body .tier-pill {
+      display: inline-block;
+      font-size: 0.66rem;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 999px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      margin: 0 2px;
+    }
+    .wo-timeline-empty { color: var(--muted); font-size: 0.88rem; padding: 12px 0; }
+
+    /* --- Adjustments ------------------------------------------------------ */
+    .hero { padding-top: 0; margin-bottom: 24px; padding-bottom: 22px; }
+
+    /* ==================== MEL tab ======================================== */
+    #panel-mel .hidden { display: none; }
+
+    /* View-mode toggle: list vs critical slide. */
+    .mel-viewmode {
+      display: inline-flex; gap: 0; margin: 0 0 14px;
+      background: var(--bg1); border: 1px solid var(--border); border-radius: 10px; padding: 4px;
+    }
+    .mel-vm-btn {
+      background: transparent; border: 0; color: var(--muted);
+      padding: 6px 14px; font-size: 0.82rem; font-weight: 600;
+      border-radius: 7px; cursor: pointer; letter-spacing: 0.02em;
+    }
+    .mel-vm-btn:hover { color: var(--text); }
+    .mel-vm-btn.active { background: var(--surface); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,0.2); }
+
+    /* Critical chip in the status filter strip. */
+    .mel-filter-btn.critical { color: #f7d96b; }
+    .mel-filter-btn.critical.active { background: rgba(247,217,107,0.16); border-color: rgba(247,217,107,0.5); color: #ffe486; }
+
+    /* Wrap so the star can sit alongside the card without breaking the
+     * existing button click handler. */
+    .mel-card-wrap { position: relative; display: block; }
+    .mel-card-wrap .mel-card { padding-right: 38px; }
+    .mel-card-star {
+      position: absolute; top: 8px; right: 8px;
+      background: transparent; border: 1px solid transparent;
+      color: var(--text-dim); width: 26px; height: 26px;
+      border-radius: 6px; cursor: pointer; font-size: 0.95rem;
+      display: inline-flex; align-items: center; justify-content: center;
+      z-index: 2;
+    }
+    .mel-card-star:hover { background: rgba(247,217,107,0.10); color: #f7d96b; }
+    .mel-card-star.on { color: #f7d96b; background: rgba(247,217,107,0.14); }
+    .mel-card.critical { border-color: rgba(247,217,107,0.45); }
+    .mel-card-type { font-size: 0.78rem; color: var(--text-dim); font-weight: 500; }
+
+    /* ---- Critical slide view ---- */
+    .mel-slide { display: block; }
+    .mel-slide.hidden { display: none; }
+    .mel-slide-meta { color: var(--muted); font-size: 0.8rem; margin-bottom: 12px; }
+    .mel-slide-body { display: flex; flex-direction: column; gap: 18px; }
+    .slide-unit {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden;
+    }
+    .slide-unit-bar {
+      background: #1f3a8a; color: #fff; font-weight: 700; letter-spacing: 0.05em;
+      padding: 8px 14px; font-size: 0.92rem; text-transform: uppercase;
+    }
+    .slide-table {
+      width: 100%; border-collapse: collapse; font-size: 0.82rem;
+      font-variant-numeric: tabular-nums;
+    }
+    .slide-table th {
+      background: var(--bg1); color: var(--text-dim);
+      text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border);
+      font-size: 0.7rem; letter-spacing: 0.06em; text-transform: uppercase;
+    }
+    .slide-table td {
+      padding: 6px 8px; border-bottom: 1px solid var(--border-soft, var(--border));
+      color: var(--text);
+    }
+    .slide-table tr.slide-row.below { background: rgba(255,90,99,0.06); }
+    .slide-table tr.slide-row.at    { background: rgba(255,194,77,0.05); }
+    .slide-table tr.slide-row.sub td { background: rgba(255,255,255,0.02); }
+    .slide-table .td-type { font-weight: 600; }
+    .slide-table .td-type.sub { padding-left: 18px; color: var(--text-dim); font-weight: 500; }
+    .slide-table .td-key { font-family: var(--mono); }
+    .slide-table .cell-bad  { background: rgba(255,90,99,0.18); color: var(--danger); font-weight: 600; }
+    .slide-table .cell-warn { background: rgba(255,194,77,0.18); color: var(--warn); font-weight: 600; }
+    .slide-table .cell-good { color: var(--success); }
+
+    /* ---- Yard check (mobile-first) ---- */
+    #panel-yard .hidden { display: none; }
+    .yard-wrap { max-width: 100%; margin: 0; padding: 0; }
+
+    /* FM&A queue: sub-tab strip */
+    .yard-subtab {
+      background: transparent; border: 0; padding: 12px 14px; cursor: pointer;
+      color: var(--muted); font: inherit; font-weight: 600; font-size: 14px;
+      border-bottom: 2px solid transparent; margin-bottom: -1px;
+    }
+    .yard-subtab:hover { color: var(--text); }
+    .yard-subtab.active { color: var(--text); border-bottom-color: var(--accent); }
+    .yard-subbadge {
+      display: inline-block; min-width: 22px; padding: 1px 8px; margin-left: 6px;
+      border-radius: 999px; background: var(--bg2); color: var(--text);
+      font-size: 12px; font-weight: 700; text-align: center;
+    }
+    .yard-subtab.active .yard-subbadge { background: var(--accent); color: var(--accent-fg); }
+
+    /* FM&A finding chips */
+    .yard-findings-chip {
+      background: var(--bg2); border: 1px solid var(--border); color: var(--text);
+      padding: 6px 12px; border-radius: 999px; font-size: 13px; cursor: pointer;
+    }
+    .yard-findings-chip.active { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 600; }
+    .yard-findings-chip .count { opacity: 0.7; margin-left: 6px; font-size: 12px; }
+
+    /* Finding cards */
+    .yard-finding {
+      display: grid; grid-template-columns: auto 1fr auto; gap: 12px 16px;
+      padding: 14px 16px; border: 1px solid var(--border); border-radius: 12px;
+      background: var(--bg1); margin-bottom: 8px;
+    }
+    .yard-finding.acked { opacity: 0.55; }
+    .yard-finding-icon {
+      width: 38px; height: 38px; border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 18px; font-weight: 700;
+    }
+    .yard-finding-icon.missing { background: #3b1416; color: var(--danger); }
+    .yard-finding-icon.unlisted { background: #3a2a05; color: var(--warn); }
+    .yard-finding-icon.discrepancy { background: #3a230f; color: var(--due); }
+    .yard-finding-icon.unknown { background: #2a1a3a; color: var(--never); }
+    .yard-finding-body { min-width: 0; }
+    .yard-finding-id { font-weight: 700; font-size: 16px; }
+    .yard-finding-meta { color: var(--muted); font-size: 13px; margin-top: 2px; }
+    .yard-finding-disc {
+      margin-top: 6px; font-size: 13px; color: var(--text);
+      white-space: pre-wrap; word-break: break-word;
+    }
+    .yard-finding-actions { display: flex; flex-direction: column; gap: 6px; align-items: flex-end; }
+    .yard-finding-actions button {
+      padding: 6px 12px; border-radius: 8px; font-size: 13px; cursor: pointer;
+      border: 1px solid var(--border); background: var(--bg2); color: var(--text);
+      white-space: nowrap;
+    }
+    .yard-finding-actions button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 600; }
+    .yard-finding-actions button.ghost { background: transparent; }
+    .yard-finding-action {
+      grid-column: 2 / -1; margin-top: 8px; padding-top: 8px;
+      border-top: 1px dashed var(--border);
+      font-size: 12px; color: var(--muted);
+    }
+    .yard-finding-action b { color: var(--text); }
+
+    /* Activity feed */
+    .yard-activity-row {
+      display: grid; grid-template-columns: 110px auto 1fr; gap: 12px;
+      padding: 10px 0; border-bottom: 1px solid var(--border); font-size: 13px;
+    }
+    .yard-activity-row .when { color: var(--muted); }
+    .yard-activity-row .what {
+      padding: 2px 8px; border-radius: 5px; font-size: 11px; font-weight: 700;
+      align-self: flex-start; text-transform: uppercase; letter-spacing: 0.4px;
+    }
+    .yard-activity-row .what.check { background: var(--bg2); color: var(--text); }
+    .yard-activity-row .what.action { background: #15321f; color: var(--ok); }
+    .yard-activity-row .who { color: var(--muted); }
+    .yard-activity-row .text { color: var(--text); }
+
+    /* Generic modal */
+    .modal-backdrop {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+      display: flex; align-items: center; justify-content: center;
+      z-index: 200; padding: 20px;
+    }
+    .modal-backdrop.hidden { display: none; }
+    .modal-card {
+      background: var(--bg1); border: 1px solid var(--border); border-radius: 14px;
+      padding: 18px; width: 100%; max-height: 90vh; overflow: auto;
+    }
+    .yard-head, .yard-session-head {
+      display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+      margin-bottom: 14px;
+    }
+    .yard-head { justify-content: space-between; }
+    .yard-session-head { justify-content: space-between; }
+    .yard-session-title { flex: 1 1 200px; min-width: 0; }
+    .yard-session-title h2 { margin: 0; font-weight: 600; letter-spacing: -0.02em; }
+    .yard-session-sub { margin: 2px 0 0; font-size: 0.8rem; color: var(--muted); }
+    .yard-back-btn { padding: 8px 12px; }
+    .yard-sessions-list {
+      display: flex; flex-direction: column; gap: 10px;
+    }
+    .yard-session-card {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+      padding: 14px 16px; display: flex; flex-direction: column; gap: 6px;
+      cursor: pointer; transition: border-color 0.15s, background 0.15s;
+    }
+    .yard-session-card:hover { border-color: var(--accent); }
+    .yard-session-card .ys-row1 { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .yard-session-card .ys-name { font-weight: 600; font-size: 1rem; }
+    .yard-session-card .ys-meta { display: flex; gap: 12px; flex-wrap: wrap; font-size: 0.8rem; color: var(--muted); }
+    .yard-session-card .ys-status {
+      padding: 2px 8px; border-radius: 999px; font-size: 0.7rem; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.04em;
+    }
+    .yard-session-card .ys-status.open { background: rgba(94,227,151,0.18); color: var(--success); }
+    .yard-session-card .ys-status.closed { background: rgba(255,255,255,0.08); color: var(--muted); }
+    .yard-progress {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+      padding: 10px 14px; margin-bottom: 12px; display: flex; flex-direction: column; gap: 6px;
+    }
+    .yard-progress-bar {
+      height: 8px; background: rgba(255,255,255,0.06); border-radius: 999px; overflow: hidden;
+    }
+    .yard-progress-fill {
+      height: 100%; background: linear-gradient(90deg, var(--accent), var(--success));
+      width: 0%; transition: width 0.3s;
+    }
+    .yard-progress-text { font-size: 0.85rem; color: var(--muted); }
+    .yard-controls {
+      display: grid; gap: 8px; margin-bottom: 8px;
+      grid-template-columns: 1fr;
+    }
+    @media (min-width: 600px) {
+      .yard-controls { grid-template-columns: 2fr 1fr; }
+    }
+    .yard-controls input {
+      width: 100%; padding: 12px 14px; font-size: 16px; /* 16px avoids iOS zoom */
+      border-radius: 10px; border: 1px solid var(--border); background: var(--surface);
+      color: var(--text);
+    }
+    .yard-filter-row {
+      display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px;
+      overflow-x: auto; padding-bottom: 4px;
+    }
+    .yard-chip {
+      padding: 8px 14px; border-radius: 999px; border: 1px solid var(--border);
+      background: var(--surface); color: var(--text); cursor: pointer;
+      font-size: 0.85rem; white-space: nowrap; min-height: 36px;
+    }
+    .yard-chip.active {
+      background: var(--accent); color: #0b1020; border-color: var(--accent);
+    }
+    .yard-asset-list {
+      display: flex; flex-direction: column; gap: 8px;
+    }
+    .yard-asset {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+      overflow: hidden;
+    }
+    .yard-asset.done { border-color: rgba(94,227,151,0.5); }
+    .yard-asset.missing { border-color: rgba(255,90,99,0.5); }
+    .yard-asset.has-discrepancy { border-color: rgba(255,184,76,0.5); }
+    .yard-asset-summary {
+      display: flex; align-items: center; gap: 12px; padding: 12px 14px;
+      cursor: pointer; min-height: 56px;
+    }
+    .yard-asset-status-icon {
+      width: 28px; height: 28px; border-radius: 50%; flex: none;
+      display: flex; align-items: center; justify-content: center;
+      background: rgba(255,255,255,0.06); color: var(--muted);
+      font-size: 0.95rem; font-weight: 700;
+    }
+    .yard-asset.done .yard-asset-status-icon { background: rgba(94,227,151,0.2); color: var(--success); }
+    .yard-asset.missing .yard-asset-status-icon { background: rgba(255,90,99,0.18); color: var(--danger); }
+    .yard-asset-id-block { flex: 1 1 auto; min-width: 0; }
+    .yard-asset-id { font-weight: 700; font-size: 1rem; letter-spacing: 0.02em; }
+    .yard-asset-meta {
+      font-size: 0.78rem; color: var(--muted); overflow: hidden;
+      text-overflow: ellipsis; white-space: nowrap;
+    }
+    .yard-asset-badges { display: flex; gap: 4px; flex-wrap: wrap; flex: none; }
+    .yard-asset-badge {
+      padding: 2px 7px; border-radius: 6px; font-size: 0.65rem; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.04em;
+      background: rgba(255,255,255,0.08); color: var(--muted);
+    }
+    .yard-asset-badge.nce { background: rgba(167,113,255,0.22); color: #c8a4ff; }
+    .yard-asset-badge.below { background: rgba(255,90,99,0.22); color: var(--danger); }
+    .yard-asset-form {
+      display: none; flex-direction: column; gap: 10px;
+      padding: 6px 14px 14px; border-top: 1px solid var(--border);
+    }
+    .yard-asset.expanded .yard-asset-form { display: flex; }
+    .yard-asset.expanded { background: rgba(255,255,255,0.02); }
+    .yard-asset-form label.field { display: flex; flex-direction: column; gap: 4px; }
+    .yard-asset-form .label { font-size: 0.78rem; color: var(--muted); font-weight: 500; }
+    .yard-asset-form input,
+    .yard-asset-form textarea {
+      width: 100%; padding: 12px 14px; font-size: 16px;
+      border-radius: 10px; border: 1px solid var(--border); background: var(--bg0);
+      color: var(--text); font-family: inherit;
+    }
+    .yard-asset-form textarea { min-height: 64px; resize: vertical; }
+    .yard-asset-form .yard-prev-loc {
+      font-size: 0.75rem; color: var(--muted); margin: -2px 0 0;
+    }
+    .yard-asset-form .yard-prev-loc button {
+      margin-left: 6px; background: none; border: 1px dashed var(--border);
+      color: var(--accent); padding: 2px 8px; border-radius: 6px; cursor: pointer;
+      font-size: 0.72rem;
+    }
+    .yard-asset-form .hint-inline {
+      font-size: 0.7rem; font-weight: 400; color: var(--muted); margin-left: 6px;
+    }
+    .yard-asset-details {
+      font-size: 0.72rem; color: var(--muted); margin: -2px 0 4px;
+      letter-spacing: 0.02em;
+    }
+    .yard-dchip-row {
+      display: flex; flex-wrap: wrap; gap: 6px;
+    }
+    .yard-dchip {
+      padding: 8px 12px; border-radius: 999px;
+      border: 1px solid var(--border); background: var(--bg0);
+      color: var(--text-dim); cursor: pointer; font-size: 0.82rem;
+      min-height: 38px; white-space: nowrap; transition: all 0.12s;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .yard-dchip:hover { border-color: var(--accent-dim); }
+    .yard-dchip.active {
+      background: rgba(255,184,76,0.18); color: #ffb84c;
+      border-color: rgba(255,184,76,0.5);
+    }
+    .yard-status-row {
+      display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px;
+    }
+    .yard-status-btn {
+      padding: 10px 8px; border-radius: 10px; border: 1px solid var(--border);
+      background: var(--bg0); color: var(--text); cursor: pointer;
+      font-size: 0.85rem; font-weight: 500; min-height: 44px;
+    }
+    .yard-status-btn.active[data-status="present"] { background: rgba(94,227,151,0.2); border-color: var(--success); color: var(--success); }
+    .yard-status-btn.active[data-status="missing"] { background: rgba(255,90,99,0.2); border-color: var(--danger); color: var(--danger); }
+    .yard-status-btn.active[data-status="unknown"] { background: rgba(255,184,76,0.2); border-color: #ffb84c; color: #ffb84c; }
+    .yard-form-actions {
+      display: flex; justify-content: space-between; gap: 8px; align-items: center; flex-wrap: wrap;
+    }
+    .yard-form-actions .save-status { font-size: 0.78rem; color: var(--muted); }
+    .yard-form-actions .save-status.saved { color: var(--success); }
+    .yard-form-actions .save-status.saving { color: #ffb84c; }
+    .yard-form-actions .save-status.error { color: var(--danger); }
+    .yard-form-actions .right-actions { display: flex; gap: 8px; margin-left: auto; }
+    .yard-form-actions button.primary { padding: 10px 18px; min-height: 44px; }
+    .yard-form-actions button.ghost { padding: 10px 14px; min-height: 44px; }
+    .yard-empty-state {
+      padding: 40px 20px; text-align: center; color: var(--muted);
+      background: var(--surface); border: 1px dashed var(--border); border-radius: 12px;
+    }
+    @media (max-width: 540px) {
+      .yard-asset-meta { font-size: 0.72rem; }
+      .yard-asset-id { font-size: 0.95rem; }
+      .yard-head h2, .yard-session-title h2 { font-size: 1.15rem; }
+    }
+
+    /* ---- Settings tab ---- */
+    #panel-settings .hidden { display: none; }
+    .settings-wrap { display: flex; flex-direction: column; gap: 18px; max-width: 1100px; margin: 0 auto; }
+    .settings-head h2 { font-weight: 600; letter-spacing: -0.02em; }
+    .settings-status { padding: 8px 12px; border-radius: 8px; font-size: 0.85rem; margin-top: 10px; }
+    .settings-status.ok  { background: rgba(94,227,151,0.12); color: var(--success); }
+    .settings-status.err { background: rgba(255,90,99,0.12); color: var(--danger); }
+    .settings-card {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+      padding: 18px 20px; display: flex; flex-direction: column; gap: 10px;
+    }
+    .settings-card .card-title { margin: 0; font-size: 1rem; font-weight: 600; }
+    .settings-card .hint { color: var(--muted); font-size: 0.82rem; margin: 0; }
+    .settings-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 4px; }
+    @media (max-width: 720px) { .settings-grid { grid-template-columns: 1fr; } }
+    .settings-actions { display: flex; gap: 10px; margin-top: 6px; flex-wrap: wrap; }
+
+    .settings-mel-controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+    .settings-mel-controls input[type=text] {
+      flex: 1 1 240px; min-width: 200px;
+      background: var(--bg1); border: 1px solid var(--border); border-radius: 8px;
+      padding: 8px 10px; color: var(--text); font-size: 0.85rem;
+    }
+    .settings-toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--text-dim); font-size: 0.85rem; cursor: pointer; }
+    .settings-mel-tbl { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+    .settings-mel-tbl th, .settings-mel-tbl td {
+      padding: 6px 8px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: middle;
+    }
+    .settings-mel-tbl th { color: var(--text-dim); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; }
+    .settings-mel-tbl td.muted { color: var(--muted); }
+    .cfg-input {
+      background: var(--bg1); border: 1px solid var(--border); border-radius: 6px;
+      padding: 5px 8px; color: var(--text); font-size: 0.82rem; width: 100%;
+    }
+    .cfg-input.small { width: 70px; }
+
+    .settings-sub-controls {
+      display: grid; gap: 8px;
+      grid-template-columns: 2fr 2fr 1.4fr repeat(6, 0.9fr) auto;
+      align-items: stretch;
+    }
+    @media (max-width: 1100px) { .settings-sub-controls { grid-template-columns: 1fr 1fr 1fr; } }
+    .settings-sub-controls input, .settings-sub-controls select {
+      background: var(--bg1); border: 1px solid var(--border); border-radius: 8px;
+      padding: 7px 9px; color: var(--text); font-size: 0.82rem;
+    }
+    .settings-sub-list { display: flex; flex-direction: column; gap: 12px; }
+    .settings-sub-group { background: var(--bg1); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
+    .settings-sub-head { font-family: var(--mono); font-weight: 600; margin-bottom: 6px; color: var(--text); }
+    .settings-sub-tbl { width: 100%; border-collapse: collapse; font-size: 0.78rem; }
+    .settings-sub-tbl th, .settings-sub-tbl td { padding: 5px 8px; border-bottom: 1px solid var(--border); text-align: left; }
+    .settings-sub-tbl th { color: var(--text-dim); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    button.ghost.danger { color: var(--danger); }
+    button.ghost.danger:hover { background: rgba(255,90,99,0.10); }
+    .mel-header {
+      display: flex; align-items: flex-start; justify-content: space-between;
+      gap: 20px; margin: 8px 0 18px;
+    }
+    .mel-title { margin: 0 0 4px; font-size: 1.55rem; font-weight: 600; letter-spacing: -0.02em; }
+    .mel-sub { margin: 0; color: var(--muted); font-size: 0.88rem; max-width: 760px; line-height: 1.45; }
+    .mel-asof { display: flex; align-items: center; gap: 10px; }
+    .mel-asof-tag {
+      font-size: 0.62rem; font-weight: 700; letter-spacing: 0.12em;
+      color: var(--muted); background: var(--bg1); border: 1px solid var(--border);
+      padding: 3px 8px; border-radius: 999px;
+    }
+    .mel-date-select {
+      background: var(--bg1); color: var(--text);
+      border: 1px solid var(--border); border-radius: 8px;
+      padding: 6px 10px; font-size: 0.85rem;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .mel-totals {
+      display: grid; grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 10px; margin-bottom: 18px;
+    }
+    @media (max-width: 1100px) { .mel-totals { grid-template-columns: repeat(3, 1fr); } }
+    @media (max-width: 640px)  { .mel-totals { grid-template-columns: repeat(2, 1fr); } }
+    .mel-total {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 12px; padding: 12px 14px;
+      display: flex; flex-direction: column; gap: 4px; min-width: 0;
+      position: relative;
+    }
+    .mel-total .lbl {
+      font-size: 0.62rem; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.1em; color: var(--muted);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .mel-total .val {
+      font-size: 1.45rem; font-weight: 600; letter-spacing: -0.02em;
+      font-variant-numeric: tabular-nums; line-height: 1.1;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .mel-total.danger .val  { color: var(--danger); }
+    .mel-total.warn .val    { color: var(--warn); }
+    .mel-total.success .val { color: var(--success); }
+    .mel-total.accent .val  { color: var(--accent); }
+    .mel-total .sub { font-size: 0.7rem; color: var(--subtle); }
+    .mel-delta {
+      display: inline-flex; align-items: center; gap: 4px;
+      font-size: 0.72rem; font-variant-numeric: tabular-nums; font-weight: 600;
+      padding: 2px 7px; border-radius: 999px;
+      background: var(--bg1); color: var(--muted);
+    }
+    .mel-delta.good { background: rgba(94,227,151,0.12); color: var(--success); }
+    .mel-delta.bad  { background: rgba(255,90,99,0.12);  color: var(--danger); }
+    .mel-delta.flat { background: var(--bg1); color: var(--subtle); }
+
+    /* --- Trend chart --- */
+    .mel-trend-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 14px; margin-bottom: 16px; padding: 0;
+    }
+    .mel-trend-summary {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 16px; padding: 14px 18px; cursor: pointer; list-style: none;
+      flex-wrap: wrap;
+    }
+    .mel-trend-summary::-webkit-details-marker { display: none; }
+    .mel-trend-title { margin: 0; font-size: 0.95rem; font-weight: 600; }
+    .mel-trend-sub { margin: 2px 0 0; color: var(--muted); font-size: 0.78rem; }
+    .mel-trend-legend {
+      display: inline-flex; gap: 14px; flex-wrap: wrap;
+      font-size: 0.72rem; color: var(--muted);
+    }
+    .mel-trend-legend .dot {
+      display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+      margin-right: 5px; vertical-align: -1px;
+    }
+    .mel-trend-legend .dot.fmc   { background: var(--success); }
+    .mel-trend-legend .dot.nmc   { background: var(--danger); }
+    .mel-trend-legend .dot.mc    { background: var(--accent); border-radius: 999px; }
+    .mel-trend-legend .dot.below { background: transparent; border: 1.5px solid var(--danger); }
+    .mel-trend-body { padding: 0 14px 16px; }
+    .mel-chart { width: 100%; display: block; }
+    .mel-chart .grid line { stroke: var(--border); stroke-dasharray: 2 3; stroke-width: 1; }
+    .mel-chart .axis text { fill: var(--muted); font-size: 9px; font-variant-numeric: tabular-nums; }
+    .mel-chart .axis path, .mel-chart .axis line { stroke: var(--border); }
+    .mel-chart .bar-fmc { fill: var(--success); fill-opacity: 0.85; }
+    .mel-chart .bar-nmc { fill: var(--danger); fill-opacity: 0.92; }
+    .mel-chart .bar.below .bar-nmc { fill: var(--danger); }
+    .mel-chart .bar.below { stroke: rgba(255,90,99,0.5); stroke-width: 1; }
+    .mel-chart .mc-line { fill: none; stroke: var(--accent); stroke-width: 2; }
+    .mel-chart .mc-dot  { fill: var(--accent); }
+    .mel-chart .hover-band { fill: rgba(94,194,255,0.08); pointer-events: none; }
+    /* The SVG <text> elements carry the .x-tick / .y-tick classes directly,
+     * not as descendants — so target the text itself. Without this rule SVG
+     * falls back to its default fill (black) and the labels disappear into
+     * the dark background. */
+    .mel-chart text.x-tick,
+    .mel-chart text.y-tick {
+      fill: var(--text-dim, #c8d0dc);
+      font-size: 10px;
+      font-variant-numeric: tabular-nums;
+    }
+    .mel-chart text.y-tick { font-size: 10px; }
+    .mel-chart .mc-band { fill: rgba(94,194,255,0.06); }
+
+    /* --- Compare bar --- */
+    .mel-compare-bar {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 10px 12px;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 12px; padding: 10px 14px;
+      margin-bottom: 14px;
+    }
+    .mel-cmp-field { display: inline-flex; align-items: center; gap: 8px; }
+    .mel-cmp-field span {
+      font-size: 0.65rem; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.1em; color: var(--muted);
+    }
+    .mel-cmp-field select {
+      background: var(--bg1); color: var(--text);
+      border: 1px solid var(--border); border-radius: 8px;
+      padding: 5px 8px; font-size: 0.82rem;
+    }
+    .mel-cmp-meta { color: var(--muted); font-size: 0.78rem; margin-left: auto; }
+
+    .mel-controls {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 12px;
+      margin-bottom: 14px;
+    }
+    .mel-filter-tabs { display: inline-flex; gap: 6px; }
+    .mel-filter-btn {
+      background: var(--bg1); color: var(--text);
+      border: 1px solid var(--border); border-radius: 999px;
+      padding: 6px 12px; font-size: 0.78rem; cursor: pointer;
+      font-weight: 500;
+    }
+    .mel-filter-btn:hover { border-color: var(--accent); }
+    .mel-filter-btn.active { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+    .mel-filter-btn .count { color: var(--subtle); font-variant-numeric: tabular-nums; margin-left: 4px; }
+    .mel-filter-btn.active .count { color: var(--bg); }
+    .mel-refine { display: inline-flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-left: auto; }
+    .mel-refine input[type="text"], .mel-refine select {
+      background: var(--bg1); color: var(--text);
+      border: 1px solid var(--border); border-radius: 8px;
+      padding: 6px 10px; font-size: 0.82rem;
+    }
+    .mel-refine input[type="text"] { min-width: 220px; }
+
+    .mel-layout {
+      display: grid; grid-template-columns: minmax(320px, 460px) 1fr;
+      gap: 20px;
+    }
+    @media (max-width: 980px) { .mel-layout { grid-template-columns: 1fr; } }
+    .mel-sidebar { min-width: 0; }
+    .mel-list-meta { color: var(--muted); font-size: 0.8rem; margin-bottom: 10px; }
+    .mel-list { display: flex; flex-direction: column; gap: 8px; max-height: 72vh; overflow-y: auto; padding-right: 4px; }
+    .mel-card {
+      text-align: left; width: 100%; cursor: pointer;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 12px; padding: 12px 14px;
+      display: flex; flex-direction: column; gap: 8px; min-width: 0;
+      transition: border-color 0.15s, transform 0.05s;
+    }
+    .mel-card:hover { border-color: var(--accent); }
+    .mel-card.active { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(94,194,255,0.15); }
+    .mel-card[data-status="below"] { box-shadow: inset 3px 0 0 var(--danger); }
+    .mel-card[data-status="at"]    { box-shadow: inset 3px 0 0 var(--warn); }
+    .mel-card[data-status="above"] { box-shadow: inset 3px 0 0 var(--success); }
+    .mel-card.active[data-status="below"] { box-shadow: inset 3px 0 0 var(--danger), 0 0 0 2px rgba(94,194,255,0.15); }
+    .mel-card.active[data-status="at"]    { box-shadow: inset 3px 0 0 var(--warn), 0 0 0 2px rgba(94,194,255,0.15); }
+    .mel-card.active[data-status="above"] { box-shadow: inset 3px 0 0 var(--success), 0 0 0 2px rgba(94,194,255,0.15); }
+    .mel-card-head { display: flex; align-items: center; gap: 8px; }
+    .mel-key {
+      font-family: var(--mono);
+      font-size: 0.92rem; font-weight: 600; color: var(--text);
+    }
+    .mel-card-pills { margin-left: auto; display: inline-flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+    .mel-pill {
+      font-size: 0.62rem; font-weight: 700; letter-spacing: 0.08em;
+      padding: 2px 8px; border-radius: 999px; text-transform: uppercase;
+    }
+    .mel-pill.below  { background: rgba(255,90,99,0.12); color: var(--danger); }
+    .mel-pill.at     { background: rgba(255,194,77,0.12); color: var(--warn); }
+    .mel-pill.above  { background: rgba(94,227,151,0.12); color: var(--success); }
+    .mel-pill.unknown{ background: var(--bg1); color: var(--muted); }
+    .mel-pill.recall { background: rgba(94,194,255,0.10); color: var(--accent); }
+    .mel-card-meta { font-size: 0.78rem; color: var(--muted); display: flex; flex-wrap: wrap; gap: 6px 12px; }
+    .mel-card-meta .b { color: var(--text-dim); }
+    .mel-counts {
+      display: grid; grid-template-columns: repeat(3, 1fr) auto; gap: 10px;
+      align-items: end;
+      font-variant-numeric: tabular-nums;
+    }
+    .mel-count {
+      display: flex; flex-direction: column; gap: 2px;
+    }
+    .mel-count .n { font-size: 1.05rem; font-weight: 600; line-height: 1; }
+    .mel-count .l { font-size: 0.62rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
+    .mel-count.fmc .n { color: var(--success); }
+    .mel-count.nmc .n { color: var(--danger); }
+    .mel-count.req .n { color: var(--text); display: inline-flex; align-items: baseline; gap: 1px; }
+    .mel-count.req .n .assigned { color: var(--text); font-weight: 700; }
+    .mel-count.req .n .slash    { color: var(--subtle); margin: 0 1px; font-weight: 400; }
+    .mel-count.req .n .need     { color: var(--muted); font-size: 0.78rem; font-weight: 600; }
+    .mel-bar {
+      grid-column: 1 / -1;
+      height: 6px; border-radius: 999px; background: rgba(255,90,99,0.18);
+      overflow: hidden; position: relative;
+    }
+    .mel-bar > .fill {
+      position: absolute; inset: 0 auto 0 0;
+      background: var(--success); border-radius: 999px;
+      transition: width 0.25s;
+    }
+    .mel-bar > .threshold {
+      position: absolute; top: -2px; bottom: -2px;
+      width: 2px; background: var(--text-dim);
+    }
+
+    .mel-detail-pane {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 14px; padding: 22px; min-width: 0;
+    }
+    .mel-empty { color: var(--muted); padding: 40px 0; text-align: center; }
+    .mel-d-hero { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
+    .mel-d-hero .key {
+      font-family: var(--mono);
+      font-size: 1.6rem; font-weight: 600; letter-spacing: -0.02em;
+    }
+    .mel-d-hero .pills { display: inline-flex; gap: 8px; flex-wrap: wrap; }
+    .mel-d-hero .meta { color: var(--muted); font-size: 0.85rem; }
+    .mel-d-grid {
+      display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px; margin-bottom: 22px;
+    }
+    @media (max-width: 700px) { .mel-d-grid { grid-template-columns: repeat(2, 1fr); } }
+    .mel-d-cell {
+      background: var(--bg1); border: 1px solid var(--border);
+      border-radius: 10px; padding: 10px 12px;
+      display: flex; flex-direction: column; gap: 4px; min-width: 0;
+    }
+    .mel-d-cell .l { font-size: 0.62rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
+    .mel-d-cell .v {
+      font-size: 1.2rem; font-weight: 600; font-variant-numeric: tabular-nums;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .mel-d-cell.danger .v  { color: var(--danger); }
+    .mel-d-cell.warn .v    { color: var(--warn); }
+    .mel-d-cell.success .v { color: var(--success); }
+    .mel-d-cell.accent .v  { color: var(--accent); }
+
+    .mel-history-head {
+      display: flex; align-items: baseline; justify-content: space-between;
+      margin-top: 8px; margin-bottom: 10px;
+    }
+    .mel-history-head h4 { margin: 0; font-size: 0.95rem; font-weight: 600; }
+    .mel-history-head .when { font-size: 0.78rem; color: var(--subtle); }
+    .mel-spark {
+      display: flex; align-items: flex-end; gap: 2px;
+      height: 60px; margin: 6px 0 18px;
+      background: var(--bg1); border: 1px solid var(--border);
+      border-radius: 10px; padding: 8px;
+      overflow-x: auto;
+    }
+    .mel-spark .col {
+      flex: 0 0 auto; width: 6px; min-height: 2px;
+      display: flex; flex-direction: column; justify-content: flex-end; gap: 1px;
+      position: relative;
+    }
+    .mel-spark .seg.fmc { background: var(--success); border-radius: 2px 2px 0 0; }
+    .mel-spark .seg.nmc { background: var(--danger); }
+    .mel-spark .col.below { outline: 1px solid rgba(255,90,99,0.6); }
+
+    /* Open work orders list inside the MEL detail pane. Each card is a button
+     * that jumps to the Work Orders tab and selects the WO. */
+    .mel-wos { display: flex; flex-direction: column; gap: 6px; margin: 4px 0 18px; }
+    .mel-wo-row {
+      display: flex; flex-direction: column; gap: 4px;
+      text-align: left; width: 100%;
+      background: var(--bg1); border: 1px solid var(--border);
+      border-radius: 10px; padding: 10px 12px;
+      color: var(--text); cursor: pointer;
+      transition: border-color 0.15s, transform 0.05s, background 0.15s;
+    }
+    .mel-wo-row:hover { border-color: var(--accent); background: rgba(94,194,255,0.04); }
+    .mel-wo-row.tier-below { box-shadow: inset 3px 0 0 var(--danger); }
+    .mel-wo-row.tier-at    { box-shadow: inset 3px 0 0 var(--warn); }
+    .mel-wo-row.tier-above { box-shadow: inset 3px 0 0 var(--success); }
+    .mel-wo-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .mel-wo-head .wo-id { font-family: var(--mono); font-weight: 700; font-size: 0.85rem; color: var(--text); }
+    .mel-wo-head .wo-asset { font-family: var(--mono); font-size: 0.78rem; color: var(--text-dim); }
+    .mel-wo-head .wo-tier {
+      font-size: 0.62rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+      padding: 2px 8px; border-radius: 999px;
+    }
+    .mel-wo-head .wo-tier.below { background: rgba(255,90,99,0.16); color: var(--danger); }
+    .mel-wo-head .wo-tier.at    { background: rgba(255,194,77,0.16); color: var(--warn); }
+    .mel-wo-head .wo-tier.above { background: rgba(94,227,151,0.16); color: var(--success); }
+    .mel-wo-head .wo-arrow { margin-left: auto; color: var(--subtle); font-size: 1.1rem; }
+    .mel-wo-meta { font-size: 0.76rem; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 6px; }
+    .mel-wo-chips { display: inline-flex; gap: 6px; flex-wrap: wrap; }
+    .mel-wo-chips .wo-chip {
+      font-size: 0.62rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+      padding: 2px 8px; border-radius: 999px;
+      background: var(--bg2, rgba(255,255,255,0.04)); color: var(--text-dim);
+    }
+    .mel-wo-chips .wo-chip.stale { background: rgba(255,90,99,0.16); color: var(--danger); }
+    .mel-wo-chips .wo-chip.warn  { background: rgba(255,194,77,0.16); color: var(--warn); }
+    .mel-wo-remarks {
+      font-size: 0.78rem; color: var(--text-dim); line-height: 1.4;
+      background: rgba(255,255,255,0.02); border-radius: 6px; padding: 6px 8px;
+      margin-top: 2px;
+    }
+
+    .mel-changelog {
+      display: flex; flex-direction: column; gap: 10px;
+      max-height: 60vh; overflow-y: auto; padding-right: 4px;
+    }
+    .mel-cl-group {
+      background: var(--bg1); border: 1px solid var(--border);
+      border-radius: 10px; overflow: hidden;
+    }
+    .mel-cl-head {
+      display: flex; align-items: center; gap: 10px;
+      padding: 8px 12px;
+      background: rgba(255,255,255,0.02);
+      border-bottom: 1px solid var(--border);
+    }
+    .mel-cl-head .d { font-variant-numeric: tabular-nums; font-weight: 700; font-size: 0.88rem; color: var(--text); letter-spacing: 0.02em; }
+    .mel-cl-head .mel-cl-count { margin-left: auto; font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
+    .mel-cl-summary-wrap { display: inline-flex; }
+    .mel-cl-summary {
+      font-size: 0.72rem; font-weight: 700; letter-spacing: 0.06em;
+      padding: 2px 8px; border-radius: 999px; text-transform: uppercase;
+    }
+    .mel-cl-summary.bad  { background: rgba(255,90,99,0.16); color: var(--danger); }
+    .mel-cl-summary.good { background: rgba(94,227,151,0.16); color: var(--success); }
+    .mel-cl-items {
+      display: flex; flex-direction: column;
+    }
+    .mel-cl-item {
+      display: grid; grid-template-columns: 110px 1fr;
+      gap: 12px; align-items: baseline;
+      padding: 6px 12px;
+      border-top: 1px solid rgba(255,255,255,0.03);
+    }
+    .mel-cl-item:first-child { border-top: 0; }
+    @media (max-width: 600px) { .mel-cl-item { grid-template-columns: 1fr; gap: 2px; } }
+    .mel-cl-item .f { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
+    .mel-cl-item .v del { color: var(--subtle); text-decoration: line-through; margin-right: 6px; }
+    .mel-cl-item .v ins { color: var(--text); text-decoration: none; background: rgba(94,194,255,0.08); padding: 1px 6px; border-radius: 3px; }
+    .mel-cl-item .v .arrow { color: var(--subtle); margin: 0 6px; }
+    .mel-cl-item.bad  .v ins { background: rgba(255,90,99,0.15); color: #ffb4b8; }
+    .mel-cl-item.good .v ins { background: rgba(94,227,151,0.15); color: #aef0c4; }
+
+    /* ==================== ETIC Meeting tab =============================== */
+    #panel-meeting .meeting-view.hidden { display: none; }
+    .card-title {
+      margin: 0 0 12px;
+      font-size: 0.95rem;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+      color: var(--text);
+    }
+    .muted { color: var(--muted); }
+
+    .meeting-setup-grid {
+      display: grid;
+      grid-template-columns: minmax(280px, 420px) minmax(320px, 1fr);
+      gap: 20px;
+      margin-bottom: 24px;
+    }
+    @media (max-width: 900px) { .meeting-setup-grid { grid-template-columns: 1fr; } }
+    .meeting-setup-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px 20px;
+    }
+    .meeting-asof-info {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      background: rgba(94,227,151,0.06);
+      border: 1px solid rgba(94,227,151,0.25);
+      padding: 8px 12px;
+      border-radius: 8px;
+    }
+    .meeting-asof-tag {
+      font-size: 0.62rem;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      color: var(--success);
+      background: rgba(94,227,151,0.15);
+      padding: 2px 8px;
+      border-radius: 999px;
+    }
+    .meeting-asof-date {
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: var(--text);
+      font-variant-numeric: tabular-nums;
+    }
+    .field {
+      display: block;
+      margin-bottom: 12px;
+    }
+    .field .label {
+      display: block;
+      font-size: 0.72rem;
+      font-weight: 500;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 6px;
+    }
+    .field input[type="text"],
+    .field input[type="number"],
+    .field select,
+    .field textarea {
+      width: 100%;
+      font-size: 0.88rem;
+      padding: 9px 12px;
+      border-radius: 10px;
+      background: var(--bg-elev);
+      border: 1px solid var(--border-strong);
+      color: var(--text);
+      font-family: inherit;
+      transition: border-color 140ms ease;
+    }
+    .field input:focus, .field select:focus, .field textarea:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    .field textarea { resize: vertical; min-height: 72px; line-height: 1.5; }
+
+    .meeting-filter-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    @media (max-width: 560px) { .meeting-filter-grid { grid-template-columns: 1fr; } }
+    .meeting-filter-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 14px;
+      padding: 4px 0 12px;
+    }
+    .mini-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.82rem;
+      color: var(--text-dim);
+      cursor: pointer;
+      user-select: none;
+    }
+    .mini-toggle input { accent-color: var(--accent); }
+
+    .meeting-preview {
+      margin: 8px 0 12px;
+      padding: 12px 14px;
+      border-radius: 10px;
+      background: rgba(138,180,255,0.06);
+      border: 1px solid rgba(138,180,255,0.2);
+      color: var(--text);
+      font-size: 0.88rem;
+      font-variant-numeric: tabular-nums;
+    }
+    .meeting-preview .bdown {
+      display: flex; flex-wrap: wrap; gap: 4px 12px;
+      margin-top: 6px;
+      font-size: 0.76rem;
+      color: var(--muted);
+    }
+    .meeting-start-row {
+      display: flex; align-items: center; gap: 12px; margin-top: 4px;
+    }
+    button.primary {
+      background: var(--accent);
+      border: 1px solid var(--accent);
+      color: #0b1220;
+      font-weight: 600;
+      padding: 10px 16px;
+      border-radius: 10px;
+      cursor: pointer;
+      font-size: 0.9rem;
+    }
+    button.primary[disabled] { opacity: 0.45; cursor: not-allowed; }
+    button.primary:not([disabled]):hover { filter: brightness(1.08); }
+    button.ghost {
+      background: transparent;
+      border: 1px solid var(--border-strong);
+      color: var(--text);
+      padding: 9px 14px;
+      border-radius: 10px;
+      cursor: pointer;
+      font-size: 0.85rem;
+    }
+    button.ghost:hover { border-color: var(--accent); }
+    button.danger {
+      background: rgba(255,138,138,0.12);
+      border: 1px solid rgba(255,138,138,0.35);
+      color: var(--danger);
+      padding: 9px 14px;
+      border-radius: 10px;
+      cursor: pointer;
+      font-size: 0.85rem;
+      font-weight: 600;
+    }
+    button.danger:hover { background: rgba(255,138,138,0.22); }
+
+    .meeting-history-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px 20px;
+    }
+    .meeting-history-head {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 10px;
+    }
+    .meeting-history-list { display: grid; gap: 8px; }
+    .meeting-history-row {
+      display: grid;
+      grid-template-columns: 130px 1fr auto;
+      gap: 12px;
+      align-items: baseline;
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: var(--bg-elev);
+      border: 1px solid var(--border);
+      cursor: pointer;
+      transition: border-color 140ms;
+    }
+    .meeting-history-row:hover { border-color: var(--accent); }
+    .meeting-history-row .when {
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
+      font-size: 0.86rem;
+    }
+    .meeting-history-row .title { color: var(--text-dim); font-size: 0.84rem; }
+    .meeting-history-row .state {
+      font-size: 0.7rem;
+      padding: 2px 8px;
+      border-radius: 999px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .meeting-history-row .state.ended { background: rgba(94,227,151,0.1); color: var(--success); }
+    .meeting-history-row .state.active { background: rgba(245,199,84,0.14); color: var(--warn); }
+
+    /* --- Live view --- */
+    .meeting-live-head {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      align-items: center;
+      gap: 16px;
+      padding: 14px 16px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      margin-bottom: 14px;
+    }
+    .meeting-live-title { font-size: 1.05rem; font-weight: 600; color: var(--text); }
+    .meeting-live-sub { font-size: 0.78rem; color: var(--muted); margin-top: 3px; }
+    .meeting-clock {
+      text-align: center;
+      padding: 8px 24px;
+      border-radius: 14px;
+      border: 1px solid var(--border-strong);
+      background: var(--bg-elev);
+      min-width: 180px;
+    }
+    .meeting-clock-time {
+      font-size: 2rem;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: -0.03em;
+      color: var(--text);
+      line-height: 1.1;
+    }
+    .meeting-clock-sub {
+      display: flex;
+      gap: 14px;
+      justify-content: center;
+      font-size: 0.72rem;
+      color: var(--muted);
+      margin-top: 3px;
+    }
+    .meeting-clock[data-state="warn"] .meeting-clock-time { color: var(--warn); }
+    .meeting-clock[data-state="warn"] { border-color: rgba(245,199,84,0.4); background: rgba(245,199,84,0.07); }
+    .meeting-clock[data-state="overtime"] .meeting-clock-time { color: var(--danger); }
+    .meeting-clock[data-state="overtime"] { border-color: rgba(255,138,138,0.4); background: rgba(255,138,138,0.08); }
+    .meeting-clock[data-state="paused"] .meeting-clock-time { color: var(--muted); }
+    .meeting-live-actions { display: flex; gap: 8px; }
+
+    .meeting-live-body {
+      display: grid;
+      grid-template-columns: minmax(240px, 320px) 1fr;
+      gap: 14px;
+      min-height: 540px;
+    }
+    @media (max-width: 900px) { .meeting-live-body { grid-template-columns: 1fr; } }
+
+    .meeting-queue {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      min-height: 0;
+    }
+    .meeting-queue-filters { display: grid; grid-template-columns: 1fr 120px; gap: 6px; }
+    .meeting-queue-filters input, .meeting-queue-filters select {
+      font-size: 0.8rem;
+      padding: 7px 10px;
+      border-radius: 8px;
+      background: var(--bg-elev);
+      border: 1px solid var(--border-strong);
+      color: var(--text);
+    }
+    .meeting-queue-list {
+      display: flex; flex-direction: column; gap: 4px;
+      overflow-y: auto;
+      max-height: 72vh;
+    }
+    .mq-item {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 8px;
+      align-items: center;
+      padding: 9px 10px;
+      border-radius: 10px;
+      border: 1px solid transparent;
+      background: transparent;
+      cursor: pointer;
+      text-align: left;
+      color: var(--text);
+      font-family: inherit;
+      transition: border-color 140ms, background 140ms;
+    }
+    .mq-item:hover { background: rgba(255,255,255,0.02); border-color: var(--border); }
+    .mq-item.active { background: rgba(138,180,255,0.08); border-color: rgba(138,180,255,0.3); }
+    .mq-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--muted);
+    }
+    .mq-item[data-status="covered"] .mq-dot { background: var(--success); }
+    .mq-item[data-status="deferred"] .mq-dot { background: var(--accent); }
+    .mq-item[data-status="skipped"] .mq-dot { background: var(--subtle); }
+    .mq-item[data-status="pending"] .mq-dot { background: var(--warn); }
+    .mq-body .wid { font-size: 0.86rem; color: var(--text); font-weight: 500; font-variant-numeric: tabular-nums; }
+    .mq-body .sub { font-size: 0.72rem; color: var(--muted); display: flex; gap: 4px 8px; flex-wrap: wrap; }
+    .mq-tier {
+      font-size: 0.62rem; padding: 1px 6px; border-radius: 999px;
+      text-transform: uppercase; letter-spacing: 0.06em;
+      background: rgba(255,255,255,0.05); color: var(--muted);
+    }
+    .mq-tier.below { background: rgba(255,138,138,0.14); color: var(--danger); }
+    .mq-tier.at { background: rgba(245,199,84,0.14); color: var(--warn); }
+    .mq-tier.above { background: rgba(94,227,151,0.14); color: var(--success); }
+
+    .meeting-focus {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px 22px;
+      display: flex; flex-direction: column; min-height: 0;
+    }
+    .meeting-focus-empty { color: var(--muted); padding: 60px 0; text-align: center; font-size: 0.88rem; }
+    .meeting-focus-body.hidden { display: none; }
+    .meeting-focus-head {
+      padding-bottom: 12px;
+      margin-bottom: 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .mf-id { font-size: 1.2rem; font-weight: 700; color: var(--text); font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+    .mf-sub { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 6px; font-size: 0.78rem; color: var(--muted); }
+    .mf-sub .tag { padding: 2px 8px; border-radius: 999px; background: rgba(255,255,255,0.04); color: var(--text-dim); font-size: 0.72rem; }
+    .mf-remarks {
+      margin-top: 10px;
+      font-size: 0.8rem;
+      line-height: 1.45;
+      color: var(--text-dim);
+      padding: 8px 10px;
+      background: var(--bg-elev);
+      border-radius: 8px;
+      border-left: 3px solid var(--accent-strong);
+      max-height: 140px;
+      overflow-y: auto;
+    }
+    /* Mini "what's on the TV" timeline inside the controller's focus pane */
+    .mf-tl { margin-top: 12px; }
+    .mf-tl-label {
+      font-size: 0.68rem;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--muted);
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+    .mf-tl-label .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
+    .mf-tl-list {
+      display: flex; flex-direction: column; gap: 4px;
+      /* Show every change but keep the controller pane compact —
+         scrolling here also drives the presenter's timeline scroll. */
+      max-height: 220px;
+      overflow-y: auto;
+      padding-right: 6px;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(255,255,255,0.18) transparent;
+    }
+    .mf-tl-list::-webkit-scrollbar { width: 8px; }
+    .mf-tl-list::-webkit-scrollbar-track { background: transparent; }
+    .mf-tl-list::-webkit-scrollbar-thumb {
+      background: rgba(255,255,255,0.18); border-radius: 4px;
+    }
+    .mf-tl-list::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.3); }
+    .mf-tl-row {
+      display: grid;
+      grid-template-columns: 76px 70px 1fr;
+      gap: 8px;
+      align-items: baseline;
+      padding: 5px 8px;
+      border-radius: 6px;
+      background: rgba(255,255,255,0.02);
+      border-left: 2px solid rgba(255,255,255,0.12);
+      font-size: 0.78rem;
+      line-height: 1.35;
+    }
+    .mf-tl-row.mfl-slip    { border-left-color: var(--danger); background: rgba(255,138,138,0.05); }
+    .mf-tl-row.mfl-remarks { border-left-color: var(--warn);   background: rgba(245,199,84,0.04); }
+    .mf-tl-row.mfl-mel     { border-left-color: var(--text);   background: rgba(255,255,255,0.03); }
+    .mf-tl-row.mfl-parts   { border-left-color: var(--success);background: rgba(94,227,151,0.04); }
+    .mf-tl-row.mfl-initial { border-left-color: rgba(255,255,255,0.18); color: var(--muted); }
+    .mf-tl-date { font-weight: 600; font-variant-numeric: tabular-nums; color: var(--text-dim); }
+    .mf-tl-kind {
+      font-size: 0.66rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .mf-tl-body { word-break: break-word; color: var(--text-dim); }
+    .mf-tl-body del { text-decoration: line-through; color: var(--subtle); }
+    .mf-tl-body ins { text-decoration: none; color: var(--text); font-weight: 600; }
+    .mf-tl-body .mfl-slip-pill {
+      display: inline-block; margin-left: 4px; padding: 0 6px;
+      border-radius: 999px; background: rgba(255,138,138,0.14); color: var(--danger);
+      font-size: 0.95em; font-weight: 600;
+    }
+    .meeting-focus-fields { display: flex; flex-direction: column; gap: 12px; }
+    .meeting-status-row {
+      display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    }
+    .meeting-status-row .label {
+      font-size: 0.72rem; font-weight: 500; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.08em;
+    }
+    .meeting-status-group { display: inline-flex; gap: 4px; }
+    .status-pill {
+      background: transparent;
+      border: 1px solid var(--border-strong);
+      color: var(--text-dim);
+      padding: 6px 12px;
+      border-radius: 999px;
+      cursor: pointer;
+      font-size: 0.78rem;
+      font-family: inherit;
+    }
+    .status-pill:hover { border-color: var(--accent); color: var(--text); }
+    .status-pill.active[data-status="covered"] { background: rgba(94,227,151,0.14); border-color: var(--success); color: var(--success); }
+    .status-pill.active[data-status="deferred"] { background: rgba(138,180,255,0.14); border-color: var(--accent); color: var(--accent); }
+    .status-pill.active[data-status="skipped"] { background: rgba(138,143,155,0.14); border-color: var(--subtle); color: var(--muted); }
+    .status-pill.active[data-status="pending"] { background: rgba(245,199,84,0.14); border-color: var(--warn); color: var(--warn); }
+    .meeting-focus-footer {
+      display: flex; align-items: center; justify-content: space-between;
+      padding-top: 6px;
+    }
+
+    /* --- Summary view --- */
+    .meeting-summary-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 14px 18px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      margin-bottom: 14px;
+    }
+    .meeting-summary-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .meeting-summary-body {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px 22px;
+      max-height: 68vh;
+      overflow-y: auto;
+    }
+    .meeting-minutes {
+      margin: 0;
+      font-family: ui-monospace, "SF Mono", Consolas, monospace;
+      font-size: 0.82rem;
+      line-height: 1.55;
+      color: var(--text-dim);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .meeting-summary-footer { padding: 14px 0 0; }
+
+    /* --- Presenter view (conference room screen) ------------------------- */
+    /* When ?present=<id> is in the URL we hide everything else and take over.
+       Designed to look great projected onto a TV from across the room. */
+    body.presenter-mode .app { display: none; }
+    body.presenter-mode { background: #0a0c12; overflow: hidden; }
+    .presenter {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      background: radial-gradient(circle at 20% -10%, rgba(91,167,255,0.10), transparent 60%),
+                  radial-gradient(circle at 90% 110%, rgba(120,255,180,0.06), transparent 55%),
+                  #0a0c12;
+      color: #f1f4fb;
+      padding: 28px 40px;
+      gap: 18px;
+    }
+    .presenter.hidden { display: none; }
+    .presenter-top {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      align-items: center;
+      gap: 28px;
+      border-bottom: 1px solid rgba(255,255,255,0.08);
+      padding-bottom: 18px;
+    }
+    .presenter-meeting-title {
+      font-size: clamp(1.6rem, 2.2vw, 2.6rem);
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+    .presenter-meeting-sub {
+      font-size: clamp(0.95rem, 1.1vw, 1.2rem);
+      color: rgba(241,244,251,0.6);
+      margin-top: 4px;
+    }
+    .presenter-clock {
+      text-align: center;
+      padding: 8px 22px;
+      border-radius: 16px;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.08);
+      min-width: 220px;
+    }
+    .presenter-clock-time {
+      font-variant-numeric: tabular-nums;
+      font-weight: 700;
+      font-size: clamp(2.2rem, 3vw, 3.4rem);
+      letter-spacing: 0.02em;
+      line-height: 1;
+    }
+    .presenter-clock-sub {
+      font-size: clamp(0.85rem, 1vw, 1.05rem);
+      color: rgba(241,244,251,0.65);
+      margin-top: 6px;
+    }
+    .presenter-clock[data-state="warn"] .presenter-clock-time { color: var(--warn); }
+    .presenter-clock[data-state="overtime"] .presenter-clock-time { color: var(--danger); }
+    .presenter-clock[data-state="paused"] .presenter-clock-time { color: rgba(241,244,251,0.4); }
+    .presenter-position {
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+      font-size: clamp(1.1rem, 1.4vw, 1.5rem);
+      color: rgba(241,244,251,0.7);
+    }
+
+    .presenter-stage {
+      flex: 1 1 auto;
+      min-height: 0;
+      display: flex;
+      align-items: stretch;
+      justify-content: stretch;
+    }
+    .presenter-empty {
+      margin: auto;
+      font-size: clamp(1.4rem, 2vw, 2rem);
+      color: rgba(241,244,251,0.5);
+      text-align: center;
+      padding: 40px;
+    }
+    .presenter-card {
+      flex: 1 1 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+      padding: 28px 32px;
+      border-radius: 22px;
+      background: rgba(22,25,34,0.85);
+      border: 1px solid rgba(255,255,255,0.08);
+      box-shadow: 0 30px 80px rgba(0,0,0,0.45);
+      overflow-y: auto;
+    }
+    .presenter-card.hidden { display: none; }
+    .presenter-card { transition: opacity 180ms ease, transform 180ms ease; }
+    .presenter-card.presenter-card-flip { opacity: 0.35; transform: translateY(4px); }
+    .presenter-fact .val,
+    .presenter-text,
+    #presenter-position,
+    #presenter-clock-time { transition: color 220ms ease; }
+    .presenter-card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+    }
+    .presenter-card-wid {
+      font-family: ui-monospace, "SF Mono", Consolas, monospace;
+      font-size: clamp(1.2rem, 1.5vw, 1.6rem);
+      color: rgba(241,244,251,0.65);
+      letter-spacing: 0.04em;
+    }
+    .presenter-card-tier {
+      padding: 6px 14px;
+      border-radius: 999px;
+      font-weight: 700;
+      font-size: clamp(0.95rem, 1.1vw, 1.15rem);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      border: 1px solid rgba(255,255,255,0.12);
+    }
+    .presenter-card-tier[data-tier="below"] { background: rgba(255,138,138,0.18); color: #ffb4b4; border-color: rgba(255,138,138,0.55); }
+    .presenter-card-tier[data-tier="at"]    { background: rgba(245,199,84,0.16);  color: #f5d885; border-color: rgba(245,199,84,0.45); }
+    .presenter-card-tier[data-tier="above"] { background: rgba(120,255,180,0.14); color: #9ee9bf; border-color: rgba(120,255,180,0.45); }
+    .presenter-card-tier[data-tier=""],
+    .presenter-card-tier[data-tier="unknown"] { background: rgba(255,255,255,0.06); color: rgba(241,244,251,0.6); }
+    .presenter-card-nce {
+      padding: 6px 14px;
+      border-radius: 999px;
+      font-size: 0.85rem;
+      font-weight: 800;
+      letter-spacing: 0.14em;
+      background: rgba(138,180,255,0.18);
+      color: #b0c8ff;
+      border: 1px solid rgba(138,180,255,0.55);
+    }
+    .presenter-card-nce.hidden { display: none; }
+    .p-opened {
+      margin-top: 10px;
+      font-size: 0.92rem;
+      color: rgba(241,244,251,0.55);
+      font-variant-numeric: tabular-nums;
+    }
+    .p-opened.hidden { display: none; }
+    .p-reason-section.hidden { display: none; }
+    .p-reason-section h3 { color: #b0c8ff; }
+    .presenter-card-title {
+      margin: 0;
+      font-size: clamp(2.4rem, 3.2vw, 3.6rem);
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      line-height: 1.1;
+    }
+    /* Hero block: WID + tier on top, big asset title, then a tight identity strip */
+    .p-hero { display: flex; flex-direction: column; gap: 8px; }
+    .p-hero-line { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+    .p-id-strip {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px 8px;
+      margin-top: 4px;
+      align-items: center;
+    }
+    /* Bump the sighting pill on the presenter so it reads from across the room. */
+    .p-id-strip .sighting-badge {
+      font-size: clamp(0.78rem, 0.95vw, 0.95rem);
+      padding: 3px 12px;
+      border-width: 1px;
+    }
+    .p-id-pill {
+      display: inline-flex;
+      align-items: baseline;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.08);
+      font-size: clamp(0.78rem, 0.95vw, 0.95rem);
+      color: rgba(241,244,251,0.85);
+    }
+    .p-id-pill .lbl {
+      font-size: clamp(0.62rem, 0.7vw, 0.75rem);
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: rgba(241,244,251,0.45);
+    }
+    .p-id-pill .val { font-weight: 600; }
+
+    /* Status dashboard: 4 big tiles, vehicle-dashboard style */
+    .p-dashboard {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 14px;
+    }
+    @media (max-width: 1100px) {
+      .p-dashboard { grid-template-columns: repeat(2, 1fr); }
+    }
+    .p-tile {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding: 16px 18px;
+      border-radius: 14px;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.07);
+      min-height: 92px;
+    }
+    .p-tile .lbl {
+      font-size: clamp(0.68rem, 0.8vw, 0.85rem);
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      color: rgba(241,244,251,0.55);
+      font-weight: 600;
+    }
+    .p-tile .val {
+      font-size: clamp(1.6rem, 2.2vw, 2.4rem);
+      font-weight: 700;
+      line-height: 1.1;
+      letter-spacing: -0.01em;
+    }
+    .p-tile .sub {
+      font-size: clamp(0.78rem, 0.95vw, 1rem);
+      color: rgba(241,244,251,0.55);
+    }
+    .p-tile.ok    { background: rgba(94,227,151,0.08);  border-color: rgba(94,227,151,0.25); }
+    .p-tile.warn  { background: rgba(245,199,84,0.10); border-color: rgba(245,199,84,0.32); }
+    .p-tile.danger{ background: rgba(255,138,138,0.10); border-color: rgba(255,138,138,0.35); }
+    .p-tile.ok .val     { color: var(--success); }
+    .p-tile.warn .val   { color: var(--warn); }
+    .p-tile.danger .val { color: var(--danger); }
+
+    /* Section headers + bodies */
+    .p-section {
+      padding: 14px 18px;
+      border-radius: 14px;
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.06);
+    }
+    .p-section-fill { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; }
+    .presenter-card-section h3 {
+      margin: 0 0 8px;
+      font-size: clamp(0.78rem, 0.92vw, 0.95rem);
+      text-transform: uppercase;
+      letter-spacing: 0.14em;
+      color: rgba(241,244,251,0.6);
+      font-weight: 700;
+    }
+    .presenter-text {
+      margin: 0;
+      font-size: clamp(1.1rem, 1.4vw, 1.5rem);
+      line-height: 1.4;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .presenter-list {
+      margin: 0;
+      padding-left: 1.3em;
+      font-size: clamp(1.05rem, 1.3vw, 1.4rem);
+      line-height: 1.4;
+    }
+    .presenter-list li { margin: 4px 0; }
+
+    /* Recent-changes timeline */
+    .p-timeline {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      /* Show every change in history but cap the section height so the
+         dashboard / discussion below stay visible. The controller's scroll
+         position (sent via PATCH /cursor) is mirrored here. */
+      max-height: clamp(280px, 36vh, 520px);
+      overflow-y: auto;
+      padding-right: 10px;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(255,255,255,0.25) transparent;
+      scroll-behavior: smooth;
+    }
+    .p-timeline::-webkit-scrollbar { width: 12px; }
+    .p-timeline::-webkit-scrollbar-track { background: transparent; }
+    .p-timeline::-webkit-scrollbar-thumb {
+      background: rgba(255,255,255,0.25); border-radius: 6px;
+    }
+    .p-timeline::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.4); }
+    .p-tl-row {
+      display: grid;
+      grid-template-columns: 130px 130px 1fr;
+      gap: 14px;
+      align-items: baseline;
+      padding: 8px 10px;
+      border-radius: 10px;
+      background: rgba(255,255,255,0.025);
+      border-left: 3px solid rgba(255,255,255,0.15);
+      font-size: clamp(0.95rem, 1.15vw, 1.2rem);
+    }
+    .p-tl-row.tl-slip    { border-left-color: var(--danger); background: rgba(255,138,138,0.06); }
+    .p-tl-row.tl-remarks { border-left-color: var(--warn);   background: rgba(245,199,84,0.05); }
+    .p-tl-row.tl-mel     { border-left-color: var(--text);   background: rgba(255,255,255,0.04); }
+    .p-tl-row.tl-parts   { border-left-color: var(--success);background: rgba(94,227,151,0.05); }
+    .p-tl-row.tl-initial { border-left-color: rgba(255,255,255,0.2); color: rgba(241,244,251,0.65); }
+    .p-tl-date { font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: 0.02em; }
+    .p-tl-kind {
+      font-size: clamp(0.75rem, 0.85vw, 0.9rem);
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: rgba(241,244,251,0.6);
+      font-weight: 600;
+    }
+    .p-tl-body { line-height: 1.4; word-break: break-word; }
+    .p-tl-body del { text-decoration: line-through; color: rgba(241,244,251,0.45); }
+    .p-tl-body ins { text-decoration: none; color: var(--text); font-weight: 600; }
+    .p-tl-body .arrow { margin: 0 8px; color: rgba(241,244,251,0.4); }
+    .p-tl-body .slip-pill {
+      display: inline-block;
+      margin-left: 8px;
+      padding: 1px 8px;
+      border-radius: 999px;
+      background: rgba(255,138,138,0.15);
+      color: var(--danger);
+      font-size: 0.85em;
+      font-weight: 600;
+    }
+    .p-tl-empty { color: rgba(241,244,251,0.5); font-size: clamp(0.95rem, 1.1vw, 1.15rem); padding: 4px 2px; }
+
+    /* Bottom split: notes + due-outs */
+    .p-discuss {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+    @media (max-width: 1100px) {
+      .p-discuss { grid-template-columns: 1fr; }
+    }
+    .presenter-foot {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      font-size: 0.95rem;
+      color: rgba(241,244,251,0.5);
+      border-top: 1px solid rgba(255,255,255,0.05);
+      padding-top: 14px;
+    }
+    .presenter-status::before {
+      content: "● ";
+      color: #6dd28f;
+      margin-right: 4px;
+    }
+    .presenter-status.stale::before { color: var(--warn); }
+    .presenter-status.error::before { color: var(--danger); }
+    .presenter-url {
+      font-family: ui-monospace, "SF Mono", Consolas, monospace;
+      font-size: 0.85rem;
+      color: rgba(241,244,251,0.4);
+    }
+
+    /* ─────────────────────── AI assistant (Ask) ─────────────────────── */
+    .ask-fab {
+      position: fixed;
+      right: 22px;
+      bottom: 22px;
+      width: 52px;
+      height: 52px;
+      border-radius: 50%;
+      border: 1px solid rgba(255,255,255,0.12);
+      background: linear-gradient(135deg, #4f7cff, #7a4dff);
+      color: #fff;
+      box-shadow: 0 12px 36px rgba(79,124,255,0.45), 0 4px 12px rgba(0,0,0,0.3);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 90;
+      transition: transform 0.18s ease, box-shadow 0.18s ease;
+    }
+    .ask-fab:hover { transform: translateY(-2px) scale(1.04); box-shadow: 0 18px 44px rgba(79,124,255,0.55), 0 6px 14px rgba(0,0,0,0.35); }
+    .ask-fab:active { transform: translateY(0) scale(0.98); }
+    .ask-fab.hidden { display: none; }
+
+    .ask-dock {
+      position: fixed;
+      right: 22px;
+      bottom: 22px;
+      width: min(420px, calc(100vw - 32px));
+      height: min(640px, calc(100vh - 60px));
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      box-shadow: 0 30px 70px rgba(0,0,0,0.55), 0 10px 24px rgba(0,0,0,0.35);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      z-index: 95;
+      animation: askSlideIn 0.22s ease-out;
+    }
+    .ask-dock.hidden { display: none; }
+    @keyframes askSlideIn {
+      from { opacity: 0; transform: translateY(20px) scale(0.97); }
+      to   { opacity: 1; transform: translateY(0) scale(1); }
+    }
+    .ask-dock-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border);
+      background: linear-gradient(135deg, rgba(79,124,255,0.18), rgba(122,77,255,0.12));
+    }
+    .ask-dock-title {
+      font-weight: 700;
+      font-size: 0.95rem;
+      letter-spacing: -0.01em;
+    }
+    .ask-dock-actions { display: flex; gap: 12px; align-items: center; }
+    .ask-dock-close {
+      background: transparent;
+      border: none;
+      color: var(--text-dim);
+      font-size: 1.05rem;
+      cursor: pointer;
+      padding: 4px 8px;
+      border-radius: 6px;
+    }
+    .ask-dock-close:hover { background: rgba(255,255,255,0.06); color: var(--text); }
+
+    /* Reusable "Ask AI" pill that lives next to charts. Compact so it can sit
+     * inline with section headings without throwing off the layout. */
+    .ai-ask-btn {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 4px 10px;
+      font-size: 0.72rem; font-weight: 600; letter-spacing: 0.04em;
+      color: var(--text);
+      background: linear-gradient(135deg, rgba(79,124,255,0.16), rgba(94,194,255,0.10));
+      border: 1px solid rgba(79,124,255,0.45);
+      border-radius: 999px;
+      cursor: pointer;
+      transition: transform 0.05s, border-color 0.15s, background 0.15s;
+      white-space: nowrap;
+    }
+    .ai-ask-btn::before {
+      content: "✨";
+      font-size: 0.85em;
+    }
+    .ai-ask-btn:hover {
+      border-color: rgba(94,194,255,0.85);
+      background: linear-gradient(135deg, rgba(79,124,255,0.28), rgba(94,194,255,0.18));
+    }
+    .ai-ask-btn:active { transform: scale(0.97); }
+
+    /* Pinned-context chip rendered at the top of the AI dock. */
+    .ask-ctx-card {
+      margin: 0 0 12px;
+      padding: 10px 12px;
+      border: 1px solid rgba(94,194,255,0.35);
+      border-radius: 10px;
+      background: linear-gradient(135deg, rgba(79,124,255,0.10), rgba(94,194,255,0.05));
+    }
+    .ask-ctx-head {
+      display: flex; align-items: center; gap: 8px;
+    }
+    .ask-ctx-eyebrow {
+      font-size: 0.62rem; font-weight: 700; letter-spacing: 0.08em;
+      text-transform: uppercase; color: var(--accent);
+    }
+    .ask-ctx-title {
+      font-size: 0.84rem; font-weight: 600; color: var(--text);
+      flex: 1; min-width: 0;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .ask-ctx-clear {
+      background: transparent; border: 0; color: var(--muted);
+      font-size: 0.95rem; cursor: pointer; padding: 2px 6px; border-radius: 4px;
+    }
+    .ask-ctx-clear:hover { background: rgba(255,255,255,0.06); color: var(--text); }
+    .ask-ctx-summary {
+      margin-top: 6px; font-size: 0.78rem; color: var(--text-dim);
+      line-height: 1.45;
+    }
+    .ask-ctx-sugs {
+      margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px;
+    }
+    .ask-ctx-chip {
+      padding: 4px 10px; font-size: 0.72rem;
+      background: rgba(255,255,255,0.04); color: var(--text-dim);
+      border: 1px solid var(--border); border-radius: 999px; cursor: pointer;
+      transition: color 0.15s, border-color 0.15s, background 0.15s;
+    }
+    .ask-ctx-chip:hover {
+      color: var(--text); border-color: rgba(79,124,255,0.5);
+      background: rgba(79,124,255,0.10);
+    }
+
+    .ask-suggestions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(255,255,255,0.02);
+    }
+    .ask-chip {
+      background: var(--card-2, rgba(255,255,255,0.04));
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      padding: 6px 11px;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      white-space: nowrap;
+    }
+    .ask-chip:hover { color: var(--text); border-color: rgba(79,124,255,0.5); background: rgba(79,124,255,0.1); }
+
+    .ask-log {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      scroll-behavior: smooth;
+    }
+    .ask-msg {
+      display: flex;
+      gap: 10px;
+      max-width: 100%;
+    }
+    .ask-msg.user { justify-content: flex-end; }
+    .ask-bubble {
+      padding: 11px 14px;
+      border-radius: 14px;
+      max-width: 86%;
+      font-size: 0.9rem;
+      line-height: 1.5;
+      word-wrap: break-word;
+      overflow-wrap: anywhere;
+    }
+    .ask-msg.user .ask-bubble {
+      background: linear-gradient(135deg, #4f7cff, #6a5dff);
+      color: #fff;
+      border-bottom-right-radius: 4px;
+    }
+    .ask-msg.assistant .ask-bubble {
+      background: var(--card-2, rgba(255,255,255,0.04));
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-bottom-left-radius: 4px;
+    }
+    .ask-bubble p { margin: 0 0 8px; }
+    .ask-bubble p:last-child { margin-bottom: 0; }
+    .ask-bubble code { font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 0.82em; background: rgba(255,255,255,0.08); padding: 1px 5px; border-radius: 4px; }
+    .ask-bubble pre { background: rgba(0,0,0,0.3); padding: 10px; border-radius: 8px; overflow-x: auto; font-size: 0.78rem; margin: 6px 0; }
+    .ask-bubble pre code { background: transparent; padding: 0; }
+    .ask-bubble ul, .ask-bubble ol { margin: 6px 0 8px 22px; padding: 0; }
+    .ask-bubble li { margin: 2px 0; }
+    .ask-bubble table { border-collapse: collapse; margin: 8px 0; font-size: 0.82rem; }
+    .ask-bubble th, .ask-bubble td { border: 1px solid var(--border); padding: 4px 8px; text-align: left; }
+    .ask-bubble th { background: rgba(255,255,255,0.04); font-weight: 600; }
+    .ask-bubble strong { color: var(--text); font-weight: 600; }
+    .ask-bubble a { color: #82a4ff; }
+    .ask-trace {
+      margin-top: 8px;
+      font-size: 0.72rem;
+      color: var(--text-dim);
+    }
+    .ask-trace summary { cursor: pointer; user-select: none; opacity: 0.7; }
+    .ask-trace summary:hover { opacity: 1; }
+    .ask-trace ul { margin: 6px 0 0 16px; padding: 0; list-style: disc; }
+    .ask-trace code { font-size: 0.72rem; }
+
+    .ask-typing {
+      display: inline-flex;
+      gap: 4px;
+      align-items: center;
+      padding: 4px 0;
+    }
+    .ask-typing span {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: var(--text-dim); opacity: 0.55;
+      animation: askTyping 1.2s infinite;
+    }
+    .ask-typing span:nth-child(2) { animation-delay: 0.15s; }
+    .ask-typing span:nth-child(3) { animation-delay: 0.3s; }
+    @keyframes askTyping {
+      0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
+      30% { transform: translateY(-4px); opacity: 1; }
+    }
+
+    .ask-input-row {
+      display: flex;
+      gap: 8px;
+      padding: 12px 14px;
+      border-top: 1px solid var(--border);
+      background: rgba(255,255,255,0.02);
+    }
+    .ask-input-row textarea {
+      flex: 1;
+      resize: none;
+      max-height: 160px;
+      min-height: 38px;
+      background: var(--card-2, rgba(255,255,255,0.04));
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 9px 12px;
+      font: inherit;
+      font-size: 0.9rem;
+      line-height: 1.4;
+      outline: none;
+      transition: border-color 0.15s ease;
+    }
+    .ask-input-row textarea:focus { border-color: rgba(79,124,255,0.6); }
+    .ask-input-row button {
+      background: linear-gradient(135deg, #4f7cff, #7a4dff);
+      color: #fff;
+      border: none;
+      border-radius: 10px;
+      padding: 0 16px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.12s ease, opacity 0.15s ease;
+    }
+    .ask-input-row button:hover { transform: translateY(-1px); }
+    .ask-input-row button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+
+    /* Full-tab "Ask AI" view — same components, more breathing room. */
+    .ask-tab {
+      max-width: 980px;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      height: calc(100vh - 220px);
+      min-height: 520px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      overflow: hidden;
+    }
+    .ask-tab-head {
+      padding: 18px 22px;
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 14px;
+      border-bottom: 1px solid var(--border);
+    }
+    .ask-tab-actions { display: flex; gap: 10px; }
+    #panel-ask .ask-suggestions { padding: 12px 20px; }
+    #panel-ask .ask-log { padding: 22px; }
+    #panel-ask .ask-input-row { padding: 14px 18px; }
+    #panel-ask .ask-bubble { font-size: 0.95rem; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="top">
+      <div class="brand">
+        <h1>${escapedTitle}</h1>
+        <p id="brand-sub">Fleet readiness at a glance.</p>
+      </div>
+    </header>
+
+    <nav class="main-nav" id="main-nav" aria-label="Main sections">
+      <button type="button" id="tab-snapshot" class="active">Snapshot</button>
+      <button type="button" id="tab-work-orders">Work orders</button>
+      <button type="button" id="tab-mel">MEL</button>
+      <button type="button" id="tab-meeting">ETIC Meeting</button>
+      <button type="button" id="tab-yard">Yard Check</button>
+      <button type="button" id="tab-ask">Ask AI</button>
+      <button type="button" id="tab-settings">Settings</button>
+    </nav>
+
+    <div id="view-empty" class="empty-state hidden">
+      <p><strong>No ETIC files yet.</strong><br />Email the Vehicle ETIC workbook to your ingest address to get dates here.</p>
+    </div>
+
+    <div id="view-main" class="hidden">
+      <div id="panel-snapshot">
+        <div class="date-picker" role="group" aria-label="Pick a report date">
+          <button type="button" id="date-jump-latest" class="date-pick-btn" title="Jump to the most recent snapshot">⤒ Latest</button>
+          <button type="button" id="date-jump-prev" class="date-pick-btn date-pick-arrow" title="Previous snapshot" aria-label="Previous snapshot">◂</button>
+          <select id="date-select" class="date-select" aria-label="Pick a snapshot date"></select>
+          <button type="button" id="date-jump-next" class="date-pick-btn date-pick-arrow" title="Next snapshot" aria-label="Next snapshot">▸</button>
+          <span class="date-picker-meta" id="date-picker-meta"></span>
+        </div>
+
+        <section class="hero">
+          <div class="hero-inner">
+            <div class="hero-date"><span class="dot" aria-hidden="true"></span> <span id="hero-kicker">Report</span></div>
+            <h2 id="hero-title">—</h2>
+            <p class="hero-file" id="hero-file"></p>
+          </div>
+        </section>
+
+        <div class="kpi-strip" id="kpi-strip" style="display:none" aria-label="Asset Manager summary">
+          <div class="kpi-head">
+            <span>Asset Manager</span>
+            <span class="kpi-compare" id="kpi-compare"></span>
+          </div>
+          <div class="kpi-row" id="kpi-row"></div>
+        </div>
+
+        <details class="card breakdown-card collapsible-card" id="breakdown-card" style="display:none">
+          <summary class="collapsible-summary">
+            <div class="collapsible-summary-text">
+              <h3 style="margin:0">MC rate by Unit</h3>
+              <p class="hint" id="breakdown-hint">Per-unit and NCE breakdown from the Asset Manager sheet.</p>
+            </div>
+            <button type="button" class="ai-ask-btn" id="ai-ask-bd" title="Ask the AI about MC rate by unit" onclick="event.stopPropagation()">Ask AI</button>
+            <span class="collapsible-chev" aria-hidden="true">▾</span>
+          </summary>
+          <div class="collapsible-body breakdown-body">
+            <div class="breakdown-controls">
+              <div class="breakdown-tabs" role="tablist" aria-label="Breakdown filter">
+                <button type="button" class="bd-tab active" data-bd-filter="units">Units</button>
+                <button type="button" class="bd-tab" data-bd-filter="nce">NCE</button>
+                <button type="button" class="bd-tab" data-bd-filter="all">All</button>
+              </div>
+              <label class="bd-compare-field">
+                <span>Compare to</span>
+                <select id="bd-compare-date" aria-label="Compare MC% against another snapshot">
+                  <option value="">Off</option>
+                </select>
+              </label>
+              <div class="preset-chips" id="bd-preset-chips" role="group" aria-label="Compare presets">
+                <button type="button" class="preset-chip" data-preset="fytd" title="Compare against the start of the current fiscal year (1 OCT)">FYTD</button>
+                <button type="button" class="preset-chip" data-preset="lastfy" title="Compare against 1 OCT of the previous fiscal year">Last FY</button>
+                <button type="button" class="preset-chip" data-preset="cytd" title="Compare against 1 JAN of the current calendar year">CYTD</button>
+                <button type="button" class="preset-chip" data-preset="lastcy" title="Compare against 1 JAN of the previous calendar year">Last CY</button>
+                <button type="button" class="preset-chip" data-preset="qtd" title="Compare against the start of the current calendar quarter">QTD</button>
+                <button type="button" class="preset-chip" data-preset="lastq" title="Compare against the start of the previous calendar quarter">Last Q</button>
+                <button type="button" class="preset-chip" data-preset="mtd" title="Compare against the start of the current month">MTD</button>
+                <button type="button" class="preset-chip" data-preset="30d" title="Compare against ~30 days ago">30d</button>
+                <button type="button" class="preset-chip" data-preset="90d" title="Compare against ~90 days ago">90d</button>
+                <button type="button" class="preset-chip" data-preset="1y" title="Compare against ~1 year ago">1y</button>
+              </div>
+              <span class="bd-compare-summary" id="bd-compare-summary"></span>
+            </div>
+            <div class="breakdown-grid" id="breakdown-grid"></div>
+          </div>
+        </details>
+
+        <details class="card compare-card collapsible-card" id="compare-card">
+          <summary class="collapsible-summary">
+            <div class="collapsible-summary-text">
+              <h3 style="margin:0">Snapshot history</h3>
+              <p class="hint" id="compare-hint">Compare any two dates and see day-over-day movement.</p>
+            </div>
+            <button type="button" class="ai-ask-btn" id="ai-ask-history" title="Ask the AI about snapshot history" onclick="event.stopPropagation()">Ask AI</button>
+            <span class="collapsible-chev" aria-hidden="true">▾</span>
+          </summary>
+          <div class="collapsible-body">
+            <div class="cmp-controls">
+              <label class="cmp-field">
+                <span>From</span>
+                <select id="cmp-from" aria-label="Compare from date"></select>
+              </label>
+              <span class="cmp-arrow" aria-hidden="true">→</span>
+              <label class="cmp-field">
+                <span>To</span>
+                <select id="cmp-to" aria-label="Compare to date"></select>
+              </label>
+              <button type="button" id="cmp-clear" class="ghost cmp-clear" title="Clear comparison">Clear</button>
+            </div>
+            <div class="preset-chips cmp-preset-row" id="cmp-preset-chips" role="group" aria-label="Compare presets">
+              <span class="preset-chips-label">Quick range:</span>
+              <button type="button" class="preset-chip" data-preset="fytd" title="Fiscal year-to-date (1 OCT → latest)">FYTD</button>
+              <button type="button" class="preset-chip" data-preset="lastfy" title="Previous fiscal year (1 OCT → 30 SEP)">Last FY</button>
+              <button type="button" class="preset-chip" data-preset="cytd" title="Calendar year-to-date (1 JAN → latest)">CYTD</button>
+              <button type="button" class="preset-chip" data-preset="lastcy" title="Previous calendar year (1 JAN → 31 DEC)">Last CY</button>
+              <button type="button" class="preset-chip" data-preset="qtd" title="Quarter-to-date">QTD</button>
+              <button type="button" class="preset-chip" data-preset="lastq" title="Previous calendar quarter">Last Q</button>
+              <button type="button" class="preset-chip" data-preset="mtd" title="Month-to-date">MTD</button>
+              <button type="button" class="preset-chip" data-preset="30d" title="Last ~30 days">30d</button>
+              <button type="button" class="preset-chip" data-preset="90d" title="Last ~90 days">90d</button>
+              <button type="button" class="preset-chip" data-preset="1y" title="Last ~1 year">1y</button>
+            </div>
+            <div class="cmp-summary" id="cmp-summary"></div>
+            <div class="table-wrap">
+              <table class="compare-table" id="compare-table" aria-label="Snapshot history">
+                <thead><tr><th>Report date</th><th>MC %</th><th>Δ MC</th><th>Fleet</th><th>FMC</th><th>NMC</th><th>Surplus</th></tr></thead>
+                <tbody id="compare-body"><tr><td colspan="7" style="text-align:center;color:var(--muted)">Loading…</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+        </details>
+
+        <section class="card downloads-row">
+          <h3>Downloads</h3>
+          <div class="dl-row">
+            <button type="button" class="btn-etic" id="btn-download-etic">Vehicle ETIC (.xlsx)</button>
+            <button type="button" class="btn-etic" id="btn-yard-check">Yard check export</button>
+          </div>
+          <p class="status" id="etic-dl-status" role="status"></p>
+          <p class="status" id="yard-status" role="status"></p>
+        </section>
+
+        <p class="ingest-footer" id="ingest-footer"></p>
+      </div>
+
+      <div id="panel-work-orders" class="hidden">
+        <div class="wo-layout">
+          <aside class="wo-sidebar">
+            <div class="wo-searchbar">
+              <input type="text" id="wo-id-input" placeholder="Search work orders…" autocomplete="off" aria-label="Search work orders" />
+              <span class="wo-asof-pill" id="wo-asof-pill" title="Always shows the most recent ETIC workbook (history is preserved in the change timeline).">Latest</span>
+            </div>
+            <div class="wo-filters" id="wo-filters" role="tablist" aria-label="Filter work orders">
+              <button type="button" class="wo-filter-btn active" data-filter="all">All <span class="count" data-count="all">·</span></button>
+              <button type="button" class="wo-filter-btn" data-filter="below">Below-MEL <span class="count" data-count="below">·</span></button>
+              <button type="button" class="wo-filter-btn" data-filter="stale">Stale <span class="count" data-count="stale">·</span></button>
+              <button type="button" class="wo-filter-btn" data-filter="pushed">Pushed <span class="count" data-count="pushed">·</span></button>
+              <button type="button" class="wo-filter-btn" data-filter="slipped">Slipped <span class="count" data-count="slipped">·</span></button>
+            </div>
+            <div class="wo-refine">
+              <select id="wo-shop" class="wo-refine-sel" aria-label="Filter by shop"><option value="">All shops</option></select>
+              <select id="wo-unit" class="wo-refine-sel" aria-label="Filter by unit"><option value="">All units</option></select>
+              <select id="wo-melkey" class="wo-refine-sel" aria-label="Filter by MEL key"><option value="">All MEL keys</option></select>
+              <select id="wo-mgmtcd" class="wo-refine-sel" aria-label="Filter by Mgmt Cd"><option value="">All Mgmt Cd</option></select>
+              <select id="wo-sort" class="wo-refine-sel" aria-label="Sort work orders">
+                <option value="default">Sort: Priority</option>
+                <option value="wo">Sort: WO ID</option>
+                <option value="asset">Sort: Asset</option>
+                <option value="unit">Sort: Unit</option>
+                <option value="shop">Sort: Shop</option>
+                <option value="melkey">Sort: MEL key</option>
+                <option value="mgmtcd">Sort: Mgmt Cd</option>
+                <option value="makemodel">Sort: Make/Model</option>
+                <option value="etic-asc">Sort: ETIC (soonest)</option>
+                <option value="etic-desc">Sort: ETIC (latest)</option>
+                <option value="remarks-age">Sort: Remarks age</option>
+                <option value="pushes">Sort: Pushes</option>
+                <option value="slip">Sort: Total slip</option>
+              </select>
+            </div>
+            <div class="wo-list-meta" id="wo-list-meta">Loading…</div>
+            <div class="wo-list" id="wo-list"></div>
+          </aside>
+
+          <section class="wo-detail-pane">
+            <div id="wo-detail-empty" class="wo-empty">Select a work order from the list to see its full state, remarks, and change timeline.</div>
+            <div id="wo-detail" class="hidden">
+              <div class="wo-hero" id="wo-hero"></div>
+              <div class="wo-kpis" id="wo-kpis"></div>
+              <div id="wo-stale-banner" class="wo-stale-banner hidden"></div>
+
+              <div class="wo-remarks-card">
+                <div class="wo-remarks-head">
+                  <span class="t">Latest remarks</span>
+                  <span class="when" id="wo-remarks-when"></span>
+                </div>
+                <div class="wo-remarks-body" id="wo-remarks-text"></div>
+              </div>
+
+              <dl class="wo-facts" id="wo-facts"></dl>
+
+              <details class="wo-action-card" id="wo-action-card">
+                <summary class="wo-action-summary">
+                  <span class="wo-action-title">Log FM&amp;A action</span>
+                  <span class="wo-action-hint">Record what you just did so the change shows in the timeline and we can check the next ETIC.</span>
+                  <span class="wo-action-chev" aria-hidden="true">▾</span>
+                </summary>
+                <form class="wo-action-form" id="wo-action-form">
+                  <div class="wo-action-row">
+                    <label class="wo-action-field">
+                      <span>Action</span>
+                      <select id="wo-action-type" required>
+                        <option value="remarks_update">Remarks updated</option>
+                        <option value="etic_update">ETIC updated</option>
+                        <option value="parts_update">Parts status updated</option>
+                        <option value="shop_update">Shop / transfer updated</option>
+                        <option value="other">Other (no auto-verify)</option>
+                      </select>
+                    </label>
+                    <label class="wo-action-field">
+                      <span>Your name</span>
+                      <input type="text" id="wo-action-name" placeholder="e.g. Sgt. Smith" autocomplete="name" />
+                    </label>
+                  </div>
+                  <label class="wo-action-field wo-action-note-field">
+                    <span>Note (optional)</span>
+                    <input type="text" id="wo-action-note" placeholder="e.g. updated remarks in fleet system, awaiting next ETIC" maxlength="240" />
+                  </label>
+                  <div class="wo-action-row wo-action-actions">
+                    <button type="submit" class="primary" id="wo-action-submit">Log action</button>
+                    <span class="wo-action-status" id="wo-action-status" role="status"></span>
+                  </div>
+                </form>
+              </details>
+
+              <div class="wo-timeline-head">
+                <h4 class="wo-section-title" style="margin:0">Change timeline</h4>
+                <button type="button" class="linkish" id="watch-rebuild">Rebuild history</button>
+              </div>
+              <div class="wo-timeline" id="wo-timeline"><div class="wo-timeline-empty">Loading…</div></div>
+              <p class="status" id="watch-rebuild-status"></p>
+              <p class="status" id="wo-lookup-status" style="margin-top:10px"></p>
+            </div>
+          </section>
+        </div>
+      </div>
+
+      <div id="panel-mel" class="hidden">
+        <div class="mel-header">
+          <div>
+            <h2 class="mel-title">Minimum Essential Levels</h2>
+            <p class="mel-sub">Per-MEL-key readiness. The MEL is the number of mission-capable assets the unit needs to perform its mission. If NMC ≥ MEL the unit is <em>below</em>. Recall +/- shows loaner vehicles brought in as a band-aid.</p>
+          </div>
+          <div class="mel-asof">
+            <span class="mel-asof-tag">SNAPSHOT</span>
+            <select id="mel-date" class="mel-date-select" aria-label="MEL snapshot date"></select>
+          </div>
+        </div>
+
+        <details class="mel-trend-card" id="mel-trend-card" open>
+          <summary class="mel-trend-summary">
+            <div>
+              <h3 class="mel-trend-title">Readiness over time</h3>
+              <p class="mel-trend-sub" id="mel-trend-sub">Stacked bars = NMC vs FMC. Line = fleet MC%. Honors current filters.</p>
+            </div>
+            <div class="mel-trend-legend">
+              <span><i class="dot fmc"></i>FMC</span>
+              <span><i class="dot nmc"></i>NMC</span>
+              <span><i class="dot mc"></i>MC%</span>
+              <span><i class="dot below"></i>below MEL</span>
+              <button type="button" class="ai-ask-btn" id="ai-ask-mel-trend" title="Ask the AI about this chart">Ask AI</button>
+            </div>
+          </summary>
+          <div class="mel-trend-body" id="mel-trend-body"></div>
+        </details>
+
+        <div class="mel-compare-bar">
+          <label class="mel-cmp-field">
+            <span>Compare to</span>
+            <select id="mel-cmp-date" aria-label="Compare against another snapshot">
+              <option value="">Off</option>
+            </select>
+          </label>
+          <div class="preset-chips" id="mel-preset-chips" role="group" aria-label="Compare presets">
+            <button type="button" class="preset-chip" data-preset="fytd">FYTD</button>
+            <button type="button" class="preset-chip" data-preset="lastfy">Last FY</button>
+            <button type="button" class="preset-chip" data-preset="cytd">CYTD</button>
+            <button type="button" class="preset-chip" data-preset="lastcy">Last CY</button>
+            <button type="button" class="preset-chip" data-preset="qtd">QTD</button>
+            <button type="button" class="preset-chip" data-preset="lastq">Last Q</button>
+            <button type="button" class="preset-chip" data-preset="mtd">MTD</button>
+            <button type="button" class="preset-chip" data-preset="30d">30d</button>
+            <button type="button" class="preset-chip" data-preset="90d">90d</button>
+            <button type="button" class="preset-chip" data-preset="1y">1y</button>
+          </div>
+          <span class="mel-cmp-meta" id="mel-cmp-meta"></span>
+          <button type="button" class="ai-ask-btn" id="ai-ask-mel-totals" title="Ask the AI about the current MEL scope">Ask AI</button>
+        </div>
+
+        <div class="mel-totals" id="mel-totals" aria-label="MEL totals"></div>
+
+        <div class="mel-viewmode" role="tablist" aria-label="MEL view mode">
+          <button type="button" class="mel-vm-btn active" data-mel-view="list">Detail list</button>
+          <button type="button" class="mel-vm-btn" data-mel-view="slide">Critical slide</button>
+        </div>
+
+        <div class="mel-controls">
+          <div class="mel-filter-tabs" role="tablist" aria-label="MEL status filter">
+            <button type="button" class="mel-filter-btn active" data-mel-filter="all">All <span class="count" data-mel-count="all">·</span></button>
+            <button type="button" class="mel-filter-btn" data-mel-filter="below">Below <span class="count" data-mel-count="below">·</span></button>
+            <button type="button" class="mel-filter-btn" data-mel-filter="at">At <span class="count" data-mel-count="at">·</span></button>
+            <button type="button" class="mel-filter-btn" data-mel-filter="above">Above <span class="count" data-mel-count="above">·</span></button>
+            <button type="button" class="mel-filter-btn critical" data-mel-filter="critical">★ Critical <span class="count" data-mel-count="critical">·</span></button>
+          </div>
+          <div class="mel-refine">
+            <input type="text" id="mel-search" placeholder="Search MEL key, doc #, mgmt code…" aria-label="Search MEL keys" />
+            <select id="mel-unit" aria-label="Filter by unit"><option value="">All units</option></select>
+            <select id="mel-mgmt" aria-label="Filter by mgmt code"><option value="">All mgmt codes</option></select>
+            <select id="mel-tier" aria-label="Filter by priority tier"><option value="">All tiers</option></select>
+            <select id="mel-sort" aria-label="Sort">
+              <option value="deficit">Sort: Most assets needed</option>
+              <option value="status">Sort: Status (worst first)</option>
+              <option value="nmc">Sort: Most NMC</option>
+              <option value="recall">Sort: Most recall loans</option>
+              <option value="key">Sort: MEL key</option>
+              <option value="unit">Sort: Unit</option>
+              <option value="mc-asc">Sort: MC% (lowest)</option>
+              <option value="mc-desc">Sort: MC% (highest)</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="mel-layout" id="mel-layout-list">
+          <aside class="mel-sidebar">
+            <div class="mel-list-meta" id="mel-list-meta">Loading…</div>
+            <div class="mel-list" id="mel-list"></div>
+          </aside>
+          <section class="mel-detail-pane">
+            <div id="mel-detail-empty" class="mel-empty">Select a MEL key to see its history and changelog.</div>
+            <div id="mel-detail" class="hidden"></div>
+          </section>
+        </div>
+
+        <div class="mel-slide hidden" id="mel-slide">
+          <div class="mel-slide-meta" id="mel-slide-meta">Loading…</div>
+          <div class="mel-slide-body" id="mel-slide-body"></div>
+        </div>
+      </div>
+
+      <div id="panel-meeting" class="hidden">
+        <!-- SETUP view -->
+        <div id="meeting-setup" class="meeting-view">
+          <div class="meeting-setup-grid">
+            <div class="meeting-setup-card">
+              <h3 class="card-title">New ETIC meeting</h3>
+              <label class="field">
+                <span class="label">Meeting title <span class="muted">(optional)</span></span>
+                <input type="text" id="meeting-title" placeholder="Daily ETIC stand-up" autocomplete="off" />
+              </label>
+              <label class="field">
+                <span class="label">Attendees</span>
+                <input type="text" id="meeting-attendees" placeholder="e.g. MSgt Smith, TSgt Lee, 2d Lt Patel" autocomplete="off" />
+              </label>
+              <div class="field">
+                <span class="label">Snapshot</span>
+                <div class="meeting-asof-info">
+                  <span class="meeting-asof-tag">LATEST</span>
+                  <span class="meeting-asof-date" id="meeting-asof-display">—</span>
+                </div>
+              </div>
+              <label class="field">
+                <span class="label">Target length (minutes)</span>
+                <input type="number" id="meeting-target" value="30" min="5" max="240" step="5" />
+              </label>
+            </div>
+
+            <div class="meeting-setup-card">
+              <h3 class="card-title">Who are we covering?</h3>
+              <div class="meeting-filter-grid">
+                <label class="field">
+                  <span class="label">Shop</span>
+                  <select id="meeting-shop"><option value="">All shops</option></select>
+                </label>
+                <label class="field">
+                  <span class="label">Unit</span>
+                  <select id="meeting-unit"><option value="">All units</option></select>
+                </label>
+                <label class="field">
+                  <span class="label">MEL key</span>
+                  <select id="meeting-melkey"><option value="">All MEL keys</option></select>
+                </label>
+                <label class="field">
+                  <span class="label">Mgmt Cd</span>
+                  <select id="meeting-mgmtcd"><option value="">All Mgmt Cd</option></select>
+                </label>
+                <label class="field">
+                  <span class="label">MEL tier</span>
+                  <select id="meeting-meltier">
+                    <option value="">Any tier</option>
+                    <option value="below">Below MEL</option>
+                    <option value="at">At MEL</option>
+                    <option value="above">Above MEL</option>
+                  </select>
+                </label>
+              </div>
+              <div class="meeting-filter-chips">
+                <label class="mini-toggle"><input type="checkbox" id="meeting-only-stale" /> Only stale remarks</label>
+                <label class="mini-toggle"><input type="checkbox" id="meeting-only-pushed" /> Only pushed ETICs</label>
+                <label class="mini-toggle"><input type="checkbox" id="meeting-only-slipped" /> Only slipped</label>
+              </div>
+              <div class="meeting-preview" id="meeting-preview">0 work orders selected</div>
+              <div class="meeting-start-row">
+                <button type="button" class="primary" id="meeting-start" disabled>Start meeting</button>
+                <span class="status" id="meeting-start-status"></span>
+              </div>
+            </div>
+          </div>
+
+          <div class="meeting-history-card">
+            <div class="meeting-history-head">
+              <h3 class="card-title" style="margin:0">Past meetings</h3>
+              <button type="button" class="linkish" id="meeting-history-refresh">Refresh</button>
+            </div>
+            <div id="meeting-history-list" class="meeting-history-list">Loading…</div>
+          </div>
+        </div>
+
+        <!-- LIVE view -->
+        <div id="meeting-live" class="meeting-view hidden">
+          <header class="meeting-live-head">
+            <div class="meeting-live-meta">
+              <div class="meeting-live-title" id="meeting-live-title">ETIC meeting</div>
+              <div class="meeting-live-sub" id="meeting-live-sub"></div>
+            </div>
+            <div class="meeting-clock" id="meeting-clock" data-state="idle">
+              <div class="meeting-clock-time" id="meeting-clock-time">00:00</div>
+              <div class="meeting-clock-sub">
+                <span id="meeting-clock-target">of 30:00</span>
+                <span class="meeting-clock-progress" id="meeting-progress">0 / 0 covered</span>
+              </div>
+            </div>
+            <div class="meeting-live-actions">
+              <button type="button" id="meeting-present" class="ghost" title="Open the conference-room view in a new window. Anyone (including the projector) can also load this meeting via the displayed URL.">📺 Present on TV…</button>
+              <button type="button" id="meeting-pause" class="ghost">Pause</button>
+              <button type="button" id="meeting-stop" class="danger">Stop &amp; summarize</button>
+            </div>
+          </header>
+          <div class="meeting-live-body">
+            <aside class="meeting-queue">
+              <div class="meeting-queue-filters">
+                <input type="text" id="meeting-queue-search" placeholder="Search this meeting…" />
+                <select id="meeting-queue-status">
+                  <option value="">All status</option>
+                  <option value="pending">Pending</option>
+                  <option value="covered">Covered</option>
+                  <option value="deferred">Deferred</option>
+                  <option value="skipped">Skipped</option>
+                </select>
+              </div>
+              <div class="meeting-queue-list" id="meeting-queue-list"></div>
+            </aside>
+            <section class="meeting-focus" id="meeting-focus">
+              <div class="meeting-focus-empty" id="meeting-focus-empty">Select a work order from the list to start notes.</div>
+              <div class="meeting-focus-body hidden" id="meeting-focus-body">
+                <div class="meeting-focus-head" id="meeting-focus-head"></div>
+                <div class="meeting-focus-fields">
+                  <label class="field">
+                    <span class="label">Notes (said in the room)</span>
+                    <textarea id="meeting-note-notes" rows="6" placeholder="Discussion points, decisions, status…"></textarea>
+                  </label>
+                  <label class="field">
+                    <span class="label">Due-outs <span class="muted">(owed back — one per line)</span></span>
+                    <textarea id="meeting-note-dueouts" rows="5" placeholder="E.g.&#10;Smith: EDD from Genuine Parts by Mon&#10;Lee: check QA backlog on WO 2024061..."></textarea>
+                  </label>
+                  <div class="meeting-status-row">
+                    <span class="label">Status:</span>
+                    <div class="meeting-status-group" role="radiogroup" aria-label="Work order status">
+                      <button type="button" class="status-pill" data-status="pending">Pending</button>
+                      <button type="button" class="status-pill" data-status="covered">Covered</button>
+                      <button type="button" class="status-pill" data-status="deferred">Deferred</button>
+                      <button type="button" class="status-pill" data-status="skipped">Skipped</button>
+                    </div>
+                  </div>
+                  <div class="meeting-focus-footer">
+                    <button type="button" id="meeting-prev-wo" class="ghost" title="Previous WO on big screen">◂ Prev</button>
+                    <button type="button" id="meeting-next-wo" class="ghost" title="Next WO on big screen">Next ▸</button>
+                    <button type="button" id="meeting-next" class="primary">Mark covered &amp; next ▸</button>
+                    <span class="status" id="meeting-save-status"></span>
+                    <span class="status muted" id="meeting-cursor-hint"></span>
+                  </div>
+                </div>
+              </div>
+            </section>
+          </div>
+        </div>
+
+        <!-- SUMMARY view -->
+        <div id="meeting-summary" class="meeting-view hidden">
+          <header class="meeting-summary-head">
+            <div>
+              <h2 style="margin:0 0 4px">Meeting summary</h2>
+              <div class="muted" id="meeting-summary-sub"></div>
+            </div>
+            <div class="meeting-summary-actions">
+              <button type="button" id="meeting-export-copy" class="ghost">Copy to clipboard</button>
+              <button type="button" id="meeting-export-download" class="ghost">Download .md</button>
+              <button type="button" id="meeting-export-mail" class="primary">Email minutes…</button>
+            </div>
+          </header>
+          <div class="meeting-summary-body">
+            <pre id="meeting-summary-md" class="meeting-minutes"></pre>
+          </div>
+          <div class="meeting-summary-footer">
+            <button type="button" id="meeting-new" class="ghost">◂ New meeting</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Yard check: a fleet manager walks the lot with their phone, ticking
+           off where each vehicle actually is and noting any new discrepancies.
+           Sessions are persisted in D1; this UI is mobile-first. -->
+      <div id="panel-yard" class="hidden">
+        <section class="yard-wrap" id="yard-wrap" style="padding:0;">
+          <header class="yard-head" style="padding:16px 20px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+            <div style="flex:1 1 auto;min-width:0;">
+              <h2 style="margin:0">Yard check</h2>
+              <p class="hint" style="margin:4px 0 0">FM&amp;A follow-up queue. Walkers tag in the field; you triage the misses, unlisted finds, and discrepancies here.</p>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;">
+              <a class="ghost" href="/yard?desktop=1" target="_blank" rel="noopener" style="text-decoration:none;padding:8px 14px;border-radius:8px;background:var(--bg2);color:var(--text);border:1px solid var(--border);">Open walker app \u2197</a>
+            </div>
+          </header>
+          <nav class="yard-subnav" id="yard-subnav" style="padding:0 20px;display:flex;gap:6px;border-bottom:1px solid var(--border);">
+            <button type="button" class="yard-subtab active" data-yard-sub="roster">Roster</button>
+            <button type="button" class="yard-subtab" data-yard-sub="findings">
+              Findings <span class="yard-subbadge" id="yard-sub-findings-count">0</span>
+            </button>
+            <button type="button" class="yard-subtab" data-yard-sub="activity">Recent activity</button>
+          </nav>
+
+          <div id="yard-sub-findings" class="yard-subpanel hidden" style="padding:16px 20px;">
+            <div class="yard-findings-controls" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px;">
+              <div class="yard-findings-chips" id="yard-findings-chips" style="display:flex;gap:6px;flex-wrap:wrap;">
+                <button type="button" class="yard-findings-chip active" data-finding-kind="all">All <span class="count" id="ff-all">0</span></button>
+                <button type="button" class="yard-findings-chip" data-finding-kind="missing">Not seen <span class="count" id="ff-missing">0</span></button>
+                <button type="button" class="yard-findings-chip" data-finding-kind="unlisted">Unlisted <span class="count" id="ff-unlisted">0</span></button>
+                <button type="button" class="yard-findings-chip" data-finding-kind="discrepancy">Discrepancies <span class="count" id="ff-discrepancy">0</span></button>
+              </div>
+              <label style="margin-left:auto;display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted);cursor:pointer;"
+                     title="Include findings FM&amp;A has already recorded an action against (history view).">
+                <input type="checkbox" id="yard-findings-show-ack" /> Show resolved
+              </label>
+              <button type="button" class="ghost" id="yard-findings-refresh" style="padding:6px 12px;"
+                      title="Re-fetch the list. The page also reloads automatically when you switch into this tab.">Refresh</button>
+            </div>
+            <div id="yard-findings-list" class="yard-findings-list">Loading\u2026</div>
+          </div>
+
+          <div id="yard-sub-roster" class="yard-subpanel" style="padding:0;">
+            <iframe id="yard-frame" src="about:blank" title="Yard roster"
+                    style="display:block;width:100%;height:calc(100vh - 240px);min-height:600px;border:0;background:var(--bg);"></iframe>
+          </div>
+
+          <div id="yard-sub-activity" class="yard-subpanel hidden" style="padding:16px 20px;">
+            <div id="yard-activity-list" class="yard-activity-list">Loading\u2026</div>
+          </div>
+        </section>
+
+        <!-- FM&A "Resolve finding" modal -->
+        <div id="yard-resolve-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-hidden="true">
+          <div class="modal-card" style="max-width:520px;">
+            <header style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;">
+              <h3 style="margin:0;" id="yard-resolve-title">Resolve finding</h3>
+              <button type="button" class="ghost" id="yard-resolve-close" aria-label="Close" style="font-size:20px;line-height:1;padding:4px 10px;">\u00D7</button>
+            </header>
+            <p class="hint" id="yard-resolve-sub" style="margin:0 0 12px;"></p>
+            <div class="settings-grid">
+              <label class="field">
+                <span class="label">What did you do?</span>
+                <select id="yard-resolve-resolution">
+                  <option value="resolved">Resolved (no further action)</option>
+                  <option value="wo_opened">Opened a work order</option>
+                  <option value="in_progress">In progress / following up</option>
+                  <option value="reassigned">Reassigned to a shop</option>
+                  <option value="retired">Retired / removed from fleet</option>
+                  <option value="dismissed">Dismissed (false alarm)</option>
+                </select>
+              </label>
+              <label class="field" id="yard-resolve-wo-field">
+                <span class="label">WO number (if opened)</span>
+                <input type="text" id="yard-resolve-wo" placeholder="e.g. 12345" />
+              </label>
+              <label class="field">
+                <span class="label">Your name</span>
+                <input type="text" id="yard-resolve-by" autocomplete="name" />
+              </label>
+              <label class="field" style="grid-column: 1 / -1;">
+                <span class="label">Notes</span>
+                <textarea id="yard-resolve-note" rows="3" placeholder="What you found, where the asset went, who you contacted, etc."></textarea>
+              </label>
+            </div>
+            <div class="settings-actions" style="margin-top:14px;">
+              <button type="button" class="primary" id="yard-resolve-save">Record action</button>
+              <button type="button" class="ghost" id="yard-resolve-cancel">Cancel</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- AI assistant panel (full-tab view). The same chat state is shared
+           with the floating bubble so the user can switch between modes. -->
+      <div id="panel-ask" class="hidden">
+        <section class="ask-tab">
+          <header class="ask-tab-head">
+            <div>
+              <h2 style="margin:0">Ask the data</h2>
+              <p class="hint" style="margin:4px 0 0">Plain-English questions across snapshots, work orders, and meetings — answered with live data.</p>
+            </div>
+            <div class="ask-tab-actions">
+              <button type="button" class="ghost ask-clear" id="ask-clear-tab">Clear chat</button>
+            </div>
+          </header>
+          <div class="ask-suggestions" id="ask-suggestions-tab">
+            <button type="button" class="ask-chip" data-q="How has 5 CES done this last quarter for the MC rate?">How has 5 CES done this last quarter for MC rate?</button>
+            <button type="button" class="ask-chip" data-q="Which units are below MEL right now?">Which units are below MEL right now?</button>
+            <button type="button" class="ask-chip" data-q="Show me the 10 work orders with the most ETIC pushes.">10 work orders with the most ETIC pushes</button>
+            <button type="button" class="ask-chip" data-q="Compare today's MC rate vs 30 days ago.">Compare today's MC rate vs 30 days ago</button>
+            <button type="button" class="ask-chip" data-q="What's the trend for NCE vehicles over the last 60 days?">NCE vehicle trend last 60 days</button>
+          </div>
+          <div class="ask-log" id="ask-log-tab" aria-live="polite"></div>
+          <form class="ask-input-row" id="ask-form-tab" autocomplete="off">
+            <textarea id="ask-input-tab" rows="1" placeholder="Ask a question about the data… (Enter to send, Shift+Enter for newline)"></textarea>
+            <button type="submit" id="ask-send-tab">Ask</button>
+          </form>
+        </section>
+      </div>
+
+      <div id="panel-settings" class="hidden">
+        <div class="settings-wrap">
+          <header class="settings-head">
+            <h2 style="margin:0">Settings</h2>
+            <p class="hint" style="margin:4px 0 0">Tune what's flagged "stale", which MEL keys are critical, and the per-type splits used in the Critical slide. Changes take effect immediately.</p>
+            <div id="settings-status" class="settings-status hidden"></div>
+          </header>
+
+          <section class="settings-card">
+            <h3 class="card-title">Work-order remark staleness</h3>
+            <p class="hint">A WO is considered "stale" when its last remark is older than this many days. Tunable per MEL status so below-MEL keys can be held to a tighter cadence.</p>
+            <div class="settings-grid">
+              <label class="field">
+                <span class="label">Below MEL (days)</span>
+                <input type="number" id="settings-stale-below" min="1" max="60" />
+              </label>
+              <label class="field">
+                <span class="label">At MEL (days)</span>
+                <input type="number" id="settings-stale-at" min="1" max="60" />
+              </label>
+              <label class="field">
+                <span class="label">Above MEL (days)</span>
+                <input type="number" id="settings-stale-above" min="1" max="60" />
+              </label>
+            </div>
+            <div class="settings-actions">
+              <button type="button" class="primary" id="settings-stale-save">Save thresholds</button>
+              <button type="button" class="ghost" id="settings-stale-reset">Reset to defaults (3 / 5 / 10)</button>
+            </div>
+          </section>
+
+          <section class="settings-card">
+            <h3 class="card-title">Critical MEL keys</h3>
+            <p class="hint">Star the MEL keys that belong on the Critical slide. You can also override the TYPE label here so the slide reads "Cranes" instead of the cryptic mgmt-code description.</p>
+            <div class="settings-mel-controls">
+              <input type="text" id="settings-mel-search" placeholder="Search MEL key, unit, mgmt code…" />
+              <label class="settings-toggle">
+                <input type="checkbox" id="settings-mel-only-critical" />
+                <span>Show critical only</span>
+              </label>
+            </div>
+            <div class="settings-mel-table" id="settings-mel-table">Loading…</div>
+          </section>
+
+          <section class="settings-card">
+            <h3 class="card-title">Subdivisions</h3>
+            <p class="hint">When a single MEL key actually covers multiple TYPEs (e.g. PT TRACTOR + PT TRAILER + PTR TRAILER under one missile-crew transport key), break it out here with its own MEL targets. Subdivisions appear under their parent MEL key in the Critical slide.</p>
+            <div class="settings-sub-controls">
+              <select id="settings-sub-melkey" aria-label="MEL key"></select>
+              <input type="text" id="settings-sub-type" placeholder="TYPE label (e.g. PT TRACTOR)" />
+              <input type="text" id="settings-sub-mgmt" placeholder="Mgmt code (optional)" />
+              <input type="number" id="settings-sub-mel" placeholder="MEL" min="0" />
+              <input type="number" id="settings-sub-assigned" placeholder="Assigned" min="0" />
+              <input type="number" id="settings-sub-fmc" placeholder="FMC" min="0" />
+              <input type="number" id="settings-sub-nmc" placeholder="NMC" min="0" />
+              <input type="number" id="settings-sub-acc" placeholder="Acc" min="0" />
+              <input type="number" id="settings-sub-abu" placeholder="Abus" min="0" />
+              <button type="button" class="primary" id="settings-sub-add">Add / update</button>
+            </div>
+            <div class="settings-sub-list" id="settings-sub-list">No subdivisions yet.</div>
+          </section>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Floating chat bubble + slide-in panel. Available on every tab. -->
+  <button type="button" id="ask-fab" class="ask-fab" title="Ask the data" aria-label="Ask the data">
+    <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M12 3a9 9 0 0 0-7.6 13.84L3 21l4.32-1.36A9 9 0 1 0 12 3Zm-3 8h6m-6 3h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>
+  </button>
+  <aside id="ask-dock" class="ask-dock hidden" aria-label="AI assistant">
+    <header class="ask-dock-head">
+      <div class="ask-dock-title">Ask the data</div>
+      <div class="ask-dock-actions">
+        <button type="button" class="linkish" id="ask-clear">Clear</button>
+        <button type="button" class="ask-dock-close" id="ask-close" aria-label="Close">✕</button>
+      </div>
+    </header>
+    <div class="ask-suggestions" id="ask-suggestions">
+      <button type="button" class="ask-chip" data-q="How has 5 CES done this last quarter for the MC rate?">5 CES last quarter</button>
+      <button type="button" class="ask-chip" data-q="Which units are below MEL right now?">Below MEL today</button>
+      <button type="button" class="ask-chip" data-q="Compare today's MC rate vs 30 days ago.">MC% vs 30d ago</button>
+    </div>
+    <div class="ask-log" id="ask-log" aria-live="polite"></div>
+    <form class="ask-input-row" id="ask-form" autocomplete="off">
+      <textarea id="ask-input" rows="1" placeholder="Ask a question…"></textarea>
+      <button type="submit" id="ask-send">Ask</button>
+    </form>
+  </aside>
+
+  <!-- Conference-room / "presenter" view. Activated by ?present=<meetingId>.
+       Polls /api/meeting/:id every couple seconds and renders the WO that the
+       controller (laptop) has selected. Designed to fill the projector. -->
+  <div id="presenter" class="presenter hidden" aria-hidden="true">
+    <header class="presenter-top">
+      <div class="presenter-meta">
+        <div class="presenter-meeting-title" id="presenter-meeting-title">ETIC meeting</div>
+        <div class="presenter-meeting-sub" id="presenter-meeting-sub"></div>
+      </div>
+      <div class="presenter-clock" id="presenter-clock">
+        <div class="presenter-clock-time" id="presenter-clock-time">00:00</div>
+        <div class="presenter-clock-sub" id="presenter-clock-sub"></div>
+      </div>
+      <div class="presenter-position" id="presenter-position">— / —</div>
+    </header>
+    <main class="presenter-stage" id="presenter-stage">
+      <div class="presenter-empty" id="presenter-empty">Waiting for the controller to pick a work order…</div>
+      <article class="presenter-card hidden" id="presenter-card">
+        <!-- 1. WHO + WHAT -->
+        <header class="p-hero">
+          <div class="p-hero-line">
+            <div class="presenter-card-wid" id="p-wid"></div>
+            <div class="presenter-card-nce hidden" id="p-nce">NCE</div>
+            <div class="presenter-card-tier" id="p-tier"></div>
+          </div>
+          <h2 class="presenter-card-title" id="p-title"></h2>
+          <div class="p-id-strip" id="p-id-strip"></div>
+          <div class="p-opened hidden" id="p-opened"></div>
+        </header>
+
+        <!-- 2. STATUS DASHBOARD: 4 big tiles for shop leads -->
+        <section class="p-dashboard" id="p-dashboard"></section>
+
+        <!-- 3. WO REASON (from workbook) -->
+        <section class="presenter-card-section p-section p-reason-section hidden" id="p-reason-section">
+          <h3>Reason</h3>
+          <p class="presenter-text" id="p-reason">—</p>
+        </section>
+
+        <!-- 4. LATEST REMARK -->
+        <section class="presenter-card-section p-section">
+          <h3>Latest workbook remark</h3>
+          <p class="presenter-text" id="p-remark">—</p>
+        </section>
+
+        <!-- 4. CHANGE TIMELINE -->
+        <section class="presenter-card-section p-section">
+          <h3>Recent changes</h3>
+          <div class="p-timeline" id="p-timeline"></div>
+        </section>
+
+        <!-- 5. LIVE DISCUSSION (notes + due-outs side-by-side) -->
+        <div class="p-discuss">
+          <section class="presenter-card-section p-section p-section-fill">
+            <h3>Meeting notes</h3>
+            <p class="presenter-text" id="p-notes">—</p>
+          </section>
+          <section class="presenter-card-section p-section p-section-fill">
+            <h3>Due-outs</h3>
+            <ul class="presenter-list" id="p-dueouts"></ul>
+          </section>
+        </div>
+      </article>
+    </main>
+    <footer class="presenter-foot">
+      <span id="presenter-status" class="presenter-status">Connected · auto-refreshing every 2s</span>
+      <span id="presenter-url" class="presenter-url"></span>
+    </footer>
+  </div>
+
+  <script>
+    function esc(s) {
+      if (s == null || s === undefined) return "";
+      return String(s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+    // The yard FM&A code (and friends) was originally written against the
+    // walker app's escapeHtml() helper, which lives in a different script
+    // block (renderYardAppHtml) and isn't in scope here. Alias it to esc()
+    // so those call sites work in the desktop dashboard scope too.
+    // (No backticks in this comment on purpose: the whole file is one big TS
+    // template literal and a stray backtick closes it mid-comment.)
+    const escapeHtml = esc;
+
+    /* =========================================================================
+       LAST-SIGHTING BADGES (yard check ⇒ Work Orders / MEL / Meeting / Presenter)
+       Single in-memory map of assetId → { location, at, by } populated by one
+       fetch of /api/yard/sightings on tab enter (cheap — a few KB gzipped).
+       Any renderer that has an asset id in scope can call renderSightingBadge()
+       to drop a tiny pill that says where the asset was last physically seen
+       and how long ago. The point is to give the dispatcher / shop / meeting
+       presenter the same situational awareness the walker has, without making
+       them open the Yard Check tab.
+       ====================================================================== */
+    var sightingsState = {
+      map: new Map(),     // assetId -> { location, at, by }
+      loadedAt: 0,        // ms epoch of last successful load (0 = never)
+      inflight: null,     // de-dupe concurrent fetches
+    };
+    var SIGHTINGS_TTL_MS = 30 * 1000;
+
+    function loadSightings(force) {
+      var now = Date.now();
+      if (!force && sightingsState.loadedAt && (now - sightingsState.loadedAt) < SIGHTINGS_TTL_MS) {
+        return Promise.resolve(sightingsState.map);
+      }
+      if (sightingsState.inflight) return sightingsState.inflight;
+      var url = "/api/yard/sightings" + (force ? ("?_=" + now) : "");
+      sightingsState.inflight = fetch(url, force ? { cache: "no-store" } : undefined)
+        .then(function (r) { return r.ok ? r.json() : { sightings: {} }; })
+        .then(function (data) {
+          var src = (data && data.sightings) || {};
+          var m = new Map();
+          for (var k in src) if (Object.prototype.hasOwnProperty.call(src, k)) m.set(k, src[k]);
+          sightingsState.map = m;
+          sightingsState.loadedAt = Date.now();
+          return m;
+        })
+        .catch(function () { return sightingsState.map; })
+        .then(function (m) { sightingsState.inflight = null; return m; });
+      return sightingsState.inflight;
+    }
+
+    function fmtRelativeAge(iso) {
+      if (!iso) return "";
+      var t = Date.parse(iso);
+      if (!isFinite(t)) return "";
+      var diffMs = Date.now() - t;
+      if (diffMs < 0) diffMs = 0;
+      var mins = Math.floor(diffMs / 60000);
+      if (mins < 1) return "just now";
+      if (mins < 60) return mins + "m ago";
+      var hrs = Math.floor(mins / 60);
+      if (hrs < 24) return hrs + "h ago";
+      var days = Math.floor(hrs / 24);
+      if (days < 14) return days + "d ago";
+      var wks = Math.floor(days / 7);
+      if (wks < 9) return wks + "w ago";
+      var mos = Math.floor(days / 30);
+      return mos + "mo ago";
+    }
+
+    function sightingFreshness(iso) {
+      if (!iso) return "never";
+      var days = (Date.now() - Date.parse(iso)) / 86400000;
+      if (!isFinite(days) || days < 0) return "fresh";
+      if (days <= 7) return "fresh";
+      if (days <= 14) return "stale";
+      return "old";
+    }
+
+    /**
+     * Tiny inline pill: "📍 Lot B · 3d ago" or muted "📍 not yet sighted".
+     * Returns "" when assetId is empty so callers can concatenate freely.
+     * Pass opts.compact=true to drop the location text on tight rows.
+     */
+    function renderSightingBadge(assetId, opts) {
+      if (!assetId) return "";
+      opts = opts || {};
+      var s = sightingsState.map.get(assetId);
+      if (!s || !s.at) {
+        return "<span class='sighting-badge sighting-never' title='No yard sightings yet'>" +
+          "<span class='sighting-pin' aria-hidden='true'>\u25CB</span>" +
+          "<span class='sighting-text'>not yet sighted</span></span>";
+      }
+      var fresh = sightingFreshness(s.at);
+      var loc = (s.location || "").trim();
+      var age = fmtRelativeAge(s.at);
+      var by = (s.by || "").trim();
+      var titleParts = [];
+      if (loc) titleParts.push("Last seen at " + loc);
+      titleParts.push("on " + new Date(s.at).toLocaleString());
+      if (by) titleParts.push("by " + by);
+      var title = titleParts.join(" ");
+      var locTxt = (loc && !opts.compact) ? esc(loc) : "";
+      var sep = (locTxt && age) ? " \u00b7 " : "";
+      return "<span class='sighting-badge sighting-" + fresh + "' title='" + esc(title) + "'>" +
+        "<span class='sighting-pin' aria-hidden='true'>\u25CE</span>" +
+        "<span class='sighting-text'>" + locTxt + sep + esc(age) + "</span></span>";
+    }
+
+    function fmtKpi(n) {
+      if (n === null || n === undefined || typeof n !== "number") return "—";
+      return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
+    }
+
+    function fmtMc(n) {
+      if (n === null || n === undefined || typeof n !== "number") return "—";
+      return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + "%";
+    }
+
+    function fmtSignedInt(n) {
+      if (n === null || n === undefined || typeof n !== "number" || !isFinite(n)) return "—";
+      if (n === 0) return "0";
+      return (n > 0 ? "+" : "") + n.toLocaleString(undefined, { maximumFractionDigits: 0 });
+    }
+
+    function fmtSignedPts(n) {
+      if (n === null || n === undefined || typeof n !== "number" || !isFinite(n)) return "—";
+      if (Math.abs(n) < 0.005) return "0.00 pts";
+      return (n > 0 ? "+" : "") + n.toFixed(2) + " pts";
+    }
+
+    function arrow(n) {
+      if (n === null || n === undefined || !isFinite(n)) return "·";
+      if (Math.abs(n) < 0.005) return "·";
+      return n > 0 ? "▲" : "▼";
+    }
+
+    function sortDesc(entries) {
+      return [...entries].sort((a, b) => b.dateKey.localeCompare(a.dateKey));
+    }
+
+    function dayOfWeekShort(dateKey) {
+      try {
+        const [y, m, d] = dateKey.split("-").map(Number);
+        const dt = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
+        return dt.toLocaleDateString(undefined, { weekday: "short", timeZone: "UTC" });
+      } catch (_) { return ""; }
+    }
+
+    function shortDate(dateKey) {
+      try {
+        const [y, m, d] = dateKey.split("-").map(Number);
+        const dt = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
+        return dt.toLocaleDateString(undefined, { month: "short", day: "numeric", timeZone: "UTC" });
+      } catch (_) { return dateKey; }
+    }
+
+    function daysAgo(dateKey) {
+      try {
+        const [y, m, d] = dateKey.split("-").map(Number);
+        const a = Date.UTC(y, m - 1, d, 12, 0, 0);
+        const now = new Date();
+        const b = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate(), 12, 0, 0);
+        return Math.round((b - a) / 86400000);
+      } catch (_) { return null; }
+    }
+
+    function relDate(dateKey) {
+      const n = daysAgo(dateKey);
+      if (n === null) return "";
+      if (n === 0) return "today";
+      if (n === 1) return "yesterday";
+      return n + " days ago";
+    }
+
+    function readHashRoute() {
+      const raw = (location.hash || "").replace(/^#/, "");
+      if (!raw) return { tab: "snapshot", dateKey: null, workOrderId: null };
+      if (raw.indexOf("wo=") === 0) {
+        const id = decodeURIComponent(raw.slice(3).trim());
+        return { tab: "wo", dateKey: null, workOrderId: id || null };
+      }
+      if (/^\\d{4}-\\d{2}-\\d{2}$/.test(raw)) {
+        return { tab: "snapshot", dateKey: raw, workOrderId: null };
+      }
+      return { tab: "snapshot", dateKey: null, workOrderId: null };
+    }
+
+    let historyEntries = [];
+    let selectedDate = null;
+    let snapshotRows = [];
+    const watchCacheByDate = new Map();
+    const changelogCache = new Map();
+    let selectedWoId = null;
+    let woFilter = "all";
+    let woQuery = "";
+    let woUnit = "";
+    let woMelKey = "";
+    let woShop = "";
+    let woMgmtCd = "";
+    let woSort = "default";
+    // Snapshot screen: compare-2-dates state + per-Unit/NCE breakdown filter.
+    const compareState = { from: "", to: "" };
+    let breakdownFilter = "units"; // "units" | "nce" | "all"
+    let currentBreakdown = [];
+    // Per-Unit compare-to-another-date state. When set, every tile shows a
+    // delta-pp pill versus its label's MC% on the comparison date.
+    let breakdownCompareDate = ""; // "" = off
+    let breakdownCompareData = null; // Array<Breakdown> for the compare date
+    const breakdownCacheByDate = new Map();
+
+    function setHashSnapshot(dateKey) {
+      if (dateKey) location.hash = "#" + dateKey;
+      else location.hash = "";
+    }
+
+    function setHashWorkOrder(woId) {
+      const t = (woId || "").trim();
+      if (!t) { location.hash = ""; return; }
+      location.hash = "#wo=" + encodeURIComponent(t);
+    }
+
+    async function loadHistory() {
+      const res = await fetch("/api/history");
+      if (!res.ok) throw new Error("Could not load history");
+      const data = await res.json();
+      return Array.isArray(data.entries) ? data.entries : [];
+    }
+
+    async function syncSnapshotsOnce() {
+      try {
+        if (sessionStorage.getItem("etic_d1_sync_v1")) return;
+        await fetch("/api/snapshots?sync=1", { method: "POST" });
+        sessionStorage.setItem("etic_d1_sync_v1", "1");
+      } catch (_) {}
+    }
+
+    async function loadSnapshots() {
+      const res = await fetch("/api/snapshots");
+      if (!res.ok) return [];
+      const data = await res.json();
+      return Array.isArray(data.snapshots) ? data.snapshots : [];
+    }
+
+    async function loadAnalysis(dateKey) {
+      const res = await fetch("/api/analysis/" + encodeURIComponent(dateKey));
+      if (!res.ok) throw new Error("No analysis for " + dateKey);
+      return res.json();
+    }
+
+    async function loadWatchForDate(dateKey, opts) {
+      if (!dateKey) return [];
+      const force = !!(opts && opts.force);
+      // Always kick off a sightings refresh in parallel — every place watch
+      // rows render also wants the asset's last-yard-sighting badge, and the
+      // sightings cache has its own TTL so this is a no-op when warm.
+      loadSightings(force);
+      if (!force && watchCacheByDate.has(dateKey)) return watchCacheByDate.get(dateKey);
+      // Use scope=snapshot (default) so the list shows ONLY the work orders
+      // that were actually present in the .xlsx for this date. scope=all would
+      // return every WO we've ever ingested (work_order_state), which inflates
+      // the count well beyond what's in the latest workbook.
+      const url = "/api/watch?date=" + encodeURIComponent(dateKey) +
+        (force ? "&_=" + Date.now() : "");
+      const res = await fetch(url, force ? { cache: "no-store" } : undefined);
+      if (!res.ok) { watchCacheByDate.set(dateKey, []); return []; }
+      const data = await res.json();
+      const rows = Array.isArray(data.rows) ? data.rows : [];
+      watchCacheByDate.set(dateKey, rows);
+      return rows;
+    }
+
+    async function loadChangelog(woId, opts) {
+      const force = !!(opts && opts.force);
+      if (!force && changelogCache.has(woId)) return changelogCache.get(woId);
+      const res = await fetch(
+        "/api/work-order-changelog?workOrderId=" + encodeURIComponent(woId) +
+        (force ? "&_=" + Date.now() : ""),
+        force ? { cache: "no-store" } : undefined,
+      );
+      if (!res.ok) return { entries: [], actions: [] };
+      const data = await res.json();
+      const payload = {
+        entries: Array.isArray(data.entries) ? data.entries : [],
+        actions: Array.isArray(data.actions) ? data.actions : [],
+      };
+      changelogCache.set(woId, payload);
+      return payload;
+    }
+
+    /* --- Date picker -------------------------------------------------------
+     * Replaces the old horizontal scroller with a year-grouped dropdown plus
+     * Latest / Prev / Next jump buttons — scales cleanly to years of files.
+     * --------------------------------------------------------------------- */
+    function latestSnapshotDate() {
+      const sorted = sortDesc(historyEntries);
+      return sorted.length ? sorted[0].dateKey : null;
+    }
+
+    function renderDatePicker() {
+      const sel = document.getElementById("date-select");
+      const latestBtn = document.getElementById("date-jump-latest");
+      const prevBtn = document.getElementById("date-jump-prev");
+      const nextBtn = document.getElementById("date-jump-next");
+      const meta = document.getElementById("date-picker-meta");
+      if (!sel) return;
+      const sorted = sortDesc(historyEntries);
+      const latestKey = sorted[0] ? sorted[0].dateKey : null;
+
+      // Group by year so users with hundreds of snapshots get a tidy picker.
+      const byYear = {};
+      sorted.forEach(function (e) {
+        const yr = (e.dateKey || "").slice(0, 4);
+        if (!byYear[yr]) byYear[yr] = [];
+        byYear[yr].push(e);
+      });
+      const years = Object.keys(byYear).sort(function (a, b) { return b.localeCompare(a); });
+      sel.innerHTML = years.map(function (yr) {
+        const opts = byYear[yr].map(function (e) {
+          const lbl = fmtKeyShort(e.dateKey) + (e.dateKey === latestKey ? " · Latest" : "");
+          return "<option value='" + esc(e.dateKey) + "'>" + esc(lbl) + "</option>";
+        }).join("");
+        return "<optgroup label='" + esc(yr) + "'>" + opts + "</optgroup>";
+      }).join("");
+      if (selectedDate) sel.value = selectedDate;
+
+      const idx = sorted.findIndex(function (e) { return e.dateKey === selectedDate; });
+      if (latestBtn) latestBtn.disabled = !latestKey || selectedDate === latestKey;
+      if (prevBtn) prevBtn.disabled = idx < 0 || idx >= sorted.length - 1;
+      if (nextBtn) nextBtn.disabled = idx <= 0;
+
+      if (meta) {
+        const total = sorted.length;
+        const pos = idx >= 0 ? (idx + 1) : null;
+        const rel = relDate(selectedDate);
+        meta.textContent = (pos != null ? pos + " of " + total : total + " snapshots") +
+          (rel ? " · " + rel : "");
+      }
+    }
+
+    function jumpDateRel(delta) {
+      const sorted = sortDesc(historyEntries);
+      const idx = sorted.findIndex(function (e) { return e.dateKey === selectedDate; });
+      if (idx < 0) return;
+      const nextIdx = Math.max(0, Math.min(sorted.length - 1, idx + delta));
+      const target = sorted[nextIdx];
+      if (target && target.dateKey !== selectedDate) selectDate(target.dateKey, true);
+    }
+
+    function jumpDateLatest() {
+      const latest = latestSnapshotDate();
+      if (latest && latest !== selectedDate) selectDate(latest, true);
+    }
+
+    /* --- Compare table with deltas ---------------------------------------- */
+    function renderCompareTable() {
+      const body = document.getElementById("compare-body");
+      const hint = document.getElementById("compare-hint");
+      if (!snapshotRows.length) {
+        body.innerHTML = "<tr><td colspan='7' style='text-align:center;color:var(--muted)'>No rows in index yet. Reload after a moment, or ingest a new ETIC.</td></tr>";
+        return;
+      }
+      const sorted = [...snapshotRows].sort((a, b) => b.dateKey.localeCompare(a.dateKey));
+      // If a compare range is set, show count + range; otherwise just total.
+      const inRange = compareDateInRange.bind(null);
+      const rangeCount = (compareState.from && compareState.to)
+        ? sorted.filter(function (r) { return inRange(r.dateKey); }).length
+        : 0;
+      hint.textContent = (compareState.from && compareState.to)
+        ? rangeCount + " in range · " + sorted.length + " total"
+        : sorted.length + " snapshots · newest first";
+      body.innerHTML = sorted.map(function (r, i) {
+        const prev = sorted[i + 1];
+        const dash = "—";
+        const mc = r.mcRatePercent != null ? fmtMc(r.mcRatePercent) : dash;
+        const ft = r.fleetTotal != null ? fmtKpi(r.fleetTotal) : dash;
+        const fmc = r.fmc != null ? fmtKpi(r.fmc) : dash;
+        const nmc = r.nmc != null ? fmtKpi(r.nmc) : dash;
+        const sur = r.surplus != null ? fmtKpi(r.surplus) : dash;
+        let mcDelta = "<span class='delta flat'>·</span>";
+        if (prev && r.mcRatePercent != null && prev.mcRatePercent != null) {
+          const diff = r.mcRatePercent - prev.mcRatePercent;
+          const cls = Math.abs(diff) < 0.005 ? "flat" : (diff > 0 ? "neg-down" : "neg-up");
+          mcDelta = "<span class='delta " + cls + "'>" + arrow(diff) + " " + esc(fmtSignedPts(diff)) + "</span>";
+        }
+        const selAttr = r.dateKey === selectedDate ? " data-selected='true'" : "";
+        const inR = (compareState.from && compareState.to && inRange(r.dateKey)) ? " data-in-range='true'" : "";
+        return (
+          "<tr" + selAttr + inR + " data-date='" + esc(r.dateKey) + "' style='cursor:pointer'>" +
+          "<td><strong>" + esc(fmtKeyShort(r.dateKey)) + "</strong></td>" +
+          "<td class='mc'>" + esc(mc) + "</td>" +
+          "<td>" + mcDelta + "</td>" +
+          "<td>" + esc(ft) + "</td>" +
+          "<td class='fmc'>" + esc(fmc) + "</td>" +
+          "<td class='nmc'>" + esc(nmc) + "</td>" +
+          "<td class='surp'>" + esc(sur) + "</td>" +
+          "</tr>"
+        );
+      }).join("");
+      body.querySelectorAll("tr[data-date]").forEach(function (tr) {
+        tr.addEventListener("click", function () {
+          const dk = tr.getAttribute("data-date");
+          if (dk && dk !== selectedDate) selectDate(dk, true);
+        });
+      });
+    }
+
+    /* --- Compare presets (FY/CY/QTR/MTD/Nd) ------------------------------ */
+    // Air Force fiscal year runs 1 OCT → 30 SEP. Calendar quarters are used
+    // for QTD / Last Q because they line up with the way the shop reports
+    // talk about quarters (Q1/Q2/Q3/Q4 = JAN/APR/JUL/OCT).
+    function isoUtc(y, m0, d) {
+      const mm = String(m0 + 1).padStart(2, "0");
+      const dd = String(d).padStart(2, "0");
+      return y + "-" + mm + "-" + dd;
+    }
+    function lastDayOfMonth(y, m0) {
+      return new Date(Date.UTC(y, m0 + 1, 0)).getUTCDate();
+    }
+    function addDaysIso(iso, days) {
+      const d = new Date(iso + "T00:00:00Z");
+      d.setUTCDate(d.getUTCDate() + days);
+      return d.toISOString().slice(0, 10);
+    }
+    /**
+     * Translate a preset key ("fytd", "lastfy", ...) into a literal
+     * {fromISO, toISO} date range. The "to" of an XTD preset is the latest
+     * available snapshot key so the answer always fits the data we have.
+     */
+    function presetRange(preset, latestKey) {
+      const latest = latestKey || (historyEntries[0] && historyEntries[0].dateKey) || new Date().toISOString().slice(0, 10);
+      const ld = new Date(latest + "T00:00:00Z");
+      const ly = ld.getUTCFullYear();
+      const lm = ld.getUTCMonth();
+      // Fiscal year that the latest snapshot belongs to. Oct(9)+ -> next FY.
+      const fyEnd = lm >= 9 ? ly + 1 : ly;
+      // Calendar quarter index the latest snapshot belongs to (0..3).
+      const q = Math.floor(lm / 3);
+      switch (preset) {
+        case "fytd":
+          return { fromISO: isoUtc(fyEnd - 1, 9, 1), toISO: latest, label: "FY" + String(fyEnd).slice(-2) + " to date" };
+        case "lastfy":
+          return { fromISO: isoUtc(fyEnd - 2, 9, 1), toISO: isoUtc(fyEnd - 1, 8, 30), label: "FY" + String(fyEnd - 1).slice(-2) };
+        case "cytd":
+          return { fromISO: isoUtc(ly, 0, 1), toISO: latest, label: "CY" + String(ly).slice(-2) + " to date" };
+        case "lastcy":
+          return { fromISO: isoUtc(ly - 1, 0, 1), toISO: isoUtc(ly - 1, 11, 31), label: "CY" + String(ly - 1).slice(-2) };
+        case "qtd":
+          return { fromISO: isoUtc(ly, q * 3, 1), toISO: latest, label: "Q" + (q + 1) + " " + ly + " to date" };
+        case "lastq": {
+          let lqY = ly, lqM = (q - 1) * 3;
+          if (q === 0) { lqY = ly - 1; lqM = 9; }
+          const endDay = lastDayOfMonth(lqY, lqM + 2);
+          const lqIdx = Math.floor(lqM / 3) + 1;
+          return { fromISO: isoUtc(lqY, lqM, 1), toISO: isoUtc(lqY, lqM + 2, endDay), label: "Q" + lqIdx + " " + lqY };
+        }
+        case "mtd":
+          return { fromISO: isoUtc(ly, lm, 1), toISO: latest, label: ld.toLocaleString("en-US", { month: "short", year: "numeric", timeZone: "UTC" }) + " to date" };
+        case "30d":
+          return { fromISO: addDaysIso(latest, -30), toISO: latest, label: "Last 30 days" };
+        case "90d":
+          return { fromISO: addDaysIso(latest, -90), toISO: latest, label: "Last 90 days" };
+        case "1y":
+          return { fromISO: addDaysIso(latest, -365), toISO: latest, label: "Last 1 year" };
+      }
+      return null;
+    }
+    /**
+     * Snap a literal date range to the nearest snapshots we actually have.
+     * Returns null if the data doesn't cover any part of the range.
+     */
+    function snapPresetToSnapshots(range) {
+      if (!range) return null;
+      const sorted = sortDesc(historyEntries).slice().reverse(); // ascending
+      const inRange = sorted.filter(function (e) {
+        return e.dateKey >= range.fromISO && e.dateKey <= range.toISO;
+      });
+      if (!inRange.length) return null;
+      return { from: inRange[0].dateKey, to: inRange[inRange.length - 1].dateKey, label: range.label };
+    }
+    /**
+     * Disable preset chips that don't have any covering snapshots, and
+     * highlight the chip whose snapped range matches the active selection.
+     */
+    function refreshPresetChipsState(containerId, activeFrom, activeTo) {
+      const root = document.getElementById(containerId);
+      if (!root) return;
+      const latest = (historyEntries[0] && historyEntries[0].dateKey) || "";
+      root.querySelectorAll(".preset-chip").forEach(function (btn) {
+        const key = btn.getAttribute("data-preset");
+        const snap = snapPresetToSnapshots(presetRange(key, latest));
+        btn.disabled = !snap;
+        const matches = snap && snap.from === activeFrom && (!activeTo || snap.to === activeTo);
+        btn.classList.toggle("active", !!matches);
+      });
+    }
+
+    /* --- Compare two dates (snapshot history) ---------------------------- */
+    function populateCompareDateSelects() {
+      const fromSel = document.getElementById("cmp-from");
+      const toSel = document.getElementById("cmp-to");
+      if (!fromSel || !toSel) return;
+      const sorted = sortDesc(historyEntries);
+      const opts = '<option value="">— pick a date —</option>' + sorted.map(function (e) {
+        return "<option value='" + esc(e.dateKey) + "'>" + esc(fmtKeyShort(e.dateKey)) + "</option>";
+      }).join("");
+      fromSel.innerHTML = opts;
+      toSel.innerHTML = opts;
+      if (compareState.from) fromSel.value = compareState.from;
+      if (compareState.to) toSel.value = compareState.to;
+      refreshPresetChipsState("cmp-preset-chips", compareState.from, compareState.to);
+    }
+
+    function compareDateInRange(dk) {
+      if (!dk || !compareState.from || !compareState.to) return false;
+      const lo = compareState.from < compareState.to ? compareState.from : compareState.to;
+      const hi = compareState.from < compareState.to ? compareState.to : compareState.from;
+      return dk >= lo && dk <= hi;
+    }
+
+    function renderCompareSummary() {
+      const box = document.getElementById("cmp-summary");
+      if (!box) return;
+      const from = compareState.from;
+      const to = compareState.to;
+      if (!from || !to) {
+        box.classList.remove("active");
+        box.innerHTML = "";
+        renderCompareTable();
+        return;
+      }
+      const fromRow = snapshotRows.find(function (r) { return r.dateKey === from; });
+      const toRow = snapshotRows.find(function (r) { return r.dateKey === to; });
+      if (!fromRow || !toRow) {
+        box.classList.add("active");
+        box.innerHTML = "<div class='cmp-summary-head'><strong>Range incomplete</strong></div>" +
+          "<p class='hint' style='margin:0'>One of the picked dates isn't in the snapshot index yet — try again in a moment.</p>";
+        renderCompareTable();
+        return;
+      }
+      // Normalize so "From" is always the earlier date.
+      const earlier = from < to ? fromRow : toRow;
+      const later = from < to ? toRow : fromRow;
+      const inRange = snapshotRows
+        .filter(function (r) { return r.dateKey >= earlier.dateKey && r.dateKey <= later.dateKey; })
+        .sort(function (a, b) { return a.dateKey.localeCompare(b.dateKey); });
+      const days = daysBetweenKeys(later.dateKey, earlier.dateKey);
+      function avg(arr) {
+        const vals = arr.filter(function (n) { return typeof n === "number" && isFinite(n); });
+        if (!vals.length) return null;
+        return vals.reduce(function (a, b) { return a + b; }, 0) / vals.length;
+      }
+      const avgMc = avg(inRange.map(function (r) { return r.mcRatePercent; }));
+      const avgFleet = avg(inRange.map(function (r) { return r.fleetTotal; }));
+      const avgFmc = avg(inRange.map(function (r) { return r.fmc; }));
+      const avgNmc = avg(inRange.map(function (r) { return r.nmc; }));
+      function delta(a, b, kind) {
+        if (a == null || b == null) return "<span class='delta flat'>·</span>";
+        const d = a - b;
+        if (!isFinite(d)) return "<span class='delta flat'>·</span>";
+        let cls = "flat";
+        if (kind === "pct") {
+          if (Math.abs(d) >= 0.005) cls = d > 0 ? "up" : "down";
+        } else if (kind === "good-up") {
+          if (Math.abs(d) >= 0.5) cls = d > 0 ? "up" : "down";
+        } else if (kind === "bad-up") {
+          if (Math.abs(d) >= 0.5) cls = d > 0 ? "neg-up" : "neg-down";
+        } else {
+          if (Math.abs(d) >= 0.5) cls = d > 0 ? "up" : "down";
+        }
+        const fmt = kind === "pct" ? fmtSignedPts(d) : fmtSignedInt(d);
+        return "<span class='delta " + cls + "'>" + arrow(d) + " " + esc(fmt) + "</span>";
+      }
+      const avgDelta = (inRange.length > 1)
+        ? ((later.mcRatePercent != null && earlier.mcRatePercent != null)
+            ? (later.mcRatePercent - earlier.mcRatePercent) / Math.max(1, inRange.length - 1)
+            : null)
+        : null;
+      box.classList.add("active");
+      box.innerHTML =
+        "<div class='cmp-summary-head'>" +
+          "<strong>" + esc(fmtKeyShort(earlier.dateKey)) + "</strong>" +
+          " <span class='span'>→</span> " +
+          "<strong>" + esc(fmtKeyShort(later.dateKey)) + "</strong>" +
+          " <span class='span'>· " + (days != null ? days + " day" + (days === 1 ? "" : "s") : "—") +
+          " · " + inRange.length + " snapshot" + (inRange.length === 1 ? "" : "s") + " in range</span>" +
+        "</div>" +
+        "<div class='cmp-stats'>" +
+          stat("MC % start", earlier.mcRatePercent != null ? fmtMc(earlier.mcRatePercent) : "—") +
+          stat("MC % end",   later.mcRatePercent   != null ? fmtMc(later.mcRatePercent)   : "—",
+                delta(later.mcRatePercent, earlier.mcRatePercent, "pct")) +
+          stat("MC % avg",   avgMc != null ? fmtMc(avgMc) : "—") +
+          stat("Avg Δ MC / snapshot", avgDelta != null ? fmtSignedPts(avgDelta) : "—") +
+          stat("Δ Fleet", "", delta(later.fleetTotal, earlier.fleetTotal, "flat")) +
+          stat("Δ FMC",   "", delta(later.fmc,        earlier.fmc,        "good-up")) +
+          stat("Δ NMC",   "", delta(later.nmc,        earlier.nmc,        "bad-up")) +
+          stat("Avg fleet",  avgFleet != null ? fmtKpi(Math.round(avgFleet)) : "—") +
+          stat("Avg FMC",    avgFmc   != null ? fmtKpi(Math.round(avgFmc))   : "—") +
+          stat("Avg NMC",    avgNmc   != null ? fmtKpi(Math.round(avgNmc))   : "—") +
+        "</div>";
+      function stat(label, value, deltaHtml) {
+        return "<div class='cmp-stat'>" +
+          "<span class='lbl'>" + esc(label) + "</span>" +
+          (value ? "<span class='val'>" + esc(value) + "</span>" : "") +
+          (deltaHtml ? deltaHtml : "") +
+          "</div>";
+      }
+      renderCompareTable();
+    }
+
+    /* --- Per-Unit / NCE breakdown card ----------------------------------- */
+    function renderBreakdownCard(rows) {
+      currentBreakdown = Array.isArray(rows) ? rows : [];
+      const card = document.getElementById("breakdown-card");
+      const grid = document.getElementById("breakdown-grid");
+      if (!card || !grid) return;
+      if (!currentBreakdown.length) {
+        card.style.display = "none";
+        grid.innerHTML = "";
+        return;
+      }
+      card.style.display = "";
+      // Filter logic per breakdown tab. NCE tab only shows NCE rows; Units tab
+      // shows everything that's NOT NCE and NOT a totals/grand-total row; All
+      // shows everything except totals (totals are already in the KPI strip).
+      let visible = currentBreakdown;
+      if (breakdownFilter === "nce") {
+        visible = currentBreakdown.filter(function (r) { return r.isNce; });
+      } else if (breakdownFilter === "units") {
+        visible = currentBreakdown.filter(function (r) { return !r.isNce && !r.isTotal; });
+      } else {
+        visible = currentBreakdown.filter(function (r) { return !r.isTotal; });
+      }
+      if (!visible.length) {
+        grid.innerHTML = "<div class='bd-empty'>" +
+          (breakdownFilter === "nce"
+            ? "No NCE rows on this snapshot — labels containing 'NCE' are auto-flagged. Add an NCE row to the Asset Manager sheet to see it here."
+            : "No matching rows in the Asset Manager sheet.") +
+        "</div>";
+        return;
+      }
+      // Sort: lowest MC% first (most attention needed), unknowns last.
+      visible = visible.slice().sort(function (a, b) {
+        const aN = a.mcRatePercent == null;
+        const bN = b.mcRatePercent == null;
+        if (aN !== bN) return aN ? 1 : -1;
+        return (a.mcRatePercent || 0) - (b.mcRatePercent || 0);
+      });
+      // Build a compare-by-label index when a comparison date is active.
+      const cmpByLabel = {};
+      if (breakdownCompareDate && Array.isArray(breakdownCompareData)) {
+        for (let i = 0; i < breakdownCompareData.length; i++) {
+          const c = breakdownCompareData[i];
+          if (c && c.label) cmpByLabel[String(c.label).toLowerCase()] = c;
+        }
+      }
+      const cmpDateLabel = breakdownCompareDate ? fmtKeyShort(breakdownCompareDate) : "";
+      grid.innerHTML = visible.map(function (r) {
+        const mc = r.mcRatePercent;
+        let mcCls = "";
+        if (mc != null) {
+          if (mc < 70) mcCls = "bad";
+          else if (mc < 85) mcCls = "warn";
+          else mcCls = "ok";
+        }
+        const stats = [];
+        const fleetLbl = r.isNce ? "Assets" : "Fleet";
+        if (r.fleetTotal != null) stats.push("<span class='stat'><span class='lbl'>" + fleetLbl + "</span>" + esc(fmtKpi(r.fleetTotal)) + "</span>");
+        if (r.fmc != null)        stats.push("<span class='stat'><span class='lbl'>FMC</span>" + esc(fmtKpi(r.fmc)) + "</span>");
+        if (r.nmc != null)        stats.push("<span class='stat'><span class='lbl'>NMC</span>" + esc(fmtKpi(r.nmc)) + "</span>");
+        if (r.surplus != null)    stats.push("<span class='stat'><span class='lbl'>Surplus</span>" + esc(fmtKpi(r.surplus)) + "</span>");
+        const headline = (mc != null)
+          ? esc(fmtMc(mc))
+          : (r.isNce && r.fleetTotal != null ? esc(fmtKpi(r.fleetTotal)) : "—");
+        const headlineSub = (mc == null && r.isNce && r.fleetTotal != null)
+          ? "<span class='bd-tile-sub'>NCE assets</span>"
+          : "";
+        // Compare delta pill (when compare date is active).
+        let deltaHtml = "";
+        if (breakdownCompareDate) {
+          const prev = cmpByLabel[String(r.label).toLowerCase()];
+          if (prev && mc != null && prev.mcRatePercent != null) {
+            const d = mc - prev.mcRatePercent;
+            const cls = Math.abs(d) < 0.05 ? "flat" : (d > 0 ? "up" : "down");
+            const arrow = cls === "up" ? "▲" : (cls === "down" ? "▼" : "—");
+            const sign = d > 0 ? "+" : "";
+            deltaHtml =
+              "<span class='bd-tile-delta " + cls + "'>" + arrow + " " + esc(sign + d.toFixed(1) + " pp") + "</span>" +
+              "<span class='bd-tile-delta-sub'>vs " + esc(cmpDateLabel) + " (" + esc(fmtMc(prev.mcRatePercent)) + ")</span>";
+          } else if (prev && mc != null && prev.mcRatePercent == null) {
+            deltaHtml = "<span class='bd-tile-delta new'>new MC%</span>" +
+              "<span class='bd-tile-delta-sub'>no MC% on " + esc(cmpDateLabel) + "</span>";
+          } else if (!prev) {
+            deltaHtml = "<span class='bd-tile-delta new'>new</span>" +
+              "<span class='bd-tile-delta-sub'>not on " + esc(cmpDateLabel) + "</span>";
+          }
+        }
+        return "<div class='bd-tile" + (r.isNce ? " is-nce" : "") + "'>" +
+          "<span class='bd-tile-label'>" + esc(r.label) + "</span>" +
+          "<span class='bd-tile-mc " + mcCls + "'>" + headline + "</span>" +
+          headlineSub +
+          deltaHtml +
+          "<div class='bd-tile-stats'>" + stats.join("") + "</div>" +
+        "</div>";
+      }).join("");
+      renderBreakdownCompareSummary(visible, cmpByLabel);
+    }
+
+    function renderBreakdownCompareSummary(visible, cmpByLabel) {
+      const box = document.getElementById("bd-compare-summary");
+      if (!box) return;
+      if (!breakdownCompareDate || !cmpByLabel) { box.textContent = ""; return; }
+      let n = 0, sum = 0, up = 0, down = 0;
+      for (let i = 0; i < visible.length; i++) {
+        const r = visible[i];
+        if (r.mcRatePercent == null) continue;
+        const prev = cmpByLabel[String(r.label).toLowerCase()];
+        if (!prev || prev.mcRatePercent == null) continue;
+        const d = r.mcRatePercent - prev.mcRatePercent;
+        n++; sum += d;
+        if (d > 0.05) up++; else if (d < -0.05) down++;
+      }
+      if (!n) {
+        box.innerHTML = "No overlapping rows on " + esc(fmtKeyShort(breakdownCompareDate));
+        return;
+      }
+      const avg = sum / n;
+      const cls = Math.abs(avg) < 0.05 ? "flat" : (avg > 0 ? "up" : "down");
+      const sign = avg > 0 ? "+" : "";
+      box.innerHTML =
+        "Avg Δ MC% <span class='pp " + cls + "'>" + esc(sign + avg.toFixed(2) + " pp") + "</span>" +
+        " &nbsp;·&nbsp; " + n + " rows &nbsp;·&nbsp; " +
+        "<span class='pp up'>▲ " + up + "</span> &nbsp; " +
+        "<span class='pp down'>▼ " + down + "</span>";
+    }
+
+    /**
+     * Populate the per-Unit "Compare to" dropdown with all snapshot dates
+     * except the currently-selected one. Mirrors populateCompareDateSelects.
+     */
+    function populateBreakdownCompareSelect() {
+      const sel = document.getElementById("bd-compare-date");
+      if (!sel) return;
+      const sorted = sortDesc(historyEntries).filter(function (e) {
+        return e.dateKey !== selectedDate;
+      });
+      // Group by year -> month for scalability with many snapshots.
+      const groups = {};
+      for (let i = 0; i < sorted.length; i++) {
+        const dk = sorted[i].dateKey;
+        const d = new Date(dk + "T00:00:00Z");
+        if (isNaN(d.getTime())) continue;
+        const y = String(d.getUTCFullYear());
+        const m = d.toLocaleString("en-US", { month: "short", timeZone: "UTC" }).toUpperCase();
+        const k = y + "-" + m;
+        if (!groups[k]) groups[k] = { y: y, m: m, items: [] };
+        groups[k].items.push(dk);
+      }
+      const keys = Object.keys(groups).sort().reverse();
+      let html = "<option value=''>Off</option>";
+      for (let i = 0; i < keys.length; i++) {
+        const g = groups[keys[i]];
+        html += "<optgroup label='" + esc(g.m + " " + g.y) + "'>";
+        for (let j = 0; j < g.items.length; j++) {
+          const dk = g.items[j];
+          html += "<option value='" + esc(dk) + "'>" + esc(fmtKeyShort(dk)) + "</option>";
+        }
+        html += "</optgroup>";
+      }
+      sel.innerHTML = html;
+      // Restore selection if it's still valid.
+      if (breakdownCompareDate) {
+        const stillExists = sorted.some(function (e) { return e.dateKey === breakdownCompareDate; });
+        sel.value = stillExists ? breakdownCompareDate : "";
+        if (!stillExists) {
+          breakdownCompareDate = "";
+          breakdownCompareData = null;
+        }
+      }
+      refreshPresetChipsState("bd-preset-chips", breakdownCompareDate, selectedDate || "");
+    }
+
+    /**
+     * Switch the per-Unit compare date. Empty string disables. Fetches and
+     * caches the comparison breakdown, then re-renders the card.
+     */
+    async function setBreakdownCompareDate(dateKey) {
+      breakdownCompareDate = dateKey || "";
+      if (!breakdownCompareDate) {
+        breakdownCompareData = null;
+        renderBreakdownCard(currentBreakdown);
+        return;
+      }
+      const summary = document.getElementById("bd-compare-summary");
+      if (summary) summary.textContent = "Loading " + fmtKeyShort(breakdownCompareDate) + "…";
+      try {
+        let data = breakdownCacheByDate.get(breakdownCompareDate);
+        if (!data) {
+          const a = await loadAnalysis(breakdownCompareDate);
+          data = Array.isArray(a && a.assetManagerBreakdown) ? a.assetManagerBreakdown : [];
+          breakdownCacheByDate.set(breakdownCompareDate, data);
+        }
+        // Guard against the user changing the dropdown mid-fetch.
+        if (breakdownCompareDate !== dateKey) return;
+        breakdownCompareData = data;
+      } catch (err) {
+        breakdownCompareData = [];
+        if (summary) summary.textContent = "Couldn't load " + fmtKeyShort(breakdownCompareDate);
+      }
+      renderBreakdownCard(currentBreakdown);
+    }
+
+    /* --- KPIs with deltas ------------------------------------------------- */
+    function renderKpis(am, prev) {
+      const row = document.getElementById("kpi-row");
+      const strip = document.getElementById("kpi-strip");
+      const cmp = document.getElementById("kpi-compare");
+      if (!am || !am.sheetFound) {
+        strip.style.display = "none";
+        row.innerHTML = "";
+        if (cmp) cmp.textContent = "";
+        return;
+      }
+      strip.style.display = "block";
+      if (cmp) {
+        cmp.innerHTML = prev
+          ? "vs. <strong>" + esc(fmtKeyShort(prev.dateKey)) + "</strong>"
+          : "no prior snapshot";
+      }
+      function makeDelta(curr, prv, kind) {
+        if (curr == null || prv == null) return "";
+        const diff = curr - prv;
+        if (!isFinite(diff)) return "";
+        const fmt = kind === "pct" ? fmtSignedPts(diff) : fmtSignedInt(diff);
+        let cls = "flat";
+        if (Math.abs(diff) >= (kind === "pct" ? 0.005 : 0.5)) {
+          if (kind === "good-up") cls = diff > 0 ? "up" : "down";
+          else if (kind === "bad-up") cls = diff > 0 ? "neg-up" : "neg-down";
+          else if (kind === "pct") cls = diff > 0 ? "neg-down" : "neg-up";
+          else cls = diff > 0 ? "up" : "down";
+        }
+        return "<div class='delta " + cls + "'><span class='arrow'>" + arrow(diff) + "</span>" + esc(fmt) + "</div>";
+      }
+      const cells = [
+        { lbl: "MC Rate", sub: "", val: fmtMc(am.mcRatePercent), cls: "kpi-val-mc em", miss: am.mcRatePercent == null, delta: makeDelta(am.mcRatePercent, prev && prev.mcRatePercent, "pct") },
+        { lbl: "Fleet Total", sub: "", val: fmtKpi(am.fleetTotal), cls: "kpi-val-fleet", miss: am.fleetTotal == null, delta: makeDelta(am.fleetTotal, prev && prev.fleetTotal, "flat") },
+        { lbl: "No. Vehs", sub: "FMC", val: fmtKpi(am.fmc), cls: "kpi-val-fmc", miss: am.fmc == null, delta: makeDelta(am.fmc, prev && prev.fmc, "good-up") },
+        { lbl: "No. Vehs", sub: "NMC", val: fmtKpi(am.nmc), cls: "kpi-val-nmc", miss: am.nmc == null, delta: makeDelta(am.nmc, prev && prev.nmc, "bad-up") },
+        { lbl: "No. Vehs", sub: "Surplus", val: fmtKpi(am.surplus), cls: "kpi-val-surplus", miss: am.surplus == null, delta: makeDelta(am.surplus, prev && prev.surplus, "flat") },
+      ];
+      row.innerHTML = cells.map(function (c) {
+        const miss = c.miss ? " kpi-missing" : "";
+        const sub = c.sub ? "<small>" + esc(c.sub) + "</small>" : "";
+        return (
+          "<div class='kpi-cell" + miss + "'><div class='lbl'>" + esc(c.lbl) + sub + "</div>" +
+          "<div class='val " + c.cls + "'>" + esc(c.val) + "</div>" +
+          (c.delta || "") +
+          "</div>"
+        );
+      }).join("");
+    }
+
+    /* --- Ingest footer (was a whole card) -------------------------------- */
+    function renderIngestFooter(analysis) {
+      const el = document.getElementById("ingest-footer");
+      const recv = analysis.receivedAtIso ? fmtKeyShort(analysis.receivedAtIso) : "—";
+      const size = typeof analysis.workbookBytes === "number"
+        ? (analysis.workbookBytes / 1024 / 1024).toFixed(2) + " MB"
+        : "—";
+      el.innerHTML =
+        "Ingested <strong>" + esc(recv) + "</strong> · from <strong>" + esc(analysis.from || "—") + "</strong>" +
+        " · workbook <strong>" + esc(analysis.workbookFileName || "—") + "</strong> (" + esc(size) + ")";
+    }
+
+    function tierClass(t) {
+      if (t === "below") return "tier-below";
+      if (t === "at") return "tier-at";
+      if (t === "above") return "tier-above";
+      return "tier-unknown";
+    }
+
+    /**
+     * Work Orders tab is locked to the most-recent snapshot — the change
+     * timeline already preserves history, so a date selector adds noise.
+     * This helper centralizes that decision.
+     */
+    function woAsOfDate() {
+      return latestSnapshotDate() || selectedDate || "";
+    }
+
+    function setMainTab(which) {
+      const snapBtn = document.getElementById("tab-snapshot");
+      const woBtn = document.getElementById("tab-work-orders");
+      const melBtn = document.getElementById("tab-mel");
+      const meetBtn = document.getElementById("tab-meeting");
+      const yardBtn = document.getElementById("tab-yard");
+      const askBtn = document.getElementById("tab-ask");
+      const setBtn = document.getElementById("tab-settings");
+      const panelSnap = document.getElementById("panel-snapshot");
+      const panelWo = document.getElementById("panel-work-orders");
+      const panelMel = document.getElementById("panel-mel");
+      const panelMeet = document.getElementById("panel-meeting");
+      const panelYard = document.getElementById("panel-yard");
+      const panelAsk = document.getElementById("panel-ask");
+      const panelSet = document.getElementById("panel-settings");
+      const brandSub = document.getElementById("brand-sub");
+      const fab = document.getElementById("ask-fab");
+      const isWo = which === "wo";
+      const isMel = which === "mel";
+      const isMeet = which === "meeting";
+      const isYard = which === "yard";
+      const isAsk = which === "ask";
+      const isSet = which === "settings";
+      const isSnap = !isWo && !isMel && !isMeet && !isYard && !isAsk && !isSet;
+      snapBtn.classList.toggle("active", isSnap);
+      woBtn.classList.toggle("active", isWo);
+      if (melBtn) melBtn.classList.toggle("active", isMel);
+      if (meetBtn) meetBtn.classList.toggle("active", isMeet);
+      if (yardBtn) yardBtn.classList.toggle("active", isYard);
+      if (askBtn) askBtn.classList.toggle("active", isAsk);
+      if (setBtn) setBtn.classList.toggle("active", isSet);
+      panelSnap.classList.toggle("hidden", !isSnap);
+      panelWo.classList.toggle("hidden", !isWo);
+      if (panelMel) panelMel.classList.toggle("hidden", !isMel);
+      if (panelMeet) panelMeet.classList.toggle("hidden", !isMeet);
+      if (panelYard) panelYard.classList.toggle("hidden", !isYard);
+      if (panelAsk) panelAsk.classList.toggle("hidden", !isAsk);
+      if (panelSet) panelSet.classList.toggle("hidden", !isSet);
+      if (fab) fab.classList.toggle("hidden", isAsk);
+      brandSub.textContent = isWo
+        ? "Browse, filter, and inspect work orders. Select one to see its change timeline."
+        : isMel
+        ? "Per-MEL-key status, recall loans, and history. NMC ≥ MEL required = below."
+        : isMeet
+        ? "Run a live ETIC meeting. Timer, notes, due-outs, and auto-generated minutes."
+        : isYard
+        ? "Walk the lot with your phone. Confirm each asset's location and log discrepancies."
+        : isAsk
+        ? "Ask plain-English questions about your fleet data."
+        : isSet
+        ? "Tune thresholds, mark MEL keys as critical, and define type subdivisions."
+        : "Fleet readiness at a glance.";
+      if (isWo) {
+        const asOf = woAsOfDate();
+        if (asOf) loadAndRenderWoList(asOf, { force: true });
+      } else if (isMel) {
+        onEnterMelTab();
+      } else if (isMeet) {
+        onEnterMeetingTab();
+      } else if (isYard) {
+        onEnterYardTab();
+      } else if (isAsk) {
+        askRenderInto("ask-log-tab");
+        setTimeout(function () { const t = document.getElementById("ask-input-tab"); if (t) t.focus(); }, 30);
+      } else if (isSet) {
+        onEnterSettingsTab();
+      }
+    }
+
+    /* --- Work Orders list + filters -------------------------------------- */
+    function woMatchesFilter(r, filter) {
+      if (filter === "all") return true;
+      if (filter === "stale") return !!r.remarkStale;
+      if (filter === "pushed") return (r.eticPushCount || 0) >= 1;
+      if (filter === "slipped") return (r.cumulativeEticSlipDays || 0) >= 1;
+      if (filter === "below") return r.melTier === "below";
+      return true;
+    }
+
+    function woMatchesQuery(r, q) {
+      if (!q) return true;
+      const ql = q.toLowerCase();
+      return (
+        (r.workOrderId || "").toLowerCase().indexOf(ql) !== -1 ||
+        (r.assetId || "").toLowerCase().indexOf(ql) !== -1 ||
+        (r.remarks || "").toLowerCase().indexOf(ql) !== -1 ||
+        (r.owningUnit || "").toLowerCase().indexOf(ql) !== -1 ||
+        (r.melKey || "").toLowerCase().indexOf(ql) !== -1 ||
+        (r.shop || "").toLowerCase().indexOf(ql) !== -1 ||
+        (r.mgmtCd || "").toLowerCase().indexOf(ql) !== -1 ||
+        (r.makeModel || "").toLowerCase().indexOf(ql) !== -1 ||
+        (r.vehNomen || "").toLowerCase().indexOf(ql) !== -1
+      );
+    }
+
+    function woMatchesRefine(r) {
+      if (woUnit && (r.owningUnit || "") !== woUnit) return false;
+      if (woMelKey && (r.melKey || "") !== woMelKey) return false;
+      if (woShop && (r.shop || "") !== woShop) return false;
+      if (woMgmtCd && (r.mgmtCd || "") !== woMgmtCd) return false;
+      return true;
+    }
+
+    function woSortKey(r) {
+      if (r.melTier === "below" && r.remarkStale) return 0;
+      if (r.remarkStale) return 1;
+      if (r.melTier === "below") return 2;
+      if ((r.eticPushCount || 0) >= 3) return 3;
+      if ((r.cumulativeEticSlipDays || 0) >= 7) return 4;
+      return 5;
+    }
+
+    function cmpStr(a, b) { return (a || "").localeCompare(b || "", undefined, { sensitivity: "base", numeric: true }); }
+    function cmpNumDesc(a, b) { return (b || 0) - (a || 0); }
+    function cmpEticAsc(a, b) {
+      const ax = a.eticDate || "9999-99-99";
+      const bx = b.eticDate || "9999-99-99";
+      if (ax !== bx) return ax < bx ? -1 : 1;
+      return cmpStr(a.workOrderId, b.workOrderId);
+    }
+    function cmpEticDesc(a, b) {
+      const ax = a.eticDate || "0000-00-00";
+      const bx = b.eticDate || "0000-00-00";
+      if (ax !== bx) return ax < bx ? 1 : -1;
+      return cmpStr(a.workOrderId, b.workOrderId);
+    }
+
+    function applySort(filtered) {
+      const sort = woSort || "default";
+      if (sort === "wo") {
+        filtered.sort(function (a, b) { return cmpStr(a.workOrderId, b.workOrderId); });
+      } else if (sort === "asset") {
+        filtered.sort(function (a, b) { return cmpStr(a.assetId, b.assetId) || cmpStr(a.workOrderId, b.workOrderId); });
+      } else if (sort === "unit") {
+        filtered.sort(function (a, b) { return cmpStr(a.owningUnit, b.owningUnit) || cmpStr(a.workOrderId, b.workOrderId); });
+      } else if (sort === "shop") {
+        filtered.sort(function (a, b) { return cmpStr(a.shop, b.shop) || cmpStr(a.workOrderId, b.workOrderId); });
+      } else if (sort === "melkey") {
+        filtered.sort(function (a, b) { return cmpStr(a.melKey, b.melKey) || cmpStr(a.workOrderId, b.workOrderId); });
+      } else if (sort === "mgmtcd") {
+        filtered.sort(function (a, b) { return cmpStr(a.mgmtCd, b.mgmtCd) || cmpStr(a.workOrderId, b.workOrderId); });
+      } else if (sort === "makemodel") {
+        filtered.sort(function (a, b) { return cmpStr(a.makeModel, b.makeModel) || cmpStr(a.workOrderId, b.workOrderId); });
+      } else if (sort === "etic-asc") {
+        filtered.sort(cmpEticAsc);
+      } else if (sort === "etic-desc") {
+        filtered.sort(cmpEticDesc);
+      } else if (sort === "remarks-age") {
+        filtered.sort(function (a, b) { return cmpNumDesc(a.daysSinceRemarkChange, b.daysSinceRemarkChange) || cmpStr(a.workOrderId, b.workOrderId); });
+      } else if (sort === "pushes") {
+        filtered.sort(function (a, b) { return cmpNumDesc(a.eticPushCount, b.eticPushCount) || cmpNumDesc(a.cumulativeEticSlipDays, b.cumulativeEticSlipDays); });
+      } else if (sort === "slip") {
+        filtered.sort(function (a, b) { return cmpNumDesc(a.cumulativeEticSlipDays, b.cumulativeEticSlipDays) || cmpNumDesc(a.eticPushCount, b.eticPushCount); });
+      } else {
+        filtered.sort(function (a, b) {
+          const sa = woSortKey(a), sb = woSortKey(b);
+          if (sa !== sb) return sa - sb;
+          return cmpStr(a.workOrderId, b.workOrderId);
+        });
+      }
+      return filtered;
+    }
+
+    function filterAndSortWoList(rows) {
+      const filtered = rows.filter(function (r) {
+        return woMatchesFilter(r, woFilter) && woMatchesRefine(r) && woMatchesQuery(r, woQuery);
+      });
+      return applySort(filtered);
+    }
+
+    function renderWoListCounts(rows) {
+      function count(f) {
+        return rows.filter(function (r) { return woMatchesFilter(r, f) && woMatchesRefine(r) && woMatchesQuery(r, woQuery); }).length;
+      }
+      const map = { all: count("all"), below: count("below"), stale: count("stale"), pushed: count("pushed"), slipped: count("slipped") };
+      document.querySelectorAll("#wo-filters .count").forEach(function (el) {
+        const k = el.getAttribute("data-count");
+        if (k && map[k] !== undefined) el.textContent = map[k];
+      });
+    }
+
+    /**
+     * Cascading dropdowns: each select shows only the values that exist in
+     * rows matching the OTHER currently-selected filters. Unit picks shape the
+     * available shops, MEL keys, and Mgmt Cds (and vice versa).
+     *
+     * If the current value of a dropdown becomes invalid (e.g. user picks Unit
+     * X then changes Shop and the previously-selected Mgmt no longer appears
+     * in any X+Shop row), we silently null it out and recompute.
+     */
+    function refreshRefineOptions(rows) {
+      const unitSel = document.getElementById("wo-unit");
+      const melSel = document.getElementById("wo-melkey");
+      const shopSel = document.getElementById("wo-shop");
+      const mgmtSel = document.getElementById("wo-mgmtcd");
+      if (!unitSel || !melSel) return;
+
+      function build(except) {
+        const m = new Map();
+        rows.forEach(function (r) {
+          if (except !== "unit"   && woUnit   && (r.owningUnit || "") !== woUnit) return;
+          if (except !== "melKey" && woMelKey && (r.melKey || "") !== woMelKey) return;
+          if (except !== "shop"   && woShop   && (r.shop || "") !== woShop) return;
+          if (except !== "mgmtCd" && woMgmtCd && (r.mgmtCd || "") !== woMgmtCd) return;
+          const v = (
+            except === "unit"   ? r.owningUnit
+            : except === "melKey" ? r.melKey
+            : except === "shop"   ? r.shop
+            : except === "mgmtCd" ? r.mgmtCd
+            : ""
+          ) || "";
+          const t = String(v).trim();
+          if (t) m.set(t, (m.get(t) || 0) + 1);
+        });
+        return Array.from(m.entries()).sort(function (a, b) { return cmpStr(a[0], b[0]); });
+      }
+
+      // First pass: compute options + drop any current selection that is no
+      // longer valid given the other active filters.
+      let unitItems = build("unit");
+      let melItems  = build("melKey");
+      let shopItems = build("shop");
+      let mgmtItems = build("mgmtCd");
+      let dirty = false;
+      if (woUnit   && !unitItems.some(function (it) { return it[0] === woUnit; }))   { woUnit = "";   dirty = true; }
+      if (woMelKey && !melItems.some(function  (it) { return it[0] === woMelKey; })) { woMelKey = ""; dirty = true; }
+      if (woShop   && !shopItems.some(function (it) { return it[0] === woShop; }))   { woShop = "";   dirty = true; }
+      if (woMgmtCd && !mgmtItems.some(function (it) { return it[0] === woMgmtCd; })) { woMgmtCd = ""; dirty = true; }
+      if (dirty) {
+        unitItems = build("unit");
+        melItems  = build("melKey");
+        shopItems = build("shop");
+        mgmtItems = build("mgmtCd");
+      }
+
+      function rebuild(sel, allLabel, items, current) {
+        if (!sel) return;
+        const total = items.reduce(function (s, it) { return s + it[1]; }, 0);
+        const opts = ["<option value=''>" + esc(allLabel) + " (" + total + ")</option>"]
+          .concat(items.map(function (it) {
+            return "<option value='" + esc(it[0]) + "'" + (it[0] === current ? " selected" : "") + ">" + esc(it[0]) + " (" + it[1] + ")</option>";
+          }));
+        sel.innerHTML = opts.join("");
+      }
+      rebuild(unitSel, "All units", unitItems, woUnit);
+      rebuild(melSel, "All MEL keys", melItems, woMelKey);
+      rebuild(shopSel, "All shops", shopItems, woShop);
+      rebuild(mgmtSel, "All Mgmt Cd", mgmtItems, woMgmtCd);
+    }
+
+    function renderWoList(rows) {
+      const list = document.getElementById("wo-list");
+      const meta = document.getElementById("wo-list-meta");
+      refreshRefineOptions(rows);
+      const visible = filterAndSortWoList(rows);
+      renderWoListCounts(rows);
+      meta.textContent = visible.length + " of " + rows.length + " work orders";
+      if (!visible.length) {
+        list.innerHTML = "<div class='problem-empty' style='padding:18px 4px'>No work orders match this filter.</div>";
+        return;
+      }
+      list.innerHTML = visible.map(function (r) {
+        const isActive = r.workOrderId === selectedWoId;
+        const staleChip = r.remarkStale
+          ? "<span class='chip stale'>Stale</span>"
+          : "";
+        const tierBadge = "<span class='badge-tier " + tierClass(r.melTier) + "'>" + esc(r.melTier) + "</span>";
+        const nceChip = r.nce ? "<span class='chip nce' title='Nuclear Certified Equipment" + (r.nceStatus ? " · " + esc(r.nceStatus) : "") + "'>NCE</span>" : "";
+        const reasonChip = r.woReason ? "<div class='wo-reason'><span class='lbl'>Reason</span>" + esc(r.woReason) + "</div>" : "";
+        const openedLine = r.establishedDateIso ? "<span class='wo-opened'>Opened " + esc(fmtKeyShort(r.establishedDateIso)) + "</span>" : (r.establishedDate ? "<span class='wo-opened'>Opened " + esc(fmtMaybeDate(r.establishedDate)) + "</span>" : "");
+        const dsc = r.daysSinceRemarkChange == null
+          ? "—"
+          : (r.historyBounded ? "≥" : "") + r.daysSinceRemarkChange + "d";
+        const dscCls = r.remarkStale ? " danger" : (r.daysSinceRemarkChange >= (r.requiredIntervalDays || 99) - 1 ? " warn" : "");
+        const remarksLabel = r.historyBounded ? "Remarks*" : "Remarks";
+        const etic = r.eticDate ? fmtKeyShort(r.eticDate) : (r.eticRaw ? fmtMaybeDate(r.eticRaw) : "—");
+        const pushes = r.eticPushCount || 0;
+        const slip = r.cumulativeEticSlipDays || 0;
+        const remarkSnippet = (r.remarks || "").trim().replace(/\\s+/g, " ");
+        const remarkHtml = remarkSnippet
+          ? "<div class='remark-snippet'>" + esc(remarkSnippet) + "</div>"
+          : "";
+        const metaChips = [];
+        if (r.owningUnit) metaChips.push("<span class='meta-chip'><span class='lbl'>Unit</span>" + esc(r.owningUnit) + "</span>");
+        if (r.shop) metaChips.push("<span class='meta-chip'><span class='lbl'>Shop</span>" + esc(r.shop) + "</span>");
+        if (r.melKey) metaChips.push("<span class='meta-chip'><span class='lbl'>MEL</span>" + esc(r.melKey) + "</span>");
+        if (r.mgmtCd) metaChips.push("<span class='meta-chip'><span class='lbl'>Mgmt</span>" + esc(r.mgmtCd) + "</span>");
+        if (r.makeModel) metaChips.push("<span class='meta-chip'><span class='lbl'>M/M</span>" + esc(r.makeModel) + "</span>");
+        const metaChipsHtml = metaChips.length ? "<div class='meta-chips'>" + metaChips.join("") + "</div>" : "";
+        return (
+          "<button type='button' class='wo-card" + (isActive ? " active" : "") + "' data-wo='" + esc(r.workOrderId) + "' data-tier='" + esc(r.melTier || "unknown") + "' data-nce='" + (r.nce ? "1" : "0") + "'>" +
+          "<div class='top-line'>" +
+          "<span class='wo-id'>" + esc(r.workOrderId) + "</span>" +
+          "<span class='badges'>" + nceChip + tierBadge + staleChip + "</span>" +
+          "</div>" +
+          "<div class='top-line'><span class='asset'>" + esc(r.assetId || "—") + "</span>" +
+          (r.partsStatus ? "<span class='asset'>" + esc(r.partsStatus) + "</span>" : "<span></span>") +
+          "</div>" +
+          // Sighting pill rides the same wrap-friendly meta row as "Opened ..."
+          // — keeping it off the asset/parts row prevents the badge from
+          // colliding with long parts-status text on narrow cards.
+          ((openedLine || r.assetId) ? (
+            "<div class='wo-meta-line'>" +
+              (openedLine || "") +
+              renderSightingBadge(r.assetId) +
+            "</div>"
+          ) : "") +
+          reasonChip +
+          metaChipsHtml +
+          "<div class='meta'>" +
+          "<span><span class='k'>ETIC</span> <span class='v'>" + esc(etic) + "</span></span>" +
+          "<span" + (r.historyBounded ? " title='History limited — work order existed before our earliest snapshot (" + esc(r.firstSeenDate || "") + ")'" : "") + "><span class='k'>" + remarksLabel + "</span> <span class='v" + dscCls + "'>" + esc(dsc) + "</span></span>" +
+          (pushes > 0 ? "<span><span class='k'>Pushes</span> <span class='v" + (pushes >= 3 ? " warn" : "") + "'>" + pushes + "</span></span>" : "") +
+          (slip > 0 ? "<span><span class='k'>Days slipped</span> <span class='v" + (slip >= 7 ? " danger" : " warn") + "'>" + slip + "</span></span>" : "") +
+          "</div>" +
+          remarkHtml +
+          "</button>"
+        );
+      }).join("");
+      list.querySelectorAll(".wo-card").forEach(function (el) {
+        el.addEventListener("click", function () {
+          const wo = el.getAttribute("data-wo");
+          if (wo) selectWo(wo, true);
+        });
+      });
+    }
+
+    async function loadAndRenderWoList(dateKey, opts) {
+      const meta = document.getElementById("wo-list-meta");
+      meta.textContent = "Loading…";
+      try {
+        // Pull WO rows + last-yard-sighting map in parallel so the asset id
+        // and its current physical location render together on first paint.
+        const [rows] = await Promise.all([
+          loadWatchForDate(dateKey, opts),
+          loadSightings(!!(opts && opts.force)),
+        ]);
+        renderWoList(rows);
+      } catch (e) {
+        meta.textContent = "Could not load work orders.";
+      }
+    }
+
+    /* --- WO Detail + inline timeline ------------------------------------- */
+    async function fetchWoById(woId, asOfDate) {
+      const res = await fetch(
+        "/api/watch?workOrderId=" + encodeURIComponent(woId) + "&date=" + encodeURIComponent(asOfDate),
+      );
+      if (!res.ok) throw new Error("Lookup failed");
+      return res.json();
+    }
+
+    function prettyFieldName(f) {
+      if (f === "etic_date_slip") return "ETIC slip";
+      if (f === "etic") return "ETIC";
+      if (f === "parts_status") return "Parts";
+      if (f === "mel_tier") return "MEL tier";
+      if (f === "remarks") return "Remarks";
+      if (f === "shop") return "Shop";
+      if (f === "initial") return "Tracking start";
+      return f || "";
+    }
+
+    const WO_MONTHS = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
+    const WO_DOW = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+    function parseDateKey(k) {
+      if (!k) return null;
+      const parts = String(k).slice(0, 10).split("-");
+      if (parts.length !== 3) return null;
+      const y = +parts[0], mo = +parts[1], d = +parts[2];
+      if (!y || !mo || !d) return null;
+      return new Date(Date.UTC(y, mo - 1, d));
+    }
+    // Canonical date format across the entire UI: "01 APR 26" (DD MMM YY).
+    // Accepts either a "YYYY-MM-DD" key or an ISO timestamp; time/Z are dropped.
+    function fmtKeyLong(k) {
+      const d = parseDateKey(k); if (!d) return k || "—";
+      const dd = String(d.getUTCDate()).padStart(2, "0");
+      const yy = String(d.getUTCFullYear()).slice(-2);
+      return dd + " " + WO_MONTHS[d.getUTCMonth()] + " " + yy;
+    }
+    function fmtKeyShort(k) {
+      // Same format as fmtKeyLong — the user wants one consistent date style.
+      return fmtKeyLong(k);
+    }
+    // Workbook cells sometimes come through as ISO datetimes ("2026-04-17T00:00:00.000Z")
+    // or "2026-04-17 00:00:00". Auto-format any such value to "17 APR 26"; leave
+    // anything else (codes, freeform text) untouched.
+    function fmtMaybeDate(s) {
+      if (s == null) return "";
+      const str = String(s).trim();
+      if (!str) return "";
+      // Anything that starts with YYYY-MM-DD (optionally followed by T or space
+      // and time/zone gunk) gets normalized to "DD MMM YY". This catches every
+      // variant of ISO timestamp Excel might cough up.
+      const m = str.match(/^(\\d{4}-\\d{2}-\\d{2})(?:[T\\s]|$)/);
+      if (m) return fmtKeyLong(m[1]);
+      return str;
+    }
+    function keyDow(k) {
+      const d = parseDateKey(k); if (!d) return "";
+      return WO_DOW[d.getUTCDay()];
+    }
+    function daysBetweenKeys(aK, bK) {
+      const a = parseDateKey(aK), b = parseDateKey(bK);
+      if (!a || !b) return null;
+      return Math.round((a - b) / 86400000);
+    }
+
+    function renderWoHero(r, asOf) {
+      const el = document.getElementById("wo-hero");
+      const chips = [];
+      if (r.nce) chips.push("<span class='wo-chip nce' title='Nuclear Certified Equipment" + (r.nceStatus ? " · " + esc(r.nceStatus) : "") + "'>NCE</span>");
+      chips.push("<span class='wo-chip " + tierClass(r.melTier) + "'>" + esc(r.melTier || "unknown") + "</span>");
+      if (r.remarkStale) chips.push("<span class='wo-chip stale'>Stale</span>");
+      else chips.push("<span class='wo-chip ok'>On cadence</span>");
+      const subParts = [];
+      // Asset id leads the sub line — the dispatcher cares about which truck
+      // we're talking about more than the snapshot file we pulled it from.
+      // Mono + brighter color makes it visually echo the WO id above.
+      if (r.assetId) {
+        subParts.push(
+          "<span class='wo-hero-asset'>" + esc(r.assetId) + "</span>" +
+          " " + renderSightingBadge(r.assetId)
+        );
+      }
+      const openedTxt = r.establishedDateIso ? fmtKeyShort(r.establishedDateIso) : fmtMaybeDate(r.establishedDate || "");
+      if (openedTxt) subParts.push("Opened " + esc(openedTxt));
+      // Only surface workbook absence (WO dropped from latest snapshot) — the
+      // common case "snapshot is the latest" was just noise on the hero.
+      // Reword to make it clear this is workbook-presence, not yard-sighting.
+      if (r.lastSnapshotDate && r.lastSnapshotDate !== asOf) {
+        subParts.push("Off latest workbook · last in " + esc(fmtKeyShort(r.lastSnapshotDate)));
+      }
+      // Reason rides the same sub line as a small inline chip instead of its
+      // own padded box — it's usually a 4-letter code and the dedicated row
+      // looked top-heavy on short reasons.
+      if (r.woReason) {
+        subParts.push(
+          "<span class='wo-hero-reason-chip'><span class='lbl'>Reason</span>" + esc(r.woReason) + "</span>"
+        );
+      }
+      const reasonHtml = "";
+      el.innerHTML =
+        "<div class='wo-hero-row'>" +
+        "<div class='wo-hero-id'>" + esc(r.workOrderId) + "</div>" +
+        chips.join("") +
+        "</div>" +
+        "<div class='wo-hero-sub'>" + subParts.join("<span class='dot'>·</span>") + "</div>" +
+        reasonHtml;
+    }
+
+    function renderWoKpis(r, asOf) {
+      const el = document.getElementById("wo-kpis");
+      const tiles = [];
+
+      // ETIC
+      const eticVal = r.eticDate ? fmtKeyShort(r.eticDate) : "—";
+      let eticSub = "";
+      let eticCls = "";
+      if (r.eticDate) {
+        const d = daysBetweenKeys(r.eticDate, asOf);
+        if (d == null) eticSub = "";
+        else if (d > 0) eticSub = "in " + d + " day" + (d === 1 ? "" : "s");
+        else if (d === 0) { eticSub = "due today"; eticCls = "warn"; }
+        else { eticSub = "overdue " + (-d) + "d"; eticCls = "danger"; }
+      } else {
+        eticSub = "no date set";
+        eticCls = "dim";
+      }
+      tiles.push(
+        "<div class='wo-kpi " + eticCls + "'>" +
+        "<span class='k-label'>Current ETIC</span>" +
+        "<span class='k-value'>" + esc(eticVal) + "</span>" +
+        "<span class='k-sub'>" + esc(eticSub) + "</span>" +
+        "</div>"
+      );
+
+      // Remarks age
+      const ageVal = r.daysSinceRemarkChange == null
+        ? "—"
+        : (r.historyBounded ? "≥" : "") + r.daysSinceRemarkChange + "d";
+      const ageCls = r.remarkStale ? "warn" : "";
+      const ageSub = r.historyBounded
+        ? "history limited (since " + fmtKeyShort(r.firstSeenDate) + ")"
+        : (r.requiredIntervalDays != null
+            ? "expect ≤ " + r.requiredIntervalDays + "d"
+            : (r.lastRemarkChangeDate ? "since " + fmtKeyShort(r.lastRemarkChangeDate) : ""));
+      tiles.push(
+        "<div class='wo-kpi " + ageCls + "'" +
+        (r.historyBounded ? " title='Work order existed before our earliest snapshot — true age is unknown, this is a lower bound.'" : "") +
+        ">" +
+        "<span class='k-label'>Remarks age</span>" +
+        "<span class='k-value'>" + esc(ageVal) + "</span>" +
+        "<span class='k-sub'>" + esc(ageSub) + "</span>" +
+        "</div>"
+      );
+
+      // ETIC pushes
+      const pushCount = r.eticPushCount || 0;
+      const pushSub = pushCount > 0 && r.firstEticDate && r.lastEticDate
+        ? "<span style='white-space:nowrap'>" + esc(fmtKeyShort(r.firstEticDate)) + "</span>" +
+          "<span class='arrow-sep'>→</span>" +
+          "<span style='white-space:nowrap'>" + esc(fmtKeyShort(r.lastEticDate)) + "</span>"
+        : "no changes";
+      tiles.push(
+        "<div class='wo-kpi " + (pushCount > 0 ? "warn" : "dim") + "'>" +
+        "<span class='k-label'>ETIC pushes</span>" +
+        "<span class='k-value'>" + esc(String(pushCount)) + "</span>" +
+        "<span class='k-sub'>" + pushSub + "</span>" +
+        "</div>"
+      );
+
+      // Total slip
+      const slip = r.cumulativeEticSlipDays || 0;
+      const slipCls = slip > 0 ? "danger" : "dim";
+      const slipSub = slip > 0
+        ? "across " + pushCount + " push" + (pushCount === 1 ? "" : "es")
+        : "on schedule";
+      tiles.push(
+        "<div class='wo-kpi " + slipCls + "'>" +
+        "<span class='k-label'>Days slipped</span>" +
+        "<span class='k-value'>" + esc(String(slip)) + "</span>" +
+        "<span class='k-sub'>" + esc(slipSub) + "</span>" +
+        "</div>"
+      );
+
+      el.innerHTML = tiles.join("");
+    }
+
+    function renderWoRemarks(r) {
+      const body = document.getElementById("wo-remarks-text");
+      const when = document.getElementById("wo-remarks-when");
+      const raw = (r.remarks && String(r.remarks).trim()) ? String(r.remarks).trim() : "";
+      if (!raw) {
+        body.innerHTML = "<span style='color:var(--subtle)'>No remarks recorded.</span>";
+      } else {
+        const segs = raw.split("//").map(function (s) { return s.trim(); }).filter(Boolean);
+        if (segs.length > 1) {
+          body.innerHTML = segs.map(function (s) {
+            return "<span class='seg'>" + esc(s) + "</span>";
+          }).join("<span class='sep'>//</span>");
+        } else {
+          body.innerHTML = esc(raw);
+        }
+      }
+      when.textContent = r.lastRemarkChangeDate
+        ? (r.historyBounded
+            ? "unchanged since first observed " + fmtKeyLong(r.firstSeenDate) + " (history limited)"
+            : "changed " + fmtKeyLong(r.lastRemarkChangeDate))
+        : "";
+    }
+
+    function renderWoFacts(r) {
+      const el = document.getElementById("wo-facts");
+      const rows = [];
+      if (r.nce) rows.push({ dt: "NCE", dd: "<span class='nce-badge'>Yes</span>" + (r.nceStatus ? " <span class='facts-sub'>" + esc(r.nceStatus) + "</span>" : "") });
+      if (r.owningUnit) rows.push({ dt: "Unit", dd: esc(r.owningUnit) });
+      if (r.shop) rows.push({ dt: "Shop", dd: esc(r.shop) });
+      if (r.melKey) rows.push({ dt: "MEL key", dd: esc(r.melKey) });
+      if (r.mgmtCd) rows.push({ dt: "Mgmt Cd", dd: esc(r.mgmtCd) });
+      if (r.makeModel) rows.push({ dt: "Make/Model", dd: esc(r.makeModel) });
+      if (r.vehNomen) rows.push({ dt: "Veh Nomen", dd: esc(r.vehNomen) });
+      if (r.woReason) rows.push({ dt: "Reason", dd: esc(r.woReason) });
+      if (r.establishedDateIso) rows.push({ dt: "Opened", dd: esc(fmtKeyLong(r.establishedDateIso)) });
+      else if (r.establishedDate) rows.push({ dt: "Opened", dd: esc(fmtMaybeDate(r.establishedDate)) });
+      rows.push({ dt: "Parts status", dd: esc(r.partsStatus || "—") });
+      if (r.eticRaw && String(r.eticRaw).trim() && r.eticRaw !== r.eticDate) {
+        const pretty = fmtMaybeDate(r.eticRaw);
+        // Only show the row if the prettified form is meaningfully different
+        // from the parsed eticDate we already rendered above.
+        if (pretty !== fmtKeyShort(r.eticDate)) {
+          const rawTrim = pretty.length > 40 ? pretty.slice(0, 40) + "…" : pretty;
+          rows.push({ dt: "ETIC (raw cell)", dd: esc(rawTrim) });
+        }
+      }
+      if (r.firstEticDate || r.lastEticDate) {
+        const first = r.firstEticDate ? fmtKeyShort(r.firstEticDate) : "—";
+        const last = r.lastEticDate ? fmtKeyShort(r.lastEticDate) : "—";
+        if (first !== last) rows.push({ dt: "ETIC drift", dd: esc(first) + " → " + esc(last) });
+      }
+      if (!rows.length) { el.innerHTML = ""; return; }
+      el.innerHTML = rows.map(function (x) {
+        return "<div><dt>" + x.dt + "</dt><dd>" + x.dd + "</dd></div>";
+      }).join("");
+    }
+
+    function actionTypeLabel(t) {
+      switch (t) {
+        case "remarks_update": return "FM&A · Remarks updated";
+        case "etic_update":    return "FM&A · ETIC updated";
+        case "parts_update":   return "FM&A · Parts updated";
+        case "shop_update":    return "FM&A · Shop updated";
+        case "other":          return "FM&A · Action logged";
+        default:               return "FM&A · " + (t || "Action");
+      }
+    }
+
+    function renderTimeline(payload, woRow) {
+      const el = document.getElementById("wo-timeline");
+      // Backwards-compat: older callers passed just an array of changelog entries.
+      const entries = Array.isArray(payload) ? payload : ((payload && payload.entries) || []);
+      const actions = (payload && Array.isArray(payload.actions)) ? payload.actions : [];
+      if (!entries.length && !actions.length && !(woRow && woRow.establishedDateIso)) {
+        el.innerHTML = "<div class='wo-timeline-empty'>No changes recorded yet.</div>";
+        return;
+      }
+      // Group by date key (snapshot date for system events, creation date for FM&A actions).
+      const byKey = new Map();
+      entries.forEach(function (e) {
+        const k = e.snapshot_date_key || "";
+        if (!byKey.has(k)) byKey.set(k, []);
+        byKey.get(k).push({ kind: "system", ev: e });
+      });
+      actions.forEach(function (a) {
+        const k = (a.createdAtIso || "").slice(0, 10);
+        if (!k) return;
+        if (!byKey.has(k)) byKey.set(k, []);
+        byKey.get(k).push({ kind: "action", ev: a });
+      });
+      // Inject a synthetic "Opened" pin from the workbook's Estbd Dt/Time so
+      // we don't mis-label our earliest snapshot as the work order's open date.
+      if (woRow && woRow.establishedDateIso) {
+        const k = woRow.establishedDateIso;
+        if (!byKey.has(k)) byKey.set(k, []);
+        byKey.get(k).push({ kind: "opened", ev: { date: k, raw: woRow.establishedDate } });
+      }
+      const keys = Array.from(byKey.keys()).sort(function (a, b) { return a < b ? 1 : a > b ? -1 : 0; });
+      const today = selectedDate || keys[0];
+
+      const days = keys.map(function (k) {
+        const grp = byKey.get(k);
+        // Determine day class by most important event type
+        const priority = ["etic_date_slip", "remarks", "mel_tier", "etic", "parts_status", "initial"];
+        let dayCls = "";
+        const sysEvents = grp.filter(function (g) { return g.kind === "system"; }).map(function (g) { return g.ev; });
+        for (const p of priority) {
+          if (sysEvents.some(function (g) { return (g.field || "").toLowerCase() === p; })) {
+            if (p === "etic_date_slip") dayCls = "has-slip";
+            else if (p === "remarks") dayCls = "has-remarks";
+            else if (p === "mel_tier") dayCls = "has-mel";
+            else if (p === "initial") dayCls = "has-initial";
+            else dayCls = "has-mel";
+            break;
+          }
+        }
+        if (!dayCls && grp.some(function (g) { return g.kind === "action"; })) {
+          dayCls = "has-mel";
+        }
+        const ago = daysBetweenKeys(today, k);
+        const agoLabel = ago == null ? "" : (ago === 0 ? "today" : ago === 1 ? "1 day ago" : ago + " days ago");
+
+        const evs = grp.map(function (item) {
+          if (item.kind === "opened") {
+            const rawPretty = fmtMaybeDate(item.ev.raw);
+            const raw = rawPretty && rawPretty !== fmtKeyShort(item.ev.date) ? " <span style='color:var(--subtle);font-size:0.74rem'>" + esc(rawPretty) + "</span>" : "";
+            return (
+              "<div class='wo-tl-event field-opened'>" +
+              "<span class='ev-label'>Opened</span>" +
+              "<div class='ev-body'><span style='color:var(--text-dim)'>Established per workbook</span>" + raw + "</div>" +
+              "</div>"
+            );
+          }
+          if (item.kind === "action") {
+            const a = item.ev;
+            const status = (a.status || "pending").toLowerCase();
+            const statusLabel =
+              status === "confirmed" ? "Confirmed in next ETIC"
+              : status === "missed" ? "Didn't make it into next ETIC"
+              : "Pending verification";
+            const actor = (a.actorName || "").trim();
+            const note = (a.note || "").trim();
+            const verifiedSnap = a.verifiedInSnapshot ? " (" + esc(fmtKeyShort(a.verifiedInSnapshot)) + ")" : "";
+            const body =
+              (actor ? "<span class='fma-actor'>" + esc(actor) + "</span>" : "") +
+              "<span class='fma-status " + esc(status) + "'>" + esc(statusLabel) + "</span>" +
+              (status !== "pending" ? "<span style='color:var(--muted);font-size:0.74rem'>" + verifiedSnap + "</span>" : "") +
+              "<button type='button' class='fma-delete' data-fma-del='" + esc(String(a.id)) + "' title='Delete this entry'>✕</button>" +
+              (note ? "<span class='fma-note'>" + esc(note) + "</span>" : "");
+            return (
+              "<div class='wo-tl-event fma-action'>" +
+              "<span class='ev-label'>" + esc(actionTypeLabel(a.actionType)) + "</span>" +
+              "<div class='ev-body'>" + body + "</div>" +
+              "</div>"
+            );
+          }
+          const e = item.ev;
+          const fld = (e.field || "").toLowerCase();
+          let body = "";
+          if (fld === "initial") {
+            body = "<span style='color:var(--muted)'>First snapshot we have for this WO</span>";
+          } else if (fld === "remarks") {
+            const oldV = (e.old_value || "").trim();
+            const newV = (e.new_value || "").trim();
+            if (!newV && !oldV) {
+              body = "<span style='color:var(--subtle)'>cleared</span>";
+            } else if (!oldV) {
+              body = "<ins>" + esc(newV.slice(0, 260)) + (newV.length > 260 ? "…" : "") + "</ins>";
+            } else if (!newV) {
+              body = "<del>" + esc(oldV.slice(0, 260)) + (oldV.length > 260 ? "…" : "") + "</del>";
+            } else {
+              body =
+                "<del>" + esc(oldV.slice(0, 160)) + (oldV.length > 160 ? "…" : "") + "</del>" +
+                "<br />" +
+                "<ins>" + esc(newV.slice(0, 260)) + (newV.length > 260 ? "…" : "") + "</ins>";
+            }
+          } else if (fld === "mel_tier") {
+            const oldV = e.old_value || "—";
+            const newV = e.new_value || "—";
+            body =
+              "<span class='tier-pill " + tierClass(oldV) + "'>" + esc(oldV) + "</span>" +
+              "<span class='arrow'>→</span>" +
+              "<span class='tier-pill " + tierClass(newV) + "'>" + esc(newV) + "</span>";
+          } else if (fld === "etic" || fld === "etic_date_slip") {
+            const oldV = e.old_value ? fmtKeyShort(e.old_value) : "—";
+            const newV = e.new_value ? fmtKeyShort(e.new_value) : "—";
+            body = "<del>" + esc(oldV) + "</del><span class='arrow'>→</span><ins>" + esc(newV) + "</ins>";
+            const slip = daysBetweenKeys(e.new_value, e.old_value);
+            if (slip != null && slip > 0) body += "<span class='slip'>+" + slip + "d slip</span>";
+          } else {
+            const oldV = e.old_value == null || e.old_value === "" ? "—" : fmtMaybeDate(e.old_value);
+            const newV = e.new_value == null || e.new_value === "" ? "—" : fmtMaybeDate(e.new_value);
+            body = "<del>" + esc(oldV) + "</del><span class='arrow'>→</span><ins>" + esc(newV) + "</ins>";
+          }
+          return (
+            "<div class='wo-tl-event field-" + esc(fld) + "'>" +
+            "<span class='ev-label'>" + esc(prettyFieldName(fld)) + "</span>" +
+            "<div class='ev-body'>" + body + "</div>" +
+            "</div>"
+          );
+        }).join("");
+
+        return (
+          "<div class='wo-tl-day " + dayCls + "'>" +
+          "<div class='wo-tl-date'>" +
+          "<span>" + esc(fmtKeyLong(k)) + "</span>" +
+          "<span class='dow'>" + esc(keyDow(k)) + "</span>" +
+          "<span class='ago'>" + esc(agoLabel) + "</span>" +
+          "</div>" +
+          "<div class='wo-tl-events'>" + evs + "</div>" +
+          "</div>"
+        );
+      }).join("");
+
+      el.innerHTML = days;
+    }
+
+    function renderWoDetailFull(data) {
+      const empty = document.getElementById("wo-detail-empty");
+      const wrap = document.getElementById("wo-detail");
+      const st = document.getElementById("wo-lookup-status");
+      const ban = document.getElementById("wo-stale-banner");
+      const timelineEl = document.getElementById("wo-timeline");
+      if (!data.found || !data.row) {
+        empty.classList.remove("hidden");
+        wrap.classList.add("hidden");
+        empty.innerHTML = "No work order <strong>" + esc(data.workOrderId || "") + "</strong> in the index yet.";
+        return;
+      }
+      const r = data.row;
+      empty.classList.add("hidden");
+      wrap.classList.remove("hidden");
+      st.className = "status";
+      st.textContent = "";
+      renderWoHero(r, data.asOfDateKey);
+      renderWoKpis(r, data.asOfDateKey);
+      renderWoRemarks(r);
+      renderWoFacts(r);
+      if (r.remarkStale) {
+        ban.classList.remove("hidden");
+        const intv = r.requiredIntervalDays != null ? r.requiredIntervalDays + "d" : "—";
+        const days = (r.historyBounded ? "≥" : "") + r.daysSinceRemarkChange;
+        const hist = r.historyBounded
+          ? " (true age unknown — work order predates our earliest snapshot " + fmtKeyShort(r.firstSeenDate) + ")"
+          : "";
+        ban.textContent =
+          "Stale remarks — no update in " + days + " days (" + r.melTier + "-MEL expects at least every " + intv + ")" + hist + ".";
+      } else {
+        ban.classList.add("hidden");
+        ban.textContent = "";
+      }
+      timelineEl.innerHTML = "<div class='wo-timeline-empty'>Loading timeline…</div>";
+      loadChangelog(r.workOrderId).then(function (payload) { renderTimeline(payload, r); }).catch(function () {
+        timelineEl.innerHTML = "<div class='wo-timeline-empty'>Could not load timeline.</div>";
+      });
+    }
+
+    async function selectWo(woId, pushHash) {
+      selectedWoId = woId;
+      setMainTab("wo");
+      document.getElementById("wo-id-input").value = woId;
+      const asOf = woAsOfDate();
+      if (!asOf) return;
+      if (pushHash) setHashWorkOrder(woId);
+      document.querySelectorAll(".wo-card").forEach(function (el) {
+        el.classList.toggle("active", el.getAttribute("data-wo") === woId);
+      });
+      try {
+        // Pull the WO + the global sightings map in parallel so the hero's
+        // "Last seen at <lot> · Nd ago" pill renders on first paint instead
+        // of popping in a tick later.
+        const [data] = await Promise.all([fetchWoById(woId, asOf), loadSightings()]);
+        renderWoDetailFull(data);
+      } catch (e) {
+        const st = document.getElementById("wo-lookup-status");
+        st.className = "status err";
+        st.textContent = String(e && e.message ? e.message : e);
+      }
+    }
+
+    function renderDetails(analysis) {
+      document.getElementById("hero-title").textContent = fmtKeyShort(analysis.dateKey);
+      const kicker = document.getElementById("hero-kicker");
+      const rel = relDate(analysis.dateKey);
+      const dow = dayOfWeekShort(analysis.dateKey);
+      kicker.textContent = (dow ? dow + " · " : "") + (rel || "report");
+      document.getElementById("hero-file").innerHTML =
+        "Workbook <strong>" + esc(analysis.workbookFileName) + "</strong>";
+
+      const sorted = [...snapshotRows].sort((a, b) => b.dateKey.localeCompare(a.dateKey));
+      const idx = sorted.findIndex(function (r) { return r.dateKey === analysis.dateKey; });
+      const prev = idx >= 0 ? sorted[idx + 1] : null;
+      renderKpis(analysis.assetManager, prev || null);
+      renderBreakdownCard(analysis.assetManagerBreakdown || []);
+
+      renderCompareTable();
+      renderCompareSummary();
+      renderIngestFooter(analysis);
+    }
+
+    async function selectDate(dateKey, pushHash) {
+      selectedDate = dateKey;
+      if (pushHash && dateKey) setHashSnapshot(dateKey);
+      const ys = document.getElementById("yard-status"); if (ys) { ys.textContent = ""; ys.className = "status"; }
+      const es = document.getElementById("etic-dl-status"); if (es) { es.textContent = ""; es.className = "status"; }
+      if (!dateKey) return;
+      renderDatePicker();
+      populateCompareDateSelects();
+      populateBreakdownCompareSelect();
+      try {
+        const analysis = await loadAnalysis(dateKey);
+        renderDetails(analysis);
+      } catch (e) {
+        document.getElementById("ingest-footer").textContent = "Could not load snapshot: " + (e.message || e);
+      }
+    }
+
+    async function applyHashRoute() {
+      const r = readHashRoute();
+      if (r.tab === "wo" && r.workOrderId) {
+        setMainTab("wo");
+        if (selectedDate) await loadAndRenderWoList(selectedDate);
+        await selectWo(r.workOrderId, false);
+        return;
+      }
+      setMainTab("snapshot");
+      if (r.dateKey && historyEntries.some((e) => e.dateKey === r.dateKey)) {
+        await selectDate(r.dateKey, false);
+      } else if (!selectedDate) {
+        const sorted = sortDesc(historyEntries);
+        if (sorted.length) await selectDate(sorted[0].dateKey, false);
+      }
+    }
+
+    async function downloadEticWorkbook() {
+      const btn = document.getElementById("btn-download-etic");
+      const st = document.getElementById("etic-dl-status");
+      if (!selectedDate) return;
+      btn.disabled = true;
+      st.className = "status";
+      st.textContent = "Downloading…";
+      try {
+        const url = "/api/workbook.xlsx?date=" + encodeURIComponent(selectedDate);
+        const res = await fetch(url);
+        if (!res.ok) {
+          let msg = "Could not download.";
+          try {
+            const j = await res.json();
+            if (j && j.error) msg = j.error;
+          } catch (_) {}
+          st.className = "status err";
+          st.textContent = msg;
+          return;
+        }
+        const disp = res.headers.get("Content-Disposition") || "";
+        const m = /filename="?([^";]+)"?/i.exec(disp);
+        const name = m ? m[1] : "etic.xlsx";
+        const blob = await res.blob();
+        const u = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = u;
+        a.download = name;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(u);
+        st.className = "status ok";
+        st.textContent = "Saved " + name;
+      } catch (e) {
+        st.className = "status err";
+        st.textContent = String(e && e.message ? e.message : e);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function downloadYardCheck() {
+      const btn = document.getElementById("btn-yard-check");
+      const st = document.getElementById("yard-status");
+      if (!selectedDate) return;
+      btn.disabled = true;
+      st.className = "status";
+      st.textContent = "Building your file…";
+      try {
+        const url = "/api/yard-check.xlsx?date=" + encodeURIComponent(selectedDate);
+        const res = await fetch(url);
+        if (!res.ok) {
+          let msg = "Could not generate file.";
+          try {
+            const j = await res.json();
+            if (j && j.error) msg = j.error;
+          } catch (_) {}
+          st.className = "status err";
+          st.textContent = msg;
+          return;
+        }
+        const disp = res.headers.get("Content-Disposition") || "";
+        const m = /filename="?([^";]+)"?/i.exec(disp);
+        const name = m ? m[1] : "yard-check.xlsx";
+        const blob = await res.blob();
+        const u = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = u;
+        a.download = name;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(u);
+        st.className = "status ok";
+        st.textContent = "Saved as " + name;
+      } catch (e) {
+        st.className = "status err";
+        st.textContent = String(e && e.message ? e.message : e);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    /* ─────────────────────── AI assistant (Ask) ─────────────────────── */
+    // Shared chat state. The floating dock and the dedicated tab both render
+    // from this same array and append to it, so the user can switch between
+    // them mid-conversation without losing context.
+    const askState = {
+      messages: [], // [{role:'user'|'assistant', content, trace?}]
+      pending: false,
+      // When the user clicks "Ask AI" next to a specific chart, we pin that
+      // chart's on-screen data to the conversation. Every API request includes
+      // it as a leading user message so follow-up questions reuse the same
+      // context. Cleared by clicking the chip's ✕ or by switching contexts.
+      context: null, // { title, summary, data, suggestions: string[] }
+    };
+
+    function askEscape(s) {
+      return String(s == null ? "" : s)
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    }
+
+    // Tiny markdown subset: bold, italics, inline code, fenced code blocks,
+    // unordered lists, paragraphs, and plain links. Keeps assistant replies
+    // readable without pulling in a markdown library.
+    function askRenderMd(src) {
+      let s = String(src == null ? "" : src);
+      const codeBlocks = [];
+      s = s.replace(/\`\`\`([\\s\\S]*?)\`\`\`/g, function (_m, body) {
+        codeBlocks.push(body);
+        return "\\u0000CODE" + (codeBlocks.length - 1) + "\\u0000";
+      });
+      s = askEscape(s);
+      s = s.replace(/\`([^\`\\n]+)\`/g, function (_m, c) { return "<code>" + c + "</code>"; });
+      s = s.replace(/\\*\\*([^*]+)\\*\\*/g, "<strong>$1</strong>");
+      s = s.replace(/\\*([^*\\n]+)\\*/g, "<em>$1</em>");
+      s = s.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, function (_m, t, u) {
+        return "<a href=\\"" + u + "\\" target=\\"_blank\\" rel=\\"noopener\\">" + t + "</a>";
+      });
+      const lines = s.split(/\\r?\\n/);
+      const out = [];
+      let inList = false;
+      let para = [];
+      function flushPara() {
+        if (para.length) { out.push("<p>" + para.join(" ") + "</p>"); para = []; }
+      }
+      for (const raw of lines) {
+        const line = raw.trim();
+        const liMatch = line.match(/^[-*]\\s+(.*)$/);
+        if (liMatch) {
+          flushPara();
+          if (!inList) { out.push("<ul>"); inList = true; }
+          out.push("<li>" + liMatch[1] + "</li>");
+        } else if (line === "") {
+          if (inList) { out.push("</ul>"); inList = false; }
+          flushPara();
+        } else {
+          if (inList) { out.push("</ul>"); inList = false; }
+          para.push(line);
+        }
+      }
+      if (inList) out.push("</ul>");
+      flushPara();
+      let html = out.join("");
+      html = html.replace(/\\u0000CODE(\\d+)\\u0000/g, function (_m, i) {
+        return "<pre><code>" + askEscape(codeBlocks[Number(i)] || "") + "</code></pre>";
+      });
+      return html;
+    }
+
+    function askRenderInto(logId) {
+      const el = document.getElementById(logId);
+      if (!el) return;
+      const parts = [];
+      if (askState.context) {
+        const c = askState.context;
+        const sugs = (c.suggestions || []).map(function (q) {
+          return "<button type=\\"button\\" class=\\"ask-ctx-chip\\" data-ask-ctx-q=\\"" + askEscape(q) + "\\">" + askEscape(q) + "</button>";
+        }).join("");
+        parts.push(
+          "<div class=\\"ask-ctx-card\\">" +
+            "<div class=\\"ask-ctx-head\\">" +
+              "<span class=\\"ask-ctx-eyebrow\\">Asking about</span>" +
+              "<span class=\\"ask-ctx-title\\">" + askEscape(c.title) + "</span>" +
+              "<button type=\\"button\\" class=\\"ask-ctx-clear\\" data-ask-ctx-clear=\\"1\\" title=\\"Clear context\\">✕</button>" +
+            "</div>" +
+            (c.summary ? "<div class=\\"ask-ctx-summary\\">" + askEscape(c.summary) + "</div>" : "") +
+            (sugs ? "<div class=\\"ask-ctx-sugs\\">" + sugs + "</div>" : "") +
+          "</div>"
+        );
+      }
+      if (askState.messages.length === 0 && !askState.pending) {
+        if (askState.context) {
+          parts.push("<div class=\\"hint\\" style=\\"opacity:0.55;text-align:center;padding:14px 8px;font-size:0.78rem\\">Pick a suggestion above or type your own question.</div>");
+        } else {
+          parts.push("<div class=\\"hint\\" style=\\"opacity:0.6;text-align:center;padding:20px\\">Ask anything about your fleet data — pick a suggestion above or type a question below.</div>");
+        }
+        el.innerHTML = parts.join("");
+        wireAskCtxClicks(el);
+        return;
+      }
+      for (const m of askState.messages) {
+        const cls = m.role === "user" ? "user" : "assistant";
+        const body = m.role === "user" ? "<p>" + askEscape(m.content) + "</p>" : askRenderMd(m.content);
+        let trace = "";
+        if (m.trace && m.trace.length) {
+          trace = "<details class=\\"ask-trace\\"><summary>" + m.trace.length + " tool call" + (m.trace.length === 1 ? "" : "s") + "</summary><ul>";
+          for (const t of m.trace) {
+            trace += "<li><code>" + askEscape(t.tool) + "(" + askEscape(JSON.stringify(t.args)) + ")</code> — " + t.ms + "ms" + (t.ok ? "" : " <strong style=\\"color:var(--danger)\\">err</strong>") + "</li>";
+          }
+          trace += "</ul></details>";
+        }
+        parts.push("<div class=\\"ask-msg " + cls + "\\"><div class=\\"ask-bubble\\">" + body + trace + "</div></div>");
+      }
+      if (askState.pending) {
+        parts.push("<div class=\\"ask-msg assistant\\"><div class=\\"ask-bubble\\"><div class=\\"ask-typing\\"><span></span><span></span><span></span></div></div></div>");
+      }
+      el.innerHTML = parts.join("");
+      el.scrollTop = el.scrollHeight;
+      wireAskCtxClicks(el);
+    }
+
+    /** Delegated handler for the pinned-context chip: clear button and
+     *  suggestion-question buttons. Re-attached every render. */
+    function wireAskCtxClicks(el) {
+      el.querySelectorAll("[data-ask-ctx-clear]").forEach(function (b) {
+        b.addEventListener("click", function () {
+          askState.context = null;
+          askRenderAll();
+        });
+      });
+      el.querySelectorAll("[data-ask-ctx-q]").forEach(function (b) {
+        b.addEventListener("click", function () {
+          askSend(b.getAttribute("data-ask-ctx-q") || b.textContent || "");
+        });
+      });
+    }
+
+    function askRenderAll() {
+      askRenderInto("ask-log");
+      askRenderInto("ask-log-tab");
+    }
+
+    async function askSend(question) {
+      const q = String(question || "").trim();
+      if (!q || askState.pending) return;
+      askState.messages.push({ role: "user", content: q });
+      askState.pending = true;
+      askRenderAll();
+      try {
+        const apiMessages = askState.messages
+          .filter(function (m) { return m.role === "user" || m.role === "assistant"; })
+          .map(function (m) { return { role: m.role, content: m.content }; });
+        // If the user clicked "Ask AI" on a chart, inject the on-screen data
+        // as the very first user message. Trimmed to ~14k chars to stay well
+        // under the per-call budget.
+        if (askState.context) {
+          const c = askState.context;
+          let payload = "";
+          try { payload = JSON.stringify(c.data, null, 0); } catch (_) { payload = ""; }
+          if (payload.length > 14000) payload = payload.slice(0, 14000) + "\\n…[truncated]";
+          const fence = String.fromCharCode(96, 96, 96);
+          // Metric polarity is the #1 thing the model gets wrong — it'll
+          // happily say "below-MEL count went down" and call that "worse".
+          // Spell it out explicitly every time.
+          const polarityNote =
+            "Metric direction (use this to decide better vs worse):\\n" +
+            "  - Fleet MC% / mcPercent / mcPct : higher is BETTER.\\n" +
+            "  - FMC / fmc_count                : higher is BETTER.\\n" +
+            "  - NMC / nmc_count / totalNmc     : lower is BETTER.\\n" +
+            "  - Assets Below MEL / assetsBelowMel / keysBelow : lower is BETTER.\\n" +
+            "  - Assets To Reach AT MEL / assetsToReachAtMel  : lower is BETTER.\\n" +
+            "  - MEL deficit / Need +N         : lower is BETTER.\\n" +
+            "  - Recall delta (recallDelta)     : closer to 0 is BETTER; positive = loaners in, negative = pulled.\\n" +
+            "  - Acc/Abus / acc_abus            : lower is BETTER.\\n" +
+            "Trend rule: when describing a window as \\\"better\\\" or \\\"worse\\\", count how many of the above moved in the BETTER direction vs the WORSE direction, then say which side dominates. NEVER call a decrease in below-MEL count a worsening trend, and never call an increase in MC% a worsening trend. If indicators conflict, say \\\"mixed\\\" and list which moved which way.\\n" +
+            "Also: don't compute deltas yourself if first/last (or compareTotals) are in the payload — use them directly.";
+          const ctxMsg = {
+            role: "user",
+            content: "[Pinned screen context — answer from this data when possible; only call tools if the user asks about something not in this payload.]\\n" +
+              "View: " + c.title + "\\n" +
+              (c.summary ? "Summary: " + c.summary + "\\n" : "") +
+              polarityNote + "\\n" +
+              "Data (JSON):\\n" + fence + "json\\n" + payload + "\\n" + fence,
+          };
+          apiMessages.unshift(ctxMsg);
+        }
+        const r = await fetch("/api/ask", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ messages: apiMessages }),
+        });
+        const data = await r.json().catch(function () { return null; });
+        if (!r.ok) {
+          const err = (data && data.error) || ("HTTP " + r.status);
+          askState.messages.push({ role: "assistant", content: "**Error:** " + err });
+        } else if (data && typeof data.answer === "string") {
+          askState.messages.push({ role: "assistant", content: data.answer || "(no answer)", trace: data.trace || [] });
+        } else {
+          askState.messages.push({ role: "assistant", content: "(empty response)" });
+        }
+      } catch (e) {
+        askState.messages.push({ role: "assistant", content: "**Error:** " + (e && e.message ? e.message : String(e)) });
+      } finally {
+        askState.pending = false;
+        askRenderAll();
+      }
+    }
+
+    function askWireForm(formId, inputId) {
+      const form = document.getElementById(formId);
+      const input = document.getElementById(inputId);
+      if (!form || !input) return;
+      function autoSize() {
+        input.style.height = "auto";
+        input.style.height = Math.min(160, input.scrollHeight) + "px";
+      }
+      input.addEventListener("input", autoSize);
+      input.addEventListener("keydown", function (ev) {
+        if (ev.key === "Enter" && !ev.shiftKey) {
+          ev.preventDefault();
+          form.requestSubmit();
+        }
+      });
+      form.addEventListener("submit", function (ev) {
+        ev.preventDefault();
+        const q = input.value;
+        input.value = "";
+        autoSize();
+        askSend(q);
+      });
+    }
+
+    function askWireSuggestions(containerId) {
+      const c = document.getElementById(containerId);
+      if (!c) return;
+      c.addEventListener("click", function (ev) {
+        const t = ev.target.closest(".ask-chip");
+        if (!t) return;
+        askSend(t.getAttribute("data-q") || t.textContent || "");
+      });
+    }
+
+    /** MC rate by Unit (snapshot tab) -> AI context. Pulls the currently
+     *  rendered breakdown (units / NCE / all) for the selected snapshot date,
+     *  plus the comparison breakdown if one is set, so the model can talk
+     *  about deltas without re-fetching. */
+    function openAskForBreakdown() {
+      const filter = breakdownFilter || "units";
+      let visible = currentBreakdown || [];
+      if (filter === "nce") visible = visible.filter(function (r) { return r.isNce; });
+      else if (filter === "units") visible = visible.filter(function (r) { return !r.isNce && !r.isTotal; });
+      else visible = visible.filter(function (r) { return !r.isTotal; });
+      const cmpRows = breakdownCompareData || [];
+      const cmpByLabel = new Map();
+      cmpRows.forEach(function (r) { cmpByLabel.set(String(r.label || "").toLowerCase(), r); });
+      const data = {
+        view: "MC rate by Unit",
+        snapshotDate: selectedDate,
+        compareDate: breakdownCompareDate || null,
+        filter: filter,
+        rows: visible.map(function (r) {
+          const cmp = cmpByLabel.get(String(r.label || "").toLowerCase());
+          return {
+            label: r.label,
+            isNce: !!r.isNce,
+            mcPercent: r.mcRatePercent == null ? null : Number(r.mcRatePercent.toFixed(2)),
+            fmc: r.fmc, nmc: r.nmc, fleetTotal: r.fleetTotal, surplus: r.surplus,
+            comparePercent: cmp && cmp.mcRatePercent != null ? Number(cmp.mcRatePercent.toFixed(2)) : null,
+            deltaPp: cmp && cmp.mcRatePercent != null && r.mcRatePercent != null
+              ? Number((r.mcRatePercent - cmp.mcRatePercent).toFixed(2))
+              : null,
+          };
+        }),
+      };
+      const summary = "MC rate by Unit · " + fmtKeyShort(selectedDate || "") +
+        " · " + visible.length + " row" + (visible.length === 1 ? "" : "s") +
+        (breakdownCompareDate ? " · vs " + fmtKeyShort(breakdownCompareDate) : "") +
+        " · filter=" + filter;
+      askWithContext({
+        id: "snapshot-bd-" + (selectedDate || "") + "-" + filter + "-" + (breakdownCompareDate || ""),
+        title: "MC rate by Unit · " + fmtKeyShort(selectedDate || ""),
+        summary: summary,
+        data: data,
+        suggestions: [
+          "Which units have the worst MC% right now?",
+          "Which units improved the most vs the comparison date?",
+          "Rank the units by MC% from best to worst.",
+          "How is NCE doing vs the rest of the fleet?",
+          "Anything anomalous in this breakdown?",
+        ],
+      });
+    }
+
+    /** Snapshot history table -> AI context. Sends the full history with
+     *  KPIs so the model can talk about long-running trends, plus the active
+     *  compare-from/to selection if any. */
+    function openAskForHistory() {
+      const sorted = (snapshotRows || []).slice().sort(function (a, b) {
+        return a.dateKey < b.dateKey ? -1 : a.dateKey > b.dateKey ? 1 : 0;
+      });
+      const points = sorted.map(function (h) {
+        return {
+          date: h.dateKey,
+          mcPercent: h.mcRatePercent == null ? null : Number(h.mcRatePercent.toFixed(2)),
+          fmc: h.fmc, nmc: h.nmc, fleetTotal: h.fleetTotal, surplus: h.surplus,
+        };
+      });
+      const data = {
+        view: "Snapshot history",
+        compare: { from: compareState.from || null, to: compareState.to || null },
+        first: points[0] || null,
+        last: points[points.length - 1] || null,
+        points: points,
+      };
+      const summary = "Snapshot history · " + points.length + " snapshots" +
+        (compareState.from && compareState.to ? " · comparing " + fmtKeyShort(compareState.from) + " → " + fmtKeyShort(compareState.to) : "");
+      askWithContext({
+        id: "history",
+        title: "Snapshot history (" + points.length + " snapshots)",
+        summary: summary,
+        data: data,
+        suggestions: [
+          "Summarize MC% trend across all snapshots.",
+          "What was the biggest day-over-day swing in MC%?",
+          (compareState.from && compareState.to) ? "Explain the change between the compare dates." : "How does the latest snapshot compare to 30 days ago?",
+          "Identify any weeks where NMC went up sharply.",
+          "Average MC% over the last 30 snapshots?",
+        ],
+      });
+    }
+
+    /** Open the AI dock with a chart's data pinned as conversation context.
+     *  If the same context id is already pinned, just open/raise the dock so
+     *  the user can keep asking follow-ups. Switching contexts wipes prior
+     *  messages so answers don't leak across charts. */
+    function askWithContext(opts) {
+      const o = opts || {};
+      const newCtx = {
+        id: o.id || ("ctx-" + Date.now()),
+        title: String(o.title || "Selected view"),
+        summary: o.summary ? String(o.summary) : "",
+        data: o.data == null ? {} : o.data,
+        suggestions: Array.isArray(o.suggestions) ? o.suggestions.slice(0, 6) : [],
+      };
+      const sameCtx = askState.context && askState.context.id === newCtx.id;
+      if (!sameCtx) {
+        askState.context = newCtx;
+        askState.messages = [];
+      } else {
+        askState.context.data = newCtx.data;
+        askState.context.summary = newCtx.summary;
+      }
+      const dock = document.getElementById("ask-dock");
+      const fab = document.getElementById("ask-fab");
+      if (dock) dock.classList.remove("hidden");
+      if (fab) fab.classList.add("hidden");
+      askRenderAll();
+      setTimeout(function () {
+        const t = document.getElementById("ask-input");
+        if (t) t.focus();
+      }, 30);
+    }
+    window.askWithContext = askWithContext;
+
+    function askInit() {
+      const fab = document.getElementById("ask-fab");
+      const dock = document.getElementById("ask-dock");
+      const closeBtn = document.getElementById("ask-close");
+      const clearBtn = document.getElementById("ask-clear");
+      const clearTabBtn = document.getElementById("ask-clear-tab");
+      if (!fab || !dock) return;
+      fab.addEventListener("click", function () {
+        dock.classList.remove("hidden");
+        fab.classList.add("hidden");
+        askRenderInto("ask-log");
+        setTimeout(function () { const t = document.getElementById("ask-input"); if (t) t.focus(); }, 30);
+      });
+      if (closeBtn) closeBtn.addEventListener("click", function () {
+        dock.classList.add("hidden");
+        // Re-show the FAB unless we're on the dedicated tab.
+        const onAskTab = !document.getElementById("panel-ask").classList.contains("hidden");
+        if (!onAskTab) fab.classList.remove("hidden");
+      });
+      if (clearBtn) clearBtn.addEventListener("click", function () {
+        askState.messages = []; askRenderAll();
+      });
+      if (clearTabBtn) clearTabBtn.addEventListener("click", function () {
+        askState.messages = []; askRenderAll();
+      });
+      askWireForm("ask-form", "ask-input");
+      askWireForm("ask-form-tab", "ask-input-tab");
+      askWireSuggestions("ask-suggestions");
+      askWireSuggestions("ask-suggestions-tab");
+      askRenderAll();
+    }
+
+    async function init() {
+      // Presenter mode: ?present=<meetingId> takes over the entire page,
+      // hides the regular UI, and polls the meeting so the conference-room
+      // screen follows whatever the controller (laptop) has selected.
+      const presentParam = new URL(window.location.href).searchParams.get("present");
+      if (presentParam) {
+        const mid = Number.parseInt(presentParam, 10);
+        if (Number.isFinite(mid)) {
+          startPresenterMode(mid);
+          return;
+        }
+      }
+
+      try {
+        historyEntries = await loadHistory();
+      } catch (e) {
+        document.getElementById("view-empty").classList.remove("hidden");
+        document.getElementById("view-empty").querySelector("p").innerHTML =
+          "<strong>Could not load data.</strong><br />" + esc(e.message || String(e));
+        return;
+      }
+
+      if (!historyEntries.length) {
+        document.getElementById("view-empty").classList.remove("hidden");
+        return;
+      }
+
+      document.getElementById("view-main").classList.remove("hidden");
+
+      snapshotRows = await loadSnapshots();
+      await syncSnapshotsOnce();
+      setTimeout(async function () {
+        snapshotRows = await loadSnapshots();
+        renderCompareTable();
+        populateCompareDateSelects();
+        populateBreakdownCompareSelect();
+      }, 3000);
+
+      const sorted = sortDesc(historyEntries);
+      const route = readHashRoute();
+      const start =
+        route.tab === "snapshot" && route.dateKey && sorted.some((e) => e.dateKey === route.dateKey)
+          ? route.dateKey
+          : sorted[0].dateKey;
+      selectedDate = start;
+      renderDatePicker();
+      populateCompareDateSelects();
+      populateBreakdownCompareSelect();
+      await applyHashRoute();
+
+      // Date picker controls.
+      document.getElementById("date-select").addEventListener("change", function (ev) {
+        const dk = ev.target.value;
+        if (dk && dk !== selectedDate) selectDate(dk, true);
+      });
+      document.getElementById("date-jump-latest").addEventListener("click", jumpDateLatest);
+      document.getElementById("date-jump-prev").addEventListener("click", function () { jumpDateRel(1); });
+      document.getElementById("date-jump-next").addEventListener("click", function () { jumpDateRel(-1); });
+
+      // Compare panel controls.
+      const cmpFrom = document.getElementById("cmp-from");
+      const cmpTo = document.getElementById("cmp-to");
+      const cmpClear = document.getElementById("cmp-clear");
+      if (cmpFrom) cmpFrom.addEventListener("change", function () {
+        compareState.from = cmpFrom.value || "";
+        renderCompareSummary();
+        refreshPresetChipsState("cmp-preset-chips", compareState.from, compareState.to);
+      });
+      if (cmpTo) cmpTo.addEventListener("change", function () {
+        compareState.to = cmpTo.value || "";
+        renderCompareSummary();
+        refreshPresetChipsState("cmp-preset-chips", compareState.from, compareState.to);
+      });
+      if (cmpClear) cmpClear.addEventListener("click", function () {
+        compareState.from = "";
+        compareState.to = "";
+        if (cmpFrom) cmpFrom.value = "";
+        if (cmpTo) cmpTo.value = "";
+        renderCompareSummary();
+        refreshPresetChipsState("cmp-preset-chips", "", "");
+      });
+
+      // Snapshot history compare presets (FYTD, Last FY, CYTD, ...).
+      const cmpPresetRoot = document.getElementById("cmp-preset-chips");
+      if (cmpPresetRoot) {
+        cmpPresetRoot.addEventListener("click", function (ev) {
+          const btn = ev.target.closest(".preset-chip");
+          if (!btn || btn.disabled) return;
+          const key = btn.getAttribute("data-preset");
+          const latest = (historyEntries[0] && historyEntries[0].dateKey) || "";
+          const snap = snapPresetToSnapshots(presetRange(key, latest));
+          if (!snap) return;
+          compareState.from = snap.from;
+          compareState.to = snap.to;
+          if (cmpFrom) cmpFrom.value = snap.from;
+          if (cmpTo) cmpTo.value = snap.to;
+          renderCompareSummary();
+          refreshPresetChipsState("cmp-preset-chips", snap.from, snap.to);
+        });
+      }
+
+      // Per-Unit / NCE breakdown tabs.
+      document.querySelectorAll(".bd-tab").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          breakdownFilter = btn.getAttribute("data-bd-filter") || "units";
+          document.querySelectorAll(".bd-tab").forEach(function (b) {
+            b.classList.toggle("active", b === btn);
+          });
+          renderBreakdownCard(currentBreakdown);
+        });
+      });
+
+      // Per-Unit "Compare to" picker.
+      const bdCompareSel = document.getElementById("bd-compare-date");
+      if (bdCompareSel) {
+        bdCompareSel.addEventListener("change", function () {
+          setBreakdownCompareDate(bdCompareSel.value || "");
+          refreshPresetChipsState("bd-preset-chips", bdCompareSel.value || "", selectedDate || "");
+        });
+      }
+      // Per-Unit compare presets. For a single-date compare, we use the
+      // preset's snapped FROM as the comparison date (TO is the active
+      // snapshot). The "current period" presets (FYTD/CYTD/QTD/MTD) end at
+      // the selected snapshot, not the latest, so the chip honours the
+      // user's chosen "as-of" date.
+      const bdPresetRoot = document.getElementById("bd-preset-chips");
+      if (bdPresetRoot) {
+        bdPresetRoot.addEventListener("click", function (ev) {
+          const btn = ev.target.closest(".preset-chip");
+          if (!btn || btn.disabled) return;
+          const key = btn.getAttribute("data-preset");
+          const anchor = selectedDate || (historyEntries[0] && historyEntries[0].dateKey) || "";
+          const snap = snapPresetToSnapshots(presetRange(key, anchor));
+          if (!snap || !snap.from) return;
+          // For single-date compare we only need the FROM. Avoid picking
+          // the same date as the active snapshot (no-op).
+          if (snap.from === selectedDate) return;
+          if (bdCompareSel) bdCompareSel.value = snap.from;
+          setBreakdownCompareDate(snap.from);
+          refreshPresetChipsState("bd-preset-chips", snap.from, selectedDate || "");
+        });
+      }
+
+      window.addEventListener("hashchange", async () => {
+        await applyHashRoute();
+      });
+
+      document.getElementById("tab-snapshot").addEventListener("click", function () {
+        // Switch the tab directly so we don't depend on a hashchange firing —
+        // if the user came from the meeting tab the hash is already on a
+        // snapshot date and re-writing it would be a no-op (no event).
+        setMainTab("snapshot");
+        const target = selectedDate || (sortDesc(historyEntries)[0] && sortDesc(historyEntries)[0].dateKey);
+        if (target) setHashSnapshot(target);
+      });
+      document.getElementById("tab-work-orders").addEventListener("click", function () {
+        setMainTab("wo");
+        if (selectedWoId) setHashWorkOrder(selectedWoId);
+      });
+      const melTabBtn = document.getElementById("tab-mel");
+      if (melTabBtn) melTabBtn.addEventListener("click", function () { setMainTab("mel"); });
+      const meetTabBtn = document.getElementById("tab-meeting");
+      if (meetTabBtn) meetTabBtn.addEventListener("click", function () { setMainTab("meeting"); });
+      const yardTabBtn = document.getElementById("tab-yard");
+      if (yardTabBtn) yardTabBtn.addEventListener("click", function () { setMainTab("yard"); });
+      const askTabBtn = document.getElementById("tab-ask");
+      if (askTabBtn) askTabBtn.addEventListener("click", function () { setMainTab("ask"); });
+      const setTabBtn = document.getElementById("tab-settings");
+      if (setTabBtn) setTabBtn.addEventListener("click", function () { setMainTab("settings"); });
+
+      askInit();
+
+      document.getElementById("btn-yard-check").addEventListener("click", downloadYardCheck);
+      document.getElementById("btn-download-etic").addEventListener("click", downloadEticWorkbook);
+
+      const askBd = document.getElementById("ai-ask-bd");
+      if (askBd) askBd.addEventListener("click", function (ev) {
+        ev.stopPropagation();
+        ev.preventDefault();
+        openAskForBreakdown();
+      });
+      const askHistory = document.getElementById("ai-ask-history");
+      if (askHistory) askHistory.addEventListener("click", function (ev) {
+        ev.stopPropagation();
+        ev.preventDefault();
+        openAskForHistory();
+      });
+
+      const woInput = document.getElementById("wo-id-input");
+      woInput.addEventListener("input", function () {
+        woQuery = (woInput.value || "").trim();
+        const asOf = woAsOfDate();
+        const rows = (asOf && watchCacheByDate.get(asOf)) || [];
+        renderWoList(rows);
+      });
+      woInput.addEventListener("keydown", function (ev) {
+        if (ev.key === "Enter") {
+          const q = (woInput.value || "").trim();
+          if (!q) return;
+          const asOf = woAsOfDate();
+          const rows = (asOf && watchCacheByDate.get(asOf)) || [];
+          const exact = rows.find(function (r) { return (r.workOrderId || "").toLowerCase() === q.toLowerCase(); });
+          if (exact) selectWo(exact.workOrderId, true);
+          else {
+            const first = filterAndSortWoList(rows)[0];
+            if (first) selectWo(first.workOrderId, true);
+          }
+        }
+      });
+
+      document.querySelectorAll("#wo-filters .wo-filter-btn").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          woFilter = btn.getAttribute("data-filter") || "all";
+          document.querySelectorAll("#wo-filters .wo-filter-btn").forEach(function (b) {
+            b.classList.toggle("active", b === btn);
+          });
+          const asOf = woAsOfDate();
+          const rows = (asOf && watchCacheByDate.get(asOf)) || [];
+          renderWoList(rows);
+        });
+      });
+
+      function rerenderCurrentWoList() {
+        const asOf = woAsOfDate();
+        const rows = (asOf && watchCacheByDate.get(asOf)) || [];
+        renderWoList(rows);
+      }
+      document.getElementById("wo-unit").addEventListener("change", function (ev) {
+        woUnit = ev.target.value || "";
+        rerenderCurrentWoList();
+      });
+      document.getElementById("wo-melkey").addEventListener("change", function (ev) {
+        woMelKey = ev.target.value || "";
+        rerenderCurrentWoList();
+      });
+      const woShopSel = document.getElementById("wo-shop");
+      if (woShopSel) woShopSel.addEventListener("change", function (ev) {
+        woShop = ev.target.value || "";
+        rerenderCurrentWoList();
+      });
+      const woMgmtSel = document.getElementById("wo-mgmtcd");
+      if (woMgmtSel) woMgmtSel.addEventListener("change", function (ev) {
+        woMgmtCd = ev.target.value || "";
+        rerenderCurrentWoList();
+      });
+      document.getElementById("wo-sort").addEventListener("change", function (ev) {
+        woSort = ev.target.value || "default";
+        rerenderCurrentWoList();
+      });
+
+      document.getElementById("watch-rebuild").addEventListener("click", async function () {
+        const st = document.getElementById("watch-rebuild-status");
+        if (!confirm("Rebuild clears work order changelog and replays every ETIC in date order. Continue?")) return;
+        st.textContent = "Starting rebuild…";
+        try {
+          const res = await fetch("/api/watch?rebuild=1", { method: "POST" });
+          const j = await res.json();
+          st.textContent = (j && j.message) ? j.message : "Rebuild started.";
+          setTimeout(function () {
+            changelogCache.clear();
+            watchCacheByDate.clear();
+            if (selectedWoId) selectWo(selectedWoId, false);
+          }, 5000);
+        } catch (e) {
+          st.textContent = String(e && e.message ? e.message : e);
+        }
+      });
+
+      // -------- FM&A action form --------
+      // Pre-fill the actor name from the last value the user typed (per-browser).
+      const actNameEl = document.getElementById("wo-action-name");
+      const savedActor = (function () {
+        try { return localStorage.getItem("etic.fma.actor") || ""; } catch (e) { return ""; }
+      })();
+      if (actNameEl && savedActor) actNameEl.value = savedActor;
+
+      const actForm = document.getElementById("wo-action-form");
+      if (actForm) {
+        actForm.addEventListener("submit", async function (ev) {
+          ev.preventDefault();
+          if (!selectedWoId) return;
+          const typeEl = document.getElementById("wo-action-type");
+          const nameEl = document.getElementById("wo-action-name");
+          const noteEl = document.getElementById("wo-action-note");
+          const stEl = document.getElementById("wo-action-status");
+          const btn = document.getElementById("wo-action-submit");
+          const actionType = typeEl.value || "remarks_update";
+          const actorName = (nameEl.value || "").trim();
+          const note = (noteEl.value || "").trim();
+          if (actorName) {
+            try { localStorage.setItem("etic.fma.actor", actorName); } catch (e) {}
+          }
+          stEl.className = "wo-action-status busy";
+          stEl.textContent = "Saving…";
+          btn.disabled = true;
+          try {
+            const res = await fetch("/api/wo-action", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              cache: "no-store",
+              body: JSON.stringify({
+                workOrderId: selectedWoId,
+                actionType: actionType,
+                actorName: actorName,
+                note: note,
+              }),
+            });
+            if (!res.ok) throw new Error("Save failed (" + res.status + ")");
+            stEl.className = "wo-action-status ok";
+            stEl.textContent = "Logged. It'll auto-verify when the next ETIC arrives.";
+            noteEl.value = "";
+            // Re-load timeline so the new entry shows up immediately.
+            changelogCache.delete(selectedWoId);
+            const fresh = await loadChangelog(selectedWoId, { force: true });
+            renderTimeline(fresh);
+            setTimeout(function () { if (stEl.textContent.indexOf("Logged") === 0) stEl.textContent = ""; }, 4000);
+          } catch (err) {
+            stEl.className = "wo-action-status err";
+            stEl.textContent = String(err && err.message ? err.message : err);
+          } finally {
+            btn.disabled = false;
+          }
+        });
+      }
+
+      // Delete-button delegation for FM&A entries inside the timeline.
+      const tlEl = document.getElementById("wo-timeline");
+      if (tlEl) {
+        tlEl.addEventListener("click", async function (ev) {
+          const btn = ev.target.closest(".fma-delete");
+          if (!btn) return;
+          const id = btn.getAttribute("data-fma-del");
+          if (!id) return;
+          if (!confirm("Delete this FM&A entry?")) return;
+          try {
+            const res = await fetch("/api/wo-action?id=" + encodeURIComponent(id), {
+              method: "DELETE",
+              cache: "no-store",
+            });
+            if (!res.ok) throw new Error("Delete failed");
+            if (selectedWoId) {
+              changelogCache.delete(selectedWoId);
+              const fresh = await loadChangelog(selectedWoId, { force: true });
+              renderTimeline(fresh);
+            }
+          } catch (err) {
+            alert("Could not delete: " + (err && err.message ? err.message : err));
+          }
+        });
+      }
+    }
+
+    /* ==================== ETIC Meeting tab logic ==================== */
+    const meetingState = {
+      mode: "setup",
+      meeting: null,
+      notes: [],
+      selectedWid: null,
+      startedAt: null,
+      pausedAt: null,
+      pausedAccumMs: 0,
+      targetMs: 30 * 60 * 1000,
+      tickHandle: null,
+      meetingRowsCache: null,
+      asOfDate: null,
+      autosaveTimer: null,
+      lastPatch: null,
+    };
+
+    function pad2(n) { return n < 10 ? "0" + n : String(n); }
+    function formatClock(ms) {
+      const totalSec = Math.max(0, Math.floor(ms / 1000));
+      const m = Math.floor(totalSec / 60);
+      const s = totalSec % 60;
+      return pad2(m) + ":" + pad2(s);
+    }
+    function formatClockSigned(ms) {
+      const sign = ms < 0 ? "-" : "";
+      return sign + formatClock(Math.abs(ms));
+    }
+
+    function meetingShowView(name) {
+      meetingState.mode = name;
+      ["setup", "live", "summary"].forEach(function (v) {
+        const el = document.getElementById("meeting-" + v);
+        if (el) el.classList.toggle("hidden", v !== name);
+      });
+    }
+
+    function latestSnapshotDateKey() {
+      const entries = sortDesc(historyEntries);
+      return entries[0] ? entries[0].dateKey : "";
+    }
+
+    /* ============================ MEL tab ================================ */
+    const melState = {
+      asOfDate: "",
+      availableDates: [],
+      rows: [],
+      filter: "all",
+      query: "",
+      unit: "",
+      mgmt: "",
+      tier: "",
+      sort: "deficit",
+      selectedKey: null,
+      detailCache: new Map(),
+      // Compare-to:
+      cmpDate: "",
+      cmpRows: [],
+      // Trend:
+      rollup: null,
+      perDateRows: new Map(),
+      // View mode: "list" (default detail/list view) or "slide" (critical slide grouped by unit)
+      viewMode: "list",
+    };
+
+    function melIsCritical(r) {
+      return !!(r && r.config && r.config.isCritical);
+    }
+    function melTypeLabelOf(r) {
+      if (r && r.config && r.config.typeLabel) return r.config.typeLabel;
+      const s = (r.mgmt_code_name || "").trim();
+      const i = s.indexOf(" - ");
+      return i > 0 ? s.slice(i + 3).trim() : s;
+    }
+
+    /** Pull "B204" out of "B204 - TRUCK 1/2T REG CAB 4X2". */
+    function melMgmtCodeOf(r) {
+      const s = (r.mgmt_code_name || "").trim();
+      if (!s) return "";
+      const i = s.indexOf(" - ");
+      return i > 0 ? s.slice(0, i).trim() : s;
+    }
+
+    /** "Tier I - Sortie Generating" -> "Tier I". */
+    function melTierShort(t) {
+      if (!t) return "";
+      const i = t.indexOf(" - ");
+      return i > 0 ? t.slice(0, i).trim() : t.trim();
+    }
+
+    /** Compute aggregate stats for a list of MEL rows. NMC, FMC, MC%, and the
+     *  asset-level deficit (how many additional FMC the unit needs to reach
+     *  the MEL threshold for each below key). */
+    function melAggregate(rows) {
+      let nmc = 0, fmc = 0, recall = 0;
+      let belowKeys = 0, atKeys = 0, aboveKeys = 0;
+      let assetsBelow = 0, assetsToReachAt = 0;
+      for (const r of rows) {
+        const f = r.fmc_count || 0;
+        const n = r.nmc_count || 0;
+        nmc += n;
+        fmc += f;
+        recall += (r.recall_delta || 0);
+        const status = r.mel_status;
+        if (status === "below")      belowKeys += 1;
+        else if (status === "at")    atKeys += 1;
+        else if (status === "above") aboveKeys += 1;
+        if (status === "below") {
+          // "Assets below MEL" = the NMC vehicles in below-MEL keys (the ones
+          // dragging the unit under the threshold).
+          assetsBelow += n;
+          // "To reach AT MEL" = how many MORE FMC vehicles this key needs
+          // before it's no longer below. status flips to "at" when FMC >= MEL.
+          const need = (r.mel_required || 0) - f;
+          if (need > 0) assetsToReachAt += need;
+        }
+      }
+      const total = nmc + fmc;
+      return {
+        keys: rows.length,
+        belowKeys, atKeys, aboveKeys,
+        nmc, fmc, recall,
+        mcRatePercent: total > 0 ? (fmc / total) * 100 : null,
+        assetsBelow,
+        assetsToReachAt,
+      };
+    }
+
+    async function onEnterMelTab() {
+      const sel = document.getElementById("mel-date");
+      if (sel && !sel.dataset.wired) {
+        sel.addEventListener("change", function () {
+          melState.asOfDate = sel.value;
+          loadAndRenderMel();
+        });
+        sel.dataset.wired = "1";
+      }
+      const search = document.getElementById("mel-search");
+      if (search && !search.dataset.wired) {
+        search.addEventListener("input", function () {
+          melState.query = (search.value || "").trim();
+          renderMelView();
+        });
+        search.dataset.wired = "1";
+      }
+      ["mel-unit", "mel-mgmt", "mel-tier", "mel-sort"].forEach(function (id) {
+        const el = document.getElementById(id);
+        if (el && !el.dataset.wired) {
+          el.addEventListener("change", function () {
+            if (id === "mel-unit") melState.unit = el.value;
+            else if (id === "mel-mgmt") melState.mgmt = el.value;
+            else if (id === "mel-tier") melState.tier = el.value;
+            else melState.sort = el.value;
+            renderMelView();
+          });
+          el.dataset.wired = "1";
+        }
+      });
+      document.querySelectorAll('[data-mel-filter]').forEach(function (btn) {
+        if (btn.dataset.wired) return;
+        btn.addEventListener("click", function () {
+          melState.filter = btn.getAttribute("data-mel-filter");
+          document.querySelectorAll('[data-mel-filter]').forEach(function (b) {
+            b.classList.toggle("active", b === btn);
+          });
+          renderMelView();
+        });
+        btn.dataset.wired = "1";
+      });
+
+      document.querySelectorAll('[data-mel-view]').forEach(function (btn) {
+        if (btn.dataset.wired) return;
+        btn.addEventListener("click", function () {
+          melState.viewMode = btn.getAttribute("data-mel-view");
+          document.querySelectorAll('[data-mel-view]').forEach(function (b) {
+            b.classList.toggle("active", b === btn);
+          });
+          const list = document.getElementById("mel-layout-list");
+          const slide = document.getElementById("mel-slide");
+          if (list) list.classList.toggle("hidden", melState.viewMode !== "list");
+          if (slide) slide.classList.toggle("hidden", melState.viewMode !== "slide");
+          renderMelView();
+        });
+        btn.dataset.wired = "1";
+      });
+
+      // Compare-to wiring
+      const cmpSel = document.getElementById("mel-cmp-date");
+      if (cmpSel && !cmpSel.dataset.wired) {
+        cmpSel.addEventListener("change", async function () {
+          melState.cmpDate = cmpSel.value || "";
+          await loadMelCompare();
+          renderMelView();
+          refreshPresetChipsState("mel-preset-chips", melState.cmpDate, melState.asOfDate);
+        });
+        cmpSel.dataset.wired = "1";
+      }
+      document.querySelectorAll('#mel-preset-chips .preset-chip').forEach(function (btn) {
+        if (btn.dataset.wired) return;
+        btn.addEventListener("click", async function () {
+          const key = btn.getAttribute("data-preset");
+          const range = snapPresetToSnapshots(presetRange(key, melState.asOfDate));
+          if (!range) return;
+          melState.cmpDate = range.from;
+          if (cmpSel) cmpSel.value = range.from;
+          await loadMelCompare();
+          renderMelView();
+          refreshPresetChipsState("mel-preset-chips", melState.cmpDate, melState.asOfDate);
+        });
+        btn.dataset.wired = "1";
+      });
+
+      const askMelTrend = document.getElementById("ai-ask-mel-trend");
+      if (askMelTrend && !askMelTrend.dataset.wired) {
+        askMelTrend.addEventListener("click", function (ev) {
+          ev.stopPropagation();
+          openAskForMelTrend();
+        });
+        askMelTrend.dataset.wired = "1";
+      }
+      const askMelTotals = document.getElementById("ai-ask-mel-totals");
+      if (askMelTotals && !askMelTotals.dataset.wired) {
+        askMelTotals.addEventListener("click", function () {
+          openAskForMelTotals();
+        });
+        askMelTotals.dataset.wired = "1";
+      }
+
+      await loadAndRenderMel();
+    }
+
+    /** Build a compact JSON payload describing the current MEL trend chart and
+     *  hand it to the AI dock as pinned context. We send the per-snapshot
+     *  series (so the model can compute trends/deltas itself) + the active
+     *  filters + the compare-to date if any. */
+    async function openAskForMelTrend() {
+      const series = await loadFilteredTrend();
+      const last = series[series.length - 1] || null;
+      const first = series[0] || null;
+      const filters = {
+        unit: melState.unit || null,
+        mgmt: melState.mgmt || null,
+        tier: melState.tier || null,
+        status: (melState.filter && melState.filter !== "all") ? melState.filter : null,
+        critical: melState.filter === "critical" || null,
+        query: melState.query || null,
+        selectedKey: melState.selectedKey || null,
+      };
+      const data = {
+        chart: "MEL Readiness over time",
+        asOfDate: melState.asOfDate,
+        compareDate: melState.cmpDate || null,
+        filters: filters,
+        series: series.map(function (s) {
+          return {
+            date: s.date,
+            fmc: s.fmc, nmc: s.nmc,
+            mcPct: s.mcPct == null ? null : Number(s.mcPct.toFixed(2)),
+            keysBelow: s.below, keysAt: s.at, keysAbove: s.above,
+            totalKeysInScope: s.total,
+          };
+        }),
+        first: first ? { date: first.date, fmc: first.fmc, nmc: first.nmc, mcPct: first.mcPct } : null,
+        last: last ? { date: last.date, fmc: last.fmc, nmc: last.nmc, mcPct: last.mcPct } : null,
+      };
+      const filterBits = [];
+      if (filters.unit) filterBits.push("unit=" + filters.unit);
+      if (filters.mgmt) filterBits.push("mgmt=" + filters.mgmt);
+      if (filters.tier) filterBits.push("tier=" + filters.tier);
+      if (filters.status) filterBits.push("status=" + filters.status);
+      if (filters.critical) filterBits.push("critical");
+      if (filters.selectedKey) filterBits.push("key=" + filters.selectedKey);
+      const summary = "Readiness over time · " + series.length + " snapshots" +
+        (filterBits.length ? " · scope: " + filterBits.join(", ") : " · no filter") +
+        (last ? " · latest MC " + (last.mcPct == null ? "—" : last.mcPct.toFixed(1) + "%") : "");
+      askWithContext({
+        id: "mel-trend",
+        title: "MEL Readiness over time",
+        summary: summary,
+        data: data,
+        suggestions: [
+          "Summarize this trend in one paragraph.",
+          "Has MC% improved or declined? By how many points?",
+          "Which date had the worst MC%? What about the best?",
+          "What's the average daily NMC count over this window?",
+          "Project the next 7 days of MC% based on the trend.",
+        ],
+      });
+    }
+
+    /** MEL totals (the KPI strip) -> AI context. Includes both the current
+     *  scope's aggregates and, if a compare date is selected, the comparison
+     *  totals so the model can talk about deltas. */
+    function openAskForMelTotals() {
+      const scoped = melState.rows.filter(melMatchesScope);
+      const t = melAggregate(scoped);
+      const cmpScoped = melState.cmpRows.filter(melMatchesScope);
+      const c = melState.cmpDate ? melAggregate(cmpScoped) : null;
+      const filters = {
+        unit: melState.unit || null,
+        mgmt: melState.mgmt || null,
+        tier: melState.tier || null,
+        status: (melState.filter && melState.filter !== "all") ? melState.filter : null,
+        critical: melState.filter === "critical" || null,
+        query: melState.query || null,
+      };
+      const topBelow = scoped
+        .filter(function (r) { return r.mel_status === "below"; })
+        .sort(function (a, b) { return melDeficitOf(b) - melDeficitOf(a); })
+        .slice(0, 12)
+        .map(function (r) {
+          return {
+            melKey: r.mel_key, unit: r.unit, mgmtCode: melMgmtCodeOf(r),
+            type: melTypeLabelOf(r) || null,
+            fmc: r.fmc_count || 0, nmc: r.nmc_count || 0,
+            assigned: r.mel_assigned_total || 0, melRequired: r.mel_required || 0,
+            deficit: melDeficitOf(r),
+            critical: melIsCritical(r) || false,
+          };
+        });
+      const data = {
+        view: "MEL totals",
+        asOfDate: melState.asOfDate,
+        compareDate: melState.cmpDate || null,
+        filters: filters,
+        totals: {
+          assetsBelowMel: t.assetsBelow,
+          assetsToReachAtMel: t.assetsToReachAt,
+          totalNmc: t.nmc,
+          totalFmc: t.fmc,
+          fleetMcPercent: t.mcRatePercent == null ? null : Number(t.mcRatePercent.toFixed(2)),
+          recallDelta: t.recall,
+          melKeysInScope: t.keys,
+          keysBelow: t.belowKeys,
+          keysAt: t.atKeys,
+          keysAbove: t.aboveKeys,
+        },
+        compareTotals: c ? {
+          assetsBelowMel: c.assetsBelow,
+          assetsToReachAtMel: c.assetsToReachAt,
+          totalNmc: c.nmc,
+          totalFmc: c.fmc,
+          fleetMcPercent: c.mcRatePercent == null ? null : Number(c.mcRatePercent.toFixed(2)),
+          melKeysInScope: c.keys,
+          keysBelow: c.belowKeys,
+        } : null,
+        worstBelowMelKeys: topBelow,
+      };
+      const filterBits = [];
+      if (filters.unit) filterBits.push(filters.unit);
+      if (filters.mgmt) filterBits.push(filters.mgmt);
+      if (filters.tier) filterBits.push(filters.tier);
+      if (filters.status) filterBits.push(filters.status);
+      if (filters.critical) filterBits.push("critical");
+      const summary = (filterBits.length ? filterBits.join(" · ") : "Full scope") +
+        " · " + t.keys + " keys · " + t.assetsBelow + " assets below MEL" +
+        (c ? " (vs " + fmtKeyShort(melState.cmpDate) + ")" : "");
+      askWithContext({
+        id: "mel-totals",
+        title: "MEL scope: " + (filterBits.length ? filterBits.join(" / ") : "all units"),
+        summary: summary,
+        data: data,
+        suggestions: [
+          "Give me a quick health summary.",
+          "Which MEL keys are dragging us down the most?",
+          c ? "What changed since the comparison date?" : "How many vehicles do we need to fix to hit AT MEL?",
+          "Are we trending better or worse?",
+          "Which units appear most in the worst-below list?",
+        ],
+      });
+    }
+
+    async function loadAndRenderMel() {
+      const meta = document.getElementById("mel-list-meta");
+      if (meta) meta.textContent = "Loading…";
+      const url = "/api/mel" + (melState.asOfDate ? "?date=" + encodeURIComponent(melState.asOfDate) : "");
+      let data;
+      try {
+        const r = await fetch(url);
+        data = await r.json();
+      } catch (e) {
+        if (meta) meta.textContent = "Failed to load MEL data.";
+        return;
+      }
+      melState.rows = data.rows || [];
+      melState.availableDates = data.availableDates || [];
+      if (!melState.asOfDate) melState.asOfDate = data.asOfDate || data.latestDate || "";
+
+      // Populate date select
+      const sel = document.getElementById("mel-date");
+      if (sel) {
+        sel.innerHTML = melState.availableDates.map(function (d) {
+          return '<option value="' + esc(d) + '"' + (d === melState.asOfDate ? " selected" : "") + ">" + esc(fmtKeyLong(d)) + "</option>";
+        }).join("") || '<option value="">—</option>';
+      }
+      // Compare select gets every date except the current one.
+      const cmpSel = document.getElementById("mel-cmp-date");
+      if (cmpSel) {
+        const cur = melState.cmpDate;
+        cmpSel.innerHTML = '<option value="">Off</option>' + melState.availableDates
+          .filter(function (d) { return d !== melState.asOfDate; })
+          .map(function (d) {
+            return '<option value="' + esc(d) + '"' + (d === cur ? " selected" : "") + ">" + esc(fmtKeyLong(d)) + "</option>";
+          }).join("");
+      }
+
+      populateMelFilterDropdowns();
+
+      // Pull rollup + compare in parallel; rendering runs after both are in.
+      await Promise.all([loadMelRollup(), loadMelCompare()]);
+
+      renderMelView();
+      refreshPresetChipsState("mel-preset-chips", melState.cmpDate, melState.asOfDate);
+
+      if (melState.selectedKey) {
+        loadAndRenderMelDetail(melState.selectedKey);
+      }
+    }
+
+    /** Refresh the Unit / Mgmt / Tier dropdowns so each one only offers
+     *  options that are still reachable given the OTHER dropdowns. Picking
+     *  "5 CES" for unit shrinks the mgmt-code list to mgmt codes that exist
+     *  inside 5 CES, and so on — i.e. truly cascading filters. The currently
+     *  selected value is always preserved as an option so it doesn't silently
+     *  disappear; we just mark it "(no rows)" if it would now be empty. */
+    function populateMelFilterDropdowns() {
+      function fillSel(id, allLabel, items, cur) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        const opts = ['<option value="">' + allLabel + ' (' + items.length + ')</option>'];
+        const seen = new Set();
+        items.forEach(function (x) {
+          if (seen.has(x)) return;
+          seen.add(x);
+          opts.push('<option value="' + esc(x) + '"' + (x === cur ? " selected" : "") + ">" + esc(x) + "</option>");
+        });
+        // If the user has a value selected that's no longer in the cascaded
+        // list (e.g. picked Unit=A then Mgmt=B but B doesn't have any rows
+        // matching A anymore), keep it as a tagged option so they can see it.
+        if (cur && !seen.has(cur)) {
+          opts.push('<option value="' + esc(cur) + '" selected>' + esc(cur) + " (no rows)</option>");
+        }
+        el.innerHTML = opts.join("");
+      }
+      // For each filter, compute what's reachable using the OTHER filters.
+      function rowsExcept(skip) {
+        return melState.rows.filter(function (r) {
+          if (skip !== "unit" && melState.unit && r.unit !== melState.unit) return false;
+          if (skip !== "mgmt" && melState.mgmt && melMgmtCodeOf(r) !== melState.mgmt) return false;
+          if (skip !== "tier" && melState.tier && r.priority_tier !== melState.tier) return false;
+          if (skip !== "filter") {
+            if (melState.filter === "critical" && !melIsCritical(r)) return false;
+            else if (melState.filter !== "all" && melState.filter !== "critical" && r.mel_status !== melState.filter) return false;
+          }
+          const q = (melState.query || "").toLowerCase();
+          if (q) {
+            // Keep the blob in sync with melMatchesScope() — both call sites
+            // need to honor the same searchable fields (incl. detail doc #)
+            // so the chip filter dropdowns don't disagree with the visible list.
+            const blob = (r.mel_key + " " + r.unit + " " + r.user_unit + " " + r.mgmt_code_name + " " + (r.detail_doc_number || "")).toLowerCase();
+            if (blob.indexOf(q) < 0) return false;
+          }
+          return true;
+        });
+      }
+      const unitOpts = Array.from(new Set(rowsExcept("unit").map(function (r) { return r.unit; }).filter(Boolean))).sort();
+      const mgmtOpts = Array.from(new Set(rowsExcept("mgmt").map(melMgmtCodeOf).filter(Boolean))).sort();
+      const tierOpts = Array.from(new Set(rowsExcept("tier").map(function (r) { return r.priority_tier; }).filter(Boolean))).sort();
+      fillSel("mel-unit", "All units", unitOpts, melState.unit);
+      fillSel("mel-mgmt", "All mgmt codes", mgmtOpts, melState.mgmt);
+      fillSel("mel-tier", "All tiers", tierOpts, melState.tier);
+    }
+
+    async function loadMelRollup() {
+      try {
+        const r = await fetch("/api/mel-rollup");
+        const j = await r.json();
+        melState.rollup = j.rollup || [];
+      } catch (e) {
+        melState.rollup = [];
+      }
+    }
+
+    async function loadMelCompare() {
+      if (!melState.cmpDate) {
+        melState.cmpRows = [];
+        return;
+      }
+      try {
+        const r = await fetch("/api/mel?date=" + encodeURIComponent(melState.cmpDate));
+        const j = await r.json();
+        melState.cmpRows = j.rows || [];
+      } catch (e) {
+        melState.cmpRows = [];
+      }
+    }
+
+    /** Apply ALL non-status filters (unit / mgmt / tier / search). Status
+     *  filter is intentionally excluded so the totals + chart show the full
+     *  picture inside the chosen unit/mgmt scope. */
+    function melMatchesScope(r) {
+      if (melState.unit && r.unit !== melState.unit) return false;
+      if (melState.tier && r.priority_tier !== melState.tier) return false;
+      if (melState.mgmt && melMgmtCodeOf(r) !== melState.mgmt) return false;
+      const q = (melState.query || "").toLowerCase();
+      if (q) {
+        const blob = (r.mel_key + " " + r.unit + " " + r.user_unit + " " + r.mgmt_code_name + " " + r.detail_doc_number).toLowerCase();
+        if (blob.indexOf(q) < 0) return false;
+      }
+      return true;
+    }
+    function melMatchesFilters(r) {
+      if (!melMatchesScope(r)) return false;
+      if (melState.filter === "critical") return melIsCritical(r);
+      if (melState.filter !== "all" && r.mel_status !== melState.filter) return false;
+      return true;
+    }
+
+    /** Re-render the bits of the page that depend on filters / data:
+     *  trend chart, totals strip, list. (Date select is rendered separately.) */
+    function renderMelView() {
+      populateMelFilterDropdowns();
+      renderMelTotals();
+      if (melState.viewMode === "slide") {
+        renderMelSlide();
+      } else {
+        renderMelList();
+      }
+      renderMelTrend();
+      const cmpMeta = document.getElementById("mel-cmp-meta");
+      if (cmpMeta) {
+        cmpMeta.textContent = melState.cmpDate
+          ? "Comparing " + fmtKeyShort(melState.cmpDate) + " → " + fmtKeyShort(melState.asOfDate)
+          : "";
+      }
+    }
+
+    /** Format a delta number with a sign + colorize as good or bad given the
+     *  metric's polarity ("more is bad" for NMC/below, "more is good" for FMC/MC%). */
+    function melDelta(now, then, polarity) {
+      if (then == null || now == null) return "";
+      const diff = now - then;
+      if (Math.abs(diff) < 0.0001) return "<span class='mel-delta flat'>±0</span>";
+      const sign = diff > 0 ? "+" : "";
+      const isGood = polarity === "good-up" ? diff > 0 : diff < 0;
+      const cls = isGood ? "good" : "bad";
+      const arrow = diff > 0 ? "▲" : "▼";
+      let val;
+      if (polarity === "pct") {
+        val = sign + diff.toFixed(1) + "pp";
+      } else {
+        val = sign + diff;
+      }
+      return "<span class='mel-delta " + cls + "' title='vs " + esc(fmtKeyShort(melState.cmpDate)) + "'>" + arrow + " " + val + "</span>";
+    }
+
+    function renderMelTotals() {
+      const el = document.getElementById("mel-totals");
+      if (!el) return;
+      const scoped = melState.rows.filter(melMatchesScope);
+      const t = melAggregate(scoped);
+      const cmpScoped = melState.cmpRows.filter(melMatchesScope);
+      const c = melState.cmpDate ? melAggregate(cmpScoped) : null;
+      const mcLabel = t.mcRatePercent == null ? "—" : t.mcRatePercent.toFixed(1) + "%";
+      const recallSign = t.recall > 0 ? "+" : "";
+
+      const cells = [
+        {
+          lbl: "Assets below MEL", val: String(t.assetsBelow),
+          sub: t.belowKeys + " keys below",
+          cls: t.assetsBelow > 0 ? "danger" : "success",
+          delta: c ? melDelta(t.assetsBelow, c.assetsBelow, "good-down") : "",
+        },
+        {
+          lbl: "To reach AT MEL", val: String(t.assetsToReachAt),
+          sub: t.assetsToReachAt === 1 ? "asset needed" : "assets needed",
+          cls: t.assetsToReachAt > 0 ? "warn" : "success",
+          delta: c ? melDelta(t.assetsToReachAt, c.assetsToReachAt, "good-down") : "",
+        },
+        {
+          lbl: "Total NMC", val: String(t.nmc),
+          sub: "out of " + (t.nmc + t.fmc) + " assigned",
+          cls: "danger",
+          delta: c ? melDelta(t.nmc, c.nmc, "good-down") : "",
+        },
+        {
+          lbl: "Total FMC", val: String(t.fmc),
+          sub: "mission capable",
+          cls: "success",
+          delta: c ? melDelta(t.fmc, c.fmc, "good-up") : "",
+        },
+        {
+          lbl: "Fleet MC%", val: mcLabel,
+          sub: t.keys + " MEL keys in scope",
+          cls: "",
+          delta: c && c.mcRatePercent != null && t.mcRatePercent != null ? melDelta(t.mcRatePercent, c.mcRatePercent, "pct") : "",
+        },
+        {
+          lbl: "Recall +/-", val: recallSign + t.recall,
+          sub: t.recall === 0 ? "no loaners" : (t.recall < 0 ? "loaners pulled" : "loaners in"),
+          cls: "accent",
+          delta: c ? melDelta(t.recall, c.recall, "good-up") : "",
+        },
+      ];
+      el.innerHTML = cells.map(function (c) {
+        return "<div class='mel-total " + c.cls + "'>" +
+               "<span class='lbl'>" + esc(c.lbl) + "</span>" +
+               "<span class='val'>" + esc(c.val) + "</span>" +
+               "<span class='sub'>" + esc(c.sub) + (c.delta ? " " + c.delta : "") + "</span>" +
+               "</div>";
+      }).join("");
+    }
+
+    /** Render the trend chart. Uses the rollup endpoint when no scope filters
+     *  are active (it's already aggregated and fast). When the user has
+     *  filtered down to a unit / mgmt code / tier, we fetch each snapshot's
+     *  rows on demand (cached) and aggregate client-side so the chart shows
+     *  trends inside the chosen scope. */
+    /** "Generation token" — incremented every time the trend is asked to
+     *  re-render. The async filtered-trend pipeline checks this before
+     *  writing back, so a stale fetch from a previous filter selection
+     *  can't clobber a newer one. */
+    let melTrendGen = 0;
+
+    async function renderMelTrend() {
+      const el = document.getElementById("mel-trend-body");
+      const sub = document.getElementById("mel-trend-sub");
+      if (!el) return;
+      const myGen = ++melTrendGen;
+      const hasScope = !!(
+        melState.unit || melState.mgmt || melState.tier || melState.query ||
+        melState.selectedKey ||
+        (melState.filter && melState.filter !== "all")
+      );
+
+      let series;
+      if (!hasScope && melState.rollup) {
+        series = melState.rollup.map(function (r) {
+          const tot = (r.total_fmc || 0) + (r.total_nmc || 0);
+          return {
+            date: r.snapshot_date_key,
+            nmc: r.total_nmc || 0,
+            fmc: r.total_fmc || 0,
+            mcPct: tot > 0 ? (r.total_fmc / tot) * 100 : null,
+            below: r.below || 0,
+            at: r.at || 0,
+            above: r.above || 0,
+            total: r.total_keys || 0,
+          };
+        });
+        if (sub) sub.textContent = "Stacked bars = NMC vs FMC across all MEL keys. Line = fleet MC%. Filter to scope.";
+      } else {
+        if (sub) sub.textContent = "Filtered to current scope · loading…";
+        series = await loadFilteredTrend();
+        if (myGen !== melTrendGen) return;
+        if (sub) {
+          const scopeBits = [];
+          if (melState.unit) scopeBits.push(melState.unit);
+          if (melState.mgmt) scopeBits.push(melState.mgmt);
+          if (melState.tier) scopeBits.push(melTierShort(melState.tier));
+          if (melState.query) scopeBits.push("'" + melState.query + "'");
+          if (melState.filter === "critical") scopeBits.push("critical");
+          else if (melState.filter && melState.filter !== "all") scopeBits.push(melState.filter + " MEL");
+          if (melState.selectedKey) scopeBits.unshift("MEL " + melState.selectedKey);
+          sub.textContent = "Scoped to " + (scopeBits.join(" · ") || "—") + ". Stacked bars = NMC vs FMC. Line = MC%.";
+        }
+      }
+      if (myGen !== melTrendGen) return;
+      el.innerHTML = renderMelChartSvg(series);
+    }
+
+    /** Aggregate the filtered-by-scope rows for every snapshot date into a
+     *  trend series. Caches per-date row sets so subsequent toggles are fast.
+     *  Honors EVERY filter (unit/mgmt/tier/query/status/critical) so the
+     *  chart actually moves when you click a status chip. */
+    async function loadFilteredTrend() {
+      const dates = (melState.availableDates || []).slice().sort();
+      const missing = dates.filter(function (d) { return !melState.perDateRows.has(d); });
+      const chunkSize = 6;
+      for (let i = 0; i < missing.length; i += chunkSize) {
+        const batch = missing.slice(i, i + chunkSize);
+        await Promise.all(batch.map(async function (d) {
+          try {
+            const r = await fetch("/api/mel?date=" + encodeURIComponent(d));
+            const j = await r.json();
+            melState.perDateRows.set(d, j.rows || []);
+          } catch (e) {
+            melState.perDateRows.set(d, []);
+          }
+        }));
+      }
+      // Build a config map from the latest-loaded rows so historical rows can
+      // be cross-referenced for "is this key currently flagged critical?".
+      const cfgByKey = new Map();
+      melState.rows.forEach(function (r) { cfgByKey.set(r.mel_key, r.config); });
+      return dates.map(function (d) {
+        const rows = (melState.perDateRows.get(d) || []).filter(function (r) {
+          if (melState.selectedKey && r.mel_key !== melState.selectedKey) return false;
+          if (!melMatchesScope(r)) return false;
+          if (melState.filter === "critical") {
+            const cfg = cfgByKey.get(r.mel_key);
+            return !!(cfg && cfg.isCritical);
+          }
+          if (melState.filter && melState.filter !== "all") {
+            return r.mel_status === melState.filter;
+          }
+          return true;
+        });
+        const a = melAggregate(rows);
+        return {
+          date: d,
+          nmc: a.nmc, fmc: a.fmc,
+          mcPct: a.mcRatePercent,
+          below: a.belowKeys, at: a.atKeys, above: a.aboveKeys,
+          total: a.keys,
+        };
+      });
+    }
+
+    /** Render an SVG stacked bar (NMC over FMC) + MC% overlay line. */
+    function renderMelChartSvg(series) {
+      if (!series || !series.length) return "<div class='mel-empty' style='padding:20px 0'>No history yet.</div>";
+      const W = 920, H = 220;
+      const padL = 40, padR = 36, padT = 12, padB = 26;
+      const innerW = W - padL - padR;
+      const innerH = H - padT - padB;
+      const n = series.length;
+      const barW = Math.max(3, Math.floor((innerW / n) * 0.78));
+      const stepX = innerW / n;
+      const maxAssets = Math.max.apply(null, series.map(function (s) { return s.nmc + s.fmc; }).concat([1]));
+      const yScale = function (v) { return innerH - (v / maxAssets) * innerH; };
+      // MC% has its own 0..100 axis on the right.
+      const mcY = function (p) { return innerH - (p / 100) * innerH; };
+
+      // Y axis ticks (assets) — 4 grid lines.
+      const yTicks = 4;
+      let gridLines = "";
+      for (let i = 0; i <= yTicks; i++) {
+        const v = Math.round((maxAssets * i) / yTicks);
+        const y = padT + yScale(v);
+        gridLines += "<line x1='" + padL + "' x2='" + (padL + innerW) + "' y1='" + y + "' y2='" + y + "'/>";
+        gridLines += "<text x='" + (padL - 6) + "' y='" + (y + 3) + "' text-anchor='end' class='y-tick'>" + v + "</text>";
+      }
+      // MC% axis labels on the right
+      let mcLabels = "";
+      [0, 50, 100].forEach(function (p) {
+        const y = padT + mcY(p);
+        mcLabels += "<text x='" + (padL + innerW + 6) + "' y='" + (y + 3) + "' class='y-tick' fill='var(--accent)'>" + p + "%</text>";
+      });
+
+      // Bars (NMC stacked over FMC: visually FMC on bottom, NMC on top).
+      let bars = "";
+      series.forEach(function (s, i) {
+        const cx = padL + i * stepX + (stepX - barW) / 2;
+        const totalH = innerH - yScale(s.nmc + s.fmc);
+        const fmcH = (innerH - yScale(s.fmc));
+        const nmcH = totalH - fmcH;
+        const yBottom = padT + innerH;
+        const isBelowDot = s.below > 0;
+        bars += "<g class='bar" + (isBelowDot ? " below" : "") + "'>" +
+                "<rect class='bar-fmc' x='" + cx + "' y='" + (yBottom - fmcH) + "' width='" + barW + "' height='" + Math.max(0, fmcH) + "' rx='1'/>" +
+                (nmcH > 0 ? "<rect class='bar-nmc' x='" + cx + "' y='" + (yBottom - fmcH - nmcH) + "' width='" + barW + "' height='" + Math.max(0, nmcH) + "'/>" : "") +
+                "<title>" + esc(fmtKeyShort(s.date)) + " · FMC " + s.fmc + " · NMC " + s.nmc + " · MC " + (s.mcPct == null ? "—" : s.mcPct.toFixed(1) + "%") + " · " + s.below + " keys below MEL</title>" +
+                "</g>";
+      });
+
+      // MC% line
+      const linePts = series.map(function (s, i) {
+        if (s.mcPct == null) return null;
+        const cx = padL + i * stepX + stepX / 2;
+        const cy = padT + mcY(s.mcPct);
+        return cx + "," + cy;
+      }).filter(Boolean).join(" ");
+      const dots = series.map(function (s, i) {
+        if (s.mcPct == null) return "";
+        const cx = padL + i * stepX + stepX / 2;
+        const cy = padT + mcY(s.mcPct);
+        return "<circle class='mc-dot' cx='" + cx + "' cy='" + cy + "' r='2.5'><title>" + esc(fmtKeyShort(s.date)) + " · MC " + s.mcPct.toFixed(1) + "%</title></circle>";
+      }).join("");
+
+      // X labels — just show first / middle / last to avoid clutter.
+      const labelIdxs = n <= 6 ? series.map(function (_, i) { return i; }) : [0, Math.floor(n/4), Math.floor(n/2), Math.floor(3*n/4), n - 1];
+      const xLabels = labelIdxs.map(function (i) {
+        const cx = padL + i * stepX + stepX / 2;
+        return "<text x='" + cx + "' y='" + (padT + innerH + 16) + "' text-anchor='middle' class='x-tick'>" + esc(fmtKeyShort(series[i].date)) + "</text>";
+      }).join("");
+
+      return "<svg class='mel-chart' viewBox='0 0 " + W + " " + H + "' preserveAspectRatio='xMidYMid meet'>" +
+             "<g class='grid'>" + gridLines + "</g>" +
+             bars +
+             (linePts ? "<polyline class='mc-line' points='" + linePts + "'/>" : "") +
+             dots +
+             "<g class='axis'>" + xLabels + mcLabels + "</g>" +
+             "</svg>";
+    }
+
+    function statusOrder(s) {
+      // Worst-first: below > at > above > unknown
+      return s === "below" ? 0 : s === "at" ? 1 : s === "above" ? 2 : 3;
+    }
+
+    function melMcPercent(r) {
+      const tot = (r.fmc_count || 0) + (r.nmc_count || 0);
+      return tot > 0 ? (r.fmc_count / tot) * 100 : null;
+    }
+
+    /** Per-key "to-reach-AT" = max(0, MEL_required - FMC). Only meaningful
+     *  when the key is below; for at/above this returns 0. */
+    function melDeficitOf(r) {
+      if (r.mel_status !== "below") return 0;
+      return Math.max(0, (r.mel_required || 0) - (r.fmc_count || 0));
+    }
+
+    function sortMelRows(rows) {
+      const s = melState.sort;
+      const out = rows.slice();
+      out.sort(function (a, b) {
+        if (s === "key") return a.mel_key.localeCompare(b.mel_key);
+        if (s === "unit") return (a.unit || "").localeCompare(b.unit || "") || a.mel_key.localeCompare(b.mel_key);
+        if (s === "deficit") {
+          const da = melDeficitOf(a), db = melDeficitOf(b);
+          if (db !== da) return db - da;
+          return statusOrder(a.mel_status) - statusOrder(b.mel_status);
+        }
+        if (s === "nmc") {
+          const na = a.nmc_count || 0, nb = b.nmc_count || 0;
+          if (nb !== na) return nb - na;
+          return statusOrder(a.mel_status) - statusOrder(b.mel_status);
+        }
+        if (s === "recall") {
+          const ra = Math.abs(a.recall_delta || 0);
+          const rb = Math.abs(b.recall_delta || 0);
+          if (rb !== ra) return rb - ra;
+          return statusOrder(a.mel_status) - statusOrder(b.mel_status);
+        }
+        if (s === "mc-asc" || s === "mc-desc") {
+          const ma = melMcPercent(a);
+          const mb = melMcPercent(b);
+          if (ma == null && mb == null) return 0;
+          if (ma == null) return 1;
+          if (mb == null) return -1;
+          return s === "mc-asc" ? ma - mb : mb - ma;
+        }
+        // default: status (worst-first), then unit, then key
+        const so = statusOrder(a.mel_status) - statusOrder(b.mel_status);
+        if (so !== 0) return so;
+        const u = (a.unit || "").localeCompare(b.unit || "");
+        if (u !== 0) return u;
+        return a.mel_key.localeCompare(b.mel_key);
+      });
+      return out;
+    }
+
+    function renderMelList() {
+      const el = document.getElementById("mel-list");
+      const meta = document.getElementById("mel-list-meta");
+      if (!el) return;
+      const scoped = melState.rows.filter(melMatchesScope);
+      const filtered = sortMelRows(scoped.filter(function (r) {
+        if (melState.filter === "critical") return melIsCritical(r);
+        return melState.filter === "all" || r.mel_status === melState.filter;
+      }));
+
+      const counts = { all: scoped.length, below: 0, at: 0, above: 0, critical: 0 };
+      scoped.forEach(function (r) {
+        if (counts[r.mel_status] != null) counts[r.mel_status] += 1;
+        if (melIsCritical(r)) counts.critical += 1;
+      });
+      ["all","below","at","above","critical"].forEach(function (k) {
+        const c = document.querySelector('[data-mel-count="' + k + '"]');
+        if (c) c.textContent = counts[k];
+      });
+
+      if (meta) {
+        meta.textContent = filtered.length + " of " + scoped.length + " keys in scope" +
+          (scoped.length !== melState.rows.length ? " (of " + melState.rows.length + " total)" : "") +
+          (melState.asOfDate ? " · " + fmtKeyLong(melState.asOfDate) : "");
+      }
+      if (!filtered.length) {
+        el.innerHTML = "<div class='mel-empty' style='text-align:left;padding:20px 6px'>No MEL keys match your filters.</div>";
+        return;
+      }
+      el.innerHTML = filtered.map(function (r) {
+        const fmc = r.fmc_count || 0;
+        const nmc = r.nmc_count || 0;
+        const tot = fmc + nmc;
+        const mc = tot > 0 ? (fmc / tot) * 100 : null;
+        const mcLabel = mc == null ? "—" : mc.toFixed(0) + "%";
+        const need = r.mel_required || 0;
+        const assigned = r.mel_assigned_total || (fmc + nmc) || 0;
+        const deficit = melDeficitOf(r);
+        const recall = r.recall_delta || 0;
+        const pills = [];
+        pills.push("<span class='mel-pill " + esc(r.mel_status) + "'>" + esc(melStatusLabel(r.mel_status)) + "</span>");
+        if (deficit > 0) pills.push("<span class='mel-pill below' title='Need " + deficit + " more FMC to reach AT MEL'>Need +" + deficit + "</span>");
+        if (recall !== 0) pills.push("<span class='mel-pill recall'>Recall " + (recall > 0 ? "+" : "") + recall + "</span>");
+        const mgmt = melMgmtCodeOf(r);
+        const fillPct = mc == null ? 0 : Math.max(0, Math.min(100, mc));
+        const threshPct = tot > 0 ? Math.max(0, Math.min(100, (need / tot) * 100)) : 0;
+        const isActive = melState.selectedKey === r.mel_key;
+        const critical = melIsCritical(r);
+        const typeLabel = melTypeLabelOf(r);
+        return (
+          "<div class='mel-card-wrap" + (isActive ? " active" : "") + "' data-status='" + esc(r.mel_status) + "' data-mel-key='" + esc(r.mel_key) + "'>" +
+          "<button type='button' class='mel-card-star" + (critical ? " on" : "") + "' data-toggle-critical='" + esc(r.mel_key) + "' title='" + (critical ? "Unflag critical" : "Flag as critical") + "'>★</button>" +
+          "<button type='button' class='mel-card" + (isActive ? " active" : "") + (critical ? " critical" : "") + "' data-status='" + esc(r.mel_status) + "' data-mel-key='" + esc(r.mel_key) + "'>" +
+            "<div class='mel-card-head'>" +
+              "<span class='mel-key'>" + esc(r.mel_key) + "</span>" +
+              "<div class='mel-card-pills'>" + pills.join("") + "</div>" +
+            "</div>" +
+            (typeLabel ? "<div class='mel-card-type'>" + esc(typeLabel) + "</div>" : "") +
+            "<div class='mel-card-meta'>" +
+              "<span><span class='b'>" + esc(r.unit || "—") + "</span></span>" +
+              (mgmt ? "<span><span class='b'>" + esc(mgmt) + "</span></span>" : "") +
+              "<span>" + esc(melTierShort(r.priority_tier) || "—") + "</span>" +
+            "</div>" +
+            "<div class='mel-counts'>" +
+              "<div class='mel-count fmc'><span class='n'>" + fmc + "</span><span class='l'>FMC</span></div>" +
+              "<div class='mel-count nmc'><span class='n'>" + nmc + "</span><span class='l'>NMC</span></div>" +
+              "<div class='mel-count req' title='" + assigned + " vehicles assigned to this MEL key · " + need + " required FMC to be AT MEL'>" +
+                "<span class='n'><span class='assigned'>" + assigned + "</span><span class='slash'>/</span><span class='need'>" + need + "</span></span>" +
+                "<span class='l'>IN / MEL</span>" +
+              "</div>" +
+              "<div class='mel-count'><span class='n'>" + esc(mcLabel) + "</span><span class='l'>MC</span></div>" +
+              "<div class='mel-bar' title='Green = FMC%. Tick = MEL threshold.'>" +
+                "<span class='fill' style='width:" + fillPct.toFixed(1) + "%;background:" + (r.mel_status === "below" ? "var(--danger)" : r.mel_status === "at" ? "var(--warn)" : "var(--success)") + "'></span>" +
+                (tot > 0 ? "<span class='threshold' style='left:" + threshPct.toFixed(1) + "%'></span>" : "") +
+              "</div>" +
+            "</div>" +
+          "</button>" +
+          "</div>"
+        );
+      }).join("");
+
+      // One delegated handler covers star clicks AND card clicks. We attach
+      // it once and rely on event.target.closest() to identify what was hit.
+      // Rebinding on every render is what was eating the click event when
+      // the star sat on top of the card — innerHTML wipes nodes mid-bind.
+      if (!el.dataset.delegated) {
+        el.addEventListener("click", async function (ev) {
+          const star = ev.target.closest("[data-toggle-critical]");
+          if (star && el.contains(star)) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            const k = star.getAttribute("data-toggle-critical");
+            const row = melState.rows.find(function (r) { return r.mel_key === k; });
+            const next = !melIsCritical(row);
+            // Optimistic flip so the star reacts instantly.
+            star.classList.toggle("on", next);
+            await saveMelConfig(k, { isCritical: next });
+            return;
+          }
+          const card = ev.target.closest(".mel-card[data-mel-key]");
+          if (card && el.contains(card)) {
+            const k = card.getAttribute("data-mel-key");
+            // Toggle: clicking the already-selected key clears the selection
+            // so the chart returns to the full scope.
+            if (melState.selectedKey === k) {
+              melState.selectedKey = null;
+              el.querySelectorAll(".mel-card").forEach(function (c) { c.classList.remove("active"); });
+              renderMelTrend();
+              return;
+            }
+            melState.selectedKey = k;
+            el.querySelectorAll(".mel-card").forEach(function (c) {
+              c.classList.toggle("active", c === card);
+            });
+            loadAndRenderMelDetail(k);
+            renderMelTrend();
+          }
+        });
+        el.dataset.delegated = "1";
+      }
+    }
+
+    /** POST /api/mel-config and refresh local rows + view. */
+    async function saveMelConfig(melKey, patch) {
+      try {
+        const r = await fetch("/api/mel-config", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(Object.assign({ melKey: melKey }, patch)),
+        });
+        const j = await r.json();
+        // Patch the row in place so we don't need a full reload.
+        const row = melState.rows.find(function (x) { return x.mel_key === melKey; });
+        if (row) {
+          row.config = {
+            isCritical: j.config.is_critical === 1,
+            typeLabel: j.config.type_label,
+            displayOrder: j.config.display_order,
+            notes: j.config.notes,
+          };
+        }
+        renderMelView();
+      } catch (e) {
+        console.warn("saveMelConfig failed", e);
+      }
+    }
+
+    /** Critical-slide view: dense table grouped by unit, mirroring the
+     *  printed slide format. Uses the current scope/filter so the same chips
+     *  work in both views. Critical-only is implied unless the user explicitly
+     *  switches to a different status/critical filter. */
+    function renderMelSlide() {
+      const body = document.getElementById("mel-slide-body");
+      const meta = document.getElementById("mel-slide-meta");
+      if (!body) return;
+
+      const scoped = melState.rows.filter(melMatchesScope);
+      // If the user hasn't narrowed via filter, default to critical-only on
+      // the slide so it's actually a "critical slide". Other status filters
+      // still apply when chosen.
+      const useCritical = melState.filter === "all" || melState.filter === "critical";
+      const filtered = scoped.filter(function (r) {
+        if (useCritical) return melIsCritical(r);
+        return r.mel_status === melState.filter;
+      });
+
+      if (meta) {
+        meta.textContent = filtered.length + " critical row" + (filtered.length === 1 ? "" : "s") +
+          " · " + (melState.asOfDate ? fmtKeyLong(melState.asOfDate) : "—") +
+          (useCritical ? "" : " · filter: " + melState.filter);
+      }
+
+      if (!filtered.length) {
+        body.innerHTML = "<div class='mel-empty' style='padding:30px 0'>" +
+          (useCritical
+            ? "No critical MEL keys flagged yet. Star a row in Detail list, or open Settings to manage."
+            : "Nothing matches your filter.") +
+          "</div>";
+        return;
+      }
+
+      const byUnit = new Map();
+      filtered.forEach(function (r) {
+        const u = r.unit || "—";
+        const list = byUnit.get(u) || [];
+        list.push(r);
+        byUnit.set(u, list);
+      });
+      const units = Array.from(byUnit.keys()).sort();
+
+      const html = units.map(function (u) {
+        const rows = byUnit.get(u);
+        rows.sort(function (a, b) {
+          const oa = (a.config && a.config.displayOrder) || 0;
+          const ob = (b.config && b.config.displayOrder) || 0;
+          if (oa !== ob) return oa - ob;
+          return a.mel_key.localeCompare(b.mel_key);
+        });
+        const trs = [];
+        rows.forEach(function (r) {
+          trs.push(buildSlideRow(r, false));
+          (r.subdivisions || []).forEach(function (s) {
+            trs.push(buildSlideSubRow(r, s));
+          });
+        });
+        return (
+          "<div class='slide-unit'>" +
+            "<div class='slide-unit-bar'>" + esc(u) + "</div>" +
+            "<table class='slide-table'>" +
+              "<thead><tr>" +
+                "<th>TYPE</th><th>UNIT</th><th>MGMT</th><th>MEL Key</th>" +
+                "<th>Asgnd</th><th>FMC</th><th>NMC</th><th>MEL</th>" +
+                "<th>Acc</th><th>Abus</th>" +
+              "</tr></thead>" +
+              "<tbody>" + trs.join("") + "</tbody>" +
+            "</table>" +
+          "</div>"
+        );
+      }).join("");
+      body.innerHTML = html;
+    }
+
+    function buildSlideRow(r, isSub) {
+      const fmc = r.fmc_count || 0;
+      const nmc = r.nmc_count || 0;
+      const need = r.mel_required || 0;
+      const mgmt = melMgmtCodeOf(r);
+      const typeLabel = melTypeLabelOf(r);
+      // Cell highlighting mirrors the printed slide: red/amber/green per status,
+      // red NMC chip when below MEL.
+      const statusCls = "slide-row " + (r.mel_status || "");
+      const fmcCls = (need > 0 && fmc < need) ? "cell-bad" : "cell-good";
+      const nmcCls = nmc > 0 ? "cell-warn" : "";
+      return (
+        "<tr class='" + statusCls + (isSub ? " sub" : "") + "'>" +
+          "<td class='td-type'>" + esc(typeLabel || "—") + "</td>" +
+          "<td>" + esc(r.unit || "—") + "</td>" +
+          "<td>" + esc(mgmt || "—") + "</td>" +
+          "<td class='td-key'>" + esc(r.mel_key || "—") + "</td>" +
+          "<td>" + (r.mel_assigned_total || 0) + "</td>" +
+          "<td class='" + fmcCls + "'>" + fmc + "</td>" +
+          "<td class='" + nmcCls + "'>" + nmc + "</td>" +
+          "<td>" + need + "</td>" +
+          "<td>" + (r.acc_abus || 0) + "</td>" +
+          "<td>—</td>" +
+        "</tr>"
+      );
+    }
+
+    function buildSlideSubRow(parent, sub) {
+      const fmc = sub.fmc || 0;
+      const nmc = sub.nmc || 0;
+      const need = sub.mel_required || 0;
+      const fmcCls = (need > 0 && fmc < need) ? "cell-bad" : "cell-good";
+      const nmcCls = nmc > 0 ? "cell-warn" : "";
+      return (
+        "<tr class='slide-row sub'>" +
+          "<td class='td-type sub'>↳ " + esc(sub.type_label || "—") + "</td>" +
+          "<td>" + esc(parent.unit || "—") + "</td>" +
+          "<td>" + esc(sub.mgmt_code || "—") + "</td>" +
+          "<td class='td-key'>" + esc(parent.mel_key || "—") + "</td>" +
+          "<td>" + (sub.assigned || 0) + "</td>" +
+          "<td class='" + fmcCls + "'>" + fmc + "</td>" +
+          "<td class='" + nmcCls + "'>" + nmc + "</td>" +
+          "<td>" + need + "</td>" +
+          "<td>" + (sub.accidents || 0) + "</td>" +
+          "<td>" + (sub.abuses || 0) + "</td>" +
+        "</tr>"
+      );
+    }
+
+    function melStatusLabel(s) {
+      if (s === "below") return "Below MEL";
+      if (s === "at") return "At MEL";
+      if (s === "above") return "Above MEL";
+      return "Unknown";
+    }
+
+    function shortTier(t) {
+      if (!t) return "—";
+      // "Tier I - Sortie Generating" → "Tier I · Sortie Generating"
+      return t.replace(/\\s*-\\s*/, " · ");
+    }
+
+    async function loadAndRenderMelDetail(melKey) {
+      const empty = document.getElementById("mel-detail-empty");
+      const detail = document.getElementById("mel-detail");
+      if (!detail) return;
+      if (empty) empty.classList.add("hidden");
+      detail.classList.remove("hidden");
+      detail.innerHTML = "<div class='mel-empty' style='padding:20px 0'>Loading " + esc(melKey) + "…</div>";
+
+      let data = melState.detailCache.get(melKey);
+      if (!data) {
+        try {
+          const r = await fetch("/api/mel-history?melKey=" + encodeURIComponent(melKey));
+          data = await r.json();
+          melState.detailCache.set(melKey, data);
+        } catch (e) {
+          detail.innerHTML = "<div class='mel-empty'>Failed to load history.</div>";
+          return;
+        }
+      }
+      renderMelDetail(melKey, data);
+    }
+
+    /** Pretty label per raw mel field name; falls back to the raw key. */
+    const MEL_FIELD_LABELS = {
+      mel_status: "Status",
+      mel_required: "MEL",
+      mel_assigned_total: "Assigned",
+      fmc_count: "FMC",
+      nmc_count: "NMC",
+      recall_delta: "Recall",
+      acc_abus: "Acc/Abus",
+      priority_tier: "Tier",
+      mgmt_code_name: "Mgmt code",
+      detail_doc_number: "Detail doc",
+      unit: "Unit",
+      user_unit: "User unit",
+      initial: "tracking",
+    };
+    function melFieldLabel(f) { return MEL_FIELD_LABELS[f] || f; }
+
+    /** "good-up" means rising is good (FMC, MEL met assets). "bad-up" is the
+     *  opposite (NMC, recall). Anything else is neutral. */
+    function melFieldPolarity(f) {
+      if (f === "fmc_count" || f === "mel_assigned_total") return "good-up";
+      if (f === "nmc_count" || f === "recall_delta" || f === "acc_abus") return "bad-up";
+      return "neutral";
+    }
+
+    function melDeltaClass(field, oldV, newV) {
+      const polarity = melFieldPolarity(field);
+      if (polarity === "neutral") return "neutral";
+      const a = Number(oldV);
+      const b = Number(newV);
+      if (!Number.isFinite(a) || !Number.isFinite(b)) return "neutral";
+      const diff = b - a;
+      if (diff === 0) return "neutral";
+      const isGood = polarity === "good-up" ? diff > 0 : diff < 0;
+      return isGood ? "good" : "bad";
+    }
+
+    /** Group MEL changelog rows by snapshot date so FMC/NMC swaps that happen
+     *  on the same day render as one card with both deltas side-by-side
+     *  (because losing 1 FMC and gaining 1 NMC is really one event: a vehicle
+     *  going down). Within each date we also surface a one-line summary when
+     *  the change pattern matches "vehicle went NMC" / "came back FMC". */
+    function renderMelChangelogGrouped(changelog) {
+      if (!changelog || !changelog.length) return "";
+      const groups = new Map();
+      changelog.forEach(function (c) {
+        const list = groups.get(c.snapshot_date_key) || [];
+        list.push(c);
+        groups.set(c.snapshot_date_key, list);
+      });
+      // Newest first.
+      const dates = Array.from(groups.keys()).sort(function (a, b) { return a < b ? 1 : -1; });
+      const FIELD_ORDER = [
+        "initial", "mel_status", "fmc_count", "nmc_count", "mel_required",
+        "mel_assigned_total", "recall_delta", "acc_abus", "priority_tier",
+        "mgmt_code_name", "unit", "user_unit", "detail_doc_number",
+      ];
+      function fieldRank(f) {
+        const i = FIELD_ORDER.indexOf(f);
+        return i < 0 ? 99 : i;
+      }
+      return dates.map(function (d) {
+        const items = groups.get(d).slice().sort(function (a, b) {
+          return fieldRank(a.field) - fieldRank(b.field);
+        });
+
+        // Detect the common FMC↔NMC swap: same magnitude, opposite direction.
+        let summary = "";
+        const fmc = items.find(function (i) { return i.field === "fmc_count"; });
+        const nmc = items.find(function (i) { return i.field === "nmc_count"; });
+        if (fmc && nmc) {
+          const fOld = Number(fmc.old_value), fNew = Number(fmc.new_value);
+          const nOld = Number(nmc.old_value), nNew = Number(nmc.new_value);
+          if ([fOld, fNew, nOld, nNew].every(Number.isFinite)) {
+            const fDiff = fNew - fOld;
+            const nDiff = nNew - nOld;
+            if (Math.abs(fDiff) === Math.abs(nDiff) && fDiff === -nDiff && fDiff !== 0) {
+              const count = Math.abs(fDiff);
+              if (fDiff < 0) {
+                summary = "<span class='mel-cl-summary bad'>" + count + " vehicle" + (count === 1 ? "" : "s") + " went NMC</span>";
+              } else {
+                summary = "<span class='mel-cl-summary good'>" + count + " vehicle" + (count === 1 ? "" : "s") + " came back FMC</span>";
+              }
+            }
+          }
+        }
+
+        const itemsHtml = items.map(function (c) {
+          const oldV = c.old_value == null || c.old_value === "" ? "—" : c.old_value;
+          const newV = c.new_value == null || c.new_value === "" ? "—" : c.new_value;
+          const body = c.field === "initial"
+            ? "<ins>tracking starts (" + esc(String(newV)) + ")</ins>"
+            : "<del>" + esc(String(oldV)) + "</del><span class='arrow'>→</span><ins>" + esc(String(newV)) + "</ins>";
+          const cls = melDeltaClass(c.field, oldV, newV);
+          return "<div class='mel-cl-item " + cls + "'>" +
+            "<span class='f'>" + esc(melFieldLabel(c.field)) + "</span>" +
+            "<span class='v'>" + body + "</span>" +
+          "</div>";
+        }).join("");
+
+        return "<div class='mel-cl-group'>" +
+          "<div class='mel-cl-head'>" +
+            "<span class='d'>" + esc(fmtKeyShort(d)) + "</span>" +
+            (summary ? "<span class='mel-cl-summary-wrap'>" + summary + "</span>" : "") +
+            "<span class='mel-cl-count'>" + items.length + " field" + (items.length === 1 ? "" : "s") + "</span>" +
+          "</div>" +
+          "<div class='mel-cl-items'>" + itemsHtml + "</div>" +
+        "</div>";
+      }).join("");
+    }
+
+    function renderMelDetail(melKey, data) {
+      const detail = document.getElementById("mel-detail");
+      if (!detail) return;
+      const history = (data.history || []).slice();
+      const changelog = data.changelog || [];
+      const latest = history[history.length - 1] || melState.rows.find(function (r) { return r.mel_key === melKey; });
+      if (!latest) {
+        detail.innerHTML = "<div class='mel-empty'>No data for " + esc(melKey) + ".</div>";
+        return;
+      }
+      const fmc = latest.fmc_count || 0;
+      const nmc = latest.nmc_count || 0;
+      const tot = fmc + nmc;
+      const mc = tot > 0 ? (fmc / tot) * 100 : null;
+      const mcLabel = mc == null ? "—" : mc.toFixed(1) + "%";
+      const need = latest.mel_required || 0;
+      const assigned = latest.mel_assigned_total || 0;
+      const recall = latest.recall_delta || 0;
+      const recallStr = (recall > 0 ? "+" : "") + recall;
+      const status = latest.mel_status;
+
+      // Sparkline of FMC/NMC across history.
+      const maxBar = Math.max.apply(null, history.length ? history.map(function (h) { return (h.fmc_count || 0) + (h.nmc_count || 0); }) : [1]);
+      const spark = history.map(function (h) {
+        const t = (h.fmc_count || 0) + (h.nmc_count || 0);
+        const fHt = t > 0 ? Math.max(2, Math.round((h.fmc_count / maxBar) * 44)) : 0;
+        const nHt = t > 0 ? Math.max(2, Math.round((h.nmc_count / maxBar) * 44)) : 0;
+        const cls = h.mel_status === "below" ? " below" : "";
+        const tt = fmtKeyShort(h.snapshot_date_key) + " · FMC " + h.fmc_count + " · NMC " + h.nmc_count + " · MEL " + h.mel_required + " · " + melStatusLabel(h.mel_status);
+        return "<div class='col" + cls + "' title='" + esc(tt) + "'>" +
+               "<span class='seg nmc' style='height:" + nHt + "px'></span>" +
+               "<span class='seg fmc' style='height:" + fHt + "px'></span>" +
+               "</div>";
+      }).join("");
+
+      const cells = [
+        { l: "Status", v: melStatusLabel(status), cls: status === "below" ? "danger" : status === "at" ? "warn" : status === "above" ? "success" : "" },
+        { l: "FMC", v: String(fmc), cls: "success" },
+        { l: "NMC", v: String(nmc), cls: "danger" },
+        { l: "MEL Required", v: String(need), cls: "" },
+        { l: "Assigned Total", v: String(assigned), cls: "" },
+        { l: "MC%", v: mcLabel, cls: "" },
+        { l: "Recall +/-", v: recallStr, cls: "accent" },
+        { l: "Acc/Abus", v: String(latest.acc_abus || 0), cls: "" },
+      ];
+
+      const cl = renderMelChangelogGrouped(changelog);
+
+      detail.innerHTML =
+        "<div class='mel-d-hero'>" +
+          "<div><span class='key'>" + esc(melKey) + "</span></div>" +
+          "<div class='pills'>" +
+            "<span class='mel-pill " + esc(status) + "'>" + esc(melStatusLabel(status)) + "</span>" +
+            (recall !== 0 ? "<span class='mel-pill recall'>Recall " + esc(recallStr) + "</span>" : "") +
+          "</div>" +
+          "<div class='meta'>" + esc(latest.unit || "—") +
+            (latest.user_unit && latest.user_unit !== latest.unit ? " · " + esc(latest.user_unit) : "") +
+            " · " + esc(shortTier(latest.priority_tier)) +
+            (latest.mgmt_code_name ? " · " + esc(latest.mgmt_code_name) : "") +
+          "</div>" +
+        "</div>" +
+        "<div class='mel-d-grid'>" +
+          cells.map(function (c) {
+            return "<div class='mel-d-cell " + c.cls + "'>" +
+                   "<span class='l'>" + esc(c.l) + "</span>" +
+                   "<span class='v'>" + esc(c.v) + "</span>" +
+                   "</div>";
+          }).join("") +
+        "</div>" +
+        "<div class='mel-history-head'>" +
+          "<h4>Open work orders</h4>" +
+          "<span class='when' id='mel-wos-meta'>loading…</span>" +
+        "</div>" +
+        "<div class='mel-wos' id='mel-wos'></div>" +
+        "<div class='mel-history-head'>" +
+          "<h4>FMC / NMC history</h4>" +
+          "<span class='when'>" + (history.length ? fmtKeyShort(history[0].snapshot_date_key) + " → " + fmtKeyShort(history[history.length-1].snapshot_date_key) + " · " + history.length + " snapshots" : "no history yet") + "</span>" +
+        "</div>" +
+        "<div class='mel-spark'>" + (spark || "<span class='muted' style='padding:0 8px;color:var(--muted)'>No history yet.</span>") + "</div>" +
+        "<div class='mel-history-head'><h4>Change log</h4>" +
+          "<span class='when'>" + changelog.length + " entries</span>" +
+        "</div>" +
+        "<div class='mel-changelog'>" + (cl || "<div class='mel-empty' style='text-align:left;padding:8px 0'>No changes recorded.</div>") + "</div>";
+
+      renderMelWosForKey(melKey);
+    }
+
+    /** Fetch the latest snapshot's work-order list (cached) and show the WOs
+     *  whose melKey matches the selected key. Each row is a button that jumps
+     *  to the Work Orders tab and selects that WO. */
+    async function renderMelWosForKey(melKey) {
+      const list = document.getElementById("mel-wos");
+      const meta = document.getElementById("mel-wos-meta");
+      if (!list) return;
+      const asOf = latestSnapshotDate();
+      if (!asOf) {
+        if (meta) meta.textContent = "no snapshots";
+        list.innerHTML = "<div class='mel-empty' style='text-align:left;padding:8px 0'>No latest snapshot yet.</div>";
+        return;
+      }
+      let wos = [];
+      try {
+        const [_wos] = await Promise.all([loadWatchForDate(asOf), loadSightings()]);
+        wos = _wos;
+      } catch (e) {
+        if (meta) meta.textContent = "failed to load";
+        list.innerHTML = "<div class='mel-empty' style='text-align:left;padding:8px 0'>Could not load work orders.</div>";
+        return;
+      }
+      const matched = (wos || []).filter(function (w) {
+        return (w.melKey || "").toUpperCase() === (melKey || "").toUpperCase();
+      });
+      if (meta) meta.textContent = matched.length + " in " + fmtKeyShort(asOf);
+      if (!matched.length) {
+        list.innerHTML = "<div class='mel-empty' style='text-align:left;padding:8px 0'>No open work orders against this MEL key in the latest ETIC.</div>";
+        return;
+      }
+      // Worst-first: stale, then most ETIC slip days, then most pushes.
+      matched.sort(function (a, b) {
+        if (!!b.remarkStale - !!a.remarkStale !== 0) return (!!b.remarkStale) - (!!a.remarkStale);
+        const sa = a.cumulativeEticSlipDays || 0, sb = b.cumulativeEticSlipDays || 0;
+        if (sb !== sa) return sb - sa;
+        const pa = a.eticPushCount || 0, pb = b.eticPushCount || 0;
+        return pb - pa;
+      });
+      list.innerHTML = matched.map(function (w) {
+        const tier = w.melTier || "unknown";
+        const tierTxt = tier === "below" ? "Below MEL" : tier === "at" ? "At MEL" : tier === "above" ? "Above MEL" : "—";
+        const stale = w.remarkStale
+          ? "<span class='wo-chip stale'>Stale " + (w.daysSinceRemarkChange || 0) + "d</span>"
+          : (w.daysSinceRemarkChange != null
+              ? "<span class='wo-chip'>" + (w.daysSinceRemarkChange || 0) + "d since remark</span>"
+              : "");
+        const push = (w.eticPushCount || 0) >= 1 ? "<span class='wo-chip warn'>" + w.eticPushCount + " push" + (w.eticPushCount === 1 ? "" : "es") + "</span>" : "";
+        const slip = (w.cumulativeEticSlipDays || 0) >= 1 ? "<span class='wo-chip warn'>+" + w.cumulativeEticSlipDays + "d slip</span>" : "";
+        const eticTxt = w.eticDate ? fmtKeyShort(w.eticDate) : (w.eticRaw || "—");
+        return "<button type='button' class='mel-wo-row tier-" + esc(tier) + "' data-mel-wo='" + esc(w.workOrderId) + "'>" +
+          "<div class='mel-wo-head'>" +
+            "<span class='wo-id'>" + esc(w.workOrderId || "—") + "</span>" +
+            "<span class='wo-asset'>" + esc(w.assetId || "—") + "</span>" +
+            renderSightingBadge(w.assetId, { compact: true }) +
+            "<span class='wo-tier " + esc(tier) + "'>" + esc(tierTxt) + "</span>" +
+            "<span class='wo-arrow' aria-hidden='true'>›</span>" +
+          "</div>" +
+          "<div class='mel-wo-meta'>" +
+            (w.makeModel ? "<span>" + esc(w.makeModel) + "</span>" : "") +
+            (w.shop ? "<span>· " + esc(w.shop) + "</span>" : "") +
+            "<span>· ETIC " + esc(eticTxt) + "</span>" +
+          "</div>" +
+          "<div class='mel-wo-chips'>" + stale + push + slip + "</div>" +
+          (w.remarks ? "<div class='mel-wo-remarks'>" + esc(String(w.remarks).slice(0, 220)) + (w.remarks.length > 220 ? "…" : "") + "</div>" : "") +
+        "</button>";
+      }).join("");
+      list.querySelectorAll("[data-mel-wo]").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          const id = btn.getAttribute("data-mel-wo");
+          selectWo(id, true);
+        });
+      });
+    }
+
+    /* -------------------- Settings tab -------------------- */
+
+    const settingsState = {
+      staleness: { below: 3, at: 5, above: 10 },
+      melConfigsLoaded: false,
+      subdivisionsLoaded: false,
+      subdivisions: [],
+      filter: "",
+      onlyCritical: false,
+    };
+
+    async function onEnterSettingsTab() {
+      await loadStaleness();
+      // The rows in melState may not be loaded if the user hasn't opened MEL
+      // yet. Pull them so the editor table can render.
+      if (!melState.rows || !melState.rows.length) {
+        try {
+          const r = await fetch("/api/mel");
+          const j = await r.json();
+          melState.rows = j.rows || [];
+          melState.availableDates = j.availableDates || [];
+          melState.asOfDate = j.asOfDate || j.latestDate || "";
+        } catch (e) {
+          console.warn("settings: could not preload MEL rows", e);
+        }
+      }
+      await loadAllSubdivisions();
+      renderSettingsMelTable();
+      renderSettingsSubdivisions();
+      wireSettingsHandlers();
+    }
+
+    async function loadStaleness() {
+      try {
+        const r = await fetch("/api/app-config");
+        const j = await r.json();
+        settingsState.staleness = j.staleness || settingsState.staleness;
+      } catch (e) { /* leave defaults */ }
+      const b = document.getElementById("settings-stale-below");
+      const a = document.getElementById("settings-stale-at");
+      const v = document.getElementById("settings-stale-above");
+      if (b) b.value = settingsState.staleness.below;
+      if (a) a.value = settingsState.staleness.at;
+      if (v) v.value = settingsState.staleness.above;
+    }
+
+    async function loadAllSubdivisions() {
+      try {
+        const r = await fetch("/api/mel-subdivision");
+        const j = await r.json();
+        settingsState.subdivisions = j.subdivisions || [];
+      } catch (e) {
+        settingsState.subdivisions = [];
+      }
+    }
+
+    function settingsToast(msg, ok) {
+      const el = document.getElementById("settings-status");
+      if (!el) return;
+      el.textContent = msg;
+      el.classList.remove("hidden");
+      el.classList.toggle("err", !ok);
+      el.classList.toggle("ok", !!ok);
+      setTimeout(function () { el.classList.add("hidden"); }, 3000);
+    }
+
+    function wireSettingsHandlers() {
+      const saveBtn = document.getElementById("settings-stale-save");
+      if (saveBtn && !saveBtn.dataset.wired) {
+        saveBtn.addEventListener("click", async function () {
+          const below = Number(document.getElementById("settings-stale-below").value) || 0;
+          const at = Number(document.getElementById("settings-stale-at").value) || 0;
+          const above = Number(document.getElementById("settings-stale-above").value) || 0;
+          try {
+            const r = await fetch("/api/app-config", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ key: "staleness_thresholds", value: { below: below, at: at, above: above } }),
+            });
+            const j = await r.json();
+            settingsState.staleness = j.staleness || { below: below, at: at, above: above };
+            settingsToast("Saved staleness thresholds (" + below + " / " + at + " / " + above + " days)", true);
+          } catch (e) {
+            settingsToast("Failed to save: " + e.message, false);
+          }
+        });
+        saveBtn.dataset.wired = "1";
+      }
+      const resetBtn = document.getElementById("settings-stale-reset");
+      if (resetBtn && !resetBtn.dataset.wired) {
+        resetBtn.addEventListener("click", function () {
+          document.getElementById("settings-stale-below").value = 3;
+          document.getElementById("settings-stale-at").value = 5;
+          document.getElementById("settings-stale-above").value = 10;
+        });
+        resetBtn.dataset.wired = "1";
+      }
+      const search = document.getElementById("settings-mel-search");
+      if (search && !search.dataset.wired) {
+        search.addEventListener("input", function () {
+          settingsState.filter = (search.value || "").toLowerCase().trim();
+          renderSettingsMelTable();
+        });
+        search.dataset.wired = "1";
+      }
+      const onlyCrit = document.getElementById("settings-mel-only-critical");
+      if (onlyCrit && !onlyCrit.dataset.wired) {
+        onlyCrit.addEventListener("change", function () {
+          settingsState.onlyCritical = !!onlyCrit.checked;
+          renderSettingsMelTable();
+        });
+        onlyCrit.dataset.wired = "1";
+      }
+      const subAdd = document.getElementById("settings-sub-add");
+      if (subAdd && !subAdd.dataset.wired) {
+        subAdd.addEventListener("click", saveSubdivisionFromForm);
+        subAdd.dataset.wired = "1";
+      }
+    }
+
+    function renderSettingsMelTable() {
+      const el = document.getElementById("settings-mel-table");
+      if (!el) return;
+      const q = settingsState.filter;
+      const rows = (melState.rows || []).filter(function (r) {
+        if (settingsState.onlyCritical && !melIsCritical(r)) return false;
+        if (!q) return true;
+        const blob = (r.mel_key + " " + (r.unit||"") + " " + (r.mgmt_code_name||"")).toLowerCase();
+        return blob.indexOf(q) >= 0;
+      });
+      rows.sort(function (a, b) {
+        return (a.unit || "").localeCompare(b.unit || "") || a.mel_key.localeCompare(b.mel_key);
+      });
+      const sub = document.getElementById("settings-sub-melkey");
+      if (sub) {
+        const all = (melState.rows || []).slice().sort(function (a,b) { return a.mel_key.localeCompare(b.mel_key); });
+        sub.innerHTML = '<option value="">— pick MEL key —</option>' + all.map(function (r) {
+          return '<option value="' + esc(r.mel_key) + '">' + esc(r.mel_key) + " · " + esc(r.unit || "") + "</option>";
+        }).join("");
+      }
+      if (!rows.length) {
+        el.innerHTML = "<div class='mel-empty' style='padding:20px 0'>No MEL keys match.</div>";
+        return;
+      }
+      el.innerHTML =
+        "<table class='settings-mel-tbl'>" +
+          "<thead><tr><th>★</th><th>Unit</th><th>MEL Key</th><th>Mgmt</th><th>Default type</th><th>Type override</th><th>Order</th><th>Notes</th></tr></thead>" +
+          "<tbody>" +
+            rows.map(function (r) {
+              const cfg = r.config || {};
+              const mgmt = melMgmtCodeOf(r);
+              const defaultType = (function () {
+                const s = (r.mgmt_code_name || "").trim();
+                const i = s.indexOf(" - ");
+                return i > 0 ? s.slice(i + 3).trim() : s;
+              })();
+              return "<tr data-cfg-key='" + esc(r.mel_key) + "'>" +
+                "<td><button type='button' class='mel-card-star" + (cfg.isCritical ? " on" : "") + "' data-cfg-star='" + esc(r.mel_key) + "'>★</button></td>" +
+                "<td>" + esc(r.unit || "—") + "</td>" +
+                "<td><strong>" + esc(r.mel_key) + "</strong></td>" +
+                "<td>" + esc(mgmt || "") + "</td>" +
+                "<td class='muted'>" + esc(defaultType || "") + "</td>" +
+                "<td><input type='text' class='cfg-input' data-cfg-field='typeLabel' data-cfg-key='" + esc(r.mel_key) + "' value='" + esc(cfg.typeLabel || "") + "' placeholder='" + esc(defaultType) + "'/></td>" +
+                "<td><input type='number' class='cfg-input small' data-cfg-field='displayOrder' data-cfg-key='" + esc(r.mel_key) + "' value='" + (cfg.displayOrder || 0) + "'/></td>" +
+                "<td><input type='text' class='cfg-input' data-cfg-field='notes' data-cfg-key='" + esc(r.mel_key) + "' value='" + esc(cfg.notes || "") + "' placeholder='—'/></td>" +
+              "</tr>";
+            }).join("") +
+          "</tbody>" +
+        "</table>";
+
+      el.querySelectorAll('[data-cfg-star]').forEach(function (btn) {
+        btn.addEventListener("click", async function () {
+          const k = btn.getAttribute("data-cfg-star");
+          const row = melState.rows.find(function (r) { return r.mel_key === k; });
+          await saveMelConfig(k, { isCritical: !melIsCritical(row) });
+          renderSettingsMelTable();
+        });
+      });
+      el.querySelectorAll('.cfg-input').forEach(function (inp) {
+        inp.addEventListener("change", async function () {
+          const k = inp.getAttribute("data-cfg-key");
+          const f = inp.getAttribute("data-cfg-field");
+          const v = f === "displayOrder" ? Number(inp.value) || 0 : inp.value;
+          const patch = {};
+          patch[f] = v;
+          await saveMelConfig(k, patch);
+          settingsToast("Saved " + f + " for " + k, true);
+        });
+      });
+    }
+
+    function renderSettingsSubdivisions() {
+      const el = document.getElementById("settings-sub-list");
+      if (!el) return;
+      const subs = settingsState.subdivisions;
+      if (!subs.length) {
+        el.innerHTML = "<div class='mel-empty' style='padding:14px 0;text-align:left'>No subdivisions yet. Pick a MEL key above and add type splits (e.g. PT TRACTOR vs PT TRAILER).</div>";
+        return;
+      }
+      const byKey = new Map();
+      subs.forEach(function (s) {
+        const list = byKey.get(s.mel_key) || [];
+        list.push(s);
+        byKey.set(s.mel_key, list);
+      });
+      el.innerHTML = Array.from(byKey.entries()).map(function (entry) {
+        const k = entry[0]; const list = entry[1];
+        return "<div class='settings-sub-group'>" +
+          "<div class='settings-sub-head'>" + esc(k) + " — " + list.length + " split" + (list.length === 1 ? "" : "s") + "</div>" +
+          "<table class='settings-sub-tbl'>" +
+            "<thead><tr><th>Type</th><th>Mgmt</th><th>MEL</th><th>Asg</th><th>FMC</th><th>NMC</th><th>Acc</th><th>Abus</th><th>Order</th><th></th></tr></thead>" +
+            "<tbody>" +
+              list.map(function (s) {
+                return "<tr>" +
+                  "<td>" + esc(s.type_label) + "</td>" +
+                  "<td>" + esc(s.mgmt_code || "") + "</td>" +
+                  "<td>" + s.mel_required + "</td>" +
+                  "<td>" + s.assigned + "</td>" +
+                  "<td>" + s.fmc + "</td>" +
+                  "<td>" + s.nmc + "</td>" +
+                  "<td>" + s.accidents + "</td>" +
+                  "<td>" + s.abuses + "</td>" +
+                  "<td>" + s.display_order + "</td>" +
+                  "<td><button type='button' class='ghost danger' data-sub-del='" + s.id + "'>Delete</button></td>" +
+                "</tr>";
+              }).join("") +
+            "</tbody>" +
+          "</table>" +
+        "</div>";
+      }).join("");
+      el.querySelectorAll('[data-sub-del]').forEach(function (b) {
+        b.addEventListener("click", async function () {
+          const id = b.getAttribute("data-sub-del");
+          if (!confirm("Delete this subdivision?")) return;
+          try {
+            await fetch("/api/mel-subdivision?id=" + encodeURIComponent(id), { method: "DELETE" });
+            await loadAllSubdivisions();
+            renderSettingsSubdivisions();
+            settingsToast("Subdivision deleted.", true);
+          } catch (e) {
+            settingsToast("Delete failed: " + e.message, false);
+          }
+        });
+      });
+    }
+
+    async function saveSubdivisionFromForm() {
+      const melKey = document.getElementById("settings-sub-melkey").value;
+      const typeLabel = document.getElementById("settings-sub-type").value.trim();
+      if (!melKey || !typeLabel) {
+        settingsToast("MEL key and type label are required.", false);
+        return;
+      }
+      const body = {
+        melKey: melKey,
+        typeLabel: typeLabel,
+        mgmtCode: document.getElementById("settings-sub-mgmt").value.trim(),
+        melRequired: Number(document.getElementById("settings-sub-mel").value) || 0,
+        assigned: Number(document.getElementById("settings-sub-assigned").value) || 0,
+        fmc: Number(document.getElementById("settings-sub-fmc").value) || 0,
+        nmc: Number(document.getElementById("settings-sub-nmc").value) || 0,
+        accidents: Number(document.getElementById("settings-sub-acc").value) || 0,
+        abuses: Number(document.getElementById("settings-sub-abu").value) || 0,
+      };
+      try {
+        await fetch("/api/mel-subdivision", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        await loadAllSubdivisions();
+        renderSettingsSubdivisions();
+        settingsToast("Saved subdivision: " + typeLabel + " under " + melKey, true);
+        ["settings-sub-type","settings-sub-mgmt","settings-sub-mel","settings-sub-assigned","settings-sub-fmc","settings-sub-nmc","settings-sub-acc","settings-sub-abu"].forEach(function (id) {
+          const e = document.getElementById(id); if (e) e.value = "";
+        });
+      } catch (e) {
+        settingsToast("Save failed: " + e.message, false);
+      }
+    }
+
+    function onEnterMeetingTab() {
+      meetingState.asOfDate = latestSnapshotDateKey();
+      const disp = document.getElementById("meeting-asof-display");
+      if (disp) disp.textContent = meetingState.asOfDate ? fmtKeyLong(meetingState.asOfDate) : "—";
+      if (meetingState.mode === "setup") {
+        refreshMeetingSetup();
+        loadMeetingHistory();
+      }
+    }
+
+    /* ========================================================================
+       YARD CHECK
+       ====================================================================== */
+    // State shared across yard-check renders. Walker tap on a phone -> form
+    // expand -> debounced PATCH to D1. Optimistic UI updates so the list
+    // re-sorts/re-counts without waiting for the server response.
+    const yardState = {
+      view: "sessions",   // "sessions" | "session"
+      sessions: [],       // YardSessionRow[]
+      session: null,      // YardSessionRow | null
+      assets: [],         // YardAsset[]
+      locations: [],      // string[] — distinct ETIC locations from snapshot
+      entries: new Map(), // assetId -> YardEntryRow
+      filter: "todo",     // todo | all | present | missing | discrepancy
+      query: "",
+      walker: "",
+      expanded: new Set(),
+      saveTimers: new Map(),
+      saveStatus: new Map(),
+      wired: false,
+    };
+
+    // Common things a walker might note. Each chip toggles its phrase in or out
+    // of the discrepancies textarea — power users can still type free text below.
+    const YARD_DISCREP_CHIPS = [
+      "Windows down",
+      "Flat tire",
+      "Parked wrong spot",
+      "Lights left on",
+      "Doors unlocked",
+      "Keys missing",
+      "Damage visible",
+      "Fluids leaking",
+      "Mirror broken",
+      "Vehicle running",
+      "Fuel cap open",
+      "Snow / ice covered",
+      "Blocked in",
+    ];
+
+    function onEnterYardTab() {
+      yardFmWireOnce();
+      const sub = yardFmState.subTab || "findings";
+      yardActivateSub(sub);
+    }
+
+    /* ========================================================================
+       FM&A YARD QUEUE (desktop-only)
+       Live queue of follow-up findings + a "resolve" action flow tied to a
+       specific yard_check id so a newer walker check re-opens the issue.
+       ====================================================================== */
+    const yardFmState = {
+      wired: false,
+      // Default to Roster — that's the immediate operational view (the walker
+      // app embedded). Findings is for triage and is empty until walkers
+      // tag stuff, so showing it first feels broken.
+      subTab: "roster",
+      findings: [],
+      totals: { total: 0, missing: 0, unlisted: 0, discrepancy: 0, unknown: 0, acknowledged: 0 },
+      kindFilter: "all",
+      showAck: false,
+      activity: [],
+      resolveTarget: null, // { assetId, kind, checkId, asset }
+    };
+    // "Missing" is shown as "Not seen" in the UI to make it clear it's an
+    // absence-derived flag (no walker has confirmed this asset in N days), not
+    // something the walker actively declared. The internal kind is still
+    // 'missing' for back-compat with action rows. 'unknown' kept for legacy
+    // history rendering only — walker no longer produces these.
+    const FINDING_LABELS = {
+      missing: "Not seen",
+      unlisted: "Unlisted",
+      discrepancy: "Discrepancy",
+      unknown: "Unknown",
+    };
+    const FINDING_ICONS = {
+      missing: "\u25CB",
+      unlisted: "?",
+      discrepancy: "!",
+      unknown: "\u00B7",
+    };
+    const RESOLUTION_LABELS = {
+      resolved: "Resolved",
+      in_progress: "In progress",
+      dismissed: "Dismissed",
+      wo_opened: "WO opened",
+      retired: "Retired",
+      reassigned: "Reassigned",
+    };
+
+    // NOTE: must NOT be named yardWireOnce — there is a leftover walker-app
+    // yardWireOnce further down in this same script block (dead code that
+    // targets IDs like yard-new-btn which only existed when the walker was
+    // an in-page panel; it now lives at /yard with its own renderer). Function
+    // declarations hoist, so the later definition would shadow this one and
+    // the subnav (Findings / Recent activity) clicks would silently no-op.
+    function yardFmWireOnce() {
+      if (yardFmState.wired) return;
+      yardFmState.wired = true;
+      const subnav = document.getElementById("yard-subnav");
+      if (subnav) subnav.addEventListener("click", function (e) {
+        const t = e.target.closest("[data-yard-sub]");
+        if (!t) return;
+        yardActivateSub(t.getAttribute("data-yard-sub") || "findings");
+      });
+      const chips = document.getElementById("yard-findings-chips");
+      if (chips) chips.addEventListener("click", function (e) {
+        const t = e.target.closest("[data-finding-kind]");
+        if (!t) return;
+        chips.querySelectorAll(".yard-findings-chip").forEach(function (c) { c.classList.remove("active"); });
+        t.classList.add("active");
+        yardFmState.kindFilter = t.getAttribute("data-finding-kind") || "all";
+        yardRenderFindings();
+      });
+      const ackToggle = document.getElementById("yard-findings-show-ack");
+      if (ackToggle) ackToggle.addEventListener("change", function () {
+        yardFmState.showAck = ackToggle.checked;
+        yardRenderFindings();
+      });
+      const refresh = document.getElementById("yard-findings-refresh");
+      if (refresh) refresh.addEventListener("click", function () { yardLoadFindings(); });
+
+      const list = document.getElementById("yard-findings-list");
+      if (list) list.addEventListener("click", function (e) {
+        const btn = e.target.closest("[data-fa]");
+        if (!btn) return;
+        const action = btn.getAttribute("data-fa");
+        const card = btn.closest(".yard-finding");
+        if (!card) return;
+        const assetId = card.getAttribute("data-asset");
+        const kind = card.getAttribute("data-kind");
+        if (action === "resolve") {
+          yardOpenResolveModal(assetId, kind);
+        } else if (action === "reopen") {
+          yardReopenFinding(assetId, kind);
+        } else if (action === "mobile") {
+          window.open("/yard?desktop=1#asset=" + encodeURIComponent(assetId), "_blank");
+        }
+      });
+
+      const close = document.getElementById("yard-resolve-close");
+      const cancel = document.getElementById("yard-resolve-cancel");
+      const save = document.getElementById("yard-resolve-save");
+      const back = document.getElementById("yard-resolve-modal");
+      function closeModal(){ back.classList.add("hidden"); back.setAttribute("aria-hidden","true"); yardFmState.resolveTarget = null; }
+      if (close) close.addEventListener("click", closeModal);
+      if (cancel) cancel.addEventListener("click", closeModal);
+      if (back) back.addEventListener("click", function(e){ if (e.target === back) closeModal(); });
+      if (save) save.addEventListener("click", function(){ yardSubmitResolve().then(function(ok){ if (ok) closeModal(); }); });
+    }
+
+    function yardActivateSub(sub) {
+      yardFmState.subTab = sub;
+      ["findings", "roster", "activity"].forEach(function (s) {
+        const tabEl = document.querySelector('[data-yard-sub="' + s + '"]');
+        const panelEl = document.getElementById("yard-sub-" + s);
+        if (tabEl) tabEl.classList.toggle("active", s === sub);
+        if (panelEl) panelEl.classList.toggle("hidden", s !== sub);
+      });
+      if (sub === "findings") yardLoadFindings();
+      else if (sub === "roster") {
+        const f = document.getElementById("yard-frame");
+        if (f) f.src = "/yard?desktop=1&t=" + Date.now();
+      } else if (sub === "activity") yardLoadActivity();
+    }
+
+    function yardLoadFindings() {
+      const list = document.getElementById("yard-findings-list");
+      if (list) list.innerHTML = "Loading\u2026";
+      return fetch("/api/yard/findings", { cache: "no-store" })
+        .then(function (r) { return r.json(); })
+        .then(function (j) {
+          yardFmState.findings = j.findings || [];
+          yardFmState.totals = j.totals || yardFmState.totals;
+          yardRenderFindingsCounts();
+          yardRenderFindings();
+        })
+        .catch(function (e) {
+          if (list) list.innerHTML = '<div class="hint" style="color:var(--danger);">Failed to load findings: ' + escapeHtml(String(e)) + '</div>';
+        });
+    }
+
+    function yardRenderFindingsCounts() {
+      const t = yardFmState.totals || {};
+      const set = function(id, v) { const el = document.getElementById(id); if (el) el.textContent = String(v ?? 0); };
+      set("ff-all", t.total);
+      set("ff-missing", t.missing);
+      set("ff-unlisted", t.unlisted);
+      set("ff-discrepancy", t.discrepancy);
+      set("ff-unknown", t.unknown);
+      const open = (t.total || 0) - (t.acknowledged || 0);
+      set("yard-sub-findings-count", open);
+    }
+
+    function yardRenderFindings() {
+      const list = document.getElementById("yard-findings-list");
+      if (!list) return;
+      const kind = yardFmState.kindFilter;
+      const showAck = yardFmState.showAck;
+      const rows = (yardFmState.findings || []).filter(function (f) {
+        if (kind !== "all" && f.kind !== kind) return false;
+        if (!showAck && f.isAcknowledged) return false;
+        return true;
+      });
+      if (!rows.length) {
+        const totals = yardFmState.totals || {};
+        if ((totals.total || 0) === 0) {
+          // Nothing has been tagged yet at all — show explanatory copy so
+          // it's clear the page works, just has no data.
+          list.innerHTML =
+            '<div class="hint" style="padding:32px 16px;text-align:center;max-width:640px;margin:0 auto;">' +
+              '<div style="font-size:18px;color:var(--text);font-weight:600;margin-bottom:8px;">No yard checks yet</div>' +
+              '<p style="margin:0 0 12px;">Walkers tag what they actually see. Findings appear here automatically. Each one is:</p>' +
+              '<ul style="text-align:left;display:inline-block;line-height:1.7;">' +
+                '<li><b>Not seen</b> \u2014 asset is on the latest ETIC but no walker has confirmed it in roughly two check cycles. (Absence-derived, no walker action required.)</li>' +
+                '<li><b>Unlisted</b> \u2014 walker logged an asset that isn\u2019t on the latest ETIC (floor-to-book reconciliation).</li>' +
+                '<li><b>Discrepancy</b> \u2014 walker noted something (flat tire, windows down, etc).</li>' +
+              '</ul>' +
+              '<p style="margin:16px 0 0;"><a href="/yard?desktop=1" target="_blank" rel="noopener">Open the walker app \u2197</a> ' +
+              'to start tagging, or scan the QR on a phone.</p>' +
+            '</div>';
+        } else {
+          list.innerHTML = '<div class="hint" style="padding:24px;text-align:center;">' +
+            (showAck ? "Nothing matches that filter." : "All open findings cleared. \uD83C\uDF89 (Toggle \u201CShow resolved\u201D to see history.)") +
+            '</div>';
+        }
+        return;
+      }
+      const html = rows.map(yardRenderFindingCard).join("");
+      list.innerHTML = html;
+    }
+
+    function yardRenderFindingCard(f) {
+      const a = f.asset || {};
+      const tc = f.triggerCheck;
+      const meta = [];
+      if (a.shop) meta.push("\uD83D\uDD27 " + escapeHtml(a.shop));
+      else if (a.owningUnit) meta.push(escapeHtml(a.owningUnit));
+      if (a.makeModel) meta.push(escapeHtml(a.makeModel));
+      if (a.lastLocation) meta.push("\uD83D\uDCCD " + escapeHtml(a.lastLocation));
+      // For Missing (absence-derived), "last seen" reads more naturally than
+      // "seen" — the asset is on the ETIC but nobody's confirmed it in a
+      // while. For other kinds (unlisted/discrepancy), the trigger check IS
+      // the most recent walker touch, so "seen" is right.
+      const seenVerb = f.kind === "missing" ? "last seen" : "seen";
+      const neverLbl = f.kind === "missing" ? "never seen by a walker" : "never checked";
+      if (tc) meta.push(seenVerb + " " + fmtRelTs(tc.checkedAtIso) + (tc.checkedBy ? " by " + escapeHtml(tc.checkedBy) : ""));
+      else meta.push(neverLbl);
+      const badges = [];
+      if (a.isNce) badges.push('<span class="badge nce">NCE</span>');
+      if (a.isBelowMel) badges.push('<span class="badge below-mel">Below MEL</span>');
+      if (f.photoCount > 0) badges.push('<span class="badge photos">\uD83D\uDCF7 ' + f.photoCount + '</span>');
+      const disc = tc && tc.discrepancies ? '<div class="yard-finding-disc">\u201C' + escapeHtml(tc.discrepancies) + '\u201D</div>' : '';
+      const lastActionBlock = f.lastAction ? yardRenderLastAction(f.lastAction, f.isAcknowledged) : '';
+      const ackedClass = f.isAcknowledged ? ' acked' : '';
+      const buttons = f.isAcknowledged
+        ? '<button data-fa="reopen">Re-open</button>'
+        : '<button class="primary" data-fa="resolve">Record action</button>';
+      return '<article class="yard-finding' + ackedClass + '" data-asset="' + escapeHtml(f.assetId) + '" data-kind="' + escapeHtml(f.kind) + '">' +
+        '<div class="yard-finding-icon ' + escapeHtml(f.kind) + '">' + FINDING_ICONS[f.kind] + '</div>' +
+        '<div class="yard-finding-body">' +
+          '<div class="yard-finding-id">' + escapeHtml(f.assetId) + ' ' +
+            '<span class="badge" style="background:var(--bg2);color:var(--muted);border:1px solid var(--border);font-size:10px;font-weight:700;padding:2px 7px;border-radius:5px;text-transform:uppercase;letter-spacing:0.4px;margin-left:4px;">' + FINDING_LABELS[f.kind] + '</span> ' +
+            badges.join(" ") +
+          '</div>' +
+          '<div class="yard-finding-meta">' + meta.join(" \u00B7 ") + '</div>' +
+          disc +
+        '</div>' +
+        '<div class="yard-finding-actions">' + buttons + '</div>' +
+        lastActionBlock +
+      '</article>';
+    }
+
+    function yardRenderLastAction(action, isAck) {
+      const label = RESOLUTION_LABELS[action.resolution] || action.resolution;
+      const tag = isAck ? "Acknowledged" : "Last action (re-opened by newer check)";
+      const wo = action.woOpened ? ' \u00B7 WO #' + escapeHtml(action.woOpened) : '';
+      const note = action.note ? ' \u00B7 \u201C' + escapeHtml(action.note) + '\u201D' : '';
+      return '<div class="yard-finding-action"><b>' + tag + ':</b> ' +
+        escapeHtml(label) + wo +
+        ' \u00B7 ' + escapeHtml(action.resolvedBy || "(unknown)") +
+        ' \u00B7 ' + fmtRelTs(action.resolvedAtIso) +
+        note +
+      '</div>';
+    }
+
+    function fmtRelTs(iso) {
+      if (!iso) return "";
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return iso;
+      const diff = (Date.now() - d.getTime()) / 1000;
+      if (diff < 60) return "just now";
+      if (diff < 3600) return Math.floor(diff / 60) + "m ago";
+      if (diff < 86400) return Math.floor(diff / 3600) + "h ago";
+      const days = Math.floor(diff / 86400);
+      if (days < 30) return days + "d ago";
+      return d.toLocaleDateString(undefined, { day: "2-digit", month: "short", year: "2-digit" });
+    }
+
+    function yardOpenResolveModal(assetId, kind) {
+      const finding = (yardFmState.findings || []).find(function (f) {
+        return f.assetId === assetId && f.kind === kind;
+      });
+      if (!finding) return;
+      yardFmState.resolveTarget = finding;
+      const back = document.getElementById("yard-resolve-modal");
+      const title = document.getElementById("yard-resolve-title");
+      const sub = document.getElementById("yard-resolve-sub");
+      title.textContent = FINDING_LABELS[kind] + " \u2014 " + assetId;
+      const a = finding.asset || {};
+      const ctx = [];
+      if (a.shop) ctx.push("Shop " + a.shop);
+      if (a.owningUnit) ctx.push("Unit " + a.owningUnit);
+      if (a.makeModel) ctx.push(a.makeModel);
+      if (finding.triggerCheck && finding.triggerCheck.discrepancies) {
+        ctx.push('"' + finding.triggerCheck.discrepancies + '"');
+      }
+      sub.textContent = ctx.join(" \u00B7 ");
+      // Pre-fill last-known values
+      const by = document.getElementById("yard-resolve-by");
+      if (by && !by.value) {
+        try {
+          const stored = window.localStorage.getItem("yardFm.resolvedBy");
+          if (stored) by.value = stored;
+        } catch {}
+      }
+      const noteEl = document.getElementById("yard-resolve-note"); if (noteEl) noteEl.value = "";
+      const woEl = document.getElementById("yard-resolve-wo"); if (woEl) woEl.value = "";
+      const resEl = document.getElementById("yard-resolve-resolution");
+      if (resEl) resEl.value = kind === "missing" ? "in_progress" : kind === "unlisted" ? "wo_opened" : "resolved";
+      back.classList.remove("hidden");
+      back.setAttribute("aria-hidden", "false");
+    }
+
+    async function yardSubmitResolve() {
+      const t = yardFmState.resolveTarget;
+      if (!t) return false;
+      const by = (document.getElementById("yard-resolve-by") || {}).value || "";
+      const wo = (document.getElementById("yard-resolve-wo") || {}).value || "";
+      const note = (document.getElementById("yard-resolve-note") || {}).value || "";
+      const res = (document.getElementById("yard-resolve-resolution") || {}).value || "resolved";
+      try { window.localStorage.setItem("yardFm.resolvedBy", by); } catch {}
+      try {
+        const r = await fetch("/api/yard/findings/resolve", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            assetId: t.assetId,
+            kind: t.kind,
+            checkId: t.triggerCheck ? t.triggerCheck.id : null,
+            resolution: res,
+            woOpened: wo,
+            note: note,
+            resolvedBy: by,
+          }),
+        });
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || "save failed");
+        yardLoadFindings();
+        return true;
+      } catch (e) {
+        alert("Failed: " + (e && e.message ? e.message : String(e)));
+        return false;
+      }
+    }
+
+    async function yardReopenFinding(assetId, kind) {
+      if (!confirm("Re-open this finding? It will be back at the top of the queue.")) return;
+      try {
+        const r = await fetch("/api/yard/findings/reopen", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ assetId: assetId, kind: kind }),
+        });
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || "reopen failed");
+        yardLoadFindings();
+      } catch (e) {
+        alert("Failed: " + (e && e.message ? e.message : String(e)));
+      }
+    }
+
+    function yardLoadActivity() {
+      const list = document.getElementById("yard-activity-list");
+      if (list) list.innerHTML = "Loading\u2026";
+      return fetch("/api/yard/activity?limit=200", { cache: "no-store" })
+        .then(function (r) { return r.json(); })
+        .then(function (j) {
+          yardFmState.activity = j.items || [];
+          yardRenderActivity();
+        })
+        .catch(function (e) {
+          if (list) list.innerHTML = '<div class="hint" style="color:var(--danger);">Failed to load activity: ' + escapeHtml(String(e)) + '</div>';
+        });
+    }
+
+    function yardRenderActivity() {
+      const list = document.getElementById("yard-activity-list");
+      if (!list) return;
+      const items = yardFmState.activity || [];
+      if (!items.length) {
+        list.innerHTML = '<div class="hint" style="padding:24px;text-align:center;">No activity yet.</div>';
+        return;
+      }
+      const html = items.map(function (it) {
+        const when = '<div class="when">' + escapeHtml(fmtRelTs(it.at)) + '</div>';
+        if (it.kind === "check") {
+          const c = it.check;
+          const det = [];
+          if (c.location) det.push("\uD83D\uDCCD " + escapeHtml(c.location));
+          if (c.status && c.status !== "present") det.push(escapeHtml(c.status.toUpperCase()));
+          if (c.discrepancies) det.push('\u201C' + escapeHtml(c.discrepancies) + '\u201D');
+          return '<div class="yard-activity-row">' + when +
+            '<div class="what check">CHECK</div>' +
+            '<div><b>' + escapeHtml(c.assetId) + '</b> <span class="who">by ' + escapeHtml(c.checkedBy || "(unknown)") + '</span><br/>' +
+            '<span class="text">' + det.join(" \u00B7 ") + '</span></div>' +
+          '</div>';
+        }
+        const a = it.action;
+        const woTxt = a.woOpened ? ' \u00B7 WO #' + escapeHtml(a.woOpened) : '';
+        const noteTxt = a.note ? ' \u00B7 \u201C' + escapeHtml(a.note) + '\u201D' : '';
+        return '<div class="yard-activity-row">' + when +
+          '<div class="what action">' + escapeHtml((RESOLUTION_LABELS[a.resolution] || a.resolution).toUpperCase()) + '</div>' +
+          '<div><b>' + escapeHtml(a.assetId) + '</b> <span class="who">by ' + escapeHtml(a.resolvedBy || "(unknown)") + '</span> ' +
+          '<span class="text">' + escapeHtml(FINDING_LABELS[a.kind] || a.kind) + woTxt + noteTxt + '</span></div>' +
+        '</div>';
+      }).join("");
+      list.innerHTML = html;
+    }
+
+    // NOTE: This is the OLD session-based yard implementation. It's dead code
+    // — kept temporarily for reference. Renamed so it doesn't shadow the new
+    // FM&A yardWireOnce defined above (function declarations hoist last-wins,
+    // which silently broke the desktop sub-tab clicks).
+    function _deadYardWireOnceLegacy() {
+      if (yardState.wired) return;
+      yardState.wired = true;
+
+      const newBtn = document.getElementById("yard-new-btn");
+      if (newBtn) newBtn.addEventListener("click", yardCreateSessionPrompt);
+
+      const backBtn = document.getElementById("yard-back-btn");
+      if (backBtn) backBtn.addEventListener("click", function () {
+        yardState.view = "sessions";
+        yardState.session = null;
+        yardState.assets = [];
+        yardState.entries = new Map();
+        yardState.expanded.clear();
+        document.getElementById("yard-session-view").classList.add("hidden");
+        document.getElementById("yard-sessions-view").classList.remove("hidden");
+        yardLoadAndShowSessions();
+      });
+
+      const closeBtn = document.getElementById("yard-close-btn");
+      if (closeBtn) closeBtn.addEventListener("click", yardToggleClose);
+
+      const search = document.getElementById("yard-search");
+      if (search) search.addEventListener("input", function (e) {
+        yardState.query = String(e.target.value || "").toLowerCase();
+        yardRenderAssetList();
+      });
+
+      const walker = document.getElementById("yard-walker");
+      if (walker) {
+        walker.value = yardState.walker;
+        walker.addEventListener("input", function (e) {
+          yardState.walker = String(e.target.value || "").trim();
+          try { window.localStorage.setItem("yard:walker", yardState.walker); } catch {}
+        });
+      }
+
+      const filterRow = document.getElementById("yard-filter-row");
+      if (filterRow) {
+        filterRow.addEventListener("click", function (e) {
+          const btn = e.target.closest("[data-yard-filter]");
+          if (!btn) return;
+          yardState.filter = btn.getAttribute("data-yard-filter") || "todo";
+          [...filterRow.querySelectorAll(".yard-chip")].forEach(function (b) {
+            b.classList.toggle("active", b === btn);
+          });
+          yardRenderAssetList();
+        });
+      }
+
+      const list = document.getElementById("yard-asset-list");
+      if (list) {
+        list.addEventListener("click", yardOnListClick);
+        list.addEventListener("input", yardOnListInput);
+      }
+    }
+
+    async function yardLoadAndShowSessions() {
+      const root = document.getElementById("yard-sessions-list");
+      if (root) root.textContent = "Loading…";
+      try {
+        const r = await fetch("/api/yard/sessions");
+        const j = await r.json();
+        yardState.sessions = Array.isArray(j.sessions) ? j.sessions : [];
+        yardRenderSessionsList();
+      } catch (e) {
+        if (root) root.innerHTML = "<div class='yard-empty-state'>Couldn't load sessions: " + esc(e && e.message ? e.message : String(e)) + "</div>";
+      }
+    }
+
+    function yardRenderSessionsList() {
+      const root = document.getElementById("yard-sessions-list");
+      if (!root) return;
+      const sessions = yardState.sessions;
+      if (!sessions.length) {
+        root.innerHTML = "<div class='yard-empty-state'><p style='margin:0 0 8px'><strong>No yard checks yet.</strong></p><p style='margin:0;font-size:0.85rem'>Tap <em>+ New session</em> to start your first walk-through.</p></div>";
+        return;
+      }
+      const html = sessions.map(function (s) {
+        const isOpen = s.status === "open";
+        const created = fmtIsoShort(s.createdAtIso);
+        const closed = s.closedAtIso ? " · closed " + fmtIsoShort(s.closedAtIso) : "";
+        const by = s.createdBy ? " · by " + esc(s.createdBy) : "";
+        const src = s.sourceDateKey ? " · roster " + esc(fmtKeyShort(s.sourceDateKey)) : "";
+        return (
+          "<button type='button' class='yard-session-card' data-session-id='" + s.id + "'>" +
+            "<div class='ys-row1'>" +
+              "<span class='ys-name'>" + esc(s.name || ("Session #" + s.id)) + "</span>" +
+              "<span class='ys-status " + (isOpen ? "open" : "closed") + "'>" + (isOpen ? "Open" : "Closed") + "</span>" +
+            "</div>" +
+            "<div class='ys-meta'>" +
+              "<span>Started " + esc(created) + by + "</span>" +
+              "<span>" + esc(src) + "</span>" +
+              (closed ? "<span>" + esc(closed) + "</span>" : "") +
+            "</div>" +
+          "</button>"
+        );
+      }).join("");
+      root.innerHTML = html;
+      [...root.querySelectorAll("[data-session-id]")].forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          const id = Number.parseInt(btn.getAttribute("data-session-id") || "", 10);
+          if (Number.isFinite(id)) yardOpenSession(id);
+        });
+      });
+    }
+
+    async function yardCreateSessionPrompt() {
+      const defaultName = "Yard check " + new Date().toLocaleString();
+      const name = window.prompt("Name this yard check session:", defaultName);
+      if (name === null) return; // cancelled
+      try {
+        const r = await fetch("/api/yard/sessions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: name.trim(), createdBy: yardState.walker }),
+        });
+        const j = await r.json();
+        if (!r.ok || !j.session) throw new Error(j.error || "create failed");
+        await yardOpenSession(j.session.id);
+      } catch (e) {
+        alert("Couldn't start session: " + (e && e.message ? e.message : String(e)));
+      }
+    }
+
+    async function yardOpenSession(sessionId) {
+      yardState.view = "session";
+      document.getElementById("yard-sessions-view").classList.add("hidden");
+      const sv = document.getElementById("yard-session-view");
+      sv.classList.remove("hidden");
+      const list = document.getElementById("yard-asset-list");
+      if (list) list.innerHTML = "<div class='yard-empty-state'>Loading roster…</div>";
+      const nameEl = document.getElementById("yard-session-name");
+      if (nameEl) nameEl.textContent = "Session #" + sessionId;
+      try {
+        const r = await fetch("/api/yard/session/" + sessionId);
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error || "load failed");
+        yardState.session = j.session;
+        yardState.assets = Array.isArray(j.assets) ? j.assets : [];
+        yardState.locations = Array.isArray(j.locations) ? j.locations : [];
+        yardState.entries = new Map();
+        (j.entries || []).forEach(function (e) { yardState.entries.set(e.assetId, e); });
+        yardState.expanded.clear();
+        yardRenderSessionView();
+      } catch (e) {
+        if (list) list.innerHTML = "<div class='yard-empty-state'>Couldn't open session: " + esc(e && e.message ? e.message : String(e)) + "</div>";
+      }
+    }
+
+    function yardRenderSessionView() {
+      const s = yardState.session;
+      if (!s) return;
+      const nameEl = document.getElementById("yard-session-name");
+      if (nameEl) nameEl.textContent = s.name || ("Session #" + s.id);
+      const subEl = document.getElementById("yard-session-sub");
+      if (subEl) {
+        const bits = [];
+        bits.push("Started " + fmtIsoShort(s.createdAtIso));
+        if (s.createdBy) bits.push("by " + s.createdBy);
+        if (s.sourceDateKey) bits.push("roster " + fmtKeyShort(s.sourceDateKey));
+        if (s.status === "closed" && s.closedAtIso) bits.push("closed " + fmtIsoShort(s.closedAtIso));
+        subEl.textContent = bits.join(" · ");
+      }
+      const closeBtn = document.getElementById("yard-close-btn");
+      if (closeBtn) closeBtn.textContent = s.status === "closed" ? "Reopen session" : "Close session";
+      yardRenderProgress();
+      yardRenderAssetList();
+    }
+
+    function yardRenderProgress() {
+      const total = yardState.assets.length;
+      let checked = 0;
+      yardState.entries.forEach(function () { checked += 1; });
+      const fillEl = document.getElementById("yard-progress-fill");
+      const txtEl = document.getElementById("yard-progress-text");
+      const pct = total > 0 ? Math.round((checked / total) * 100) : 0;
+      if (fillEl) fillEl.style.width = pct + "%";
+      if (txtEl) txtEl.textContent = checked + " / " + total + " checked (" + pct + "%)";
+    }
+
+    function yardEntryStateClass(entry) {
+      if (!entry) return "";
+      if (entry.status === "missing") return "missing";
+      let cls = "done";
+      if (entry.discrepancies && entry.discrepancies.trim()) cls += " has-discrepancy";
+      return cls;
+    }
+
+    function yardEntryStatusIcon(entry) {
+      if (!entry) return "•";
+      if (entry.status === "missing") return "✖";
+      if (entry.status === "unknown") return "?";
+      return "✓";
+    }
+
+    function yardMatchesFilter(asset, entry) {
+      const f = yardState.filter;
+      if (f === "all") return true;
+      if (f === "todo") return !entry;
+      if (f === "present") return !!entry && entry.status === "present";
+      if (f === "missing") return !!entry && entry.status === "missing";
+      if (f === "discrepancy") return !!entry && !!(entry.discrepancies && entry.discrepancies.trim());
+      return true;
+    }
+
+    function yardMatchesQuery(asset) {
+      if (!yardState.query) return true;
+      const q = yardState.query;
+      return (
+        (asset.assetId || "").toLowerCase().indexOf(q) !== -1 ||
+        (asset.owningUnit || "").toLowerCase().indexOf(q) !== -1 ||
+        (asset.mgmtCd || "").toLowerCase().indexOf(q) !== -1 ||
+        (asset.makeModel || "").toLowerCase().indexOf(q) !== -1 ||
+        (asset.vehNomen || "").toLowerCase().indexOf(q) !== -1 ||
+        (asset.melKey || "").toLowerCase().indexOf(q) !== -1 ||
+        (asset.shop || "").toLowerCase().indexOf(q) !== -1
+      );
+    }
+
+    function yardRenderAssetList() {
+      const root = document.getElementById("yard-asset-list");
+      if (!root) return;
+      // Shared datalist with all known locations from the snapshot — backs the
+      // location combobox on every card without duplicating <option> markup.
+      const dlOpts = (yardState.locations || []).map(function (loc) {
+        return "<option value='" + esc(loc) + "'></option>";
+      }).join("");
+      const dlHtml = "<datalist id='yard-loc-options'>" + dlOpts + "</datalist>";
+
+      if (!yardState.assets.length) {
+        root.innerHTML = dlHtml + "<div class='yard-empty-state'><strong>No assets in roster.</strong><br/>The latest snapshot may have no work-order rows.</div>";
+        yardRenderProgress();
+        return;
+      }
+      const filtered = yardState.assets.filter(function (a) {
+        const e = yardState.entries.get(a.assetId);
+        return yardMatchesFilter(a, e) && yardMatchesQuery(a);
+      });
+      if (!filtered.length) {
+        root.innerHTML = dlHtml + "<div class='yard-empty-state'>No assets match this filter.</div>";
+        yardRenderProgress();
+        return;
+      }
+      root.innerHTML = dlHtml + filtered.map(yardRenderAssetCard).join("");
+      yardRenderProgress();
+    }
+
+    function yardRenderAssetCard(asset) {
+      const entry = yardState.entries.get(asset.assetId);
+      const expanded = yardState.expanded.has(asset.assetId);
+      const stateClass = yardEntryStateClass(entry);
+      const icon = yardEntryStatusIcon(entry);
+      const metaBits = [];
+      if (asset.owningUnit) metaBits.push(esc(asset.owningUnit));
+      if (asset.makeModel) metaBits.push(esc(asset.makeModel));
+      else if (asset.vehNomen) metaBits.push(esc(asset.vehNomen));
+      if (asset.vinSerial) metaBits.push("VIN " + esc(asset.vinSerial));
+      if (asset.openWoCount) metaBits.push(asset.openWoCount + " open WO" + (asset.openWoCount > 1 ? "s" : ""));
+      const badges = [];
+      if (asset.isNce) badges.push("<span class='yard-asset-badge nce'>NCE</span>");
+      if ((asset.melTier || "").toLowerCase() === "below") badges.push("<span class='yard-asset-badge below'>Below MEL</span>");
+      const status = entry ? entry.status : "present";
+      const location = entry ? entry.location : "";
+      const discrepancies = entry ? entry.discrepancies : "";
+      const prevLoc = asset.previousLocation || "";
+      const saveStatus = yardState.saveStatus.get(asset.assetId) || "";
+      const saveStatusHtml = saveStatus
+        ? "<span class='save-status " + esc(saveStatus) + "'>" + (saveStatus === "saving" ? "Saving…" : saveStatus === "saved" ? "Saved" : "Save failed") + "</span>"
+        : "<span class='save-status'></span>";
+
+      // Quick-chip discrepancies. Each chip is "active" if its phrase is
+      // already present in the textarea — clicking toggles it in/out.
+      const chipsHtml = YARD_DISCREP_CHIPS.map(function (phrase) {
+        const active = yardDiscrepHas(discrepancies, phrase);
+        return "<button type='button' class='yard-dchip" + (active ? " active" : "") +
+          "' data-asset-id='" + esc(asset.assetId) +
+          "' data-phrase='" + esc(phrase) + "'>" + esc(phrase) + "</button>";
+      }).join("");
+
+      const summaryDetails = [];
+      if (asset.melKey) summaryDetails.push("MEL " + esc(asset.melKey));
+      if (asset.shop) summaryDetails.push(esc(asset.shop));
+      const expandedDetailsHtml = summaryDetails.length
+        ? "<div class='yard-asset-details'>" + summaryDetails.join(" · ") + "</div>"
+        : "";
+
+      const formHtml = expanded ? (
+        "<div class='yard-asset-form'>" +
+          expandedDetailsHtml +
+          "<div class='yard-status-row' data-asset-id='" + esc(asset.assetId) + "'>" +
+            yardStatusBtn("present", status) +
+            yardStatusBtn("missing", status) +
+            yardStatusBtn("unknown", status) +
+          "</div>" +
+          "<label class='field'>" +
+            "<span class='label'>Location</span>" +
+            "<input type='text' class='yard-input-location' list='yard-loc-options' inputmode='text' autocomplete='off' data-asset-id='" + esc(asset.assetId) + "' value='" + esc(location) + "' placeholder='Pick or type a location…' />" +
+            (prevLoc && prevLoc !== location ? "<p class='yard-prev-loc'>Previously: " + esc(prevLoc) + "<button type='button' class='yard-use-prev' data-asset-id='" + esc(asset.assetId) + "' data-prev='" + esc(prevLoc) + "'>Use this</button></p>" : "") +
+          "</label>" +
+          "<label class='field'>" +
+            "<span class='label'>Quick discrepancies <span class='hint-inline'>tap to toggle</span></span>" +
+            "<div class='yard-dchip-row' data-asset-id='" + esc(asset.assetId) + "'>" + chipsHtml + "</div>" +
+          "</label>" +
+          "<label class='field'>" +
+            "<span class='label'>Notes <span class='hint-inline'>free text — adds to the chips above</span></span>" +
+            "<textarea class='yard-input-discrep' data-asset-id='" + esc(asset.assetId) + "' placeholder='Anything else worth noting…'>" + esc(discrepancies) + "</textarea>" +
+          "</label>" +
+          "<div class='yard-form-actions'>" +
+            saveStatusHtml +
+            "<div class='right-actions'>" +
+              (entry ? "<button type='button' class='ghost yard-clear-entry' data-asset-id='" + esc(asset.assetId) + "'>Clear</button>" : "") +
+              "<button type='button' class='primary yard-save-entry' data-asset-id='" + esc(asset.assetId) + "'>Save</button>" +
+            "</div>" +
+          "</div>" +
+        "</div>"
+      ) : "";
+
+      return (
+        "<div class='yard-asset " + stateClass + (expanded ? " expanded" : "") + "' data-asset-id='" + esc(asset.assetId) + "'>" +
+          "<div class='yard-asset-summary' data-yard-toggle='1' data-asset-id='" + esc(asset.assetId) + "'>" +
+            "<div class='yard-asset-status-icon'>" + icon + "</div>" +
+            "<div class='yard-asset-id-block'>" +
+              "<div class='yard-asset-id'>" + esc(asset.assetId) + "</div>" +
+              "<div class='yard-asset-meta'>" + (metaBits.join(" · ") || "&nbsp;") + "</div>" +
+            "</div>" +
+            (badges.length ? "<div class='yard-asset-badges'>" + badges.join("") + "</div>" : "") +
+          "</div>" +
+          formHtml +
+        "</div>"
+      );
+    }
+
+    /* --- Discrepancy chip helpers ----------------------------------------
+     * We treat the discrepancies textarea as a soup of phrases joined by
+     * "; ". Clicking a chip adds or removes its phrase. Free-form text
+     * typed by the user is preserved (it just sits as another segment).
+     */
+    function yardDiscrepSplit(s) {
+      // NOTE: this whole script lives inside a backtick template literal, so
+      // backslashes must be doubled to survive into the runtime regex source.
+      return String(s || "")
+        .split(/\\s*[;\\n]\\s*/)
+        .map(function (x) { return x.trim(); })
+        .filter(function (x) { return x.length > 0; });
+    }
+    function yardDiscrepJoin(parts) {
+      return parts.join("; ");
+    }
+    function yardDiscrepHas(s, phrase) {
+      const target = phrase.toLowerCase();
+      return yardDiscrepSplit(s).some(function (p) { return p.toLowerCase() === target; });
+    }
+    function yardDiscrepToggle(s, phrase) {
+      const parts = yardDiscrepSplit(s);
+      const target = phrase.toLowerCase();
+      const idx = parts.findIndex(function (p) { return p.toLowerCase() === target; });
+      if (idx >= 0) parts.splice(idx, 1);
+      else parts.push(phrase);
+      return yardDiscrepJoin(parts);
+    }
+
+    function yardStatusBtn(value, current) {
+      const labels = { present: "Present", missing: "Missing", unknown: "Unknown" };
+      const isActive = current === value;
+      return "<button type='button' class='yard-status-btn" + (isActive ? " active" : "") + "' data-status='" + value + "'>" + labels[value] + "</button>";
+    }
+
+    function yardOnListClick(e) {
+      const t = e.target;
+      const toggleEl = t.closest("[data-yard-toggle]");
+      if (toggleEl) {
+        const id = toggleEl.getAttribute("data-asset-id") || "";
+        if (yardState.expanded.has(id)) yardState.expanded.delete(id);
+        else yardState.expanded.add(id);
+        // Re-render just this card to keep input focus elsewhere stable.
+        yardRerenderCard(id);
+        return;
+      }
+      const statusBtn = t.closest(".yard-status-btn");
+      if (statusBtn) {
+        const row = statusBtn.closest(".yard-status-row");
+        const id = row ? row.getAttribute("data-asset-id") : "";
+        if (id) {
+          const status = statusBtn.getAttribute("data-status") || "present";
+          [...row.querySelectorAll(".yard-status-btn")].forEach(function (b) {
+            b.classList.toggle("active", b === statusBtn);
+          });
+          yardScheduleSave(id, { status: status });
+        }
+        return;
+      }
+      const dchip = t.closest(".yard-dchip");
+      if (dchip) {
+        const id = dchip.getAttribute("data-asset-id") || "";
+        const phrase = dchip.getAttribute("data-phrase") || "";
+        if (id && phrase) {
+          const entry = yardState.entries.get(id) || { discrepancies: "" };
+          const next = yardDiscrepToggle(entry.discrepancies || "", phrase);
+          dchip.classList.toggle("active");
+          // Reflect into the textarea so the user sees what's stored.
+          const ta = document.querySelector(".yard-input-discrep[data-asset-id='" + cssEscape(id) + "']");
+          if (ta) ta.value = next;
+          yardScheduleSave(id, { discrepancies: next });
+        }
+        return;
+      }
+      const usePrev = t.closest(".yard-use-prev");
+      if (usePrev) {
+        const id = usePrev.getAttribute("data-asset-id") || "";
+        const prev = usePrev.getAttribute("data-prev") || "";
+        const input = document.querySelector(".yard-input-location[data-asset-id='" + cssEscape(id) + "']");
+        if (input) {
+          input.value = prev;
+          yardScheduleSave(id, { location: prev });
+        }
+        return;
+      }
+      const saveBtn = t.closest(".yard-save-entry");
+      if (saveBtn) {
+        const id = saveBtn.getAttribute("data-asset-id") || "";
+        if (id) yardFlushSave(id);
+        return;
+      }
+      const clearBtn = t.closest(".yard-clear-entry");
+      if (clearBtn) {
+        const id = clearBtn.getAttribute("data-asset-id") || "";
+        if (id && confirm("Clear this asset's yard-check entry?")) yardClearEntry(id);
+        return;
+      }
+    }
+
+    function yardOnListInput(e) {
+      const t = e.target;
+      if (t.classList && t.classList.contains("yard-input-location")) {
+        const id = t.getAttribute("data-asset-id") || "";
+        if (id) yardScheduleSave(id, { location: t.value });
+      } else if (t.classList && t.classList.contains("yard-input-discrep")) {
+        const id = t.getAttribute("data-asset-id") || "";
+        if (id) {
+          yardScheduleSave(id, { discrepancies: t.value });
+          // Re-sync chip highlights in case the user typed/removed a phrase.
+          const row = document.querySelector(".yard-dchip-row[data-asset-id='" + cssEscape(id) + "']");
+          if (row) {
+            [...row.querySelectorAll(".yard-dchip")].forEach(function (c) {
+              const phrase = c.getAttribute("data-phrase") || "";
+              c.classList.toggle("active", yardDiscrepHas(t.value, phrase));
+            });
+          }
+        }
+      }
+    }
+
+    /** CSS.escape polyfill for our limited use (asset IDs). */
+    function cssEscape(v) {
+      return String(v).replace(/['\\\\]/g, function (c) { return "\\\\" + c; });
+    }
+
+    /** Build payload from current form state, debounced 500ms. */
+    function yardScheduleSave(assetId, patch) {
+      const existing = yardState.entries.get(assetId) || {
+        sessionId: yardState.session ? yardState.session.id : 0,
+        assetId: assetId,
+        location: "",
+        discrepancies: "",
+        status: "present",
+        enteredBy: yardState.walker,
+      };
+      const merged = Object.assign({}, existing, patch);
+      // Optimistic UI: stash the partial entry and re-render summary classes.
+      yardState.entries.set(assetId, merged);
+      yardSetSaveStatus(assetId, "saving");
+      // Defer the actual POST so fast typing collapses into one request.
+      const prev = yardState.saveTimers.get(assetId);
+      if (prev) clearTimeout(prev);
+      const t = setTimeout(function () {
+        yardState.saveTimers.delete(assetId);
+        yardFlushSave(assetId);
+      }, 500);
+      yardState.saveTimers.set(assetId, t);
+      yardUpdateCardClasses(assetId);
+      yardRenderProgress();
+    }
+
+    async function yardFlushSave(assetId) {
+      const t = yardState.saveTimers.get(assetId);
+      if (t) { clearTimeout(t); yardState.saveTimers.delete(assetId); }
+      const session = yardState.session;
+      if (!session) return;
+      const entry = yardState.entries.get(assetId);
+      if (!entry) return;
+      yardSetSaveStatus(assetId, "saving");
+      try {
+        const r = await fetch("/api/yard/session/" + session.id + "/entry", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            assetId: assetId,
+            location: entry.location || "",
+            discrepancies: entry.discrepancies || "",
+            status: entry.status || "present",
+            enteredBy: yardState.walker || entry.enteredBy || "",
+          }),
+        });
+        const j = await r.json();
+        if (!r.ok || !j.entry) throw new Error(j.error || "save failed");
+        yardState.entries.set(assetId, j.entry);
+        yardSetSaveStatus(assetId, "saved");
+        yardUpdateCardClasses(assetId);
+        // Briefly show "Saved" then fade.
+        setTimeout(function () {
+          if (yardState.saveStatus.get(assetId) === "saved") {
+            yardState.saveStatus.delete(assetId);
+            yardUpdateSaveStatusInDom(assetId);
+          }
+        }, 1500);
+      } catch (e) {
+        yardSetSaveStatus(assetId, "error");
+        console.warn("yard save failed", e);
+      }
+    }
+
+    async function yardClearEntry(assetId) {
+      const session = yardState.session;
+      if (!session) return;
+      try {
+        await fetch(
+          "/api/yard/session/" + session.id + "/entry?assetId=" + encodeURIComponent(assetId),
+          { method: "DELETE" }
+        );
+      } catch {}
+      yardState.entries.delete(assetId);
+      yardState.saveStatus.delete(assetId);
+      yardRerenderCard(assetId);
+      yardRenderProgress();
+    }
+
+    function yardSetSaveStatus(assetId, status) {
+      yardState.saveStatus.set(assetId, status);
+      yardUpdateSaveStatusInDom(assetId);
+    }
+
+    function yardUpdateSaveStatusInDom(assetId) {
+      const card = document.querySelector(".yard-asset[data-asset-id='" + cssEscape(assetId) + "']");
+      if (!card) return;
+      const span = card.querySelector(".save-status");
+      if (!span) return;
+      const status = yardState.saveStatus.get(assetId) || "";
+      span.classList.remove("saving", "saved", "error");
+      if (status) span.classList.add(status);
+      span.textContent = status === "saving" ? "Saving…" : status === "saved" ? "Saved" : status === "error" ? "Save failed" : "";
+    }
+
+    function yardUpdateCardClasses(assetId) {
+      const card = document.querySelector(".yard-asset[data-asset-id='" + cssEscape(assetId) + "']");
+      if (!card) return;
+      const entry = yardState.entries.get(assetId);
+      card.classList.remove("done", "missing", "has-discrepancy");
+      const cls = yardEntryStateClass(entry);
+      if (cls) cls.split(" ").forEach(function (c) { if (c) card.classList.add(c); });
+      const iconEl = card.querySelector(".yard-asset-status-icon");
+      if (iconEl) iconEl.textContent = yardEntryStatusIcon(entry);
+    }
+
+    function yardRerenderCard(assetId) {
+      const card = document.querySelector(".yard-asset[data-asset-id='" + cssEscape(assetId) + "']");
+      const asset = yardState.assets.find(function (a) { return a.assetId === assetId; });
+      if (!card || !asset) { yardRenderAssetList(); return; }
+      const tmp = document.createElement("div");
+      tmp.innerHTML = yardRenderAssetCard(asset);
+      const next = tmp.firstElementChild;
+      if (next) card.replaceWith(next);
+    }
+
+    async function yardToggleClose() {
+      const s = yardState.session;
+      if (!s) return;
+      const isClosed = s.status === "closed";
+      const verb = isClosed ? "reopen" : "close";
+      if (!confirm("Are you sure you want to " + verb + " this session?")) return;
+      try {
+        const r = await fetch("/api/yard/session/" + s.id + "/" + (isClosed ? "reopen" : "close"), {
+          method: "POST",
+        });
+        const j = await r.json();
+        if (!r.ok || !j.session) throw new Error(j.error || "failed");
+        yardState.session = j.session;
+        yardRenderSessionView();
+      } catch (e) {
+        alert("Couldn't " + verb + " session: " + (e && e.message ? e.message : String(e)));
+      }
+    }
+
+    function fmtIsoShort(iso) {
+      if (!iso) return "—";
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return iso;
+      const months = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
+      const dd = String(d.getDate()).padStart(2, "0");
+      const mm = months[d.getMonth()];
+      const yy = String(d.getFullYear()).slice(-2);
+      const hh = String(d.getHours()).padStart(2, "0");
+      const mi = String(d.getMinutes()).padStart(2, "0");
+      return dd + " " + mm + " " + yy + " " + hh + ":" + mi;
+    }
+
+    async function refreshMeetingSetup() {
+      const asOf = latestSnapshotDateKey();
+      if (!asOf) return;
+      meetingState.asOfDate = asOf;
+      const disp = document.getElementById("meeting-asof-display");
+      if (disp) disp.textContent = fmtKeyLong(asOf);
+      let rows = watchCacheByDate.get(asOf);
+      if (!rows) rows = await loadWatchForDate(asOf);
+      meetingState.meetingRowsCache = rows || [];
+      populateMeetingFilterOptions(meetingState.meetingRowsCache);
+      updateMeetingPreview();
+    }
+
+    /**
+     * Cascading meeting-setup filters. Each dropdown reflects only the values
+     * that exist in rows matching every OTHER filter currently selected
+     * (shop, unit, MEL key, mgmt code, MEL tier, plus the boolean "only…" toggles).
+     * Stale selections that no longer have any matching row are silently cleared.
+     */
+    function populateMeetingFilterOptions(rows) {
+      const shopSel = document.getElementById("meeting-shop");
+      const unitSel = document.getElementById("meeting-unit");
+      const melKeySel = document.getElementById("meeting-melkey");
+      const mgmtSel = document.getElementById("meeting-mgmtcd");
+      const tierSel = document.getElementById("meeting-meltier");
+      if (!shopSel || !unitSel) return;
+
+      const f = getMeetingFilterState();
+
+      function build(except) {
+        const m = new Map();
+        rows.forEach(function (r) {
+          if (except !== "shop"    && f.shop    && r.shop !== f.shop) return;
+          if (except !== "unit"    && f.unit    && r.owningUnit !== f.unit) return;
+          if (except !== "melKey"  && f.melKey  && r.melKey !== f.melKey) return;
+          if (except !== "mgmtCd"  && f.mgmtCd  && (r.mgmtCd || "") !== f.mgmtCd) return;
+          if (except !== "melTier" && f.melTier && (r.melTier || "") !== f.melTier) return;
+          if (f.onlyStale && !r.remarkStale) return;
+          if (f.onlyPushed && !(r.eticPushCount > 0)) return;
+          if (f.onlySlipped && !(r.cumulativeEticSlipDays > 0)) return;
+          const v = (
+            except === "shop"    ? r.shop
+            : except === "unit"    ? r.owningUnit
+            : except === "melKey"  ? r.melKey
+            : except === "mgmtCd"  ? r.mgmtCd
+            : except === "melTier" ? r.melTier
+            : ""
+          ) || "";
+          const t = String(v).trim();
+          if (t) m.set(t, (m.get(t) || 0) + 1);
+        });
+        return Array.from(m.entries()).sort(function (a, b) { return cmpStr(a[0], b[0]); });
+      }
+
+      // First pass: compute + null out selections that vanished.
+      let shopItems   = build("shop");
+      let unitItems   = build("unit");
+      let melKeyItems = build("melKey");
+      let mgmtItems   = build("mgmtCd");
+      let tierItems   = build("melTier");
+      let dirty = false;
+      function clearIfMissing(sel, items, val) {
+        if (val && !items.some(function (it) { return it[0] === val; })) {
+          if (sel) sel.value = "";
+          dirty = true;
+        }
+      }
+      clearIfMissing(shopSel,   shopItems,   f.shop);
+      clearIfMissing(unitSel,   unitItems,   f.unit);
+      clearIfMissing(melKeySel, melKeyItems, f.melKey);
+      clearIfMissing(mgmtSel,   mgmtItems,   f.mgmtCd);
+      clearIfMissing(tierSel,   tierItems,   f.melTier);
+      if (dirty) {
+        // Re-read state and rebuild now that some selections have been cleared.
+        const f2 = getMeetingFilterState();
+        f.shop = f2.shop; f.unit = f2.unit; f.melKey = f2.melKey;
+        f.mgmtCd = f2.mgmtCd; f.melTier = f2.melTier;
+        shopItems   = build("shop");
+        unitItems   = build("unit");
+        melKeyItems = build("melKey");
+        mgmtItems   = build("mgmtCd");
+        tierItems   = build("melTier");
+      }
+
+      function rebuild(sel, allLabel, items, current) {
+        if (!sel) return;
+        const total = items.reduce(function (s, it) { return s + it[1]; }, 0);
+        const opts = ["<option value=''>" + esc(allLabel) + " (" + total + ")</option>"]
+          .concat(items.map(function (it) {
+            const sel2 = it[0] === current ? " selected" : "";
+            return "<option value='" + esc(it[0]) + "'" + sel2 + ">" + esc(it[0]) + " (" + it[1] + ")</option>";
+          }));
+        sel.innerHTML = opts.join("");
+      }
+      rebuild(shopSel,   "All shops", shopItems, f.shop);
+      rebuild(unitSel,   "All units", unitItems, f.unit);
+      rebuild(melKeySel, "All MEL keys", melKeyItems, f.melKey);
+      rebuild(mgmtSel,   "All Mgmt Cd", mgmtItems, f.mgmtCd);
+
+      // Tier dropdown is hard-coded with options (below/at/above/etc.) — we
+      // disable rather than rebuild it so its <option> labels stay readable,
+      // but mark unavailable values as disabled.
+      if (tierSel) {
+        const available = new Set(tierItems.map(function (it) { return it[0]; }));
+        Array.prototype.forEach.call(tierSel.options, function (opt) {
+          if (!opt.value) return;
+          opt.disabled = !available.has(opt.value);
+          opt.text = opt.text.replace(/\\s*\\(\\d+\\)$/, "");
+          const cnt = tierItems.find(function (it) { return it[0] === opt.value; });
+          if (cnt) opt.text = opt.text + " (" + cnt[1] + ")";
+        });
+      }
+    }
+
+    function getMeetingFilterState() {
+      return {
+        shop: (document.getElementById("meeting-shop").value || "").trim(),
+        unit: (document.getElementById("meeting-unit").value || "").trim(),
+        melKey: (document.getElementById("meeting-melkey").value || "").trim(),
+        mgmtCd: (document.getElementById("meeting-mgmtcd").value || "").trim(),
+        melTier: (document.getElementById("meeting-meltier").value || "").trim(),
+        onlyStale: document.getElementById("meeting-only-stale").checked,
+        onlyPushed: document.getElementById("meeting-only-pushed").checked,
+        onlySlipped: document.getElementById("meeting-only-slipped").checked,
+      };
+    }
+
+    function applyMeetingFilters(rows, f) {
+      return rows.filter(function (r) {
+        if (f.shop && r.shop !== f.shop) return false;
+        if (f.unit && r.owningUnit !== f.unit) return false;
+        if (f.melKey && r.melKey !== f.melKey) return false;
+        if (f.mgmtCd && (r.mgmtCd || "") !== f.mgmtCd) return false;
+        if (f.melTier && (r.melTier || "") !== f.melTier) return false;
+        if (f.onlyStale && !r.remarkStale) return false;
+        if (f.onlyPushed && !(r.eticPushCount > 0)) return false;
+        if (f.onlySlipped && !(r.cumulativeEticSlipDays > 0)) return false;
+        return true;
+      });
+    }
+
+    function updateMeetingPreview() {
+      const rows = meetingState.meetingRowsCache || [];
+      // Re-cascade dropdowns first so their option lists shrink/grow based on
+      // every other active filter (e.g. picking a unit narrows mgmt codes).
+      populateMeetingFilterOptions(rows);
+      const filter = getMeetingFilterState();
+      const filtered = applyMeetingFilters(rows, filter);
+      const below = filtered.filter(function (r) { return r.melTier === "below"; }).length;
+      const stale = filtered.filter(function (r) { return r.remarkStale; }).length;
+      const pushed = filtered.filter(function (r) { return r.eticPushCount > 0; }).length;
+      const preview = document.getElementById("meeting-preview");
+      preview.innerHTML =
+        "<strong>" + filtered.length + "</strong> work orders on the agenda" +
+        "<div class='bdown'>" +
+          "<span>Below-MEL: " + below + "</span>" +
+          "<span>Stale: " + stale + "</span>" +
+          "<span>Pushed: " + pushed + "</span>" +
+        "</div>";
+      const btn = document.getElementById("meeting-start");
+      btn.disabled = filtered.length === 0;
+    }
+
+    function buildFilterSummary(f, count) {
+      const parts = [];
+      if (f.shop) parts.push("Shop=" + f.shop);
+      if (f.unit) parts.push("Unit=" + f.unit);
+      if (f.melKey) parts.push("MEL=" + f.melKey);
+      if (f.mgmtCd) parts.push("Mgmt=" + f.mgmtCd);
+      if (f.melTier) parts.push("Tier=" + f.melTier);
+      if (f.onlyStale) parts.push("stale only");
+      if (f.onlyPushed) parts.push("pushed only");
+      if (f.onlySlipped) parts.push("slipped only");
+      const scope = parts.length ? parts.join(" · ") : "all open WOs";
+      return scope + " (" + count + " WOs)";
+    }
+
+    async function startMeeting() {
+      const rows = meetingState.meetingRowsCache || [];
+      const filter = getMeetingFilterState();
+      const filtered = applyMeetingFilters(rows, filter);
+      if (filtered.length === 0) return;
+      const title = (document.getElementById("meeting-title").value || "").trim();
+      const attendees = (document.getElementById("meeting-attendees").value || "").trim();
+      const targetMinutes = Math.max(5, Math.min(240, Number(document.getElementById("meeting-target").value) || 30));
+      const filterSummary = buildFilterSummary(filter, filtered.length);
+      const snapshotDateKey = meetingState.asOfDate || latestSnapshotDateKey() || "";
+      const payload = {
+        title: title,
+        attendees: attendees,
+        filterSummary: filterSummary,
+        targetMinutes: targetMinutes,
+        snapshotDateKey: snapshotDateKey,
+        workOrders: filtered.map(function (r) {
+          return {
+            workOrderId: r.workOrderId,
+            assetId: r.assetId || "",
+            owningUnit: r.owningUnit || "",
+            melKey: r.melKey || "",
+            melTier: r.melTier || "",
+            shop: r.shop || "",
+            mgmtCd: r.mgmtCd || "",
+            makeModel: r.makeModel || "",
+            vehNomen: r.vehNomen || "",
+            eticDate: r.eticDate || null,
+          };
+        }),
+      };
+      const statusEl = document.getElementById("meeting-start-status");
+      statusEl.textContent = "Starting meeting…";
+      try {
+        const resp = await fetch("/api/meeting", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+        const j = await resp.json();
+        meetingState.meeting = j.meeting;
+        const full = await fetch("/api/meeting/" + j.meeting.id);
+        const fj = await full.json();
+        meetingState.notes = fj.notes || [];
+        meetingState.selectedWid = meetingState.notes.length ? meetingState.notes[0].work_order_id : null;
+        meetingState.startedAt = new Date(meetingState.meeting.started_at_iso).getTime();
+        meetingState.pausedAt = null;
+        meetingState.pausedAccumMs = 0;
+        meetingState.targetMs = meetingState.meeting.target_minutes * 60 * 1000;
+        statusEl.textContent = "";
+        enterLiveView();
+      } catch (e) {
+        statusEl.textContent = "Could not start meeting: " + (e && e.message ? e.message : e);
+      }
+    }
+
+    function enterLiveView() {
+      meetingShowView("live");
+      renderMeetingHead();
+      renderMeetingQueue();
+      renderMeetingFocus();
+      startMeetingTick();
+      // Pull sightings so each queue row + focus tag shows last-seen location.
+      // If the cache was empty, re-render once it lands so the badges appear
+      // without waiting for the next selection click.
+      const hadSightings = sightingsState.loadedAt > 0;
+      loadSightings().then(function () {
+        if (!hadSightings) {
+          renderMeetingQueue();
+          renderMeetingFocus();
+        }
+      });
+    }
+
+    function renderMeetingHead() {
+      const m = meetingState.meeting;
+      document.getElementById("meeting-live-title").textContent =
+        (m.title || "ETIC meeting") + (m.snapshot_date_key ? " — " + fmtKeyShort(m.snapshot_date_key) : "");
+      const sub = [];
+      if (m.attendees) sub.push(m.attendees);
+      if (m.filter_summary) sub.push(m.filter_summary);
+      document.getElementById("meeting-live-sub").textContent = sub.join(" · ");
+      document.getElementById("meeting-clock-target").textContent = "of " + formatClock(meetingState.targetMs);
+    }
+
+    function meetingElapsedMs() {
+      if (!meetingState.startedAt) return 0;
+      const now = meetingState.pausedAt != null ? meetingState.pausedAt : Date.now();
+      return now - meetingState.startedAt - meetingState.pausedAccumMs;
+    }
+
+    function tickMeetingClock() {
+      const elapsed = meetingElapsedMs();
+      const remaining = meetingState.targetMs - elapsed;
+      const clockEl = document.getElementById("meeting-clock");
+      const timeEl = document.getElementById("meeting-clock-time");
+      if (!clockEl || !timeEl) return;
+      timeEl.textContent = formatClockSigned(remaining);
+      let state = "idle";
+      if (meetingState.pausedAt != null) state = "paused";
+      else if (remaining <= 0) state = "overtime";
+      else if (remaining <= 5 * 60 * 1000) state = "warn";
+      clockEl.dataset.state = state;
+      const covered = meetingState.notes.filter(function (n) { return n.status === "covered"; }).length;
+      document.getElementById("meeting-progress").textContent =
+        covered + " / " + meetingState.notes.length + " covered";
+    }
+
+    function startMeetingTick() {
+      if (meetingState.tickHandle) clearInterval(meetingState.tickHandle);
+      tickMeetingClock();
+      meetingState.tickHandle = setInterval(tickMeetingClock, 1000);
+    }
+    function stopMeetingTick() {
+      if (meetingState.tickHandle) { clearInterval(meetingState.tickHandle); meetingState.tickHandle = null; }
+    }
+
+    function filterMeetingNotesForQueue() {
+      const search = (document.getElementById("meeting-queue-search").value || "").trim().toLowerCase();
+      const statusFilter = document.getElementById("meeting-queue-status").value || "";
+      return meetingState.notes.filter(function (n) {
+        if (statusFilter && n.status !== statusFilter) return false;
+        if (search) {
+          const hay = (n.work_order_id + " " + n.asset_id + " " + n.owning_unit + " " + n.mel_key + " " + n.shop + " " + (n.mgmt_cd || "") + " " + (n.make_model || "") + " " + (n.veh_nomen || "")).toLowerCase();
+          if (hay.indexOf(search) < 0) return false;
+        }
+        return true;
+      });
+    }
+
+    function renderMeetingQueue() {
+      const list = document.getElementById("meeting-queue-list");
+      const notes = filterMeetingNotesForQueue();
+      if (notes.length === 0) {
+        list.innerHTML = "<div class='muted' style='padding:12px;font-size:0.82rem'>No work orders match.</div>";
+        return;
+      }
+      list.innerHTML = notes.map(function (n) {
+        const active = n.work_order_id === meetingState.selectedWid ? " active" : "";
+        const tierCls = n.mel_tier ? " " + n.mel_tier : "";
+        const sub = [];
+        if (n.asset_id) sub.push(esc(n.asset_id));
+        if (n.shop) sub.push(esc(n.shop));
+        if (n.owning_unit) sub.push(esc(n.owning_unit));
+        if (n.mel_key) sub.push("MEL " + esc(n.mel_key));
+        const sightingHtml = n.asset_id ? renderSightingBadge(n.asset_id, { compact: true }) : "";
+        return (
+          "<button type='button' class='mq-item" + active + "' data-status='" + esc(n.status) + "' data-wid='" + esc(n.work_order_id) + "'>" +
+            "<span class='mq-dot'></span>" +
+            "<span class='mq-body'>" +
+              "<span class='wid'>" + esc(n.work_order_id) + "</span>" +
+              "<span class='sub'>" + sub.join(" · ") + (sightingHtml ? " " + sightingHtml : "") + "</span>" +
+            "</span>" +
+            (n.mel_tier ? "<span class='mq-tier" + tierCls + "'>" + esc(n.mel_tier) + "</span>" : "<span></span>") +
+          "</button>"
+        );
+      }).join("");
+      Array.prototype.forEach.call(list.querySelectorAll(".mq-item"), function (btn) {
+        btn.addEventListener("click", function () {
+          const wid = btn.getAttribute("data-wid");
+          selectMeetingWo(wid);
+        });
+      });
+    }
+
+    function getCurrentNote() {
+      return meetingState.notes.find(function (n) { return n.work_order_id === meetingState.selectedWid; }) || null;
+    }
+
+    function renderControllerTimelineRow(e) {
+      const fld = (e.field || "").toLowerCase();
+      let cls = "mfl-other", kind = prettyFieldName(fld), body = "";
+      if (fld === "etic_date_slip" || fld === "etic") {
+        cls = "mfl-slip"; kind = "ETIC slip";
+        const oldV = e.old_value ? fmtKeyShort(e.old_value) : "—";
+        const newV = e.new_value ? fmtKeyShort(e.new_value) : "—";
+        body = "<del>" + esc(oldV) + "</del> → <ins>" + esc(newV) + "</ins>";
+        const slip = daysBetweenKeys(e.new_value, e.old_value);
+        if (slip != null && slip > 0) body += " <span class='mfl-slip-pill'>+" + slip + "d</span>";
+      } else if (fld === "remarks") {
+        cls = "mfl-remarks"; kind = "Remarks";
+        const newV = (e.new_value || "").trim();
+        const trunc = newV.length > 90 ? newV.slice(0, 90) + "…" : newV;
+        body = trunc ? esc(trunc) : "<span class='muted'>cleared</span>";
+      } else if (fld === "mel_tier") {
+        cls = "mfl-mel"; kind = "MEL";
+        body = "<del>" + esc(e.old_value || "—") + "</del> → <ins>" + esc(e.new_value || "—") + "</ins>";
+      } else if (fld === "parts_status") {
+        cls = "mfl-parts"; kind = "Parts";
+        const newV = e.new_value || "—";
+        const trunc = newV.length > 60 ? newV.slice(0, 60) + "…" : newV;
+        body = esc(trunc);
+      } else if (fld === "initial") {
+        cls = "mfl-initial"; kind = "Opened"; body = "First seen";
+      } else {
+        const oldV = e.old_value == null || e.old_value === "" ? "—" : String(e.old_value);
+        const newV = e.new_value == null || e.new_value === "" ? "—" : String(e.new_value);
+        body = "<del>" + esc(oldV) + "</del> → <ins>" + esc(newV) + "</ins>";
+      }
+      return "<div class='mf-tl-row " + cls + "'>" +
+        "<span class='mf-tl-date'>" + esc(fmtKeyShort(e.snapshot_date_key || "")) + "</span>" +
+        "<span class='mf-tl-kind'>" + esc(kind) + "</span>" +
+        "<span class='mf-tl-body'>" + body + "</span>" +
+        "</div>";
+    }
+
+    function getWatchRowForWid(wid) {
+      const rows = meetingState.meetingRowsCache || [];
+      return rows.find(function (r) { return r.workOrderId === wid; }) || null;
+    }
+
+    function renderMeetingFocus() {
+      const note = getCurrentNote();
+      const empty = document.getElementById("meeting-focus-empty");
+      const body = document.getElementById("meeting-focus-body");
+      if (!note) {
+        empty.classList.remove("hidden");
+        body.classList.add("hidden");
+        return;
+      }
+      empty.classList.add("hidden");
+      body.classList.remove("hidden");
+      const head = document.getElementById("meeting-focus-head");
+      const row = getWatchRowForWid(note.work_order_id);
+      const tags = [];
+      if (note.asset_id) tags.push("<span class='tag'>" + esc(note.asset_id) + "</span>");
+      if (note.shop) tags.push("<span class='tag'>" + esc(note.shop) + "</span>");
+      if (note.owning_unit) tags.push("<span class='tag'>" + esc(note.owning_unit) + "</span>");
+      if (note.mel_key) tags.push("<span class='tag'>MEL " + esc(note.mel_key) + "</span>");
+      if (note.mel_tier) tags.push("<span class='tag'>" + esc(note.mel_tier) + "-MEL</span>");
+      const mgmt = note.mgmt_cd || (row && row.mgmtCd) || "";
+      const mm = note.make_model || (row && row.makeModel) || "";
+      const vn = note.veh_nomen || (row && row.vehNomen) || "";
+      if (mgmt) tags.push("<span class='tag'>Mgmt " + esc(mgmt) + "</span>");
+      if (mm) tags.push("<span class='tag'>" + esc(mm) + "</span>");
+      if (vn) tags.push("<span class='tag'>" + esc(vn) + "</span>");
+      if (note.etic_date) tags.push("<span class='tag'>ETIC " + esc(fmtKeyShort(note.etic_date)) + "</span>");
+      const remarks = row && row.remarks ? row.remarks : "";
+      const sightingHtml = note.asset_id ? renderSightingBadge(note.asset_id) : "";
+      head.innerHTML =
+        "<div class='mf-id'>" + esc(note.work_order_id) + "</div>" +
+        "<div class='mf-sub'>" + tags.join("") + (sightingHtml ? " " + sightingHtml : "") + "</div>" +
+        (remarks ? "<div class='mf-remarks'>" + esc(remarks) + "</div>" : "") +
+        "<div class='mf-tl' id='mf-tl'>" +
+          "<div class='mf-tl-label'>Recent changes <span class='muted'>(scroll here — the TV scrolls with you)</span></div>" +
+          "<div class='mf-tl-list' id='mf-tl-list'><div class='muted' style='font-size:0.82rem'>Loading…</div></div>" +
+        "</div>";
+      // Async populate the controller's mini timeline. Show ALL events —
+      // user can scroll through the full history. Their scroll position is
+      // pushed to the server so the conference-room screen mirrors it.
+      (function (wid, prevWid) {
+        loadChangelog(wid).then(function (payload) {
+          if (meetingState.selectedWid !== wid) return;
+          const listEl = document.getElementById("mf-tl-list");
+          if (!listEl) return;
+          // loadChangelog now returns { entries, actions }; meeting controller
+          // only cares about the snapshot-derived entries here.
+          const events = (payload && payload.entries) || (Array.isArray(payload) ? payload : []);
+          if (!events.length) {
+            listEl.innerHTML = "<div class='muted' style='font-size:0.82rem'>No changes recorded yet.</div>";
+            attachControllerTimelineScrollSync(listEl);
+            return;
+          }
+          listEl.innerHTML = events.map(renderControllerTimelineRow).join("");
+          // If we're re-rendering the SAME work order (e.g. meeting refresh),
+          // restore the controller's scroll position so they don't lose place.
+          if (wid === prevWid) {
+            const saved = meetingState.controllerTimelineScroll;
+            if (typeof saved === "number" && saved > 0) {
+              requestAnimationFrame(function () { listEl.scrollTop = saved; });
+            }
+          } else {
+            // New WO: reset scroll AND tell the presenter to start from top.
+            meetingState.controllerTimelineScroll = 0;
+            meetingState.lastSentTimelineScroll = 0;
+          }
+          attachControllerTimelineScrollSync(listEl);
+        });
+      })(note.work_order_id, meetingState.lastFocusWid);
+      meetingState.lastFocusWid = note.work_order_id;
+      document.getElementById("meeting-note-notes").value = note.notes || "";
+      document.getElementById("meeting-note-dueouts").value = note.due_outs || "";
+      Array.prototype.forEach.call(document.querySelectorAll("#meeting-focus .status-pill"), function (pill) {
+        pill.classList.toggle("active", pill.getAttribute("data-status") === note.status);
+      });
+    }
+
+    async function selectMeetingWo(wid) {
+      await flushMeetingAutosave();
+      meetingState.selectedWid = wid;
+      renderMeetingQueue();
+      renderMeetingFocus();
+      pushMeetingCursor(wid);
+    }
+
+    /**
+     * Tell the server the controller has moved to this WO so any presenter
+     * (conference-room screen) following along can update. Also resets the
+     * timeline scroll to 0 so the TV starts at the most-recent change.
+     */
+    async function pushMeetingCursor(wid) {
+      if (!meetingState.meeting || !wid) return;
+      meetingState.controllerTimelineScroll = 0;
+      meetingState.lastSentTimelineScroll = 0;
+      try {
+        const resp = await fetch("/api/meeting/" + meetingState.meeting.id + "/cursor", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ workOrderId: wid, timelineScroll: 0 }),
+        });
+        if (resp.ok) {
+          const j = await resp.json();
+          if (j.meeting) meetingState.meeting = j.meeting;
+          const hint = document.getElementById("meeting-cursor-hint");
+          if (hint) {
+            hint.textContent = "📺 on big screen";
+            setTimeout(function () { if (hint.textContent === "📺 on big screen") hint.textContent = ""; }, 1400);
+          }
+        }
+      } catch (_e) { /* swallow */ }
+    }
+
+    /**
+     * Push the controller's recent-changes scroll position (0..1) so the
+     * presenter view scrolls to the same place. Debounced; called from the
+     * scroll listener attached in renderMeetingFocus().
+     */
+    async function pushMeetingTimelineScroll(fraction) {
+      if (!meetingState.meeting) return;
+      const clamped = Math.max(0, Math.min(1, fraction));
+      // Don't spam the server with near-identical values (covers rubber-band).
+      if (typeof meetingState.lastSentTimelineScroll === "number" &&
+          Math.abs(clamped - meetingState.lastSentTimelineScroll) < 0.005) return;
+      meetingState.lastSentTimelineScroll = clamped;
+      try {
+        await fetch("/api/meeting/" + meetingState.meeting.id + "/cursor", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ timelineScroll: clamped }),
+        });
+      } catch (_e) { /* swallow — next scroll will retry */ }
+    }
+
+    /**
+     * Wire a scroll listener to the controller's mini timeline so dragging it
+     * updates the presenter view. Idempotent — safe to call after every render
+     * (we replace the listener via .onscroll).
+     */
+    function attachControllerTimelineScrollSync(listEl) {
+      if (!listEl) return;
+      listEl.onscroll = function () {
+        const max = listEl.scrollHeight - listEl.clientHeight;
+        const frac = max <= 1 ? 0 : listEl.scrollTop / max;
+        meetingState.controllerTimelineScroll = listEl.scrollTop;
+        if (meetingState.timelineScrollDebounce) {
+          clearTimeout(meetingState.timelineScrollDebounce);
+        }
+        meetingState.timelineScrollDebounce = setTimeout(function () {
+          pushMeetingTimelineScroll(frac);
+        }, 120);
+      };
+    }
+
+    function moveMeetingCursorRel(delta) {
+      const list = filterMeetingNotesForQueue();
+      if (!list.length) return;
+      let idx = list.findIndex(function (n) { return n.work_order_id === meetingState.selectedWid; });
+      if (idx < 0) idx = delta > 0 ? -1 : list.length;
+      const next = list[Math.max(0, Math.min(list.length - 1, idx + delta))];
+      if (next) selectMeetingWo(next.work_order_id);
+    }
+
+    function openPresenterWindow() {
+      if (!meetingState.meeting) return;
+      const url = window.location.origin + "/?present=" + encodeURIComponent(meetingState.meeting.id);
+      try {
+        navigator.clipboard.writeText(url);
+      } catch (_e) { /* not fatal */ }
+      window.open(url, "etic-presenter-" + meetingState.meeting.id,
+        "noopener,noreferrer,width=1600,height=1000");
+      const hint = document.getElementById("meeting-cursor-hint");
+      if (hint) {
+        hint.textContent = "Presenter URL copied · " + url;
+        setTimeout(function () { hint.textContent = ""; }, 6000);
+      }
+    }
+
+    function scheduleMeetingAutosave() {
+      if (meetingState.autosaveTimer) clearTimeout(meetingState.autosaveTimer);
+      const note = getCurrentNote();
+      if (!note) return;
+      meetingState.lastPatch = {
+        workOrderId: note.work_order_id,
+        notes: document.getElementById("meeting-note-notes").value,
+        dueOuts: document.getElementById("meeting-note-dueouts").value,
+      };
+      meetingState.autosaveTimer = setTimeout(function () {
+        flushMeetingAutosave();
+      }, 600);
+    }
+
+    async function flushMeetingAutosave() {
+      if (meetingState.autosaveTimer) { clearTimeout(meetingState.autosaveTimer); meetingState.autosaveTimer = null; }
+      const patch = meetingState.lastPatch;
+      meetingState.lastPatch = null;
+      if (!patch || !meetingState.meeting) return;
+      try {
+        const resp = await fetch("/api/meeting/" + meetingState.meeting.id + "/notes", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(patch),
+        });
+        if (!resp.ok) return;
+        const j = await resp.json();
+        if (j.note) {
+          const idx = meetingState.notes.findIndex(function (n) { return n.work_order_id === j.note.work_order_id; });
+          if (idx >= 0) meetingState.notes[idx] = j.note;
+        }
+        const st = document.getElementById("meeting-save-status");
+        st.textContent = "Saved";
+        setTimeout(function () { if (st.textContent === "Saved") st.textContent = ""; }, 1200);
+      } catch (_e) { /* swallow */ }
+    }
+
+    async function setMeetingWoStatus(status) {
+      const note = getCurrentNote();
+      if (!note || !meetingState.meeting) return;
+      await flushMeetingAutosave();
+      try {
+        const resp = await fetch("/api/meeting/" + meetingState.meeting.id + "/notes", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            workOrderId: note.work_order_id,
+            status: status,
+            notes: document.getElementById("meeting-note-notes").value,
+            dueOuts: document.getElementById("meeting-note-dueouts").value,
+          }),
+        });
+        if (!resp.ok) return;
+        const j = await resp.json();
+        if (j.note) {
+          const idx = meetingState.notes.findIndex(function (n) { return n.work_order_id === j.note.work_order_id; });
+          if (idx >= 0) meetingState.notes[idx] = j.note;
+        }
+        renderMeetingQueue();
+        renderMeetingFocus();
+      } catch (_e) { /* swallow */ }
+    }
+
+    async function advanceToNextPending(afterMarkCovered) {
+      if (afterMarkCovered) await setMeetingWoStatus("covered");
+      const pending = meetingState.notes.filter(function (n) { return n.status === "pending"; });
+      let next = pending[0];
+      if (next && meetingState.selectedWid) {
+        const idx = meetingState.notes.findIndex(function (n) { return n.work_order_id === meetingState.selectedWid; });
+        const after = meetingState.notes.slice(idx + 1).find(function (n) { return n.status === "pending"; });
+        if (after) next = after;
+      }
+      if (next) selectMeetingWo(next.work_order_id);
+    }
+
+    function toggleMeetingPause() {
+      if (!meetingState.startedAt) return;
+      if (meetingState.pausedAt != null) {
+        meetingState.pausedAccumMs += Date.now() - meetingState.pausedAt;
+        meetingState.pausedAt = null;
+        document.getElementById("meeting-pause").textContent = "Pause";
+      } else {
+        meetingState.pausedAt = Date.now();
+        document.getElementById("meeting-pause").textContent = "Resume";
+      }
+      tickMeetingClock();
+    }
+
+    async function stopMeeting() {
+      if (!meetingState.meeting) return;
+      await flushMeetingAutosave();
+      stopMeetingTick();
+      try {
+        const resp = await fetch("/api/meeting/" + meetingState.meeting.id + "/end", { method: "POST" });
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+        const j = await resp.json();
+        meetingState.meeting = j.meeting;
+        renderMeetingSummary(j.notes_md || "");
+        meetingShowView("summary");
+      } catch (e) {
+        alert("Could not end meeting: " + (e && e.message ? e.message : e));
+      }
+    }
+
+    function renderMeetingSummary(md) {
+      document.getElementById("meeting-summary-md").textContent = md;
+      const m = meetingState.meeting;
+      const subParts = [];
+      if (m.title) subParts.push(m.title);
+      if (m.snapshot_date_key) subParts.push("Snapshot " + fmtKeyShort(m.snapshot_date_key));
+      if (m.attendees) subParts.push(m.attendees);
+      document.getElementById("meeting-summary-sub").textContent = subParts.join(" · ");
+    }
+
+    function mailtoBodyFor(md) {
+      const maxLen = 1800;
+      const body = md.length > maxLen ? md.slice(0, maxLen) + "\\n\\n…(truncated — full minutes on dashboard)" : md;
+      const m = meetingState.meeting;
+      const subject = "ETIC Meeting Minutes" + (m && m.snapshot_date_key ? " — " + m.snapshot_date_key : "");
+      return "mailto:?subject=" + encodeURIComponent(subject) + "&body=" + encodeURIComponent(body);
+    }
+
+    function downloadMinutes(md) {
+      const m = meetingState.meeting;
+      const d = (m && m.snapshot_date_key) || (m && m.started_at_iso ? m.started_at_iso.slice(0, 10) : "meeting");
+      const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "etic-meeting-" + d + ".md";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+    }
+
+    async function copyMinutesToClipboard(md) {
+      try { await navigator.clipboard.writeText(md); return true; } catch (_e) { return false; }
+    }
+
+    async function loadMeetingHistory() {
+      const list = document.getElementById("meeting-history-list");
+      list.textContent = "Loading…";
+      try {
+        const resp = await fetch("/api/meetings?limit=50");
+        const j = await resp.json();
+        const rows = j.meetings || [];
+        if (rows.length === 0) {
+          list.innerHTML = "<div class='muted' style='font-size:0.84rem'>No past meetings yet.</div>";
+          return;
+        }
+        list.innerHTML = rows.map(function (m) {
+          const when = m.started_at_iso ? fmtKeyShort(m.started_at_iso) : "";
+          const title = m.title ? esc(m.title) : "ETIC meeting";
+          const sub = m.filter_summary ? esc(m.filter_summary) : (m.snapshot_date_key ? "Snapshot " + esc(fmtKeyShort(m.snapshot_date_key)) : "");
+          const stateCls = m.status === "ended" ? "ended" : "active";
+          return (
+            "<div class='meeting-history-row' data-id='" + m.id + "'>" +
+              "<div class='when'>" + esc(when) + "</div>" +
+              "<div><div>" + title + "</div><div class='title'>" + sub + "</div></div>" +
+              "<div class='state " + stateCls + "'>" + esc(m.status) + "</div>" +
+            "</div>"
+          );
+        }).join("");
+        Array.prototype.forEach.call(list.querySelectorAll(".meeting-history-row"), function (row) {
+          row.addEventListener("click", function () {
+            openPastMeeting(Number(row.getAttribute("data-id")));
+          });
+        });
+      } catch (e) {
+        list.textContent = "Could not load meetings: " + (e && e.message ? e.message : e);
+      }
+    }
+
+    async function openPastMeeting(id) {
+      try {
+        const resp = await fetch("/api/meeting/" + id);
+        const j = await resp.json();
+        if (!j.meeting) return;
+        meetingState.meeting = j.meeting;
+        meetingState.notes = j.notes || [];
+        if (j.meeting.status === "ended") {
+          renderMeetingSummary(j.meeting.notes_md || "");
+          meetingShowView("summary");
+        } else {
+          meetingState.startedAt = new Date(j.meeting.started_at_iso).getTime();
+          meetingState.pausedAt = null;
+          meetingState.pausedAccumMs = 0;
+          meetingState.targetMs = j.meeting.target_minutes * 60 * 1000;
+          meetingState.selectedWid = meetingState.notes.length ? meetingState.notes[0].work_order_id : null;
+          const asOf = j.meeting.snapshot_date_key;
+          if (asOf) {
+            let rows = watchCacheByDate.get(asOf);
+            if (!rows) rows = await loadWatchForDate(asOf);
+            meetingState.meetingRowsCache = rows || [];
+          }
+          enterLiveView();
+        }
+      } catch (e) {
+        alert("Could not open meeting: " + (e && e.message ? e.message : e));
+      }
+    }
+
+    // ---------------------------------------------------------------------
+    // PRESENTER MODE
+    // ---------------------------------------------------------------------
+    // The conference-room screen opens /?present=<meetingId>. We hide the
+    // normal app, show the .presenter card, and poll the meeting every 2s.
+    // Whatever WO the controller has selected (current_wid) we render large.
+    // ---------------------------------------------------------------------
+    var presenterState = {
+      meetingId: null,
+      meeting: null,
+      notes: [],
+      lastCursor: null,
+      pollTimer: null,
+      tickTimer: null,
+      consecFail: 0,
+      lastCardKey: "",
+      lastHeaderKey: "",
+      lastIdStripKey: "",
+      lastDashboardKey: "",
+      lastTimelineKey: "",
+      lastDueKey: "",
+      watchWid: null,
+      watchExtra: null,
+      watchPending: false,
+      watchLastFetchedAt: 0,
+      changelogWid: null,
+      changelog: null,
+      changelogPending: false,
+      // Last timeline scroll fraction we applied to #p-timeline. -1 = "force apply".
+      lastAppliedScroll: -1,
+    };
+
+    function pSetText(el, value) {
+      if (!el) return;
+      var v = value == null ? "" : String(value);
+      if (el.textContent !== v) el.textContent = v;
+    }
+    function pSetAttr(el, name, value) {
+      if (!el) return;
+      if (el.getAttribute(name) !== value) el.setAttribute(name, value);
+    }
+
+    function startPresenterMode(meetingId) {
+      presenterState.meetingId = meetingId;
+      document.body.classList.add("presenter-mode");
+      const root = document.getElementById("presenter");
+      if (root) {
+        root.classList.remove("hidden");
+        root.setAttribute("aria-hidden", "false");
+      }
+      const urlEl = document.getElementById("presenter-url");
+      if (urlEl) urlEl.textContent = window.location.host + window.location.pathname + "?present=" + meetingId;
+      pollPresenter();
+      presenterState.pollTimer = setInterval(pollPresenter, 2000);
+      presenterState.tickTimer = setInterval(renderPresenterClock, 500);
+    }
+
+    async function pollPresenter() {
+      try {
+        // Refresh meeting + sightings in parallel each tick. Sightings has its
+        // own TTL so this is mostly a no-op but ensures the conference-room
+        // screen never lags more than ~30s behind a fresh yard sweep.
+        const [resp] = await Promise.all([
+          fetch("/api/meeting/" + presenterState.meetingId, { cache: "no-store" }),
+          loadSightings(),
+        ]);
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+        const j = await resp.json();
+        presenterState.meeting = j.meeting;
+        presenterState.notes = Array.isArray(j.notes) ? j.notes : [];
+        presenterState.consecFail = 0;
+        renderPresenterAll();
+        const st = document.getElementById("presenter-status");
+        if (st) {
+          st.classList.remove("stale", "error");
+          st.textContent = "Connected · auto-refreshing every 2s";
+        }
+      } catch (e) {
+        presenterState.consecFail += 1;
+        const st = document.getElementById("presenter-status");
+        if (st) {
+          st.classList.remove("stale");
+          st.classList.add(presenterState.consecFail > 5 ? "error" : "stale");
+          st.textContent = "Reconnecting… (" + presenterState.consecFail + ")";
+        }
+      }
+    }
+
+    function renderPresenterAll() {
+      const m = presenterState.meeting;
+      if (!m) return;
+
+      // Header + subline only re-render if changed.
+      const headerKey = (m.title || "") + "|" + (m.snapshot_date_key || "") +
+        "|" + (m.attendees || "") + "|" + (m.filter_summary || "");
+      if (headerKey !== presenterState.lastHeaderKey) {
+        pSetText(document.getElementById("presenter-meeting-title"), m.title || "ETIC meeting");
+        const subParts = [];
+        if (m.snapshot_date_key) subParts.push("Snapshot " + fmtKeyShort(m.snapshot_date_key));
+        if (m.attendees) subParts.push(m.attendees);
+        if (m.filter_summary) subParts.push(m.filter_summary);
+        pSetText(document.getElementById("presenter-meeting-sub"), subParts.join(" · "));
+        presenterState.lastHeaderKey = headerKey;
+      }
+
+      const notes = presenterState.notes;
+      const covered = notes.filter(function (n) { return n.status === "covered"; }).length;
+      const wid = (m.current_wid || "").trim();
+      let idx = -1;
+      if (wid) idx = notes.findIndex(function (n) { return n.work_order_id === wid; });
+      pSetText(
+        document.getElementById("presenter-position"),
+        idx >= 0
+          ? "WO " + (idx + 1) + " of " + notes.length + " · " + covered + " covered"
+          : covered + " / " + notes.length + " covered",
+      );
+
+      const card = document.getElementById("presenter-card");
+      const empty = document.getElementById("presenter-empty");
+      if (idx < 0) {
+        if (card && !card.classList.contains("hidden")) card.classList.add("hidden");
+        if (empty) {
+          if (empty.classList.contains("hidden")) empty.classList.remove("hidden");
+          pSetText(empty, wid
+            ? "Loading work order " + wid + "…"
+            : (notes.length
+                ? "Waiting for the controller to pick a work order… (" + notes.length + " on the agenda)"
+                : "No work orders on the agenda yet."));
+        }
+        // Reset card-level fingerprints so the next switch always renders.
+        presenterState.lastCardKey = "";
+        presenterState.lastFactsKey = "";
+        presenterState.lastDueKey = "";
+        return;
+      }
+      if (empty && !empty.classList.contains("hidden")) empty.classList.add("hidden");
+      if (card && card.classList.contains("hidden")) card.classList.remove("hidden");
+      renderPresenterCard(notes[idx]);
+      renderPresenterClock();
+      // Mirror the controller's timeline scroll. Done after card render so the
+      // <div id="p-timeline"> already has its events laid out.
+      applyPresenterTimelineScroll();
+    }
+
+    /**
+     * Scroll the presenter's recent-changes section to the same fractional
+     * position the controller is at (meeting.timeline_scroll, 0..1). We diff
+     * against the last applied value to avoid touching scrollTop unnecessarily
+     * (which can fight the smooth-scroll animation).
+     */
+    function applyPresenterTimelineScroll() {
+      const tl = document.getElementById("p-timeline");
+      const m = presenterState.meeting;
+      if (!tl || !m) return;
+      const raw = (typeof m.timeline_scroll === "number") ? m.timeline_scroll : 0;
+      const target = Math.max(0, Math.min(1, raw));
+      if (Math.abs(target - presenterState.lastAppliedScroll) < 0.005) return;
+      // Defer one frame so any innerHTML written this tick has laid out and
+      // scrollHeight reflects the real list size.
+      requestAnimationFrame(function () {
+        const max = tl.scrollHeight - tl.clientHeight;
+        if (max <= 0) {
+          presenterState.lastAppliedScroll = target;
+          return;
+        }
+        const next = Math.round(target * max);
+        if (Math.abs(tl.scrollTop - next) > 1) tl.scrollTop = next;
+        presenterState.lastAppliedScroll = target;
+      });
+    }
+
+    function renderPresenterCard(note) {
+      if (!note) return;
+
+      const widChanged = presenterState.watchWid !== note.work_order_id;
+      if (widChanged) {
+        presenterState.watchWid = note.work_order_id;
+        presenterState.watchExtra = null;
+        presenterState.watchPending = false;
+        presenterState.watchLastFetchedAt = 0;
+        presenterState.changelog = null;
+        presenterState.lastIdStripKey = "";
+        presenterState.lastDashboardKey = "";
+        presenterState.lastTimelineKey = "";
+        presenterState.lastDueKey = "";
+        presenterState.lastCardKey = "";
+        presenterState.lastAppliedScroll = -1;
+        const cardEl = document.getElementById("presenter-card");
+        if (cardEl) {
+          cardEl.classList.add("presenter-card-flip");
+          setTimeout(function () { cardEl.classList.remove("presenter-card-flip"); }, 350);
+        }
+      }
+
+      const m = presenterState.meeting;
+      const extra = presenterState.watchExtra;
+      const dateKey = (m && m.snapshot_date_key) || "";
+      const cl = presenterState.changelog;
+
+      // Card-level fingerprint — skip whole render if nothing changed.
+      const cardKey = [
+        note.work_order_id,
+        note.asset_id || "",
+        note.veh_nomen || "",
+        (note.mel_tier || "").toLowerCase(),
+        note.mel_key || "",
+        note.owning_unit || "",
+        note.shop || "",
+        note.mgmt_cd || "",
+        note.make_model || "",
+        note.etic_date || "",
+        note.notes || "",
+        note.due_outs || "",
+        note.updated_at_iso || "",
+        extra ? (extra.partsStatus + "|" + extra.eticRaw + "|" + extra.eticPushCount + "|" +
+                 extra.cumulativeEticSlipDays + "|" + extra.lastRemarkChangeDate + "|" +
+                 (extra.daysDown == null ? "" : extra.daysDown) + "|" + (extra.remarks || "") + "|" +
+                 (extra.woReason || "") + "|" + (extra.establishedDateIso || extra.establishedDate || "") + "|" +
+                 (extra.nce ? "1" : "0")) : "",
+        cl ? cl.length + ":" + (cl[0] ? cl[0].id : "") : "",
+        dateKey,
+      ].join("\u241F");
+
+      if (cardKey === presenterState.lastCardKey) return;
+
+      // ---- HERO ----
+      pSetText(document.getElementById("p-wid"), "WO " + note.work_order_id);
+      const tierEl = document.getElementById("p-tier");
+      const tier = (note.mel_tier || "unknown").toLowerCase();
+      if (tierEl) {
+        pSetAttr(tierEl, "data-tier", tier);
+        const tierLabel = tier === "above" ? "Above MEL"
+          : tier === "at" ? "At MEL"
+          : tier === "below" ? "Below MEL"
+          : "MEL Unknown";
+        pSetText(tierEl, tierLabel);
+      }
+      pSetText(
+        document.getElementById("p-title"),
+        (note.asset_id || "—") + (note.veh_nomen ? " · " + note.veh_nomen : ""),
+      );
+
+      // NCE chip
+      const nceEl = document.getElementById("p-nce");
+      if (nceEl) {
+        const isNce = !!(extra && extra.nce);
+        nceEl.classList.toggle("hidden", !isNce);
+        if (isNce && extra.nceStatus) {
+          pSetAttr(nceEl, "title", "Nuclear Certified Equipment · " + extra.nceStatus);
+        }
+      }
+
+      // Opened (from workbook Estbd Dt/Time)
+      const openedEl = document.getElementById("p-opened");
+      if (openedEl) {
+        const txt = extra && extra.establishedDateIso ? "Opened " + fmtKeyLong(extra.establishedDateIso)
+                  : extra && extra.establishedDate ? "Opened " + fmtMaybeDate(extra.establishedDate)
+                  : "";
+        openedEl.classList.toggle("hidden", !txt);
+        if (txt) pSetText(openedEl, txt);
+      }
+
+      // WO Reason section
+      const reasonSec = document.getElementById("p-reason-section");
+      const reasonEl = document.getElementById("p-reason");
+      if (reasonSec && reasonEl) {
+        const reason = (extra && extra.woReason) || "";
+        reasonSec.classList.toggle("hidden", !reason);
+        if (reason) pSetText(reasonEl, reason);
+      }
+
+      // ---- IDENTITY STRIP (Unit · Shop · Mgmt · Make/Model) ----
+      const stripEl = document.getElementById("p-id-strip");
+      if (stripEl) {
+        const ids = [];
+        const addId = function (lbl, val) {
+          if (val == null || val === "") return;
+          ids.push({ lbl: lbl, val: String(val) });
+        };
+        addId("Unit", note.owning_unit);
+        addId("Shop", note.shop);
+        addId("Mgmt", note.mgmt_cd);
+        addId("Make/Model", note.make_model);
+        // Yard-sighting pill leads the strip so the room sees "where is it?"
+        // before the meta-data drilldown. Include the sighting timestamp in
+        // the cache key so the strip re-renders when a new sighting lands.
+        const sightingObj = note.asset_id ? sightingsState.map.get(note.asset_id) : null;
+        const sightingHtml = note.asset_id ? renderSightingBadge(note.asset_id) : "";
+        const sightingKey = sightingObj ? (sightingObj.at + "|" + sightingObj.location) : "none";
+        const idKey = ids.map(function (it) { return it.lbl + "=" + it.val; }).join("|") + "||sight=" + sightingKey;
+        if (idKey !== presenterState.lastIdStripKey) {
+          stripEl.innerHTML = sightingHtml + ids.map(function (it) {
+            return '<span class="p-id-pill"><span class="lbl">' + esc(it.lbl) +
+                   '</span><span class="val">' + esc(it.val) + '</span></span>';
+          }).join("");
+          presenterState.lastIdStripKey = idKey;
+        }
+      }
+
+      // ---- STATUS DASHBOARD (4 big tiles) ----
+      const dashEl = document.getElementById("p-dashboard");
+      if (dashEl) {
+        // Tile 1: ETIC due
+        let eticVal = "—", eticSub = "no date set", eticCls = "";
+        if (note.etic_date) {
+          eticVal = fmtKeyShort(note.etic_date);
+          if (dateKey) {
+            const d = daysBetweenKeys(note.etic_date, dateKey);
+            if (d == null) eticSub = "";
+            else if (d > 0) { eticSub = "in " + d + " day" + (d === 1 ? "" : "s"); eticCls = d <= 3 ? "warn" : ""; }
+            else if (d === 0) { eticSub = "due today"; eticCls = "warn"; }
+            else { eticSub = "overdue " + (-d) + "d"; eticCls = "danger"; }
+          } else { eticSub = ""; }
+        } else if (extra && extra.eticRaw) {
+          eticVal = fmtMaybeDate(extra.eticRaw);
+          eticSub = "raw cell";
+        }
+
+        // Tile 2: Parts status
+        const parts = (extra && extra.partsStatus) || "—";
+        const partsLow = parts.toLowerCase();
+        let partsCls = "";
+        if (parts === "—" || partsLow.indexOf("on shelf") >= 0 || partsLow.indexOf("on hand") >= 0) partsCls = "ok";
+        else if (partsLow.indexOf("ordered") >= 0 || partsLow.indexOf("edd") >= 0 || partsLow.indexOf("eta") >= 0) partsCls = "warn";
+        else if (partsLow.indexOf("backorder") >= 0 || partsLow.indexOf("nis") >= 0 || partsLow.indexOf("not in stock") >= 0) partsCls = "danger";
+        const partsLines = parts.split(/[:•·]/).map(function (s) { return s.trim(); }).filter(Boolean);
+        const partsHead = partsLines[0] || parts || "—";
+        const partsSub = partsLines.slice(1).join(" · ");
+
+        // Tile 3: Days down
+        const dd = extra && extra.daysDown != null && extra.daysDown !== "" ? Number(extra.daysDown) : null;
+        const ddVal = dd == null || isNaN(dd) ? "—" : String(dd);
+        let ddCls = "";
+        if (dd != null && !isNaN(dd)) {
+          if (dd >= 30) ddCls = "danger";
+          else if (dd >= 14) ddCls = "warn";
+        }
+        const ddSub = dd == null || isNaN(dd) ? "" : (dd === 1 ? "day down" : "days down");
+
+        // Tile 4: ETIC slips combined
+        const pushes = extra && extra.eticPushCount != null ? Number(extra.eticPushCount) : 0;
+        const slipDays = extra && extra.cumulativeEticSlipDays != null ? Number(extra.cumulativeEticSlipDays) : 0;
+        let slipCls = pushes > 0 || slipDays > 0 ? (slipDays >= 7 ? "danger" : "warn") : "ok";
+        const slipVal = String(slipDays || 0);
+        const slipSub = pushes > 0
+          ? (pushes + " push" + (pushes === 1 ? "" : "es") + " · days slipped")
+          : "no slips · on track";
+
+        const tiles = [
+          { lbl: "ETIC due",       val: eticVal,   sub: eticSub,  cls: eticCls },
+          { lbl: "Parts status",   val: partsHead, sub: partsSub, cls: partsCls },
+          { lbl: "Days down",      val: ddVal,     sub: ddSub,    cls: ddCls },
+          { lbl: "Days slipped",   val: slipVal,   sub: slipSub,  cls: slipCls },
+        ];
+        const dashKey = tiles.map(function (t) { return t.lbl + "=" + t.val + "/" + t.sub + "/" + t.cls; }).join("|");
+        if (dashKey !== presenterState.lastDashboardKey) {
+          dashEl.innerHTML = tiles.map(function (t) {
+            return '<div class="p-tile ' + esc(t.cls) + '">' +
+              '<span class="lbl">' + esc(t.lbl) + '</span>' +
+              '<span class="val">' + esc(t.val) + '</span>' +
+              (t.sub ? '<span class="sub">' + esc(t.sub) + '</span>' : '') +
+              '</div>';
+          }).join("");
+          presenterState.lastDashboardKey = dashKey;
+        }
+      }
+
+      // ---- LATEST REMARK ----
+      const remarkEl = document.getElementById("p-remark");
+      if (remarkEl) {
+        if (extra) pSetText(remarkEl, extra.remarks || "—");
+        else if (widChanged) pSetText(remarkEl, "Loading workbook remark…");
+      }
+
+      // ---- RECENT CHANGES TIMELINE ----
+      const tlEl = document.getElementById("p-timeline");
+      if (tlEl) {
+        if (cl == null) {
+          if (widChanged) {
+            tlEl.innerHTML = '<div class="p-tl-empty">Loading recent changes…</div>';
+            presenterState.lastTimelineKey = "__loading__";
+          }
+        } else if (cl.length === 0) {
+          if (presenterState.lastTimelineKey !== "__none__") {
+            tlEl.innerHTML = '<div class="p-tl-empty">No changes recorded yet.</div>';
+            presenterState.lastTimelineKey = "__none__";
+          }
+        } else {
+          // Show ALL events — the section is scrollable and the controller
+          // can scroll us through history (see applyPresenterTimelineScroll).
+          const tlKey = cl.map(function (e) { return e.id + ":" + e.field + ":" + (e.new_value || ""); }).join("|");
+          if (tlKey !== presenterState.lastTimelineKey) {
+            tlEl.innerHTML = cl.map(function (e) { return renderPresenterTimelineRow(e); }).join("");
+            presenterState.lastTimelineKey = tlKey;
+            // Force re-apply since scrollHeight changed.
+            presenterState.lastAppliedScroll = -1;
+          }
+        }
+      }
+
+      // ---- MEETING NOTES ----
+      pSetText(
+        document.getElementById("p-notes"),
+        (note.notes && note.notes.trim()) || "(no notes yet — controller hasn't typed anything)",
+      );
+
+      // ---- DUE-OUTS ----
+      const dueEl = document.getElementById("p-dueouts");
+      if (dueEl) {
+        const lines = (note.due_outs || "").split(/\\r?\\n/).map(function (s) { return s.trim(); }).filter(Boolean);
+        const dueKey = lines.join("\u241E");
+        if (dueKey !== presenterState.lastDueKey) {
+          if (!lines.length) {
+            dueEl.innerHTML = '<li class="muted" style="color:rgba(241,244,251,0.4)">(none)</li>';
+          } else {
+            dueEl.innerHTML = lines.map(function (l) { return "<li>" + esc(l) + "</li>"; }).join("");
+          }
+          presenterState.lastDueKey = dueKey;
+        }
+      }
+
+      presenterState.lastCardKey = cardKey;
+
+      // -------- background fetches (don't block render) --------
+
+      // Watch row: refresh on WID change or every 30s.
+      const now = Date.now();
+      const watchStale = now - presenterState.watchLastFetchedAt > 30000;
+      if (dateKey && !presenterState.watchPending && (widChanged || watchStale)) {
+        presenterState.watchPending = true;
+        const fetchWid = note.work_order_id;
+        fetch("/api/watch?workOrderId=" + encodeURIComponent(fetchWid) +
+              "&date=" + encodeURIComponent(dateKey), { cache: "no-store" })
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (j) {
+            if (presenterState.watchWid !== fetchWid) return;
+            const w = j && j.row;
+            if (!w) {
+              presenterState.watchExtra = { remarks: "—" };
+            } else {
+              presenterState.watchExtra = {
+                partsStatus: w.partsStatus,
+                eticRaw: w.eticRaw,
+                eticPushCount: w.eticPushCount,
+                cumulativeEticSlipDays: w.cumulativeEticSlipDays,
+                lastRemarkChangeDate: w.lastRemarkChangeDate,
+                daysDown: (w.raw && (w.raw["days down"] || w.raw["fleet.days down"])) || null,
+                remarks: w.remarks || "—",
+                woReason: w.woReason || "",
+                establishedDate: w.establishedDate || "",
+                establishedDateIso: w.establishedDateIso || null,
+                nce: !!w.nce,
+                nceStatus: w.nceStatus || "",
+              };
+            }
+            presenterState.watchLastFetchedAt = Date.now();
+            presenterState.lastCardKey = "";
+            renderPresenterCard(note);
+          })
+          .catch(function () {
+            if (presenterState.watchWid === fetchWid) {
+              presenterState.watchExtra = presenterState.watchExtra || { remarks: "—" };
+            }
+          })
+          .then(function () { presenterState.watchPending = false; });
+      }
+
+      // Changelog: fetch once per WID change. Only the controller advances WO,
+      // so the list rarely changes during a single slide.
+      if (!presenterState.changelogPending && presenterState.changelogWid !== note.work_order_id) {
+        presenterState.changelogPending = true;
+        const fetchWid = note.work_order_id;
+        presenterState.changelogWid = fetchWid;
+        fetch("/api/work-order-changelog?workOrderId=" + encodeURIComponent(fetchWid),
+              { cache: "no-store" })
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (j) {
+            if (presenterState.watchWid !== fetchWid) return;
+            const events = j && Array.isArray(j.entries) ? j.entries
+              : j && Array.isArray(j.events) ? j.events
+              : j && Array.isArray(j.changelog) ? j.changelog
+              : Array.isArray(j) ? j : [];
+            presenterState.changelog = events;
+            presenterState.lastCardKey = "";
+            renderPresenterCard(note);
+          })
+          .catch(function () {
+            if (presenterState.watchWid === fetchWid) presenterState.changelog = [];
+          })
+          .then(function () { presenterState.changelogPending = false; });
+      }
+    }
+
+    function renderPresenterTimelineRow(e) {
+      const fld = (e.field || "").toLowerCase();
+      let cls = "tl-other", kind = prettyFieldName(fld), body = "";
+      if (fld === "etic_date_slip" || fld === "etic") {
+        cls = "tl-slip";
+        kind = "ETIC slip";
+        const oldV = e.old_value ? fmtKeyShort(e.old_value) : "—";
+        const newV = e.new_value ? fmtKeyShort(e.new_value) : "—";
+        body = "<del>" + esc(oldV) + "</del><span class='arrow'>→</span><ins>" + esc(newV) + "</ins>";
+        const slip = daysBetweenKeys(e.new_value, e.old_value);
+        if (slip != null && slip > 0) body += "<span class='slip-pill'>+" + slip + "d</span>";
+      } else if (fld === "remarks") {
+        cls = "tl-remarks";
+        kind = "Remarks";
+        const oldV = (e.old_value || "").trim();
+        const newV = (e.new_value || "").trim();
+        const truncN = newV.length > 220 ? newV.slice(0, 220) + "…" : newV;
+        const truncO = oldV.length > 120 ? oldV.slice(0, 120) + "…" : oldV;
+        if (!newV && !oldV) body = "<span style='color:rgba(241,244,251,0.5)'>cleared</span>";
+        else if (!oldV) body = "<ins>" + esc(truncN) + "</ins>";
+        else if (!newV) body = "<del>" + esc(truncO) + "</del>";
+        else body = "<ins>" + esc(truncN) + "</ins>";
+      } else if (fld === "mel_tier") {
+        cls = "tl-mel";
+        kind = "MEL tier";
+        body = "<del>" + esc(e.old_value || "—") + "</del><span class='arrow'>→</span><ins>" + esc(e.new_value || "—") + "</ins>";
+      } else if (fld === "parts_status") {
+        cls = "tl-parts";
+        kind = "Parts";
+        const oldV = e.old_value || "—";
+        const newV = e.new_value || "—";
+        const truncO = oldV.length > 80 ? oldV.slice(0, 80) + "…" : oldV;
+        const truncN = newV.length > 120 ? newV.slice(0, 120) + "…" : newV;
+        body = "<del>" + esc(truncO) + "</del><span class='arrow'>→</span><ins>" + esc(truncN) + "</ins>";
+      } else if (fld === "initial") {
+        cls = "tl-initial";
+        kind = "Opened";
+        body = "First seen in snapshot";
+      } else {
+        const oldV = e.old_value == null || e.old_value === "" ? "—" : String(e.old_value);
+        const newV = e.new_value == null || e.new_value === "" ? "—" : String(e.new_value);
+        body = "<del>" + esc(oldV) + "</del><span class='arrow'>→</span><ins>" + esc(newV) + "</ins>";
+      }
+      const date = fmtKeyShort(e.snapshot_date_key || "");
+      return '<div class="p-tl-row ' + cls + '">' +
+        '<span class="p-tl-date">' + esc(date) + '</span>' +
+        '<span class="p-tl-kind">' + esc(kind) + '</span>' +
+        '<span class="p-tl-body">' + body + '</span>' +
+        '</div>';
+    }
+
+    function renderPresenterClock() {
+      const m = presenterState.meeting;
+      if (!m) return;
+      const clockEl = document.getElementById("presenter-clock");
+      const timeEl = document.getElementById("presenter-clock-time");
+      const subEl = document.getElementById("presenter-clock-sub");
+      if (!timeEl) return;
+      const target = (m.target_minutes || 0) * 60000;
+      const ended = m.ended_at_iso ? new Date(m.ended_at_iso).getTime() : null;
+      const started = m.started_at_iso ? new Date(m.started_at_iso).getTime() : null;
+      if (!started) { timeEl.textContent = "00:00"; return; }
+      const now = ended || Date.now();
+      const elapsed = Math.max(0, now - started);
+      timeEl.textContent = formatClock(elapsed);
+      let state = "ok";
+      if (m.status === "ended") state = "paused";
+      else if (target && elapsed > target) state = "overtime";
+      else if (target && elapsed > target * 0.85) state = "warn";
+      if (clockEl) clockEl.setAttribute("data-state", state);
+      if (subEl) {
+        if (m.status === "ended") subEl.textContent = "Meeting ended";
+        else if (target) subEl.textContent = "of " + formatClock(target);
+        else subEl.textContent = "";
+      }
+    }
+
+    function wireMeetingEvents() {
+      ["meeting-shop", "meeting-unit", "meeting-melkey", "meeting-mgmtcd", "meeting-meltier"].forEach(function (id) {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener("change", updateMeetingPreview);
+      });
+      ["meeting-only-stale", "meeting-only-pushed", "meeting-only-slipped"].forEach(function (id) {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener("change", updateMeetingPreview);
+      });
+      const startBtn = document.getElementById("meeting-start");
+      if (startBtn) startBtn.addEventListener("click", startMeeting);
+      const refreshHist = document.getElementById("meeting-history-refresh");
+      if (refreshHist) refreshHist.addEventListener("click", loadMeetingHistory);
+
+      const notes = document.getElementById("meeting-note-notes");
+      const dueouts = document.getElementById("meeting-note-dueouts");
+      if (notes) notes.addEventListener("input", scheduleMeetingAutosave);
+      if (dueouts) dueouts.addEventListener("input", scheduleMeetingAutosave);
+
+      Array.prototype.forEach.call(document.querySelectorAll("#meeting-focus .status-pill"), function (pill) {
+        pill.addEventListener("click", function () { setMeetingWoStatus(pill.getAttribute("data-status")); });
+      });
+
+      const qSearch = document.getElementById("meeting-queue-search");
+      const qStatus = document.getElementById("meeting-queue-status");
+      if (qSearch) qSearch.addEventListener("input", renderMeetingQueue);
+      if (qStatus) qStatus.addEventListener("change", renderMeetingQueue);
+
+      const pause = document.getElementById("meeting-pause");
+      if (pause) pause.addEventListener("click", toggleMeetingPause);
+      const stop = document.getElementById("meeting-stop");
+      if (stop) stop.addEventListener("click", function () {
+        if (confirm("Stop meeting and generate minutes?")) stopMeeting();
+      });
+      const nextBtn = document.getElementById("meeting-next");
+      if (nextBtn) nextBtn.addEventListener("click", function () { advanceToNextPending(true); });
+      const prevWoBtn = document.getElementById("meeting-prev-wo");
+      if (prevWoBtn) prevWoBtn.addEventListener("click", function () { moveMeetingCursorRel(-1); });
+      const nextWoBtn = document.getElementById("meeting-next-wo");
+      if (nextWoBtn) nextWoBtn.addEventListener("click", function () { moveMeetingCursorRel(1); });
+      const presentBtn = document.getElementById("meeting-present");
+      if (presentBtn) presentBtn.addEventListener("click", openPresenterWindow);
+
+      const cp = document.getElementById("meeting-export-copy");
+      if (cp) cp.addEventListener("click", async function () {
+        const md = document.getElementById("meeting-summary-md").textContent;
+        const ok = await copyMinutesToClipboard(md);
+        cp.textContent = ok ? "Copied!" : "Copy failed";
+        setTimeout(function () { cp.textContent = "Copy to clipboard"; }, 1400);
+      });
+      const dl = document.getElementById("meeting-export-download");
+      if (dl) dl.addEventListener("click", function () {
+        downloadMinutes(document.getElementById("meeting-summary-md").textContent);
+      });
+      const mail = document.getElementById("meeting-export-mail");
+      if (mail) mail.addEventListener("click", function () {
+        const md = document.getElementById("meeting-summary-md").textContent;
+        window.location.href = mailtoBodyFor(md);
+      });
+      const newBtn = document.getElementById("meeting-new");
+      if (newBtn) newBtn.addEventListener("click", function () {
+        meetingState.meeting = null;
+        meetingState.notes = [];
+        meetingState.selectedWid = null;
+        meetingShowView("setup");
+        refreshMeetingSetup();
+        loadMeetingHistory();
+      });
+    }
+
+    wireMeetingEvents();
+
+    init();
+  </script>
+</body>
+</html>`;
+}
+
+function escapeHtml(input: string): string {
+  return input
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+export {
+  analyzeWorkbook,
+  countMelMentions,
+  extractAssetManagerKpis,
+  isoDateKey,
+  parseMaxAttachmentBytes,
+  parseReportDateKeyFromSubject,
+  pickWorkbookAttachment,
+  readCellText,
+  resolveAnalysisDateKey,
+  sanitizeFileName,
+  upsertHistoryEntry,
+};

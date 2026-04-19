@@ -1,0 +1,44 @@
+{
+  "name": "eticanalysis",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker dashboard for daily Vehicle ETIC workbook ingest, work-order tracking, MEL rollup, yard checks, and ETIC meetings",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "wrangler dev --local --persist-to .wrangler/state",
+    "dev:remote": "wrangler dev --remote",
+    "cf-typegen": "wrangler types",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run cf-typegen && npm run typecheck && npm run test",
+    "deploy": "wrangler deploy --env-file .env.cloudflare"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ScheelJW/eticanalysis.git"
+  },
+  "keywords": [
+    "cloudflare-workers",
+    "r2",
+    "email-routing",
+    "automation"
+  ],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/ScheelJW/eticanalysis/issues"
+  },
+  "homepage": "https://github.com/ScheelJW/eticanalysis#readme",
+  "dependencies": {
+    "exceljs": "^4.4.0",
+    "postal-mime": "^2.7.4"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.4",
+    "wrangler": "^4.83.0"
+  }
+}
