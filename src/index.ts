@@ -57,6 +57,20 @@ import {
   type YardEntryStatus,
 } from "./yardSession";
 import {
+  approveWaiver,
+  deleteWaiver,
+  getWaiverById,
+  getWaiverCounts,
+  getWaiverPhoto,
+  listPendingWaivers,
+  listVerifications as listWaiverVerifications,
+  listWaiversForAsset,
+  rejectWaiver,
+  submitWaiver,
+  verifyWaiver,
+  type Waiver,
+} from "./waivers";
+import {
   deleteMelConfig,
   deleteMelSubdivision,
   extractMelRowsFromBinary,
@@ -393,6 +407,39 @@ export default {
       return handleYardAssetDetailApi(env, assetId);
     }
 
+    // ---------- Waiver-card API ----------
+    if (url.pathname === "/api/waivers") {
+      return handleWaiverSubmitApi(env, request);
+    }
+    if (url.pathname === "/api/waivers/pending") {
+      return handleWaiverPendingApi(env);
+    }
+    if (url.pathname === "/api/waivers/counts") {
+      return handleWaiverCountsApi(env);
+    }
+    const waiverAssetMatch = url.pathname.match(/^\/api\/waivers\/asset\/([^/]+)$/);
+    if (waiverAssetMatch) {
+      const assetId = decodeURIComponent(waiverAssetMatch[1] ?? "");
+      return handleWaiverAssetApi(env, url, assetId);
+    }
+    const waiverIdActionMatch = url.pathname.match(
+      /^\/api\/waivers\/(\d+)(?:\/(approve|reject|verify|delete|photo))?$/,
+    );
+    if (waiverIdActionMatch) {
+      const id = Number.parseInt(waiverIdActionMatch[1] ?? "", 10);
+      const action = waiverIdActionMatch[2] ?? "";
+      if (!Number.isFinite(id)) return new Response("Invalid waiver id", { status: 400 });
+      if (action === "photo") return handleWaiverPhotoApi(env, id);
+      if (action === "approve" || action === "reject" || action === "verify" || action === "delete") {
+        return handleWaiverActionApi(env, request, id, action);
+      }
+      // No action segment + DELETE = soft delete via /api/waivers/:id
+      if (request.method === "DELETE") {
+        return handleWaiverActionApi(env, request, id, "delete");
+      }
+      return handleWaiverDetailApi(env, id);
+    }
+
     if (url.pathname === "/api/meetings") {
       return handleMeetingsListApi(env, request);
     }
@@ -432,6 +479,43 @@ export default {
         icons: [],
       }, {
         headers: { "Content-Type": "application/manifest+json", "Cache-Control": "public, max-age=300" },
+      });
+    }
+
+    // Standalone mobile waiver-card app — no nav, full-bleed, mechanic-focused.
+    if (url.pathname === "/waivers") {
+      return new Response(renderWaiverAppHtml(), {
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "private, no-store, no-cache, must-revalidate, max-age=0",
+        },
+      });
+    }
+    if (url.pathname === "/waivers/manifest.webmanifest") {
+      return Response.json({
+        name: "Waiver Card",
+        short_name: "Waivers",
+        start_url: "/waivers",
+        display: "standalone",
+        background_color: "#0a0a0d",
+        theme_color: "#0a0a0d",
+        orientation: "portrait",
+        icons: [],
+      }, {
+        headers: { "Content-Type": "application/manifest+json", "Cache-Control": "public, max-age=300" },
+      });
+    }
+    // Printable waiver card — server-rendered HTML so the desktop "Print"
+    // button just opens this in a new window and the user hits Ctrl/Cmd-P.
+    const waiverPrintMatch = url.pathname.match(/^\/waivers\/card\/([^/]+)\/print$/);
+    if (waiverPrintMatch) {
+      const assetId = decodeURIComponent(waiverPrintMatch[1] ?? "");
+      const waivers = await listWaiversForAsset(env, assetId, { approvedOnly: true });
+      return new Response(renderWaiverPrintCardHtml(assetId, waivers), {
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "private, no-store",
+        },
       });
     }
 
@@ -1535,6 +1619,887 @@ async function handleYardPhotoFetchApi(env: Env, request: Request, id: number): 
       "Content-Disposition": "inline; filename=\"" + got.meta.assetId + "-" + id + "\"",
     },
   });
+}
+
+/**
+ * Standalone mobile-first waiver app served at /waivers.
+ *
+ * Mechanic flow (the only one this UI cares about):
+ *   1. Type / scan / pick an asset id.
+ *   2. See the approved waivers already on the card so they don't chase
+ *      defects management has accepted.
+ *   3. Tap "Verify" on any waiver to log a name + timestamp (counts as
+ *      that mechanic confirming the waiver is still valid — this is what
+ *      drives the annual re-verification requirement).
+ *   4. Tap "Request waiver" to capture a new defect with title +
+ *      description + camera photo. Submission lands in the desktop
+ *      management queue as `pending` and does NOT appear on the card
+ *      until approved.
+ *
+ * Self-contained HTML — no build step. Same dark palette as /yard so
+ * mechanics jumping between the two apps don't context-switch.
+ */
+function renderWaiverAppHtml(): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="theme-color" content="#0a0a0d" />
+  <link rel="manifest" href="/waivers/manifest.webmanifest" />
+  <title>Waiver Card</title>
+  <style>
+    :root {
+      --bg: #0a0a0d;
+      --bg1: #14141b;
+      --bg2: #1c1c25;
+      --bg3: #262631;
+      --border: #2f2f3c;
+      --text: #f4f4f7;
+      --muted: #9b9bab;
+      --muted2: #6f6f80;
+      --accent: #6aa9ff;
+      --accent-fg: #0a0a0d;
+      --ok: #4ade80;
+      --warn: #facc15;
+      --danger: #ef4444;
+      --pending: #c084fc;
+      --safe-top: env(safe-area-inset-top, 0px);
+      --safe-bottom: env(safe-area-inset-bottom, 0px);
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { margin: 0; padding: 0; min-height: 100%; background: var(--bg); color: var(--text); }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      padding-top: var(--safe-top);
+      padding-bottom: calc(var(--safe-bottom) + 16px);
+      font-size: 16px;
+      line-height: 1.4;
+    }
+    header {
+      position: sticky; top: 0; z-index: 5;
+      background: linear-gradient(180deg, rgba(10,10,13,0.98), rgba(10,10,13,0.85));
+      backdrop-filter: blur(8px);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 16px 10px;
+      padding-top: calc(var(--safe-top) + 12px);
+    }
+    .h-row { display: flex; align-items: center; gap: 10px; }
+    .h-back {
+      background: var(--bg2); border: 1px solid var(--border); color: var(--text);
+      width: 38px; height: 38px; border-radius: 10px; font-size: 20px; line-height: 1;
+      display: none; align-items: center; justify-content: center;
+    }
+    body.detail .h-back { display: inline-flex; }
+    .h-title { font-weight: 600; font-size: 1.05rem; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .h-sub { font-size: 0.78rem; color: var(--muted); margin-top: 2px; }
+    main { padding: 14px 16px 24px; max-width: 720px; margin: 0 auto; }
+    .lookup {
+      display: flex; gap: 8px; margin-top: 4px;
+    }
+    .lookup input {
+      flex: 1; min-width: 0;
+      background: var(--bg1); border: 1px solid var(--border); color: var(--text);
+      border-radius: 12px; padding: 14px 14px; font-size: 1.05rem;
+      font-variant-numeric: tabular-nums;
+    }
+    .lookup input:focus { outline: none; border-color: var(--accent); }
+    .btn {
+      background: var(--accent); color: var(--accent-fg); border: 0;
+      border-radius: 12px; padding: 14px 18px; font-size: 1rem; font-weight: 600;
+      display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    }
+    .btn.secondary { background: var(--bg2); color: var(--text); border: 1px solid var(--border); }
+    .btn.danger { background: var(--danger); color: var(--text); }
+    .btn.success { background: var(--ok); color: var(--accent-fg); }
+    .btn:disabled { opacity: 0.5; }
+    .btn.block { width: 100%; }
+    .btn-row { display: flex; gap: 8px; margin-top: 14px; }
+    .empty {
+      margin-top: 28px; text-align: center; color: var(--muted);
+      padding: 28px 16px; border: 1px dashed var(--border); border-radius: 14px;
+      background: var(--bg1);
+    }
+    .empty strong { color: var(--text); display: block; margin-bottom: 6px; }
+    .name-prompt {
+      margin-top: 16px; padding: 12px 14px; background: var(--bg1);
+      border: 1px solid var(--border); border-radius: 12px;
+    }
+    .name-prompt label { display: block; color: var(--muted); font-size: 0.78rem; margin-bottom: 6px; }
+    .name-prompt input {
+      width: 100%; background: var(--bg2); border: 1px solid var(--border); color: var(--text);
+      border-radius: 8px; padding: 10px 12px; font-size: 1rem;
+    }
+    .recent { margin-top: 18px; }
+    .recent .lbl { color: var(--muted); font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 6px; }
+    .recent .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+    .recent .chip {
+      background: var(--bg2); border: 1px solid var(--border); border-radius: 999px;
+      padding: 6px 12px; font-size: 0.86rem; color: var(--text); font-variant-numeric: tabular-nums;
+    }
+
+    .summary {
+      margin-top: 14px; padding: 14px;
+      background: var(--bg1); border: 1px solid var(--border); border-radius: 14px;
+      display: flex; align-items: center; gap: 14px;
+    }
+    .summary .asset {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 1.4rem; font-weight: 600; letter-spacing: -0.01em;
+    }
+    .summary .stat { color: var(--muted); font-size: 0.85rem; }
+    .summary .stat strong { color: var(--text); }
+
+    .wlist { margin-top: 14px; display: flex; flex-direction: column; gap: 10px; }
+    .wcard {
+      background: var(--bg1); border: 1px solid var(--border); border-radius: 14px;
+      overflow: hidden;
+    }
+    .wcard.pending { border-color: rgba(192,132,252,0.35); }
+    .wcard.overdue { border-color: rgba(239,68,68,0.45); }
+    .wcard.dueSoon { border-color: rgba(250,204,21,0.45); }
+    .wcard-head {
+      padding: 12px 14px 6px;
+      display: flex; align-items: flex-start; gap: 10px;
+    }
+    .wcard-head .title { font-weight: 600; flex: 1; min-width: 0; }
+    .wcard-head .pill {
+      font-size: 0.7rem; padding: 2px 8px; border-radius: 999px;
+      border: 1px solid transparent; white-space: nowrap;
+      text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600;
+    }
+    .pill.approved { background: rgba(74,222,128,0.12); color: var(--ok); border-color: rgba(74,222,128,0.30); }
+    .pill.pending  { background: rgba(192,132,252,0.12); color: var(--pending); border-color: rgba(192,132,252,0.30); }
+    .pill.overdue  { background: rgba(239,68,68,0.12); color: var(--danger); border-color: rgba(239,68,68,0.40); }
+    .pill.dueSoon  { background: rgba(250,204,21,0.10); color: var(--warn); border-color: rgba(250,204,21,0.35); }
+    .wcard-body { padding: 0 14px 12px; color: var(--muted); font-size: 0.9rem; }
+    .wcard-body .desc { color: var(--text); margin-bottom: 6px; white-space: pre-wrap; }
+    .wcard-body .meta { font-size: 0.78rem; }
+    .wcard-photo {
+      display: block; width: 100%; max-height: 320px; object-fit: cover;
+      border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
+      background: #000;
+    }
+    .wcard-actions {
+      display: flex; gap: 8px; padding: 10px 12px;
+      background: var(--bg2); border-top: 1px solid var(--border);
+    }
+    .wcard-actions .btn { flex: 1; padding: 12px; font-size: 0.92rem; }
+
+    .modal-back {
+      position: fixed; inset: 0; z-index: 20;
+      background: rgba(0,0,0,0.6); backdrop-filter: blur(2px);
+      display: none; align-items: flex-end; justify-content: center;
+    }
+    .modal-back.open { display: flex; }
+    .modal {
+      width: 100%; max-width: 720px; background: var(--bg1);
+      border-top: 1px solid var(--border);
+      border-radius: 18px 18px 0 0;
+      padding: 16px 16px calc(var(--safe-bottom) + 16px);
+      max-height: 90vh; overflow-y: auto;
+    }
+    .modal h2 { margin: 0 0 12px; font-size: 1.1rem; }
+    .modal label { display: block; color: var(--muted); font-size: 0.78rem; margin: 10px 0 4px; }
+    .modal input[type=text], .modal textarea {
+      width: 100%; background: var(--bg2); border: 1px solid var(--border); color: var(--text);
+      border-radius: 10px; padding: 12px; font-size: 1rem; font-family: inherit;
+    }
+    .modal textarea { min-height: 96px; resize: vertical; }
+    .modal .file-row { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
+    .modal .file-row input[type=file] { display: none; }
+    .modal .file-btn {
+      background: var(--bg2); border: 1px solid var(--border); color: var(--text);
+      border-radius: 10px; padding: 12px 14px; font-size: 0.95rem; cursor: pointer;
+    }
+    .modal .preview {
+      margin-top: 10px; max-width: 100%; max-height: 240px; object-fit: contain;
+      border-radius: 10px; background: #000;
+    }
+    .modal .err { color: var(--danger); font-size: 0.85rem; margin-top: 10px; }
+    .modal .ok  { color: var(--ok); font-size: 0.85rem; margin-top: 10px; }
+
+    .verif-log { margin-top: 14px; font-size: 0.82rem; color: var(--muted); }
+    .verif-log .row { padding: 4px 0; border-bottom: 1px dashed var(--border); }
+    .verif-log .row:last-child { border-bottom: 0; }
+
+    .toast {
+      position: fixed; bottom: calc(var(--safe-bottom) + 18px); left: 50%;
+      transform: translateX(-50%) translateY(20px);
+      background: var(--bg2); border: 1px solid var(--border); color: var(--text);
+      padding: 10px 16px; border-radius: 12px; font-size: 0.92rem;
+      opacity: 0; transition: opacity 0.2s, transform 0.2s; pointer-events: none;
+      z-index: 30;
+    }
+    .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+    .toast.err { border-color: rgba(239,68,68,0.5); }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="h-row">
+      <button type="button" class="h-back" id="back-btn" aria-label="Back">‹</button>
+      <div style="flex:1; min-width:0;">
+        <div class="h-title" id="h-title">Waiver Card</div>
+        <div class="h-sub" id="h-sub">Pull up an asset to view or request waivers.</div>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <div id="view-lookup">
+      <div class="lookup">
+        <input id="asset-input" type="text" inputmode="text" autocapitalize="characters" autocorrect="off"
+               spellcheck="false" placeholder="Asset ID (e.g. M-1234)" />
+        <button type="button" class="btn" id="lookup-btn">Open</button>
+      </div>
+      <div class="name-prompt">
+        <label for="name-input">Your name (used on every action you take)</label>
+        <input id="name-input" type="text" autocomplete="name" placeholder="First Last" />
+      </div>
+      <div class="recent" id="recent-wrap" hidden>
+        <div class="lbl">Recent</div>
+        <div class="chips" id="recent-chips"></div>
+      </div>
+    </div>
+
+    <div id="view-detail" hidden>
+      <div class="summary" id="summary"></div>
+      <div class="btn-row">
+        <button type="button" class="btn block" id="new-waiver-btn">+ Request waiver</button>
+      </div>
+      <div class="wlist" id="wlist"></div>
+    </div>
+  </main>
+
+  <!-- Submit modal -->
+  <div class="modal-back" id="submit-modal">
+    <div class="modal">
+      <h2>Request a waiver</h2>
+      <div class="h-sub" id="submit-asset-line"></div>
+      <label for="sub-title">Short title (what is the defect?)</label>
+      <input id="sub-title" type="text" maxlength="120" placeholder="e.g. Driver-side mirror crack < 2&quot;" />
+      <label for="sub-desc">Details (where it is, why it doesn't affect safety, etc.)</label>
+      <textarea id="sub-desc" maxlength="2000"></textarea>
+      <label>Photo of the defect</label>
+      <div class="file-row">
+        <label class="file-btn" for="sub-photo">📷 Take / choose photo</label>
+        <input id="sub-photo" type="file" accept="image/*" capture="environment" />
+        <span id="sub-photo-name" style="font-size:0.85rem;color:var(--muted);"></span>
+      </div>
+      <img id="sub-preview" class="preview" hidden alt="" />
+      <div id="sub-err" class="err" hidden></div>
+      <div class="btn-row">
+        <button type="button" class="btn secondary" id="sub-cancel">Cancel</button>
+        <button type="button" class="btn" id="sub-submit">Submit for review</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Verify modal -->
+  <div class="modal-back" id="verify-modal">
+    <div class="modal">
+      <h2>Verify this waiver</h2>
+      <div class="h-sub" id="verify-line"></div>
+      <label for="verify-name">Your name (required)</label>
+      <input id="verify-name" type="text" placeholder="First Last" />
+      <label for="verify-note">Optional note</label>
+      <textarea id="verify-note" maxlength="500" placeholder="e.g. Re-checked during PMI, still applies"></textarea>
+      <div id="verify-err" class="err" hidden></div>
+      <div class="btn-row">
+        <button type="button" class="btn secondary" id="verify-cancel">Cancel</button>
+        <button type="button" class="btn success" id="verify-confirm">Verify</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+<script>
+(function () {
+  var NAME_KEY = "waiver.mechanicName";
+  var RECENT_KEY = "waiver.recentAssets";
+  var state = {
+    assetId: "",
+    waivers: [],
+    pendingActionId: null,
+  };
+
+  function $(id) { return document.getElementById(id); }
+  function esc(s) {
+    if (s == null) return "";
+    return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+  }
+  function fmtAge(iso) {
+    if (!iso) return "—";
+    var t = Date.parse(iso); if (!isFinite(t)) return "—";
+    var d = (Date.now() - t) / 86400000;
+    if (d < 1) return "today";
+    if (d < 2) return "yesterday";
+    if (d < 14) return Math.floor(d) + "d ago";
+    if (d < 60) return Math.floor(d / 7) + "w ago";
+    if (d < 730) return Math.floor(d / 30) + "mo ago";
+    return Math.floor(d / 365) + "y ago";
+  }
+  function fmtDate(iso) {
+    if (!iso) return "—";
+    var t = new Date(iso);
+    if (isNaN(t)) return "—";
+    return t.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+  }
+  function showToast(msg, isErr) {
+    var t = $("toast");
+    t.textContent = msg;
+    t.classList.toggle("err", !!isErr);
+    t.classList.add("show");
+    setTimeout(function () { t.classList.remove("show"); }, 2400);
+  }
+  function readName() { return ($("name-input").value || localStorage.getItem(NAME_KEY) || "").trim(); }
+  function rememberName(n) {
+    if (n) localStorage.setItem(NAME_KEY, n);
+  }
+  function loadRecent() {
+    try {
+      var raw = localStorage.getItem(RECENT_KEY);
+      var arr = raw ? JSON.parse(raw) : [];
+      return Array.isArray(arr) ? arr : [];
+    } catch { return []; }
+  }
+  function pushRecent(assetId) {
+    var cur = loadRecent().filter(function (a) { return a !== assetId; });
+    cur.unshift(assetId);
+    if (cur.length > 8) cur = cur.slice(0, 8);
+    localStorage.setItem(RECENT_KEY, JSON.stringify(cur));
+    renderRecent();
+  }
+  function renderRecent() {
+    var arr = loadRecent();
+    var wrap = $("recent-wrap");
+    var chips = $("recent-chips");
+    if (!arr.length) { wrap.hidden = true; return; }
+    wrap.hidden = false;
+    chips.innerHTML = arr.map(function (a) {
+      return '<button type="button" class="chip" data-asset="' + esc(a) + '">' + esc(a) + '</button>';
+    }).join("");
+    chips.querySelectorAll(".chip").forEach(function (b) {
+      b.addEventListener("click", function () {
+        $("asset-input").value = b.getAttribute("data-asset");
+        openAsset();
+      });
+    });
+  }
+
+  function showLookup() {
+    document.body.classList.remove("detail");
+    $("view-lookup").hidden = false;
+    $("view-detail").hidden = true;
+    $("h-title").textContent = "Waiver Card";
+    $("h-sub").textContent = "Pull up an asset to view or request waivers.";
+    state.assetId = "";
+  }
+  function showDetail() {
+    document.body.classList.add("detail");
+    $("view-lookup").hidden = true;
+    $("view-detail").hidden = false;
+  }
+
+  async function openAsset() {
+    var raw = $("asset-input").value.trim().toUpperCase();
+    if (!raw) { showToast("Enter an asset id", true); return; }
+    state.assetId = raw;
+    pushRecent(raw);
+    $("h-title").textContent = "Asset " + raw;
+    $("h-sub").textContent = "Loading waivers…";
+    showDetail();
+    try {
+      var r = await fetch("/api/waivers/asset/" + encodeURIComponent(raw), { cache: "no-store" });
+      var j = await r.json();
+      state.waivers = (j && j.waivers) || [];
+      renderDetail();
+    } catch (e) {
+      $("h-sub").textContent = "Could not load waivers.";
+    }
+  }
+
+  function renderDetail() {
+    var ws = state.waivers;
+    var approved = ws.filter(function (w) { return w.status === "approved"; });
+    var pending = ws.filter(function (w) { return w.status === "pending"; });
+    var overdue = approved.filter(function (w) { return w.verifyState === "overdue"; });
+    $("h-sub").textContent = approved.length + " approved · " + pending.length + " pending review";
+    var summaryHtml =
+      '<div><div class="asset">' + esc(state.assetId) + '</div>' +
+      '<div class="stat"><strong>' + approved.length + '</strong> on card · ' +
+      '<strong>' + pending.length + '</strong> pending' +
+      (overdue.length ? ' · <strong style="color:var(--danger)">' + overdue.length + '</strong> overdue verify' : '') +
+      '</div></div>';
+    $("summary").innerHTML = summaryHtml;
+
+    if (!ws.length) {
+      $("wlist").innerHTML =
+        '<div class="empty"><strong>No waivers on file.</strong>' +
+        'Tap "Request waiver" if there is a defect that should be accepted.</div>';
+      return;
+    }
+    $("wlist").innerHTML = ws.map(renderCard).join("");
+    $("wlist").querySelectorAll("[data-verify]").forEach(function (b) {
+      b.addEventListener("click", function () { openVerifyModal(Number(b.getAttribute("data-verify"))); });
+    });
+  }
+
+  function renderCard(w) {
+    var status = w.status;
+    var state = (status === "approved") ? (w.verifyState || "fresh") : status;
+    var pillCls = (status === "pending") ? "pending"
+                : (w.verifyState === "overdue") ? "overdue"
+                : (w.verifyState === "dueSoon") ? "dueSoon" : "approved";
+    var pillTxt = (status === "pending") ? "Pending review"
+                : (w.verifyState === "overdue") ? "Verify overdue"
+                : (w.verifyState === "dueSoon") ? "Verify due soon" : "On card";
+    var subLine = (status === "approved")
+      ? ('Approved by ' + esc(w.reviewedBy || "—") + ' · ' + fmtDate(w.reviewedAtIso) +
+         (w.lastVerifiedAtIso
+            ? (' · Last verified ' + fmtDate(w.lastVerifiedAtIso) + ' by ' + esc(w.lastVerifiedBy || "—"))
+            : ''))
+      : ('Submitted by ' + esc(w.submittedBy) + ' · ' + fmtAge(w.submittedAtIso));
+    var photo = w.hasPhoto
+      ? '<img class="wcard-photo" src="' + esc(w.photoUrl) + '" alt="Defect photo" loading="lazy" />'
+      : '';
+    var actions = (status === "approved")
+      ? ('<div class="wcard-actions">' +
+           '<button type="button" class="btn" data-verify="' + w.id + '">Verify</button>' +
+         '</div>')
+      : '';
+    return '<div class="wcard ' + state + '">' +
+             '<div class="wcard-head">' +
+               '<div class="title">' + esc(w.title) + '</div>' +
+               '<span class="pill ' + pillCls + '">' + esc(pillTxt) + '</span>' +
+             '</div>' +
+             (w.description ? '<div class="wcard-body"><div class="desc">' + esc(w.description) + '</div><div class="meta">' + subLine + '</div></div>'
+                            : '<div class="wcard-body"><div class="meta">' + subLine + '</div></div>') +
+             photo +
+             actions +
+           '</div>';
+  }
+
+  // ---- Submit modal ----
+  function openSubmitModal() {
+    if (!state.assetId) { showToast("Pick an asset first", true); return; }
+    $("submit-asset-line").textContent = "For asset " + state.assetId;
+    $("sub-title").value = "";
+    $("sub-desc").value = "";
+    $("sub-photo").value = "";
+    $("sub-photo-name").textContent = "";
+    $("sub-preview").hidden = true;
+    $("sub-err").hidden = true;
+    $("submit-modal").classList.add("open");
+  }
+  function closeSubmitModal() { $("submit-modal").classList.remove("open"); }
+  $("new-waiver-btn").addEventListener("click", openSubmitModal);
+  $("sub-cancel").addEventListener("click", closeSubmitModal);
+  $("sub-photo").addEventListener("change", function () {
+    var f = $("sub-photo").files && $("sub-photo").files[0];
+    if (!f) { $("sub-preview").hidden = true; $("sub-photo-name").textContent = ""; return; }
+    $("sub-photo-name").textContent = f.name + " (" + Math.round(f.size / 1024) + " KB)";
+    var url = URL.createObjectURL(f);
+    $("sub-preview").src = url;
+    $("sub-preview").hidden = false;
+  });
+  $("sub-submit").addEventListener("click", async function () {
+    var name = readName();
+    if (!name) { $("sub-err").textContent = "Enter your name on the lookup screen first."; $("sub-err").hidden = false; return; }
+    rememberName(name);
+    var title = $("sub-title").value.trim();
+    if (!title) { $("sub-err").textContent = "Title is required."; $("sub-err").hidden = false; return; }
+    var photo = $("sub-photo").files && $("sub-photo").files[0];
+    if (!photo) { $("sub-err").textContent = "Photo is required for a waiver request."; $("sub-err").hidden = false; return; }
+    var fd = new FormData();
+    fd.append("assetId", state.assetId);
+    fd.append("title", title);
+    fd.append("description", $("sub-desc").value.trim());
+    fd.append("submittedBy", name);
+    fd.append("photo", photo);
+    $("sub-submit").disabled = true;
+    try {
+      var r = await fetch("/api/waivers", { method: "POST", body: fd });
+      var j = await r.json();
+      if (!r.ok) throw new Error((j && j.error) || ("HTTP " + r.status));
+      closeSubmitModal();
+      showToast("Submitted — pending management approval");
+      await openAsset();
+    } catch (e) {
+      $("sub-err").textContent = "Submit failed: " + (e.message || e);
+      $("sub-err").hidden = false;
+    } finally {
+      $("sub-submit").disabled = false;
+    }
+  });
+
+  // ---- Verify modal ----
+  function openVerifyModal(id) {
+    state.pendingActionId = id;
+    var w = state.waivers.find(function (x) { return x.id === id; });
+    $("verify-line").textContent = w ? ('"' + w.title + '"') : "";
+    $("verify-name").value = readName();
+    $("verify-note").value = "";
+    $("verify-err").hidden = true;
+    $("verify-modal").classList.add("open");
+  }
+  function closeVerifyModal() { $("verify-modal").classList.remove("open"); state.pendingActionId = null; }
+  $("verify-cancel").addEventListener("click", closeVerifyModal);
+  $("verify-confirm").addEventListener("click", async function () {
+    var name = $("verify-name").value.trim();
+    if (!name) { $("verify-err").textContent = "Name is required."; $("verify-err").hidden = false; return; }
+    rememberName(name);
+    var id = state.pendingActionId;
+    if (!id) return;
+    $("verify-confirm").disabled = true;
+    try {
+      var r = await fetch("/api/waivers/" + id + "/verify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ by: name, note: $("verify-note").value.trim(), kind: "annual" }),
+      });
+      var j = await r.json();
+      if (!r.ok) throw new Error((j && j.error) || ("HTTP " + r.status));
+      closeVerifyModal();
+      showToast("Verified — thanks " + name.split(" ")[0]);
+      await openAsset();
+    } catch (e) {
+      $("verify-err").textContent = "Failed: " + (e.message || e);
+      $("verify-err").hidden = false;
+    } finally {
+      $("verify-confirm").disabled = false;
+    }
+  });
+
+  // ---- Header back ----
+  $("back-btn").addEventListener("click", function () { showLookup(); });
+
+  // ---- Lookup binding ----
+  $("lookup-btn").addEventListener("click", openAsset);
+  $("asset-input").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") { e.preventDefault(); openAsset(); }
+  });
+  $("name-input").addEventListener("change", function () { rememberName($("name-input").value.trim()); });
+
+  // ---- Init ----
+  $("name-input").value = localStorage.getItem(NAME_KEY) || "";
+  renderRecent();
+  // Allow ?asset=M-1234 deep link from desktop "Open in mobile" buttons.
+  var hashParams = new URLSearchParams(location.search);
+  var deep = hashParams.get("asset");
+  if (deep) { $("asset-input").value = deep; openAsset(); }
+})();
+</script>
+</body>
+</html>`;
+}
+
+/**
+ * Server-rendered, print-friendly waiver card for one vehicle.
+ *
+ * The card is sized so a single sheet of letter paper can be folded once
+ * (or trimmed) and tucked behind the visor. We deliberately don't show
+ * pending or rejected waivers — only items management has approved are
+ * "live" on the card.
+ *
+ * The page auto-opens the print dialog on load so the desktop "Print"
+ * button is one click → Cmd/Ctrl+P. Suppress on `?noprint=1`.
+ */
+function renderWaiverPrintCardHtml(assetId: string, waivers: Waiver[]): string {
+  const today = new Date().toISOString().slice(0, 10);
+  const escHtml = (s: string) =>
+    String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  const fmtDate = (iso: string) => {
+    if (!iso) return "—";
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return "—";
+    return d.toISOString().slice(0, 10);
+  };
+  const rows = waivers
+    .map((w, i) => {
+      const verifyState =
+        w.verifyState === "overdue" ? "overdue" :
+        w.verifyState === "dueSoon" ? "due-soon" : "fresh";
+      const lastVerifiedTxt = w.lastVerifiedAtIso
+        ? `${fmtDate(w.lastVerifiedAtIso)} by ${escHtml(w.lastVerifiedBy || "—")}`
+        : `${fmtDate(w.reviewedAtIso)} (initial approval)`;
+      return `
+        <article class="row ${verifyState}">
+          <div class="num">${i + 1}</div>
+          <div class="body">
+            <div class="head">
+              <div class="title">${escHtml(w.title)}</div>
+              <div class="approved-by">Approved ${fmtDate(w.reviewedAtIso)} · ${escHtml(w.reviewedBy || "—")}</div>
+            </div>
+            ${w.description ? `<div class="desc">${escHtml(w.description)}</div>` : ""}
+            <div class="footline">
+              <div><strong>Last verified:</strong> ${lastVerifiedTxt}</div>
+              <div class="next-verify-line">Next verify due by:
+                <span class="due-line"></span>
+              </div>
+            </div>
+            <div class="sig-row">
+              <div class="sig"><span class="lbl">Re-verified by</span></div>
+              <div class="sig"><span class="lbl">Date</span></div>
+            </div>
+          </div>
+        </article>`;
+    })
+    .join("");
+  const empty = waivers.length === 0
+    ? `<div class="empty">No approved waivers on file for this vehicle.</div>`
+    : "";
+  return `<!doctype html>
+<html lang="en"><head>
+  <meta charset="utf-8" />
+  <title>Waiver Card · ${escHtml(assetId)}</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: #fff; color: #111;
+                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    body { padding: 24px; }
+    .page-head {
+      border-bottom: 2px solid #111; padding-bottom: 8px; margin-bottom: 14px;
+      display: flex; align-items: flex-end; justify-content: space-between; gap: 12px;
+    }
+    .page-head h1 { margin: 0; font-size: 1.6rem; letter-spacing: 0.02em; }
+    .page-head .asset {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 1.7rem; font-weight: 700; letter-spacing: -0.01em;
+    }
+    .page-head .meta { font-size: 0.85rem; color: #444; text-align: right; }
+    .lead {
+      font-size: 0.85rem; color: #333; margin-bottom: 14px;
+      border: 1px solid #ccc; padding: 8px 10px; border-radius: 4px; background: #fafafa;
+    }
+    .row {
+      display: flex; gap: 14px; padding: 12px 12px;
+      border: 1px solid #888; border-radius: 6px;
+      margin-bottom: 10px; page-break-inside: avoid;
+      background: #fff;
+    }
+    .row.overdue { border-color: #b00; background: #fff5f5; }
+    .row.due-soon { border-color: #b08000; background: #fffbe6; }
+    .num {
+      font-size: 1.4rem; font-weight: 700; color: #111;
+      width: 36px; flex: 0 0 36px; text-align: center;
+      border-right: 1px solid #ccc; padding-right: 12px;
+    }
+    .body { flex: 1; min-width: 0; }
+    .head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+    .title { font-size: 1.05rem; font-weight: 600; }
+    .approved-by { font-size: 0.78rem; color: #555; white-space: nowrap; }
+    .desc { font-size: 0.9rem; margin: 4px 0 8px; white-space: pre-wrap; }
+    .footline {
+      display: flex; gap: 24px; flex-wrap: wrap;
+      font-size: 0.82rem; color: #333; margin-bottom: 8px;
+    }
+    .due-line {
+      display: inline-block; min-width: 110px;
+      border-bottom: 1px solid #888; padding: 0 4px;
+    }
+    .sig-row { display: flex; gap: 18px; margin-top: 4px; }
+    .sig {
+      flex: 1; border-bottom: 1px solid #888; height: 28px;
+      position: relative;
+    }
+    .sig .lbl {
+      position: absolute; bottom: -14px; left: 0;
+      font-size: 0.7rem; color: #666; text-transform: uppercase; letter-spacing: 0.06em;
+    }
+    .empty {
+      padding: 36px; text-align: center; border: 1px dashed #999; border-radius: 8px;
+      color: #555;
+    }
+    .footer {
+      margin-top: 24px; padding-top: 10px; border-top: 1px solid #ccc;
+      font-size: 0.72rem; color: #666; text-align: center;
+    }
+    @page { size: letter; margin: 0.5in; }
+    @media print {
+      body { padding: 0; }
+      .noprint { display: none !important; }
+    }
+    .noprint {
+      position: fixed; top: 8px; right: 8px;
+      background: #111; color: #fff; border: 0; border-radius: 6px;
+      padding: 8px 14px; font-size: 0.85rem; cursor: pointer;
+    }
+  </style>
+</head><body>
+  <button class="noprint" onclick="window.print()">Print</button>
+  <div class="page-head">
+    <div>
+      <h1>Vehicle Waiver Card</h1>
+      <div class="asset">Asset ${escHtml(assetId)}</div>
+    </div>
+    <div class="meta">
+      Printed ${today}<br />
+      ${waivers.length} approved waiver${waivers.length === 1 ? "" : "s"}
+    </div>
+  </div>
+  <div class="lead">
+    These items have been formally accepted by management and do <strong>not</strong> need to be repaired
+    on the next maintenance visit. They <strong>must</strong> be re-verified at least annually — sign and
+    date the line below each entry when you re-confirm. If a defect changes (gets worse, or is no longer
+    present), open a new request from the mobile app instead of overwriting this card.
+  </div>
+  ${rows}
+  ${empty}
+  <div class="footer">Generated by Vehicle ETIC dashboard · ${today}</div>
+  <script>
+    if (!new URLSearchParams(location.search).has("noprint")) {
+      setTimeout(function () { window.print(); }, 250);
+    }
+  </script>
+</body></html>`;
+}
+
+/* -------------------- Waiver-card endpoints -------------------- */
+
+/**
+ * GET  /api/waivers/asset/:assetId         → all (approved + pending) for one truck
+ * GET  /api/waivers/asset/:assetId?card=1  → approved only (printable card)
+ */
+async function handleWaiverAssetApi(env: Env, url: URL, assetId: string): Promise<Response> {
+  const approvedOnly = url.searchParams.get("card") === "1";
+  const waivers = await listWaiversForAsset(env, assetId, { approvedOnly });
+  return Response.json({ assetId, waivers }, { headers: cacheHeaders() });
+}
+
+/** GET /api/waivers/pending — management review queue. */
+async function handleWaiverPendingApi(env: Env): Promise<Response> {
+  const waivers = await listPendingWaivers(env);
+  return Response.json({ waivers }, { headers: cacheHeaders() });
+}
+
+/** GET /api/waivers/counts — Map<assetId, {approved,pending,overdueVerify}> for badges. */
+async function handleWaiverCountsApi(env: Env): Promise<Response> {
+  const counts = await getWaiverCounts(env);
+  const out: Record<string, { approved: number; pending: number; overdueVerify: number }> = {};
+  for (const [assetId, c] of counts) out[assetId] = c;
+  return Response.json(
+    { generatedAtIso: new Date().toISOString(), counts: out },
+    { headers: cacheHeaders() },
+  );
+}
+
+/**
+ * POST /api/waivers — submit a new waiver request.
+ * multipart/form-data: assetId, title, description?, submittedBy, photo (file).
+ * Photo is strongly recommended but not strictly required at the API layer
+ * (mobile UI enforces it) — that way an admin can backfill an existing
+ * paper waiver from the desktop without forcing a photo capture.
+ */
+async function handleWaiverSubmitApi(env: Env, request: Request): Promise<Response> {
+  if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+  const ct = request.headers.get("content-type") || "";
+  if (!ct.startsWith("multipart/form-data")) {
+    return Response.json({ error: "expected multipart/form-data" }, { status: 415, headers: cacheHeaders() });
+  }
+  let form: FormData;
+  try {
+    form = await request.formData();
+  } catch (e) {
+    return Response.json(
+      { error: "could not parse form: " + (e instanceof Error ? e.message : String(e)) },
+      { status: 400, headers: cacheHeaders() },
+    );
+  }
+  const assetId = String(form.get("assetId") ?? "").trim();
+  const title = String(form.get("title") ?? "").trim();
+  const submittedBy = String(form.get("submittedBy") ?? "").trim();
+  const description = String(form.get("description") ?? "").trim();
+  if (!assetId || !title || !submittedBy) {
+    return Response.json(
+      { error: "assetId, title, and submittedBy are required" },
+      { status: 400, headers: cacheHeaders() },
+    );
+  }
+  const file = form.get("photo");
+  let photo: { body: ArrayBuffer; contentType: string } | undefined;
+  if (file instanceof File && file.size > 0) {
+    const MAX_BYTES = 10 * 1024 * 1024;
+    if (file.size > MAX_BYTES) {
+      return Response.json({ error: "photo too large (max 10MB)" }, { status: 413, headers: cacheHeaders() });
+    }
+    photo = { body: await file.arrayBuffer(), contentType: file.type || "image/jpeg" };
+  }
+  try {
+    const waiver = await submitWaiver(env, { assetId, title, description, submittedBy, photo });
+    return Response.json({ waiver }, { headers: cacheHeaders() });
+  } catch (e) {
+    return Response.json(
+      { error: e instanceof Error ? e.message : String(e) },
+      { status: 400, headers: cacheHeaders() },
+    );
+  }
+}
+
+/** POST /api/waivers/:id/(approve|reject|verify) — JSON body. DELETE /:id also handled. */
+async function handleWaiverActionApi(
+  env: Env,
+  request: Request,
+  id: number,
+  action: "approve" | "reject" | "verify" | "delete",
+): Promise<Response> {
+  if (action === "delete") {
+    if (request.method !== "DELETE" && request.method !== "POST") {
+      return new Response("Method Not Allowed", { status: 405 });
+    }
+    const ok = await deleteWaiver(env, id);
+    return Response.json({ ok }, { headers: cacheHeaders() });
+  }
+  if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+  const body = (await readJsonBody<{
+    by?: string;
+    note?: string;
+    reason?: string;
+    kind?: "annual" | "adhoc";
+  }>(request)) ?? {};
+  try {
+    let waiver: Waiver;
+    if (action === "approve") {
+      waiver = await approveWaiver(env, id, body.by ?? "", body.note);
+    } else if (action === "reject") {
+      waiver = await rejectWaiver(env, id, body.by ?? "", body.reason ?? "");
+    } else {
+      waiver = await verifyWaiver(env, id, body.by ?? "", body.note, body.kind ?? "annual");
+    }
+    return Response.json({ waiver }, { headers: cacheHeaders() });
+  } catch (e) {
+    return Response.json(
+      { error: e instanceof Error ? e.message : String(e) },
+      { status: 400, headers: cacheHeaders() },
+    );
+  }
+}
+
+/** GET /api/waivers/:id/photo — stream from R2. */
+async function handleWaiverPhotoApi(env: Env, id: number): Promise<Response> {
+  const got = await getWaiverPhoto(env, id);
+  if (!got) return new Response("Not Found", { status: 404 });
+  return new Response(got.body, {
+    headers: {
+      "Content-Type": got.contentType,
+      "Cache-Control": "public, max-age=86400, immutable",
+      "Content-Disposition": `inline; filename="waiver-${id}"`,
+    },
+  });
+}
+
+/** GET /api/waivers/:id — single waiver + verification audit log. */
+async function handleWaiverDetailApi(env: Env, id: number): Promise<Response> {
+  const [waiver, verifications] = await Promise.all([
+    getWaiverById(env, id),
+    listWaiverVerifications(env, id),
+  ]);
+  if (!waiver) return new Response("Not Found", { status: 404 });
+  return Response.json({ waiver, verifications }, { headers: cacheHeaders() });
 }
 
 /* -------------------- ETIC live-meeting endpoints -------------------- */
@@ -5892,6 +6857,133 @@ function renderDashboardHtml(): string {
       .yard-head h2, .yard-session-title h2 { font-size: 1.15rem; }
     }
 
+    /* ---- Waivers tab ---- */
+    #panel-waivers .hidden { display: none; }
+    .waivers-wrap { display: flex; flex-direction: column; gap: 14px; max-width: 1200px; margin: 0 auto; }
+    .waivers-head {
+      display: flex; align-items: center; gap: 14px; justify-content: space-between;
+      border-bottom: 1px solid var(--border);
+    }
+    .waivers-subnav { display: flex; gap: 0; }
+    .waivers-sub {
+      background: transparent; border: 0; padding: 12px 14px; cursor: pointer;
+      color: var(--muted); font: inherit; font-weight: 600; font-size: 14px;
+      border-bottom: 2px solid transparent; margin-bottom: -1px;
+    }
+    .waivers-sub:hover { color: var(--text); }
+    .waivers-sub.active { color: var(--text); border-bottom-color: var(--accent); }
+    .waivers-sub .wv-count {
+      display: inline-block; min-width: 18px; text-align: center; padding: 0 6px;
+      background: var(--accent); color: var(--bg); border-radius: 999px; font-size: 11px;
+      margin-left: 6px;
+    }
+    .waivers-sub .wv-count:empty { display: none; }
+    .waivers-actions { display: flex; align-items: center; gap: 8px; padding: 8px 0; }
+
+    .wv-view { display: block; }
+    .wv-empty {
+      padding: 28px; text-align: center; color: var(--muted);
+      background: var(--surface); border: 1px dashed var(--border); border-radius: 12px;
+    }
+    .wv-pending-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 14px; }
+    .wv-pcard {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+      overflow: hidden; display: flex; flex-direction: column;
+    }
+    .wv-pcard .head {
+      padding: 12px 14px; display: flex; gap: 10px; align-items: flex-start;
+      border-bottom: 1px solid var(--border);
+    }
+    .wv-pcard .asset {
+      font-family: var(--font-mono); font-weight: 600; font-size: 1.05rem;
+      letter-spacing: -0.01em;
+    }
+    .wv-pcard .title { font-weight: 600; margin-top: 2px; }
+    .wv-pcard .submitted { color: var(--muted); font-size: 0.78rem; margin-top: 4px; }
+    .wv-pcard .body { padding: 12px 14px; font-size: 0.9rem; color: var(--text-dim); white-space: pre-wrap; min-height: 0; }
+    .wv-pcard img.photo {
+      display: block; width: 100%; max-height: 320px; object-fit: cover;
+      border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
+      background: #000;
+    }
+    .wv-pcard .actions { display: flex; gap: 8px; padding: 10px 12px; background: rgba(255,255,255,0.02); }
+    .wv-pcard .actions button { flex: 1; }
+    .wv-pcard textarea {
+      width: 100%; background: var(--bg2, var(--surface)); color: var(--text);
+      border: 1px solid var(--border); border-radius: 8px; padding: 8px;
+      font-family: inherit; font-size: 0.85rem; resize: vertical; min-height: 56px;
+    }
+    .wv-pcard .review-name {
+      width: 100%; background: var(--bg2, var(--surface)); color: var(--text);
+      border: 1px solid var(--border); border-radius: 8px; padding: 8px;
+      font-size: 0.9rem;
+    }
+    .wv-pcard .review-block { padding: 0 12px 10px; display: flex; flex-direction: column; gap: 6px; }
+    .wv-pcard .review-block label { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+
+    .wv-bv-bar { display: flex; gap: 8px; margin-bottom: 14px; }
+    .wv-bv-bar input {
+      flex: 1; max-width: 320px;
+      background: var(--surface); color: var(--text); border: 1px solid var(--border);
+      border-radius: 10px; padding: 10px 12px; font-size: 1rem;
+      font-variant-numeric: tabular-nums;
+    }
+    .wv-bv-result .vehicle-head {
+      display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+      padding-bottom: 10px; border-bottom: 1px solid var(--border); margin-bottom: 14px;
+    }
+    .wv-bv-result .vehicle-head .asset {
+      font-family: var(--font-mono); font-weight: 700; font-size: 1.5rem; letter-spacing: -0.01em;
+    }
+    .wv-bv-result .vehicle-head .stat { color: var(--muted); font-size: 0.9rem; }
+    .wv-bv-result .vehicle-head .stat strong { color: var(--text); }
+    .wv-bv-result .vehicle-head .print-btn {
+      margin-left: auto;
+    }
+    .wv-bv-list { display: flex; flex-direction: column; gap: 12px; }
+    .wv-bv-card {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+      padding: 14px 16px;
+    }
+    .wv-bv-card.overdue { border-color: rgba(255,138,138,0.4); }
+    .wv-bv-card.dueSoon { border-color: rgba(245,199,84,0.4); }
+    .wv-bv-card.pending { border-color: rgba(192,132,252,0.4); }
+    .wv-bv-card .row1 { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+    .wv-bv-card .row1 .title { font-weight: 600; flex: 1; min-width: 0; }
+    .wv-bv-card .pill {
+      font-size: 0.72rem; padding: 2px 8px; border-radius: 999px;
+      border: 1px solid transparent; white-space: nowrap;
+      text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600;
+    }
+    .wv-bv-card .pill.approved { background: rgba(94,227,151,0.10); color: var(--success); border-color: rgba(94,227,151,0.30); }
+    .wv-bv-card .pill.pending  { background: rgba(192,132,252,0.10); color: #c4a3ff; border-color: rgba(192,132,252,0.35); }
+    .wv-bv-card .pill.overdue  { background: rgba(255,138,138,0.10); color: var(--danger); border-color: rgba(255,138,138,0.40); }
+    .wv-bv-card .pill.dueSoon  { background: rgba(245,199,84,0.10); color: var(--warn); border-color: rgba(245,199,84,0.35); }
+    .wv-bv-card .desc { color: var(--text-dim); font-size: 0.9rem; margin-top: 6px; white-space: pre-wrap; }
+    .wv-bv-card .meta { color: var(--muted); font-size: 0.78rem; margin-top: 8px; display: flex; gap: 14px; flex-wrap: wrap; }
+    .wv-bv-card img.photo {
+      display: block; max-width: 320px; max-height: 220px; object-fit: cover;
+      border-radius: 8px; margin-top: 10px; border: 1px solid var(--border); background: #000;
+    }
+    .wv-bv-card .actions { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
+    .wv-bv-card .verif-log { margin-top: 10px; font-size: 0.78rem; color: var(--muted); border-top: 1px dashed var(--border); padding-top: 8px; }
+    .wv-bv-card .verif-log .v { display: flex; gap: 12px; padding: 2px 0; }
+    .wv-bv-card .verif-log .v .when { font-variant-numeric: tabular-nums; }
+
+    /* Asset-id badge for waiver counts (rides next to sighting badge). */
+    .waiver-badge {
+      display: inline-flex; align-items: center; gap: 4px;
+      font-size: 0.7rem; font-weight: 500;
+      padding: 1px 8px; border-radius: 999px;
+      border: 1px solid transparent;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap; line-height: 1.4;
+      vertical-align: baseline;
+    }
+    .waiver-badge.ok       { background: rgba(94,227,151,0.10); color: #8bd9ae; border-color: rgba(94,227,151,0.25); }
+    .waiver-badge.overdue  { background: rgba(255,138,138,0.12); color: #e69b9b; border-color: rgba(255,138,138,0.35); }
+    .waiver-badge.pending  { background: rgba(192,132,252,0.12); color: #c4a3ff; border-color: rgba(192,132,252,0.30); }
+
     /* ---- Settings tab ---- */
     #panel-settings .hidden { display: none; }
     .settings-wrap { display: flex; flex-direction: column; gap: 18px; max-width: 1100px; margin: 0 auto; }
@@ -6925,7 +8017,8 @@ function renderDashboardHtml(): string {
       align-items: center;
     }
     /* Bump the sighting pill on the presenter so it reads from across the room. */
-    .p-id-strip .sighting-badge {
+    .p-id-strip .sighting-badge,
+    .p-id-strip .waiver-badge {
       font-size: clamp(0.78rem, 0.95vw, 0.95rem);
       padding: 3px 12px;
       border-width: 1px;
@@ -7429,6 +8522,7 @@ function renderDashboardHtml(): string {
       <button type="button" id="tab-mel">MEL</button>
       <button type="button" id="tab-meeting">ETIC Meeting</button>
       <button type="button" id="tab-yard">Yard Check</button>
+      <button type="button" id="tab-waivers">Waivers</button>
       <button type="button" id="tab-ask">Ask AI</button>
       <button type="button" id="tab-settings">Settings</button>
     </nav>
@@ -8025,6 +9119,40 @@ function renderDashboardHtml(): string {
         </div>
       </div>
 
+      <!-- Waivers tab: management approval queue + per-vehicle lookup +
+           printable card. Mirrors the Yard Check tab's structure (subnav +
+           swap views). The mobile mechanic UI lives at /waivers. -->
+      <div id="panel-waivers" class="hidden">
+        <div class="waivers-wrap">
+          <header class="waivers-head">
+            <nav class="waivers-subnav" id="waivers-subnav" aria-label="Waiver views">
+              <button type="button" class="waivers-sub active" data-wv-sub="pending">Pending review <span class="wv-count" id="wv-pending-count"></span></button>
+              <button type="button" class="waivers-sub" data-wv-sub="byvehicle">By vehicle</button>
+            </nav>
+            <div class="waivers-actions">
+              <a class="ghost" href="/waivers" target="_blank" rel="noopener" title="Open the mobile waiver app in a new tab">Open mobile app ↗</a>
+              <button type="button" class="ghost" id="wv-refresh">Refresh</button>
+            </div>
+          </header>
+
+          <section id="wv-view-pending" class="wv-view">
+            <div class="wv-empty" id="wv-pending-empty" hidden>No waivers waiting for review.</div>
+            <div class="wv-pending-list" id="wv-pending-list"></div>
+          </section>
+
+          <section id="wv-view-byvehicle" class="wv-view" hidden>
+            <div class="wv-bv-bar">
+              <input type="text" id="wv-bv-input" placeholder="Asset ID (e.g. M-1234)"
+                     autocomplete="off" autocapitalize="characters" spellcheck="false" />
+              <button type="button" class="ghost" id="wv-bv-go">Look up</button>
+            </div>
+            <div class="wv-bv-result" id="wv-bv-result">
+              <p class="hint" style="color:var(--muted)">Type an asset id to view its current waiver card and verification history.</p>
+            </div>
+          </section>
+        </div>
+      </div>
+
       <!-- AI assistant panel (full-tab view). The same chat state is shared
            with the floating bubble so the user can switch between modes. -->
       <div id="panel-ask" class="hidden">
@@ -8327,6 +9455,70 @@ function renderDashboardHtml(): string {
         "<span class='sighting-text'>" + locTxt + sep + esc(age) + "</span></span>";
     }
 
+    /* =========================================================================
+       WAIVER COUNT BADGES (sightings-style)
+       Single in-memory map of assetId → {approved,pending,overdueVerify}
+       populated by one fetch of /api/waivers/counts on tab enter (or a
+       refresh action). Any renderer with an asset id in scope can call
+       renderWaiverBadge() to drop a tiny pill showing how many waivers
+       are on the card and whether any are past due for re-verification.
+       ====================================================================== */
+    var waiverCountState = {
+      map: new Map(),
+      loadedAt: 0,
+      inflight: null,
+    };
+    var WAIVER_COUNT_TTL_MS = 60 * 1000;
+
+    function loadWaiverCounts(force) {
+      var now = Date.now();
+      if (!force && waiverCountState.loadedAt && (now - waiverCountState.loadedAt) < WAIVER_COUNT_TTL_MS) {
+        return Promise.resolve(waiverCountState.map);
+      }
+      if (waiverCountState.inflight) return waiverCountState.inflight;
+      var url = "/api/waivers/counts" + (force ? ("?_=" + now) : "");
+      waiverCountState.inflight = fetch(url, force ? { cache: "no-store" } : undefined)
+        .then(function (r) { return r.ok ? r.json() : { counts: {} }; })
+        .then(function (data) {
+          var src = (data && data.counts) || {};
+          var m = new Map();
+          for (var k in src) if (Object.prototype.hasOwnProperty.call(src, k)) m.set(k, src[k]);
+          waiverCountState.map = m;
+          waiverCountState.loadedAt = Date.now();
+          return m;
+        })
+        .catch(function () { return waiverCountState.map; })
+        .then(function (m) { waiverCountState.inflight = null; return m; });
+      return waiverCountState.inflight;
+    }
+
+    /**
+     * Tiny pill: "✓ 2 waivers" (green) / "! verify overdue" (red) /
+     * "… 1 pending" (purple). Returns "" if asset has no waivers so
+     * callers can concatenate freely without nullish chips.
+     */
+    function renderWaiverBadge(assetId) {
+      if (!assetId) return "";
+      var c = waiverCountState.map.get(assetId);
+      if (!c) return "";
+      if (c.overdueVerify > 0) {
+        return "<span class='waiver-badge overdue' title='" +
+          c.overdueVerify + " waiver(s) overdue annual re-verification'>" +
+          "\u26A0 " + c.overdueVerify + " verify due</span>";
+      }
+      if (c.approved > 0) {
+        return "<span class='waiver-badge ok' title='" +
+          c.approved + " approved waiver(s) on the card'>" +
+          "\u2713 " + c.approved + " waiver" + (c.approved === 1 ? "" : "s") + "</span>";
+      }
+      if (c.pending > 0) {
+        return "<span class='waiver-badge pending' title='" +
+          c.pending + " waiver request(s) pending management review'>" +
+          "\u2026 " + c.pending + " pending</span>";
+      }
+      return "";
+    }
+
     function fmtKpi(n) {
       if (n === null || n === undefined || typeof n !== "number") return "—";
       return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
@@ -8471,10 +9663,12 @@ function renderDashboardHtml(): string {
     async function loadWatchForDate(dateKey, opts) {
       if (!dateKey) return [];
       const force = !!(opts && opts.force);
-      // Always kick off a sightings refresh in parallel — every place watch
-      // rows render also wants the asset's last-yard-sighting badge, and the
-      // sightings cache has its own TTL so this is a no-op when warm.
+      // Always kick off a sightings + waiver-counts refresh in parallel —
+      // every place watch rows render also wants the asset's last-sighting
+      // and waiver-card badges. Both caches have their own TTL so these
+      // are no-ops when warm.
       loadSightings(force);
+      loadWaiverCounts(force);
       if (!force && watchCacheByDate.has(dateKey)) return watchCacheByDate.get(dateKey);
       // Use scope=snapshot (default) so the list shows ONLY the work orders
       // that were actually present in the .xlsx for this date. scope=all would
@@ -9114,6 +10308,7 @@ function renderDashboardHtml(): string {
       const melBtn = document.getElementById("tab-mel");
       const meetBtn = document.getElementById("tab-meeting");
       const yardBtn = document.getElementById("tab-yard");
+      const wvBtn = document.getElementById("tab-waivers");
       const askBtn = document.getElementById("tab-ask");
       const setBtn = document.getElementById("tab-settings");
       const panelSnap = document.getElementById("panel-snapshot");
@@ -9121,6 +10316,7 @@ function renderDashboardHtml(): string {
       const panelMel = document.getElementById("panel-mel");
       const panelMeet = document.getElementById("panel-meeting");
       const panelYard = document.getElementById("panel-yard");
+      const panelWv = document.getElementById("panel-waivers");
       const panelAsk = document.getElementById("panel-ask");
       const panelSet = document.getElementById("panel-settings");
       const brandSub = document.getElementById("brand-sub");
@@ -9129,14 +10325,16 @@ function renderDashboardHtml(): string {
       const isMel = which === "mel";
       const isMeet = which === "meeting";
       const isYard = which === "yard";
+      const isWv = which === "waivers";
       const isAsk = which === "ask";
       const isSet = which === "settings";
-      const isSnap = !isWo && !isMel && !isMeet && !isYard && !isAsk && !isSet;
+      const isSnap = !isWo && !isMel && !isMeet && !isYard && !isWv && !isAsk && !isSet;
       snapBtn.classList.toggle("active", isSnap);
       woBtn.classList.toggle("active", isWo);
       if (melBtn) melBtn.classList.toggle("active", isMel);
       if (meetBtn) meetBtn.classList.toggle("active", isMeet);
       if (yardBtn) yardBtn.classList.toggle("active", isYard);
+      if (wvBtn) wvBtn.classList.toggle("active", isWv);
       if (askBtn) askBtn.classList.toggle("active", isAsk);
       if (setBtn) setBtn.classList.toggle("active", isSet);
       panelSnap.classList.toggle("hidden", !isSnap);
@@ -9144,6 +10342,7 @@ function renderDashboardHtml(): string {
       if (panelMel) panelMel.classList.toggle("hidden", !isMel);
       if (panelMeet) panelMeet.classList.toggle("hidden", !isMeet);
       if (panelYard) panelYard.classList.toggle("hidden", !isYard);
+      if (panelWv) panelWv.classList.toggle("hidden", !isWv);
       if (panelAsk) panelAsk.classList.toggle("hidden", !isAsk);
       if (panelSet) panelSet.classList.toggle("hidden", !isSet);
       if (fab) fab.classList.toggle("hidden", isAsk);
@@ -9155,6 +10354,8 @@ function renderDashboardHtml(): string {
         ? "Run a live ETIC meeting. Timer, notes, due-outs, and auto-generated minutes."
         : isYard
         ? "Walk the lot with your phone. Confirm each asset's location and log discrepancies."
+        : isWv
+        ? "Approve mechanic-submitted waivers, look up a vehicle's card, and print it."
         : isAsk
         ? "Ask plain-English questions about your fleet data."
         : isSet
@@ -9169,6 +10370,8 @@ function renderDashboardHtml(): string {
         onEnterMeetingTab();
       } else if (isYard) {
         onEnterYardTab();
+      } else if (isWv) {
+        onEnterWaiversTab();
       } else if (isAsk) {
         askRenderInto("ask-log-tab");
         setTimeout(function () { const t = document.getElementById("ask-input-tab"); if (t) t.focus(); }, 30);
@@ -9406,13 +10609,14 @@ function renderDashboardHtml(): string {
           "<div class='top-line'><span class='asset'>" + esc(r.assetId || "—") + "</span>" +
           (r.partsStatus ? "<span class='asset'>" + esc(r.partsStatus) + "</span>" : "<span></span>") +
           "</div>" +
-          // Sighting pill rides the same wrap-friendly meta row as "Opened ..."
-          // — keeping it off the asset/parts row prevents the badge from
-          // colliding with long parts-status text on narrow cards.
+          // Sighting + waiver pills ride the same wrap-friendly meta row as
+          // "Opened ..." — keeping them off the asset/parts row prevents the
+          // badges from colliding with long parts-status text on narrow cards.
           ((openedLine || r.assetId) ? (
             "<div class='wo-meta-line'>" +
               (openedLine || "") +
               renderSightingBadge(r.assetId) +
+              renderWaiverBadge(r.assetId) +
             "</div>"
           ) : "") +
           reasonChip +
@@ -9439,11 +10643,13 @@ function renderDashboardHtml(): string {
       const meta = document.getElementById("wo-list-meta");
       meta.textContent = "Loading…";
       try {
-        // Pull WO rows + last-yard-sighting map in parallel so the asset id
-        // and its current physical location render together on first paint.
+        // Pull WO rows + last-yard-sighting map + waiver counts in parallel
+        // so every asset-id badge (location + waiver card) renders together
+        // on first paint instead of popping in a tick later.
         const [rows] = await Promise.all([
           loadWatchForDate(dateKey, opts),
           loadSightings(!!(opts && opts.force)),
+          loadWaiverCounts(!!(opts && opts.force)),
         ]);
         renderWoList(rows);
       } catch (e) {
@@ -9531,7 +10737,8 @@ function renderDashboardHtml(): string {
       if (r.assetId) {
         subParts.push(
           "<span class='wo-hero-asset'>" + esc(r.assetId) + "</span>" +
-          " " + renderSightingBadge(r.assetId)
+          " " + renderSightingBadge(r.assetId) +
+          " " + renderWaiverBadge(r.assetId)
         );
       }
       const openedTxt = r.establishedDateIso ? fmtKeyShort(r.establishedDateIso) : fmtMaybeDate(r.establishedDate || "");
@@ -9906,10 +11113,14 @@ function renderDashboardHtml(): string {
         el.classList.toggle("active", el.getAttribute("data-wo") === woId);
       });
       try {
-        // Pull the WO + the global sightings map in parallel so the hero's
-        // "Last seen at <lot> · Nd ago" pill renders on first paint instead
-        // of popping in a tick later.
-        const [data] = await Promise.all([fetchWoById(woId, asOf), loadSightings()]);
+        // Pull the WO + the sightings + waiver-counts maps in parallel so
+        // the hero's "Last seen at <lot> · Nd ago" pill and the waiver-card
+        // pill both render on first paint instead of popping in a tick later.
+        const [data] = await Promise.all([
+          fetchWoById(woId, asOf),
+          loadSightings(),
+          loadWaiverCounts(),
+        ]);
         renderWoDetailFull(data);
       } catch (e) {
         const st = document.getElementById("wo-lookup-status");
@@ -10616,6 +11827,8 @@ function renderDashboardHtml(): string {
       if (meetTabBtn) meetTabBtn.addEventListener("click", function () { setMainTab("meeting"); });
       const yardTabBtn = document.getElementById("tab-yard");
       if (yardTabBtn) yardTabBtn.addEventListener("click", function () { setMainTab("yard"); });
+      const wvTabBtn = document.getElementById("tab-waivers");
+      if (wvTabBtn) wvTabBtn.addEventListener("click", function () { setMainTab("waivers"); });
       const askTabBtn = document.getElementById("tab-ask");
       if (askTabBtn) askTabBtn.addEventListener("click", function () { setMainTab("ask"); });
       const setTabBtn = document.getElementById("tab-settings");
@@ -12176,7 +13389,7 @@ function renderDashboardHtml(): string {
       }
       let wos = [];
       try {
-        const [_wos] = await Promise.all([loadWatchForDate(asOf), loadSightings()]);
+        const [_wos] = await Promise.all([loadWatchForDate(asOf), loadSightings(), loadWaiverCounts()]);
         wos = _wos;
       } catch (e) {
         if (meta) meta.textContent = "failed to load";
@@ -12215,6 +13428,7 @@ function renderDashboardHtml(): string {
             "<span class='wo-id'>" + esc(w.workOrderId || "—") + "</span>" +
             "<span class='wo-asset'>" + esc(w.assetId || "—") + "</span>" +
             renderSightingBadge(w.assetId, { compact: true }) +
+            renderWaiverBadge(w.assetId) +
             "<span class='wo-tier " + esc(tier) + "'>" + esc(tierTxt) + "</span>" +
             "<span class='wo-arrow' aria-hidden='true'>›</span>" +
           "</div>" +
@@ -12570,6 +13784,312 @@ function renderDashboardHtml(): string {
       yardFmWireOnce();
       const sub = yardFmState.subTab || "findings";
       yardActivateSub(sub);
+    }
+
+    /* ========================================================================
+       WAIVERS TAB (desktop-only)
+       Approval queue + per-vehicle lookup + print + verify.
+       Mobile mechanic UI lives at /waivers and is a separate document.
+       ====================================================================== */
+    const waiversState = {
+      wired: false,
+      subTab: "pending",          // "pending" | "byvehicle"
+      pending: [],
+      bv: { assetId: "", waivers: [], verifications: {} },
+    };
+
+    function waiversWireOnce() {
+      if (waiversState.wired) return;
+      waiversState.wired = true;
+      const sub = document.getElementById("waivers-subnav");
+      if (sub) sub.addEventListener("click", function (e) {
+        const t = e.target.closest("[data-wv-sub]");
+        if (!t) return;
+        const which = t.getAttribute("data-wv-sub");
+        waiversState.subTab = which;
+        document.querySelectorAll(".waivers-sub").forEach(function (b) {
+          b.classList.toggle("active", b.getAttribute("data-wv-sub") === which);
+        });
+        document.getElementById("wv-view-pending").hidden = which !== "pending";
+        document.getElementById("wv-view-byvehicle").hidden = which !== "byvehicle";
+        if (which === "pending") loadWaiverPending();
+      });
+      const refresh = document.getElementById("wv-refresh");
+      if (refresh) refresh.addEventListener("click", function () {
+        if (waiversState.subTab === "pending") loadWaiverPending();
+        else if (waiversState.bv.assetId) loadWaiverByVehicle(waiversState.bv.assetId);
+        // Counts feed the badges everywhere — keep them fresh.
+        loadWaiverCounts(true);
+      });
+      const bvInput = document.getElementById("wv-bv-input");
+      const bvGo = document.getElementById("wv-bv-go");
+      if (bvGo) bvGo.addEventListener("click", function () {
+        const v = (bvInput.value || "").trim().toUpperCase();
+        if (v) loadWaiverByVehicle(v);
+      });
+      if (bvInput) bvInput.addEventListener("keydown", function (ev) {
+        if (ev.key === "Enter") {
+          ev.preventDefault();
+          const v = (bvInput.value || "").trim().toUpperCase();
+          if (v) loadWaiverByVehicle(v);
+        }
+      });
+    }
+
+    function onEnterWaiversTab() {
+      waiversWireOnce();
+      // Always pull pending so the badge count on the subnav is current,
+      // even if the user lands on the byvehicle tab first.
+      loadWaiverPending();
+    }
+
+    async function loadWaiverPending() {
+      const list = document.getElementById("wv-pending-list");
+      const empty = document.getElementById("wv-pending-empty");
+      const countEl = document.getElementById("wv-pending-count");
+      list.innerHTML = "<div class='hint' style='color:var(--muted);padding:14px'>Loading…</div>";
+      try {
+        const r = await fetch("/api/waivers/pending", { cache: "no-store" });
+        const j = await r.json();
+        const ws = (j && j.waivers) || [];
+        waiversState.pending = ws;
+        countEl.textContent = ws.length ? String(ws.length) : "";
+        if (!ws.length) {
+          list.innerHTML = "";
+          empty.hidden = false;
+          return;
+        }
+        empty.hidden = true;
+        list.innerHTML = ws.map(renderPendingCard).join("");
+        wirePendingCardActions();
+      } catch (e) {
+        list.innerHTML = "<div class='wv-empty'>Could not load pending waivers.</div>";
+      }
+    }
+
+    function renderPendingCard(w) {
+      const photo = w.hasPhoto
+        ? "<img class='photo' src='" + esc(w.photoUrl) + "' alt='Defect photo' />"
+        : "";
+      const desc = w.description
+        ? "<div class='body'>" + esc(w.description) + "</div>"
+        : "";
+      return (
+        "<article class='wv-pcard' data-wid='" + w.id + "'>" +
+          "<div class='head'>" +
+            "<div style='flex:1;min-width:0'>" +
+              "<div class='asset'>" + esc(w.assetId) + "</div>" +
+              "<div class='title'>" + esc(w.title) + "</div>" +
+              "<div class='submitted'>Submitted by " + esc(w.submittedBy) + " · " +
+                fmtKeyShort(w.submittedAtIso.slice(0,10)) + "</div>" +
+            "</div>" +
+          "</div>" +
+          desc +
+          photo +
+          "<div class='review-block'>" +
+            "<label>Your name (required)</label>" +
+            "<input class='review-name' data-role='name' placeholder='First Last' />" +
+            "<label>Note (optional for approve, required for reject)</label>" +
+            "<textarea data-role='note' placeholder='e.g. doesn't affect serviceability per shop chief'></textarea>" +
+          "</div>" +
+          "<div class='actions'>" +
+            "<button type='button' class='btn-approve' data-act='approve'>Approve</button>" +
+            "<button type='button' class='ghost' data-act='reject'>Reject</button>" +
+          "</div>" +
+        "</article>"
+      );
+    }
+
+    function wirePendingCardActions() {
+      const cards = document.querySelectorAll("#wv-pending-list .wv-pcard");
+      cards.forEach(function (card) {
+        const id = Number(card.getAttribute("data-wid"));
+        const nameInput = card.querySelector("[data-role='name']");
+        const noteInput = card.querySelector("[data-role='note']");
+        // Pre-fill from a tiny localStorage cache so the manager doesn't
+        // type their name on every approval click.
+        const cachedName = localStorage.getItem("waiver.reviewerName") || "";
+        if (cachedName) nameInput.value = cachedName;
+        card.querySelectorAll("[data-act]").forEach(function (b) {
+          b.addEventListener("click", async function () {
+            const act = b.getAttribute("data-act");
+            const by = (nameInput.value || "").trim();
+            const note = (noteInput.value || "").trim();
+            if (!by) { nameInput.focus(); nameInput.style.borderColor = "var(--danger)"; return; }
+            if (act === "reject" && !note) { noteInput.focus(); noteInput.style.borderColor = "var(--danger)"; return; }
+            localStorage.setItem("waiver.reviewerName", by);
+            b.disabled = true;
+            try {
+              const body = act === "reject" ? { by: by, reason: note } : { by: by, note: note };
+              const r = await fetch("/api/waivers/" + id + "/" + act, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+              });
+              const j = await r.json();
+              if (!r.ok) throw new Error((j && j.error) || ("HTTP " + r.status));
+              card.style.opacity = "0.4";
+              setTimeout(function () { loadWaiverPending(); loadWaiverCounts(true); }, 200);
+            } catch (e) {
+              alert((act === "approve" ? "Approve" : "Reject") + " failed: " + (e.message || e));
+              b.disabled = false;
+            }
+          });
+        });
+      });
+    }
+
+    async function loadWaiverByVehicle(assetId) {
+      waiversState.bv.assetId = assetId;
+      const wrap = document.getElementById("wv-bv-result");
+      wrap.innerHTML = "<div class='hint' style='color:var(--muted)'>Loading waivers for " + esc(assetId) + "…</div>";
+      try {
+        const r = await fetch("/api/waivers/asset/" + encodeURIComponent(assetId), { cache: "no-store" });
+        const j = await r.json();
+        const ws = (j && j.waivers) || [];
+        waiversState.bv.waivers = ws;
+        // Pull verification logs in parallel for any approved waivers so the
+        // manager can see a full audit trail without an extra click.
+        const approved = ws.filter(function (w) { return w.status === "approved"; });
+        const verifs = await Promise.all(approved.map(function (w) {
+          return fetch("/api/waivers/" + w.id, { cache: "no-store" })
+            .then(function (rr) { return rr.json(); })
+            .then(function (jj) { return [w.id, (jj && jj.verifications) || []]; })
+            .catch(function () { return [w.id, []]; });
+        }));
+        const verMap = {};
+        verifs.forEach(function (e) { verMap[e[0]] = e[1]; });
+        waiversState.bv.verifications = verMap;
+        renderWaiverByVehicle();
+      } catch (e) {
+        wrap.innerHTML = "<div class='wv-empty'>Could not load waivers for " + esc(assetId) + ".</div>";
+      }
+    }
+
+    function renderWaiverByVehicle() {
+      const wrap = document.getElementById("wv-bv-result");
+      const ws = waiversState.bv.waivers;
+      const assetId = waiversState.bv.assetId;
+      const approved = ws.filter(function (w) { return w.status === "approved"; });
+      const pending = ws.filter(function (w) { return w.status === "pending"; });
+      const overdue = approved.filter(function (w) { return w.verifyState === "overdue"; }).length;
+      const printUrl = "/waivers/card/" + encodeURIComponent(assetId) + "/print";
+      const head =
+        "<div class='vehicle-head'>" +
+          "<div class='asset'>" + esc(assetId) + "</div>" +
+          "<div class='stat'><strong>" + approved.length + "</strong> on card · " +
+            "<strong>" + pending.length + "</strong> pending" +
+            (overdue ? " · <strong style='color:var(--danger)'>" + overdue + "</strong> overdue verify" : "") +
+          "</div>" +
+          "<button type='button' class='ghost print-btn' data-print='" + esc(printUrl) + "' " +
+            (approved.length ? "" : "disabled title='No approved waivers to print'") +
+            ">🖨 Print waiver card</button>" +
+        "</div>";
+      const list = ws.length
+        ? "<div class='wv-bv-list'>" + ws.map(renderBvCard).join("") + "</div>"
+        : "<div class='wv-empty'>No waivers (approved or pending) on file for this vehicle.</div>";
+      wrap.innerHTML = head + list;
+      const pb = wrap.querySelector("[data-print]");
+      if (pb) pb.addEventListener("click", function () {
+        window.open(pb.getAttribute("data-print"), "_blank", "noopener");
+      });
+      wrap.querySelectorAll("[data-verify]").forEach(function (b) {
+        b.addEventListener("click", function () { promptVerify(Number(b.getAttribute("data-verify"))); });
+      });
+      wrap.querySelectorAll("[data-delete]").forEach(function (b) {
+        b.addEventListener("click", function () { promptDelete(Number(b.getAttribute("data-delete"))); });
+      });
+    }
+
+    function renderBvCard(w) {
+      const status = w.status;
+      const stateCls = status === "approved" ? (w.verifyState || "fresh")
+                     : status === "pending" ? "pending" : "rejected";
+      const pillCls = status === "pending" ? "pending"
+                    : w.verifyState === "overdue" ? "overdue"
+                    : w.verifyState === "dueSoon" ? "dueSoon" : "approved";
+      const pillTxt = status === "pending" ? "Pending review"
+                    : w.verifyState === "overdue" ? "Verify overdue"
+                    : w.verifyState === "dueSoon" ? "Verify due soon" : "On card";
+      const photo = w.hasPhoto
+        ? "<img class='photo' src='" + esc(w.photoUrl) + "' alt='Defect photo' />"
+        : "";
+      const desc = w.description ? "<div class='desc'>" + esc(w.description) + "</div>" : "";
+      const meta =
+        "<div class='meta'>" +
+          "<span>Submitted " + fmtKeyShort(w.submittedAtIso.slice(0,10)) + " by " + esc(w.submittedBy) + "</span>" +
+          (w.reviewedAtIso ? "<span>Approved " + fmtKeyShort(w.reviewedAtIso.slice(0,10)) + " by " + esc(w.reviewedBy) + "</span>" : "") +
+          (w.lastVerifiedAtIso ? "<span>Last verified " + fmtKeyShort(w.lastVerifiedAtIso.slice(0,10)) + " by " + esc(w.lastVerifiedBy) + "</span>" : "") +
+        "</div>";
+      const verifs = waiversState.bv.verifications[w.id] || [];
+      const verifsHtml = verifs.length
+        ? "<div class='verif-log'>" +
+            verifs.map(function (v) {
+              return "<div class='v'>" +
+                       "<span class='when'>" + fmtKeyShort(v.verifiedAtIso.slice(0,10)) + "</span>" +
+                       "<span>" + esc(v.kind) + " — " + esc(v.verifiedBy) + (v.note ? " · " + esc(v.note) : "") + "</span>" +
+                     "</div>";
+            }).join("") +
+          "</div>"
+        : "";
+      const actions =
+        "<div class='actions'>" +
+          (status === "approved"
+            ? "<button type='button' class='btn-approve' data-verify='" + w.id + "'>Verify now</button>"
+            : "") +
+          "<button type='button' class='ghost' data-delete='" + w.id + "' " +
+            "title='Permanently delete this waiver (admin)'>Delete</button>" +
+        "</div>";
+      return (
+        "<article class='wv-bv-card " + stateCls + "'>" +
+          "<div class='row1'>" +
+            "<div class='title'>" + esc(w.title) + "</div>" +
+            "<span class='pill " + pillCls + "'>" + esc(pillTxt) + "</span>" +
+          "</div>" +
+          desc +
+          photo +
+          meta +
+          verifsHtml +
+          actions +
+        "</article>"
+      );
+    }
+
+    async function promptVerify(id) {
+      const w = waiversState.bv.waivers.find(function (x) { return x.id === id; });
+      if (!w) return;
+      const cachedName = localStorage.getItem("waiver.reviewerName") || "";
+      const by = window.prompt("Verify \\"" + w.title + "\\" — your name (required):", cachedName);
+      if (!by || !by.trim()) return;
+      localStorage.setItem("waiver.reviewerName", by.trim());
+      const note = window.prompt("Optional note:", "") || "";
+      try {
+        const r = await fetch("/api/waivers/" + id + "/verify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ by: by.trim(), note: note.trim(), kind: "annual" }),
+        });
+        const j = await r.json();
+        if (!r.ok) throw new Error((j && j.error) || ("HTTP " + r.status));
+        loadWaiverByVehicle(waiversState.bv.assetId);
+        loadWaiverCounts(true);
+      } catch (e) {
+        alert("Verify failed: " + (e.message || e));
+      }
+    }
+
+    async function promptDelete(id) {
+      const w = waiversState.bv.waivers.find(function (x) { return x.id === id; });
+      if (!w) return;
+      if (!window.confirm("Permanently delete waiver \\"" + w.title + "\\"? This cannot be undone.")) return;
+      try {
+        const r = await fetch("/api/waivers/" + id, { method: "DELETE" });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        loadWaiverByVehicle(waiversState.bv.assetId);
+        loadWaiverCounts(true);
+      } catch (e) {
+        alert("Delete failed: " + (e.message || e));
+      }
     }
 
     /* ========================================================================
@@ -13806,12 +15326,14 @@ function renderDashboardHtml(): string {
       renderMeetingQueue();
       renderMeetingFocus();
       startMeetingTick();
-      // Pull sightings so each queue row + focus tag shows last-seen location.
-      // If the cache was empty, re-render once it lands so the badges appear
-      // without waiting for the next selection click.
+      // Pull sightings + waiver counts so each queue row + focus tag shows
+      // last-seen location and any active waiver pill. If either cache was
+      // empty, re-render once it lands so the badges appear without waiting
+      // for the next selection click.
       const hadSightings = sightingsState.loadedAt > 0;
-      loadSightings().then(function () {
-        if (!hadSightings) {
+      const hadWaivers = waiverCountState.loadedAt > 0;
+      Promise.all([loadSightings(), loadWaiverCounts()]).then(function () {
+        if (!hadSightings || !hadWaivers) {
           renderMeetingQueue();
           renderMeetingFocus();
         }
@@ -13890,12 +15412,16 @@ function renderDashboardHtml(): string {
         if (n.owning_unit) sub.push(esc(n.owning_unit));
         if (n.mel_key) sub.push("MEL " + esc(n.mel_key));
         const sightingHtml = n.asset_id ? renderSightingBadge(n.asset_id, { compact: true }) : "";
+        const waiverHtml = n.asset_id ? renderWaiverBadge(n.asset_id) : "";
+        const badges = (sightingHtml || waiverHtml)
+          ? " " + sightingHtml + (sightingHtml && waiverHtml ? " " : "") + waiverHtml
+          : "";
         return (
           "<button type='button' class='mq-item" + active + "' data-status='" + esc(n.status) + "' data-wid='" + esc(n.work_order_id) + "'>" +
             "<span class='mq-dot'></span>" +
             "<span class='mq-body'>" +
               "<span class='wid'>" + esc(n.work_order_id) + "</span>" +
-              "<span class='sub'>" + sub.join(" · ") + (sightingHtml ? " " + sightingHtml : "") + "</span>" +
+              "<span class='sub'>" + sub.join(" · ") + badges + "</span>" +
             "</span>" +
             (n.mel_tier ? "<span class='mq-tier" + tierCls + "'>" + esc(n.mel_tier) + "</span>" : "<span></span>") +
           "</button>"
@@ -13983,9 +15509,13 @@ function renderDashboardHtml(): string {
       if (note.etic_date) tags.push("<span class='tag'>ETIC " + esc(fmtKeyShort(note.etic_date)) + "</span>");
       const remarks = row && row.remarks ? row.remarks : "";
       const sightingHtml = note.asset_id ? renderSightingBadge(note.asset_id) : "";
+      const waiverHtml = note.asset_id ? renderWaiverBadge(note.asset_id) : "";
       head.innerHTML =
         "<div class='mf-id'>" + esc(note.work_order_id) + "</div>" +
-        "<div class='mf-sub'>" + tags.join("") + (sightingHtml ? " " + sightingHtml : "") + "</div>" +
+        "<div class='mf-sub'>" + tags.join("") +
+          (sightingHtml ? " " + sightingHtml : "") +
+          (waiverHtml ? " " + waiverHtml : "") +
+        "</div>" +
         (remarks ? "<div class='mf-remarks'>" + esc(remarks) + "</div>" : "") +
         "<div class='mf-tl' id='mf-tl'>" +
           "<div class='mf-tl-label'>Recent changes <span class='muted'>(scroll here — the TV scrolls with you)</span></div>" +
@@ -14393,12 +15923,14 @@ function renderDashboardHtml(): string {
 
     async function pollPresenter() {
       try {
-        // Refresh meeting + sightings in parallel each tick. Sightings has its
-        // own TTL so this is mostly a no-op but ensures the conference-room
-        // screen never lags more than ~30s behind a fresh yard sweep.
+        // Refresh meeting + sightings + waiver counts in parallel each tick.
+        // Both caches have their own TTL so this is mostly a no-op but ensures
+        // the conference-room screen never lags more than ~30s behind a fresh
+        // yard sweep or new waiver approval.
         const [resp] = await Promise.all([
           fetch("/api/meeting/" + presenterState.meetingId, { cache: "no-store" }),
           loadSightings(),
+          loadWaiverCounts(),
         ]);
         if (!resp.ok) throw new Error("HTTP " + resp.status);
         const j = await resp.json();
@@ -14617,15 +16149,20 @@ function renderDashboardHtml(): string {
         addId("Shop", note.shop);
         addId("Mgmt", note.mgmt_cd);
         addId("Make/Model", note.make_model);
-        // Yard-sighting pill leads the strip so the room sees "where is it?"
-        // before the meta-data drilldown. Include the sighting timestamp in
-        // the cache key so the strip re-renders when a new sighting lands.
+        // Yard-sighting + waiver pills lead the strip so the room sees
+        // "where is it / what's been waived?" before the meta-data drilldown.
+        // Include both cache keys so the strip re-renders when a new
+        // sighting lands or a waiver is approved/verified.
         const sightingObj = note.asset_id ? sightingsState.map.get(note.asset_id) : null;
         const sightingHtml = note.asset_id ? renderSightingBadge(note.asset_id) : "";
         const sightingKey = sightingObj ? (sightingObj.at + "|" + sightingObj.location) : "none";
-        const idKey = ids.map(function (it) { return it.lbl + "=" + it.val; }).join("|") + "||sight=" + sightingKey;
+        const waiverObj = note.asset_id ? waiverCountState.map.get(note.asset_id) : null;
+        const waiverHtml = note.asset_id ? renderWaiverBadge(note.asset_id) : "";
+        const waiverKey = waiverObj ? (waiverObj.approved + "/" + waiverObj.pending + "/" + waiverObj.overdueVerify) : "none";
+        const idKey = ids.map(function (it) { return it.lbl + "=" + it.val; }).join("|") +
+          "||sight=" + sightingKey + "||wv=" + waiverKey;
         if (idKey !== presenterState.lastIdStripKey) {
-          stripEl.innerHTML = sightingHtml + ids.map(function (it) {
+          stripEl.innerHTML = sightingHtml + (sightingHtml && waiverHtml ? " " : "") + waiverHtml + ids.map(function (it) {
             return '<span class="p-id-pill"><span class="lbl">' + esc(it.lbl) +
                    '</span><span class="val">' + esc(it.val) + '</span></span>';
           }).join("");

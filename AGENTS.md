@@ -16,6 +16,8 @@ walker app on top of it. Three distinct UIs live behind one Worker:
 |---|---|---|
 | **Desktop dashboard** | `/` | Fleet manager / dispatcher at a desk |
 | **Walker (mobile)** | `/yard` | Walker out in the lot with a phone |
+| **Mechanic (mobile)** | `/waivers` | Mechanic at the bay submitting/verifying waivers |
+| **Waiver card (print)** | `/waivers/card/<assetId>/print` | Printable card that lives in the cab |
 | **Presenter (TV)** | `/?present=<meetingId>` | Conference-room screen during ETIC standup |
 
 The **same `fetch` handler** in `src/index.ts` serves all three, plus all
@@ -38,6 +40,11 @@ JSON APIs.
 - **FM&A** — the maintenance follow-up queue (Findings, Maintenance & Action).
 - **Yard check / sighting** — A walker physically tapping "I see this asset
   here at lot B." Used to compute "last seen" badges across the app.
+- **Waiver** — A defect on a vehicle that management has formally accepted
+  (doesn't affect safety/serviceability). Mechanics submit a request from
+  `/waivers` with photo + description; management approves on the desktop.
+  Approved waivers appear on a printable card kept in the vehicle and must
+  be re-verified at least annually.
 
 ---
 
@@ -66,6 +73,7 @@ src/
   meeting.ts          ETIC meeting sessions, notes, minutes, presenter cursor.
   yardCheck.ts        Workbook → yard-check seed data (asset list extraction).
   yardSession.ts      Yard checks (recordCheck), findings (FM&A), sightings, photos.
+  waivers.ts          Waiver card system: submit/approve/reject/verify + R2 photos.
   ai.ts               /api/ask chat handler.
 
 migrations/
@@ -216,6 +224,16 @@ this table only records *resolutions*.
 ETIC standup sessions and per-WO discussion notes. The presenter polls
 `/api/meeting/:id` every 2s.
 
+### `waiver`, `waiver_verification`
+Waiver card system (migration `0018_waivers.sql`). `waiver` rows are the
+defect submissions (status: `pending` / `approved` / `rejected`) with one
+optional R2 photo (`photo_r2_key` under `waiver-photos/<id>/...`).
+`waiver_verification` is the immutable audit log — every approval seeds
+an `initial` row, then mechanics or management append `annual` / `adhoc`
+rows from either app. The `last_verified_*` columns on `waiver` are
+denormalized so list views can compute "overdue annual?" without a JOIN.
+See `src/waivers.ts` and §9 "Add a new waiver-card style cross-cutting badge."
+
 ---
 
 ## 6. R2 layout
@@ -279,6 +297,13 @@ useful ones:
 | `GET /api/yard/findings` | Live FM&A queue | `listOpenFindings` |
 | `POST /api/yard/findings/resolve` | Log an FM&A action | `resolveFinding` |
 | `POST /api/yard/check` | Walker records a sighting | `recordCheck` |
+| `GET /api/waivers/asset/:id` | Waivers for one truck (approved + pending) | `listWaiversForAsset` |
+| `GET /api/waivers/pending` | Management approval queue | `listPendingWaivers` |
+| `GET /api/waivers/counts` | `{assetId → {approved,pending,overdueVerify}}` for badges | `getWaiverCounts` |
+| `POST /api/waivers` | Submit new waiver (multipart, photo) | `submitWaiver` |
+| `POST /api/waivers/:id/(approve\|reject\|verify)` | Lifecycle actions, name required | `approveWaiver`/`rejectWaiver`/`verifyWaiver` |
+| `GET /api/waivers/:id/photo` | Stream defect photo from R2 | `getWaiverPhoto` |
+| `GET /waivers/card/:assetId/print` | Server-rendered printable waiver card | `renderWaiverPrintCardHtml` |
 | `GET/POST /api/meeting/...` | ETIC meeting CRUD | `meeting.ts` |
 | `POST /api/ask` | Ask-AI chat | `ai.ts` |
 
