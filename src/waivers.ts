@@ -19,9 +19,9 @@
 //   on every action — there is no "system" actor here.
 //
 // Photo storage:
-//   We mirror the yard-photo pattern — bytes in R2 under waiver-photos/<id>/...,
-//   metadata columns on the waiver row itself. One photo per waiver is enough
-//   for the documenting-the-defect use case the shop described.
+//   Defect images live in R2 under waiver-photos/<waiverId>/... with one row
+//   per file in `waiver_photo`. Legacy `waiver.photo_r2_key` is still read as a
+//   fallback when no child rows exist (pre-migration data).
 
 type Env = { ETIC_SNAPSHOTS: D1Database; ETIC_BUCKET: R2Bucket };
 
@@ -35,6 +35,12 @@ export const WAIVER_VERIFY_DUE_SOON_MS = (365 - 30) * 24 * 60 * 60 * 1000;
 
 export type WaiverStatus = "pending" | "approved" | "rejected";
 
+export type WaiverPhotoRef = {
+  id: number;
+  /** GET path — `/api/waivers/photo/:id` for real rows; legacy single-photo uses `/api/waivers/:waiverId/photo`. */
+  url: string;
+};
+
 export type Waiver = {
   id: number;
   assetId: string;
@@ -42,7 +48,10 @@ export type Waiver = {
   description: string;
   status: WaiverStatus;
   hasPhoto: boolean;
+  /** First image URL (same as photos[0] when present). */
   photoUrl: string;
+  /** All defect photos for this waiver, ordered. */
+  photos: WaiverPhotoRef[];
   submittedBy: string;
   submittedAtIso: string;
   reviewedBy: string;
@@ -82,10 +91,12 @@ export type SubmitWaiverInput = {
   title: string;
   description?: string;
   submittedBy: string;
+  /** @deprecated use `photos` — kept for single-file clients */
   photo?: {
     body: ArrayBuffer;
     contentType: string;
   };
+  photos?: Array<{ body: ArrayBuffer; contentType: string }>;
 };
 
 type WaiverRow = {
@@ -156,7 +167,7 @@ const WAIVER_ROW_IS_NOISE_SQL = `(
   OR (trim(ifnull(title,'')) = '' AND trim(ifnull(description,'')) = '')
 )`;
 
-function rowToWaiver(r: WaiverRow): Waiver {
+function rowToWaiver(r: WaiverRow, waiverPhotos: WaiverPhotoRef[] = []): Waiver {
   const lastVerifiedAt = r.last_verified_at_iso ?? "";
   // "Anchor" date for staleness: prefer the last explicit verification; fall
   // back to the approval date so a freshly approved waiver isn't immediately
@@ -177,14 +188,21 @@ function rowToWaiver(r: WaiverRow): Waiver {
     }
   }
   const descClean = stripLegacyPatsDescription(r.description);
+  const photos: WaiverPhotoRef[] =
+    waiverPhotos.length > 0
+      ? waiverPhotos
+      : r.photo_r2_key
+        ? [{ id: 0, url: `/api/waivers/${r.id}/photo` }]
+        : [];
   return {
     id: r.id,
     assetId: r.asset_id,
     title: r.title,
     description: descClean,
     status: r.status,
-    hasPhoto: !!r.photo_r2_key,
-    photoUrl: r.photo_r2_key ? `/api/waivers/${r.id}/photo` : "",
+    hasPhoto: photos.length > 0,
+    photoUrl: photos[0]?.url ?? "",
+    photos,
     submittedBy: r.submitted_by,
     submittedAtIso: r.submitted_at_iso,
     reviewedBy: r.reviewed_by ?? "",
@@ -228,6 +246,59 @@ function extensionForContentType(ct: string): string {
   return "jpg";
 }
 
+async function listWaiverPhotosForWaiverIds(
+  env: Env,
+  waiverIds: number[],
+): Promise<Map<number, WaiverPhotoRef[]>> {
+  const out = new Map<number, WaiverPhotoRef[]>();
+  const uniq = [...new Set(waiverIds)].filter((id) => Number.isFinite(id));
+  if (!uniq.length) return out;
+  const ph = uniq.map(() => "?").join(",");
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT id, waiver_id, sort_index
+       FROM waiver_photo
+      WHERE waiver_id IN (${ph})
+      ORDER BY waiver_id, sort_index ASC, id ASC`,
+  )
+    .bind(...uniq)
+    .all<{ id: number; waiver_id: number; sort_index: number }>();
+  for (const row of r.results ?? []) {
+    const list = out.get(row.waiver_id) ?? [];
+    list.push({ id: row.id, url: `/api/waivers/photo/${row.id}` });
+    out.set(row.waiver_id, list);
+  }
+  return out;
+}
+
+async function insertWaiverPhotos(
+  env: Env,
+  waiverId: number,
+  items: Array<{ body: ArrayBuffer; contentType: string }>,
+  createdAtIso: string,
+): Promise<WaiverPhotoRef[]> {
+  const out: WaiverPhotoRef[] = [];
+  let idx = 0;
+  for (const item of items) {
+    if (!item.body.byteLength) continue;
+    const ct = item.contentType || "image/jpeg";
+    const ext = extensionForContentType(ct);
+    const r2Key = `${WAIVER_PHOTO_PREFIX}${waiverId}/${Date.now()}-${idx}-${randomHex()}.${ext}`;
+    await env.ETIC_BUCKET.put(r2Key, item.body, {
+      httpMetadata: { contentType: ct },
+    });
+    const row = await env.ETIC_SNAPSHOTS.prepare(
+      `INSERT INTO waiver_photo (waiver_id, r2_key, content_type, sort_index, created_at_iso)
+       VALUES (?, ?, ?, ?, ?)
+       RETURNING id`,
+    )
+      .bind(waiverId, r2Key, ct, idx, createdAtIso)
+      .first<{ id: number }>();
+    if (row?.id) out.push({ id: row.id, url: `/api/waivers/photo/${row.id}` });
+    idx++;
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Submit / read
 // ---------------------------------------------------------------------------
@@ -256,23 +327,19 @@ export async function submitWaiver(env: Env, input: SubmitWaiverInput): Promise<
     .first<WaiverRow>();
   if (!inserted) throw new Error("failed to insert waiver");
 
-  if (input.photo && input.photo.body && input.photo.body.byteLength > 0) {
-    const ct = input.photo.contentType || "image/jpeg";
-    const ext = extensionForContentType(ct);
-    const r2Key = `${WAIVER_PHOTO_PREFIX}${inserted.id}/${Date.now()}-${randomHex()}.${ext}`;
-    await env.ETIC_BUCKET.put(r2Key, input.photo.body, {
-      httpMetadata: { contentType: ct },
-    });
-    const updated = await env.ETIC_SNAPSHOTS.prepare(
-      `UPDATE waiver SET photo_r2_key = ?, photo_content_type = ?
-        WHERE id = ?
-        RETURNING ${SELECT_WAIVER_COLS}`,
-    )
-      .bind(r2Key, ct, inserted.id)
-      .first<WaiverRow>();
-    if (updated) return rowToWaiver(updated);
+  const picInputs: Array<{ body: ArrayBuffer; contentType: string }> = [];
+  if (input.photos?.length) {
+    for (const p of input.photos) {
+      if (p.body.byteLength > 0) picInputs.push(p);
+    }
+  } else if (input.photo?.body.byteLength) {
+    picInputs.push(input.photo);
   }
-  return rowToWaiver(inserted);
+  let photoRefs: WaiverPhotoRef[] = [];
+  if (picInputs.length) {
+    photoRefs = await insertWaiverPhotos(env, inserted.id, picInputs, submittedAtIso);
+  }
+  return rowToWaiver(inserted, photoRefs);
 }
 
 /**
@@ -297,7 +364,10 @@ export async function listWaiversForAsset(
   )
     .bind(id)
     .all<WaiverRow>();
-  return (r.results ?? []).map(rowToWaiver);
+  const rows = r.results ?? [];
+  const ids = rows.map((row) => row.id);
+  const pmap = await listWaiverPhotosForWaiverIds(env, ids);
+  return rows.map((row) => rowToWaiver(row, pmap.get(row.id) ?? []));
 }
 
 /**
@@ -310,7 +380,10 @@ export async function listPendingWaivers(env: Env): Promise<Waiver[]> {
       WHERE status = 'pending' AND NOT ${WAIVER_ROW_IS_NOISE_SQL}
       ORDER BY submitted_at_iso DESC`,
   ).all<WaiverRow>();
-  return (r.results ?? []).map(rowToWaiver);
+  const rows = r.results ?? [];
+  const ids = rows.map((row) => row.id);
+  const pmap = await listWaiverPhotosForWaiverIds(env, ids);
+  return rows.map((row) => rowToWaiver(row, pmap.get(row.id) ?? []));
 }
 
 export async function getWaiverById(env: Env, id: number): Promise<Waiver | null> {
@@ -319,7 +392,9 @@ export async function getWaiverById(env: Env, id: number): Promise<Waiver | null
   )
     .bind(id)
     .first<WaiverRow>();
-  return r ? rowToWaiver(r) : null;
+  if (!r) return null;
+  const pmap = await listWaiverPhotosForWaiverIds(env, [r.id]);
+  return rowToWaiver(r, pmap.get(r.id) ?? []);
 }
 
 // ---------------------------------------------------------------------------
@@ -349,6 +424,7 @@ export async function approveWaiver(
     .bind(by, nowIso, (note ?? "").trim() || null, by, nowIso, id)
     .first<WaiverRow>();
   if (!updated) throw new Error("waiver not found or not pending");
+  const photoMap = await listWaiverPhotosForWaiverIds(env, [updated.id]);
   // Seed an 'initial' verification entry so the audit log has a starting
   // point — otherwise the very first annual reminder would show "never
   // verified" instead of "verified at approval".
@@ -358,7 +434,7 @@ export async function approveWaiver(
   )
     .bind(id, by, nowIso, (note ?? "").trim() || null)
     .run();
-  return rowToWaiver(updated);
+  return rowToWaiver(updated, photoMap.get(updated.id) ?? []);
 }
 
 export async function rejectWaiver(
@@ -384,7 +460,8 @@ export async function rejectWaiver(
     .bind(by, nowIso, r, id)
     .first<WaiverRow>();
   if (!updated) throw new Error("waiver not found or not pending");
-  return rowToWaiver(updated);
+  const photoMap = await listWaiverPhotosForWaiverIds(env, [updated.id]);
+  return rowToWaiver(updated, photoMap.get(updated.id) ?? []);
 }
 
 // ---------------------------------------------------------------------------
@@ -443,7 +520,8 @@ export async function verifyWaiver(
     .bind(by, nowIso, id)
     .first<WaiverRow>();
   if (!updated) throw new Error("waiver disappeared mid-verify");
-  return rowToWaiver(updated);
+  const photoMap = await listWaiverPhotosForWaiverIds(env, [updated.id]);
+  return rowToWaiver(updated, photoMap.get(updated.id) ?? []);
 }
 
 export async function listVerifications(env: Env, waiverId: number): Promise<WaiverVerification[]> {
@@ -479,17 +557,35 @@ export async function getVerificationPhoto(env: Env, verificationId: number): Pr
 // ---------------------------------------------------------------------------
 
 export async function deleteWaiver(env: Env, id: number): Promise<boolean> {
-  const meta = await env.ETIC_SNAPSHOTS.prepare(
+  const exists = await env.ETIC_SNAPSHOTS.prepare(`SELECT 1 AS ok FROM waiver WHERE id = ?`)
+    .bind(id)
+    .first<{ ok: number }>();
+  if (!exists) return false;
+  const keys = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT r2_key FROM waiver_photo WHERE waiver_id = ?`,
+  )
+    .bind(id)
+    .all<{ r2_key: string }>();
+  const legacy = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT photo_r2_key FROM waiver WHERE id = ?`,
   )
     .bind(id)
     .first<{ photo_r2_key: string | null }>();
-  if (!meta) return false;
-  if (meta.photo_r2_key) {
+  const seen = new Set<string>();
+  for (const row of keys.results ?? []) {
+    if (!row.r2_key || seen.has(row.r2_key)) continue;
+    seen.add(row.r2_key);
     try {
-      await env.ETIC_BUCKET.delete(meta.photo_r2_key);
+      await env.ETIC_BUCKET.delete(row.r2_key);
     } catch {
       // Best effort — never block delete on R2 cleanup.
+    }
+  }
+  if (legacy?.photo_r2_key && !seen.has(legacy.photo_r2_key)) {
+    try {
+      await env.ETIC_BUCKET.delete(legacy.photo_r2_key);
+    } catch {
+      /* ignore */
     }
   }
   const r = await env.ETIC_SNAPSHOTS.prepare(
@@ -509,6 +605,15 @@ export async function getWaiverPhoto(env: Env, id: number): Promise<{
   body: ReadableStream;
   contentType: string;
 } | null> {
+  const row = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT r2_key, content_type FROM waiver_photo WHERE waiver_id = ? ORDER BY sort_index ASC, id ASC LIMIT 1`,
+  )
+    .bind(id)
+    .first<{ r2_key: string; content_type: string }>();
+  if (row?.r2_key) {
+    const obj = await env.ETIC_BUCKET.get(row.r2_key);
+    if (obj) return { body: obj.body, contentType: row.content_type ?? "image/jpeg" };
+  }
   const r = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT photo_r2_key, photo_content_type FROM waiver WHERE id = ?`,
   )
@@ -518,6 +623,21 @@ export async function getWaiverPhoto(env: Env, id: number): Promise<{
   const obj = await env.ETIC_BUCKET.get(r.photo_r2_key);
   if (!obj) return null;
   return { body: obj.body, contentType: r.photo_content_type ?? "image/jpeg" };
+}
+
+export async function getWaiverPhotoFile(env: Env, photoId: number): Promise<{
+  body: ReadableStream;
+  contentType: string;
+} | null> {
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT r2_key, content_type FROM waiver_photo WHERE id = ?`,
+  )
+    .bind(photoId)
+    .first<{ r2_key: string; content_type: string }>();
+  if (!r?.r2_key) return null;
+  const obj = await env.ETIC_BUCKET.get(r.r2_key);
+  if (!obj) return null;
+  return { body: obj.body, contentType: r.content_type ?? "image/jpeg" };
 }
 
 // ---------------------------------------------------------------------------

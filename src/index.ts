@@ -63,6 +63,7 @@ import {
   getWaiverCounts,
   getVerificationPhoto,
   getWaiverPhoto,
+  getWaiverPhotoFile,
   listPendingWaivers,
   listVerifications as listWaiverVerifications,
   listWaiversForAsset,
@@ -423,6 +424,12 @@ export default {
       const verId = Number.parseInt(waiverVerifyPhotoMatch[1] ?? "", 10);
       if (!Number.isFinite(verId)) return new Response("Invalid verification id", { status: 400 });
       return handleWaiverVerificationPhotoApi(env, verId);
+    }
+    const waiverPhotoBlobMatch = url.pathname.match(/^\/api\/waivers\/photo\/(\d+)$/);
+    if (waiverPhotoBlobMatch) {
+      const photoId = Number.parseInt(waiverPhotoBlobMatch[1] ?? "", 10);
+      if (!Number.isFinite(photoId)) return new Response("Invalid photo id", { status: 400 });
+      return handleWaiverPhotoFileApi(env, photoId);
     }
     const waiverAssetMatch = url.pathname.match(/^\/api\/waivers\/asset\/([^/]+)$/);
     if (waiverAssetMatch) {
@@ -1818,10 +1825,26 @@ function renderWaiverAppHtml(): string {
     .wcard-body { padding: 0 14px 12px; color: var(--muted); font-size: 0.9rem; }
     .wcard-body .desc { color: var(--text); margin-bottom: 6px; white-space: pre-wrap; }
     .wcard-body .meta { font-size: 0.78rem; }
+    .wcard-photos {
+      display: flex; flex-wrap: wrap; gap: 8px;
+      padding: 10px 12px; border-top: 1px solid var(--border);
+      background: var(--bg2);
+    }
     .wcard-photo {
-      display: block; width: 100%; max-height: 320px; object-fit: cover;
-      border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
+      display: block; width: calc(50% - 4px); max-width: 100%; min-width: 120px;
+      flex: 1 1 140px; max-height: 200px; object-fit: cover;
+      border-radius: 10px; border: 1px solid var(--border);
       background: #000;
+    }
+    @media (max-width: 420px) {
+      .wcard-photo { width: 100%; flex: 1 1 100%; max-height: 240px; }
+    }
+    .sub-preview-grid {
+      display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px;
+    }
+    .sub-preview-grid .sub-thumb {
+      width: 76px; height: 76px; object-fit: cover; border-radius: 10px;
+      border: 1px solid var(--border); background: #000;
     }
     .wcard-actions {
       display: flex; gap: 8px; padding: 10px 12px;
@@ -1930,13 +1953,13 @@ function renderWaiverAppHtml(): string {
       <input id="sub-title" type="text" maxlength="120" placeholder="e.g. Driver-side mirror crack < 2&quot;" />
       <label for="sub-desc">Details (where it is, why it doesn't affect safety, etc.)</label>
       <textarea id="sub-desc" maxlength="2000"></textarea>
-      <label>Photo of the defect</label>
+      <label>Photos of the defect (one or more)</label>
       <div class="file-row">
-        <label class="file-btn" for="sub-photo">📷 Take / choose photo</label>
-        <input id="sub-photo" type="file" accept="image/*" capture="environment" />
+        <label class="file-btn" for="sub-photo">📷 Take / choose photos</label>
+        <input id="sub-photo" type="file" accept="image/*" capture="environment" multiple />
         <span id="sub-photo-name" style="font-size:0.85rem;color:var(--muted);"></span>
       </div>
-      <img id="sub-preview" class="preview" hidden alt="" />
+      <div id="sub-preview-grid" class="sub-preview-grid" hidden></div>
       <div id="sub-err" class="err" hidden></div>
       <div class="btn-row">
         <button type="button" class="btn secondary" id="sub-cancel">Cancel</button>
@@ -2246,9 +2269,12 @@ function renderWaiverAppHtml(): string {
             ? (' · Last verified ' + fmtDate(w.lastVerifiedAtIso) + ' by ' + esc(w.lastVerifiedBy || "—"))
             : ''))
       : ('Submitted by ' + esc(w.submittedBy) + ' · ' + fmtAge(w.submittedAtIso));
-    var photo = w.hasPhoto
-      ? '<img class="wcard-photo" src="' + esc(w.photoUrl) + '" alt="Defect photo" loading="lazy" />'
-      : '';
+    var plist = (w.photos && w.photos.length) ? w.photos : (w.hasPhoto && w.photoUrl ? [{ url: w.photoUrl }] : []);
+    var photo = plist.length
+      ? ('<div class="wcard-photos">' + plist.map(function (p) {
+          return '<img class="wcard-photo" src="' + esc(p.url) + '" alt="" loading="lazy" />';
+        }).join("") + "</div>")
+      : "";
     var actions = (status === "approved")
       ? ('<div class="wcard-actions">' +
            '<button type="button" class="btn" data-verify="' + w.id + '">Verify</button>' +
@@ -2274,7 +2300,8 @@ function renderWaiverAppHtml(): string {
     $("sub-desc").value = "";
     $("sub-photo").value = "";
     $("sub-photo-name").textContent = "";
-    $("sub-preview").hidden = true;
+    var g = $("sub-preview-grid");
+    if (g) { g.innerHTML = ""; g.hidden = true; }
     $("sub-err").hidden = true;
     $("submit-modal").classList.add("open");
   }
@@ -2282,12 +2309,22 @@ function renderWaiverAppHtml(): string {
   $("new-waiver-btn").addEventListener("click", openSubmitModal);
   $("sub-cancel").addEventListener("click", closeSubmitModal);
   $("sub-photo").addEventListener("change", function () {
-    var f = $("sub-photo").files && $("sub-photo").files[0];
-    if (!f) { $("sub-preview").hidden = true; $("sub-photo-name").textContent = ""; return; }
-    $("sub-photo-name").textContent = f.name + " (" + Math.round(f.size / 1024) + " KB)";
-    var url = URL.createObjectURL(f);
-    $("sub-preview").src = url;
-    $("sub-preview").hidden = false;
+    var grid = $("sub-preview-grid");
+    var inp = $("sub-photo");
+    if (!grid || !inp) return;
+    grid.innerHTML = "";
+    var files = inp.files ? Array.from(inp.files) : [];
+    if (!files.length) { grid.hidden = true; $("sub-photo-name").textContent = ""; return; }
+    $("sub-photo-name").textContent = files.length + " photo" + (files.length === 1 ? "" : "s") + " selected";
+    grid.hidden = false;
+    files.forEach(function (f) {
+      var url = URL.createObjectURL(f);
+      var im = document.createElement("img");
+      im.className = "sub-thumb";
+      im.src = url;
+      im.alt = "";
+      grid.appendChild(im);
+    });
   });
   $("sub-submit").addEventListener("click", async function () {
     var name = readName();
@@ -2295,14 +2332,14 @@ function renderWaiverAppHtml(): string {
     rememberName(name);
     var title = $("sub-title").value.trim();
     if (!title) { $("sub-err").textContent = "Title is required."; $("sub-err").hidden = false; return; }
-    var photo = $("sub-photo").files && $("sub-photo").files[0];
-    if (!photo) { $("sub-err").textContent = "Photo is required for a waiver request."; $("sub-err").hidden = false; return; }
+    var files = $("sub-photo").files ? Array.from($("sub-photo").files) : [];
+    if (!files.length) { $("sub-err").textContent = "At least one photo is required for a waiver request."; $("sub-err").hidden = false; return; }
     var fd = new FormData();
     fd.append("assetId", state.assetId);
     fd.append("title", title);
     fd.append("description", $("sub-desc").value.trim());
     fd.append("submittedBy", name);
-    fd.append("photo", photo);
+    files.forEach(function (f) { fd.append("photo", f); });
     $("sub-submit").disabled = true;
     try {
       var r = await fetch("/api/waivers", { method: "POST", body: fd });
@@ -2703,10 +2740,8 @@ async function handleWaiverCountsApi(env: Env): Promise<Response> {
 
 /**
  * POST /api/waivers — submit a new waiver request.
- * multipart/form-data: assetId, title, description?, submittedBy, photo (file).
- * Photo is strongly recommended but not strictly required at the API layer
- * (mobile UI enforces it) — that way an admin can backfill an existing
- * paper waiver from the desktop without forcing a photo capture.
+ * multipart/form-data: assetId, title, description?, submittedBy, and one or
+ * more `photo` file fields (same name repeated). Up to 8 files, 10MB each.
  */
 async function handleWaiverSubmitApi(env: Env, request: Request): Promise<Response> {
   if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
@@ -2733,17 +2768,20 @@ async function handleWaiverSubmitApi(env: Env, request: Request): Promise<Respon
       { status: 400, headers: cacheHeaders() },
     );
   }
-  const file = form.get("photo");
-  let photo: { body: ArrayBuffer; contentType: string } | undefined;
-  if (file instanceof File && file.size > 0) {
-    const MAX_BYTES = 10 * 1024 * 1024;
-    if (file.size > MAX_BYTES) {
-      return Response.json({ error: "photo too large (max 10MB)" }, { status: 413, headers: cacheHeaders() });
+  const MAX_BYTES = 10 * 1024 * 1024;
+  const MAX_FILES = 8;
+  const rawFiles = form.getAll("photo");
+  const photos: Array<{ body: ArrayBuffer; contentType: string }> = [];
+  for (const entry of rawFiles) {
+    if (!(entry instanceof File) || entry.size <= 0) continue;
+    if (entry.size > MAX_BYTES) {
+      return Response.json({ error: "each photo must be 10MB or less" }, { status: 413, headers: cacheHeaders() });
     }
-    photo = { body: await file.arrayBuffer(), contentType: file.type || "image/jpeg" };
+    photos.push({ body: await entry.arrayBuffer(), contentType: entry.type || "image/jpeg" });
+    if (photos.length >= MAX_FILES) break;
   }
   try {
-    const waiver = await submitWaiver(env, { assetId, title, description, submittedBy, photo });
+    const waiver = await submitWaiver(env, { assetId, title, description, submittedBy, photos });
     return Response.json({ waiver }, { headers: cacheHeaders() });
   } catch (e) {
     return Response.json(
@@ -2829,6 +2867,19 @@ async function handleWaiverVerificationPhotoApi(env: Env, verificationId: number
       "Content-Type": got.contentType,
       "Cache-Control": "public, max-age=86400, immutable",
       "Content-Disposition": `inline; filename="waiver-verify-${verificationId}"`,
+    },
+  });
+}
+
+/** GET /api/waivers/photo/:photoId — one defect image row from `waiver_photo`. */
+async function handleWaiverPhotoFileApi(env: Env, photoId: number): Promise<Response> {
+  const got = await getWaiverPhotoFile(env, photoId);
+  if (!got) return new Response("Not Found", { status: 404 });
+  return new Response(got.body, {
+    headers: {
+      "Content-Type": got.contentType,
+      "Cache-Control": "public, max-age=86400, immutable",
+      "Content-Disposition": `inline; filename="waiver-photo-${photoId}"`,
     },
   });
 }
@@ -7278,10 +7329,13 @@ function renderDashboardHtml(): string {
     .wv-pcard .title { font-weight: 600; margin-top: 2px; }
     .wv-pcard .submitted { color: var(--muted); font-size: 0.78rem; margin-top: 4px; }
     .wv-pcard .body { padding: 12px 14px; font-size: 0.9rem; color: var(--text-dim); white-space: pre-wrap; min-height: 0; }
-    .wv-pcard img.photo {
-      display: block; width: 100%; max-height: 320px; object-fit: cover;
-      border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
-      background: #000;
+    .wv-photo-grid {
+      display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 0 0;
+      border-top: 1px solid var(--border);
+    }
+    .wv-photo-grid img.photo {
+      display: block; width: auto; max-width: min(48%, 280px); max-height: 220px;
+      object-fit: cover; border-radius: 8px; border: 1px solid var(--border); background: #000;
     }
     .wv-pcard .actions { display: flex; gap: 8px; padding: 10px 12px; background: rgba(255,255,255,0.02); }
     .wv-pcard .actions button { flex: 1; }
@@ -7401,9 +7455,10 @@ function renderDashboardHtml(): string {
     .wv-bv-card .pill.dueSoon  { background: rgba(245,199,84,0.10); color: var(--warn); border-color: rgba(245,199,84,0.35); }
     .wv-bv-card .desc { color: var(--text-dim); font-size: 0.9rem; margin-top: 6px; white-space: pre-wrap; }
     .wv-bv-card .meta { color: var(--muted); font-size: 0.78rem; margin-top: 8px; display: flex; gap: 14px; flex-wrap: wrap; }
-    .wv-bv-card img.photo {
-      display: block; max-width: 320px; max-height: 220px; object-fit: cover;
-      border-radius: 8px; margin-top: 10px; border: 1px solid var(--border); background: #000;
+    .wv-bv-card .wv-photo-grid { margin-top: 10px; }
+    .wv-bv-card .wv-photo-grid img.photo {
+      display: block; max-width: min(48%, 280px); max-height: 220px; object-fit: cover;
+      border-radius: 8px; border: 1px solid var(--border); background: #000;
     }
     .wv-bv-card .actions { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
     .wv-bv-card .verif-log { margin-top: 10px; font-size: 0.78rem; color: var(--muted); border-top: 1px dashed var(--border); padding-top: 8px; }
@@ -14429,10 +14484,23 @@ function renderDashboardHtml(): string {
       }
     }
 
+    function waiverDefectPhotosHtml(w) {
+      const list =
+        w.photos && w.photos.length ? w.photos : w.hasPhoto && w.photoUrl ? [{ url: w.photoUrl }] : [];
+      if (!list.length) return "";
+      return (
+        "<div class='wv-photo-grid'>" +
+        list
+          .map(function (p) {
+            return "<img class='photo' src='" + esc(p.url) + "' alt='' loading='lazy' />";
+          })
+          .join("") +
+        "</div>"
+      );
+    }
+
     function renderPendingCard(w) {
-      const photo = w.hasPhoto
-        ? "<img class='photo' src='" + esc(w.photoUrl) + "' alt='Defect photo' />"
-        : "";
+      const photo = waiverDefectPhotosHtml(w);
       const desc = w.description
         ? "<div class='body'>" + esc(w.description) + "</div>"
         : "";
@@ -14576,9 +14644,7 @@ function renderDashboardHtml(): string {
       const pillTxt = status === "pending" ? "Pending review"
                     : w.verifyState === "overdue" ? "Verify overdue"
                     : w.verifyState === "dueSoon" ? "Verify due soon" : "On card";
-      const photo = w.hasPhoto
-        ? "<img class='photo' src='" + esc(w.photoUrl) + "' alt='Defect photo' />"
-        : "";
+      const photo = waiverDefectPhotosHtml(w);
       const desc = w.description ? "<div class='desc'>" + esc(w.description) + "</div>" : "";
       const meta =
         "<div class='meta'>" +
