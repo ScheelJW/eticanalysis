@@ -7,6 +7,7 @@
   "scripts": {
     "scrape": "node scrape.mjs",
     "pats-to-sql": "node pats-to-d1-sql.mjs",
+    "pats:refresh-sql": "node pats-refresh-from-csv.mjs",
     "install-browser": "playwright install chromium"
   },
   "dependencies": {

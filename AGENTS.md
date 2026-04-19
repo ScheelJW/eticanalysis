@@ -102,6 +102,9 @@ scripts/
                       After scrape, `node pats-to-d1-sql.mjs pats_waivers.csv out.sql`
                       builds D1 SQL (AF-prefixed asset_id, Outstanding-only); apply
                       migrations/0019 first, then `wrangler d1 execute` with out.sql.
+                      If rows are already in D1 and you only have the CSV, run
+                      `node pats-refresh-from-csv.mjs pats_waivers.csv refresh.sql` then
+                      `wrangler d1 execute` — no Playwright / no PATS login.
 ```
 
 **Worker vs tooling:** Everything that answers HTTP on `minot.2t3.app` lives
