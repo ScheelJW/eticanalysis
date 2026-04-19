@@ -85,7 +85,18 @@ package.json        Scripts. `npm run check` = typegen + typecheck + tests.
 tsconfig.json       Strict TS, ES2022, WebWorker libs, includes worker-configuration.d.ts.
 README.md           User-facing overview + quick start.
 AGENTS.md           This file.
+
+scripts/
+  pats-waiver-scrape/ Optional Node + Playwright tool (NOT bundled in the Worker).
+                      Exports NEI PATS repair waiver rows to CSV for offline use.
+                      See scripts/pats-waiver-scrape/scrape.mjs. Run npm install there;
+                      node_modules is gitignored. Does not deploy to minot.2t3.app.
 ```
+
+**Worker vs tooling:** Everything that answers HTTP on `minot.2t3.app` lives
+under `src/` and `wrangler.jsonc`. There is no first-party "waiver import"
+API or UI in the Worker today; yard/FM&A data model is workbook-derived
+(`yardSession.ts`, `work_order_state`, etc.).
 
 ---
 
