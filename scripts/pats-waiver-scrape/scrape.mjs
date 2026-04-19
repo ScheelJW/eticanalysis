@@ -17,6 +17,7 @@
 import { chromium } from "playwright";
 import fs from "node:fs";
 import path from "node:path";
+import { isNoiseWaiverText } from "./is-noise-waiver.mjs";
 
 const BENCH_LOGIN = "https://www.nei.net/bench/index.cfm";
 const PATS_ENTRY = process.env.PATS_START_URL || "https://www.nei.net/pats/site/";
@@ -77,6 +78,7 @@ function parseWaiverRows(html, vehicleId, regNo) {
       const inputMatch = body.match(/<input[^>]*name="(w_note_\d+)"[^>]*value="([^"]*)"/i);
       if (!inputMatch) continue;
       const waiverNote = inputMatch[2];
+      if (isNoiseWaiverText(waiverNote)) continue;
 
       const rightTds = [...body.matchAll(/<td[^>]*style="text-align:right;"[^>]*>([\s\S]*?)<\/td>/gi)];
       const emp = rightTds[0]?.[1].replace(/<[^>]+>/g, "").trim() || "";

@@ -19,6 +19,7 @@
  */
 
 import fs from "node:fs";
+import { isNoiseWaiverText } from "./is-noise-waiver.mjs";
 
 const DEFAULT_CARD_STATUS = "Outstanding";
 
@@ -97,6 +98,7 @@ function main() {
     const legacyStatus = get(iStatus) || DEFAULT_CARD_STATUS;
 
     if (!waiverRowId || !waiverText) continue;
+    if (isNoiseWaiverText(waiverText)) continue;
     if (legacyStatus.trim().toLowerCase() !== "outstanding") {
       skipped++;
       continue;

@@ -2233,6 +2233,7 @@ function renderWaiverPrintCardHtml(assetId: string, waivers: Waiver[]): string {
           <div class="body">
             <div class="title">${escHtml(w.title)}</div>
             ${descPrint ? `<div class="desc">${escHtml(descPrint)}</div>` : ""}
+            <div class="last-verified">Last verified: legacy</div>
           </div>
         </article>`;
     })
@@ -2316,6 +2317,12 @@ function renderWaiverPrintCardHtml(assetId: string, waivers: Waiver[]): string {
       font-size: 0.62rem; line-height: 1.15;
       -webkit-line-clamp: 3;
     }
+    .last-verified {
+      font-size: 0.74rem; color: #444; margin-top: 4px; line-height: 1.2;
+    }
+    body.wv-print--medium .last-verified { font-size: 0.7rem; margin-top: 3px; }
+    body.wv-print--heavy .last-verified { font-size: 0.66rem; margin-top: 2px; }
+    body.wv-print--vheavy .last-verified { font-size: 0.62rem; margin-top: 2px; }
     .empty {
       padding: 36px; text-align: center; border: 1px dashed #999; border-radius: 8px;
       color: #555;

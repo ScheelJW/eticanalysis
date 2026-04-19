@@ -139,6 +139,17 @@ function stripLegacyPatsDescription(raw: string | null | undefined): string {
   return kept.join("\n").trim();
 }
 
+/** Exclude noise rows from SQL reads (lists, counts, by-id). Matches `scripts/pats-waiver-scrape/is-noise-waiver.mjs`. */
+const WAIVER_ROW_IS_NOISE_SQL = `(
+  lower(trim(ifnull(title,''))) LIKE '%no waiver information%'
+  OR lower(trim(ifnull(description,''))) LIKE '%no waiver information%'
+  OR lower(trim(ifnull(title,''))) LIKE '%no waivered items%'
+  OR lower(trim(ifnull(description,''))) LIKE '%no waivered items%'
+  OR lower(trim(ifnull(title,''))) LIKE '%no waiverable items%'
+  OR lower(trim(ifnull(description,''))) LIKE '%no waiverable items%'
+  OR (trim(ifnull(title,'')) = '' AND trim(ifnull(description,'')) = '')
+)`;
+
 function rowToWaiver(r: WaiverRow): Waiver {
   const lastVerifiedAt = r.last_verified_at_iso ?? "";
   // "Anchor" date for staleness: prefer the last explicit verification; fall
@@ -272,7 +283,7 @@ export async function listWaiversForAsset(
     : "asset_id = ? AND status IN ('pending','approved')";
   const r = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT ${SELECT_WAIVER_COLS} FROM waiver
-      WHERE ${where}
+      WHERE ${where} AND NOT ${WAIVER_ROW_IS_NOISE_SQL}
       ORDER BY status DESC, submitted_at_iso DESC`,
   )
     .bind(id)
@@ -287,7 +298,7 @@ export async function listWaiversForAsset(
 export async function listPendingWaivers(env: Env): Promise<Waiver[]> {
   const r = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT ${SELECT_WAIVER_COLS} FROM waiver
-      WHERE status = 'pending'
+      WHERE status = 'pending' AND NOT ${WAIVER_ROW_IS_NOISE_SQL}
       ORDER BY submitted_at_iso DESC`,
   ).all<WaiverRow>();
   return (r.results ?? []).map(rowToWaiver);
@@ -295,7 +306,7 @@ export async function listPendingWaivers(env: Env): Promise<Waiver[]> {
 
 export async function getWaiverById(env: Env, id: number): Promise<Waiver | null> {
   const r = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT ${SELECT_WAIVER_COLS} FROM waiver WHERE id = ?`,
+    `SELECT ${SELECT_WAIVER_COLS} FROM waiver WHERE id = ? AND NOT ${WAIVER_ROW_IS_NOISE_SQL}`,
   )
     .bind(id)
     .first<WaiverRow>();
@@ -501,6 +512,7 @@ export async function getWaiverCounts(env: Env): Promise<Map<string, WaiverCount
                   THEN 1 ELSE 0 END) AS overdue_verify
        FROM waiver
       WHERE status IN ('approved','pending')
+        AND NOT ${WAIVER_ROW_IS_NOISE_SQL}
       GROUP BY asset_id`,
   )
     .bind(`-${intervalDays} days`)
