@@ -13149,10 +13149,13 @@ function renderDashboardHtml(): string {
       if (!pid) return "";
       var src = "/api/yard/photo/" + pid;
       var cap = "Latest yard check photo — click to enlarge";
+      // Must NOT use a nested <button>: WO list / MEL / meeting rows are outer
+      // <button>s; nested buttons make the browser close the outer tag early and
+      // corrupt the whole card layout.
       return (
-        "<button type='button' class='yard-photo-thumb' data-yard-photo-asset='" + esc(assetId) + "' data-yard-photo-id='" + esc(String(pid)) + "' title='" + esc(cap) + "' aria-label='View yard photo for " + esc(assetId) + "'>" +
+        "<span class='yard-photo-thumb' role='button' tabindex='0' data-yard-photo-asset='" + esc(assetId) + "' data-yard-photo-id='" + esc(String(pid)) + "' title='" + esc(cap) + "' aria-label='View yard photo for " + esc(assetId) + "'>" +
           "<img src='" + esc(src) + "' alt='' loading='lazy' decoding='async' />" +
-        "</button>"
+        "</span>"
       );
     }
 
@@ -13176,23 +13179,38 @@ function renderDashboardHtml(): string {
         if (capEl) capEl.textContent = caption || "";
         lb.classList.add("open");
       }
+      function openFromThumb(el) {
+        if (!el) return;
+        var id = el.getAttribute("data-yard-photo-id");
+        if (!id) return;
+        var aid = el.getAttribute("data-yard-photo-asset") || "";
+        openLb("/api/yard/photo/" + id, aid ? ("Asset " + aid) : "", aid);
+      }
       document.addEventListener("click", function (ev) {
         var t = ev.target;
         var btn = t && t.closest ? t.closest("[data-yard-photo-id]") : null;
         if (btn && btn.getAttribute("data-yard-photo-id")) {
           ev.preventDefault();
           ev.stopPropagation();
-          var id = btn.getAttribute("data-yard-photo-id");
-          var aid = btn.getAttribute("data-yard-photo-asset") || "";
-          openLb("/api/yard/photo/" + id, aid ? ("Asset " + aid) : "", aid);
+          openFromThumb(btn);
           return;
         }
         if (t === lb) closeLb();
       });
-      if (btnClose) btnClose.addEventListener("click", function (e) { e.preventDefault(); closeLb(); });
-      document.addEventListener("keydown", function (e) {
-        if (e.key === "Escape" && lb && lb.classList.contains("open")) closeLb();
+      document.addEventListener("keydown", function (ev) {
+        if (ev.key === "Escape" && lb && lb.classList.contains("open")) {
+          closeLb();
+          return;
+        }
+        if (ev.key !== "Enter" && ev.key !== " ") return;
+        var t = ev.target;
+        var btn = t && t.closest ? t.closest("[data-yard-photo-id]") : null;
+        if (!btn || !btn.getAttribute("data-yard-photo-id") || t !== btn) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        openFromThumb(btn);
       });
+      if (btnClose) btnClose.addEventListener("click", function (e) { e.preventDefault(); closeLb(); });
     }
 
     function fmtKpi(n) {
