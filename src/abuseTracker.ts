@@ -41,6 +41,7 @@ export type AbuseCaseRow = {
   updated_at_iso: string;
   created_by: string;
   closed_at_iso: string | null;
+  work_order_id: string;
 };
 
 export type AbuseNoteRow = {
@@ -128,9 +129,31 @@ async function hydrateFleetFields(env: Env, assetId: string): Promise<{
   };
 }
 
+async function hydrateFromWorkOrderId(
+  env: Env,
+  workOrderId: string,
+): Promise<{ asset_id: string; owning_unit: string; shop: string; make_model: string; veh_nomen: string; mgmt_cd: string } | null> {
+  const wid = workOrderId.trim();
+  if (!wid) return null;
+  return env.ETIC_SNAPSHOTS.prepare(
+    `SELECT asset_id, owning_unit, shop, make_model, veh_nomen, mgmt_cd
+     FROM work_order_state WHERE work_order_id = ? LIMIT 1`,
+  )
+    .bind(wid)
+    .first<{
+      asset_id: string;
+      owning_unit: string;
+      shop: string;
+      make_model: string;
+      veh_nomen: string;
+      mgmt_cd: string;
+    }>();
+}
+
 export type CreateAbuseCaseInput = {
   caseType: AbuseCaseType;
   assetId: string;
+  workOrderId?: string;
   determination?: string;
   responsibleParty?: string;
   vehicleLocation?: string;
@@ -138,8 +161,15 @@ export type CreateAbuseCaseInput = {
 };
 
 export async function createAbuseCase(env: Env, input: CreateAbuseCaseInput): Promise<AbuseCaseRow> {
-  const assetId = input.assetId.trim();
-  if (!assetId) throw new Error("assetId required");
+  const woTrim = (input.workOrderId ?? "").trim();
+  const woRow = woTrim ? await hydrateFromWorkOrderId(env, woTrim) : null;
+  if (woTrim && !woRow) throw new Error("Work order not found in fleet data (check WO id).");
+  let assetId = (input.assetId ?? "").trim();
+  if (!assetId && woRow) assetId = (woRow.asset_id ?? "").trim();
+  if (!assetId) throw new Error("assetId or workOrderId required");
+  if (woRow && (input.assetId ?? "").trim() && (woRow.asset_id ?? "").trim() !== assetId) {
+    throw new Error("Asset id does not match that work order.");
+  }
   const caseType = input.caseType;
   if (caseType !== "accident" && caseType !== "abuse") throw new Error("caseType must be accident or abuse");
 
@@ -153,19 +183,28 @@ export async function createAbuseCase(env: Env, input: CreateAbuseCaseInput): Pr
   const control = await allocateControlNumber(env);
   const token = randomToken(16);
   const now = new Date().toISOString();
-  const fleet = await hydrateFleetFields(env, assetId);
+  const fleet = woRow
+    ? {
+        owning_unit: woRow.owning_unit ?? "",
+        shop: woRow.shop ?? "",
+        make_model: woRow.make_model ?? "",
+        veh_nomen: woRow.veh_nomen ?? "",
+        mgmt_cd: woRow.mgmt_cd ?? "",
+      }
+    : await hydrateFleetFields(env, assetId);
 
   const ins = await env.ETIC_SNAPSHOTS.prepare(
     `INSERT INTO abuse_tracker_case (
-       control_number, case_type, asset_id, owning_unit, shop, make_model, veh_nomen, mgmt_cd,
+       control_number, case_type, asset_id, work_order_id, owning_unit, shop, make_model, veh_nomen, mgmt_cd,
        determination, responsible_party, reimbursed_to_vm, reimbursed_at_iso, reimbursed_note,
        stage, vehicle_location, estimates_json, email_token, created_at_iso, updated_at_iso, created_by
-     ) VALUES (?,?,?,?,?,?,?,?,?,?,0,NULL,'','intake',?,?,?,?,?,?)`,
+     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,0,NULL,'','intake',?,?,?,?,?,?)`,
   )
     .bind(
       control,
       caseType,
       assetId,
+      woTrim,
       fleet.owning_unit,
       fleet.shop,
       fleet.make_model,
@@ -191,6 +230,7 @@ export async function createAbuseCase(env: Env, input: CreateAbuseCaseInput): Pr
 }
 
 export type UpdateAbuseCaseInput = {
+  workOrderId?: string;
   determination?: string;
   responsibleParty?: string;
   reimbursedToVm?: boolean;
@@ -228,18 +268,21 @@ export async function updateAbuseCase(
   const stage = patch.stage !== undefined ? patch.stage : cur.stage;
   const vehicleLocation =
     patch.vehicleLocation !== undefined ? patch.vehicleLocation.trim() : cur.vehicle_location;
+  const workOrderId =
+    patch.workOrderId !== undefined ? patch.workOrderId.trim() : cur.work_order_id ?? "";
   let closedAt = cur.closed_at_iso;
   if (patch.closed === true) closedAt = now;
   if (patch.closed === false) closedAt = null;
 
   await env.ETIC_SNAPSHOTS.prepare(
     `UPDATE abuse_tracker_case SET
-       determination = ?, responsible_party = ?, reimbursed_to_vm = ?, reimbursed_at_iso = ?,
+       work_order_id = ?, determination = ?, responsible_party = ?, reimbursed_to_vm = ?, reimbursed_at_iso = ?,
        reimbursed_note = ?, stage = ?, vehicle_location = ?, estimates_json = ?,
        updated_at_iso = ?, closed_at_iso = ?
      WHERE id = ?`,
   )
     .bind(
+      workOrderId,
       determination,
       responsibleParty,
       reimbursedToVm,

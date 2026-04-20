@@ -3682,6 +3682,7 @@ async function handleAbuseTrackerListApi(env: Env, request: Request): Promise<Re
         "control_number",
         "case_type",
         "asset_id",
+        "work_order_id",
         "owning_unit",
         "shop",
         "make_model",
@@ -3701,6 +3702,7 @@ async function handleAbuseTrackerListApi(env: Env, request: Request): Promise<Re
           escCsv(r.control_number),
           escCsv(r.case_type),
           escCsv(r.asset_id),
+          escCsv(r.work_order_id ?? ""),
           escCsv(r.owning_unit),
           escCsv(r.shop),
           escCsv(r.make_model),
@@ -3733,6 +3735,7 @@ async function handleAbuseTrackerListApi(env: Env, request: Request): Promise<Re
   const body = await readJsonBody<{
     caseType?: unknown;
     assetId?: unknown;
+    workOrderId?: unknown;
     determination?: unknown;
     responsibleParty?: unknown;
     vehicleLocation?: unknown;
@@ -3742,13 +3745,17 @@ async function handleAbuseTrackerListApi(env: Env, request: Request): Promise<Re
     return Response.json({ error: "caseType must be accident or abuse" }, { status: 400, headers: cacheHeaders() });
   }
   const assetId = String(body.assetId ?? "").trim();
-  if (!assetId) return Response.json({ error: "assetId required" }, { status: 400, headers: cacheHeaders() });
+  const workOrderId = String(body.workOrderId ?? "").trim();
+  if (!assetId && !workOrderId) {
+    return Response.json({ error: "assetId or workOrderId required" }, { status: 400, headers: cacheHeaders() });
+  }
   const createdBy = String(body.createdBy ?? "").trim();
   if (!createdBy) return Response.json({ error: "createdBy (your name) required" }, { status: 400, headers: cacheHeaders() });
   try {
     const c = await createAbuseCase(env, {
       caseType: body.caseType,
       assetId,
+      workOrderId,
       determination: String(body.determination ?? ""),
       responsibleParty: String(body.responsibleParty ?? ""),
       vehicleLocation: String(body.vehicleLocation ?? ""),
@@ -3782,6 +3789,7 @@ async function handleAbuseTrackerCaseApi(env: Env, request: Request, caseId: num
   }
   if (request.method !== "PATCH") return new Response("Method Not Allowed", { status: 405 });
   const body = await readJsonBody<{
+    workOrderId?: unknown;
     determination?: unknown;
     responsibleParty?: unknown;
     reimbursedToVm?: unknown;
@@ -3794,6 +3802,7 @@ async function handleAbuseTrackerCaseApi(env: Env, request: Request, caseId: num
   }>(request);
   if (!body) return Response.json({ error: "JSON body required" }, { status: 400, headers: cacheHeaders() });
   const patch: Parameters<typeof updateAbuseCase>[2] = {};
+  if (body.workOrderId !== undefined) patch.workOrderId = String(body.workOrderId ?? "");
   if (body.determination !== undefined) patch.determination = String(body.determination);
   if (body.responsibleParty !== undefined) patch.responsibleParty = String(body.responsibleParty);
   if (body.reimbursedToVm !== undefined) patch.reimbursedToVm = !!body.reimbursedToVm;
@@ -13263,6 +13272,9 @@ function renderDashboardHtml(): string {
                   <label class="field" style="grid-column:1/-1"><span class="label">Responsible for cost</span>
                     <input type="text" id="abuse-d-resp" placeholder="Unit / individual / org" />
                   </label>
+                  <label class="field" style="grid-column:1/-1"><span class="label">Work order ID</span>
+                    <input type="text" id="abuse-d-wo" placeholder="e.g. 2026040900016 (optional)" />
+                  </label>
                   <label class="field abuse-check"><input type="checkbox" id="abuse-d-reimb" /> Reimbursed to VM</label>
                   <label class="field"><span class="label">Reimbursement note</span>
                     <input type="text" id="abuse-d-reimb-note" />
@@ -13334,7 +13346,10 @@ function renderDashboardHtml(): string {
                 </select>
               </label>
               <label class="field"><span class="label">Asset ID</span>
-                <input type="text" id="abuse-new-asset" placeholder="e.g. AF08C00341" autocapitalize="characters" />
+                <input type="text" id="abuse-new-asset" placeholder="e.g. AF08C00341 (or leave blank if WO below)" autocapitalize="characters" />
+              </label>
+              <label class="field" style="grid-column:1/-1"><span class="label">Work order ID</span>
+                <input type="text" id="abuse-new-wo" placeholder="Optional — fills asset from fleet data when known" />
               </label>
               <label class="field" style="grid-column:1/-1"><span class="label">Your name</span>
                 <input type="text" id="abuse-new-by" autocomplete="name" />
@@ -22897,7 +22912,10 @@ function renderDashboardHtml(): string {
         }
         list.innerHTML = abuseTrackerState.cases.map(function (c) {
           var closed = !!c.closed_at_iso;
-          var sub = (c.make_model || "—") + " · " + abuseStageLabel(c.stage) + (closed ? " · CLOSED" : "");
+          var wo = (c.work_order_id || "").trim();
+          var sub = (c.make_model || "—") +
+            (wo ? " · WO " + wo : "") +
+            " · " + abuseStageLabel(c.stage) + (closed ? " · CLOSED" : "");
           var active = c.id === abuseTrackerState.selectedId ? " active" : "";
           return (
             "<button type='button' class='abuse-row" + active + "' data-abuse-id='" + esc(String(c.id)) + "'>" +
@@ -22977,7 +22995,8 @@ function renderDashboardHtml(): string {
         document.getElementById("abuse-d-cn").textContent = c.control_number;
         document.getElementById("abuse-d-assetline").textContent =
           c.asset_id + (c.make_model ? " · " + c.make_model : "") +
-          (c.owning_unit ? " · " + c.owning_unit : "") + (c.shop ? " · " + c.shop : "");
+          (c.owning_unit ? " · " + c.owning_unit : "") + (c.shop ? " · " + c.shop : "") +
+          ((c.work_order_id || "").trim() ? " · WO " + (c.work_order_id || "").trim() : "");
         var tp = document.getElementById("abuse-d-type");
         tp.textContent = c.case_type === "abuse" ? "Abuse / neglect" : "Accident";
         tp.className = "abuse-type-pill " + (c.case_type === "abuse" ? "abuse" : "accident");
@@ -22993,6 +23012,8 @@ function renderDashboardHtml(): string {
         document.getElementById("abuse-d-resp").value = c.responsible_party || "";
         document.getElementById("abuse-d-reimb").checked = !!c.reimbursed_to_vm;
         document.getElementById("abuse-d-reimb-note").value = c.reimbursed_note || "";
+        var woEl = document.getElementById("abuse-d-wo");
+        if (woEl) woEl.value = (c.work_order_id || "").trim();
         abuseRenderEstimates(j.estimates || []);
         var nl = document.getElementById("abuse-notes-list");
         nl.innerHTML = (j.notes || []).map(function (n) {
@@ -23024,6 +23045,7 @@ function renderDashboardHtml(): string {
         var body = {
           stage: document.getElementById("abuse-d-stage").value,
           vehicleLocation: document.getElementById("abuse-d-loc").value,
+          workOrderId: (document.getElementById("abuse-d-wo") && document.getElementById("abuse-d-wo").value) || "",
           determination: document.getElementById("abuse-d-det").value,
           responsibleParty: document.getElementById("abuse-d-resp").value,
           reimbursedToVm: document.getElementById("abuse-d-reimb").checked,
@@ -23089,10 +23111,11 @@ function renderDashboardHtml(): string {
     async function abuseCreateCase() {
       var msg = document.getElementById("abuse-new-msg");
       var asset = (document.getElementById("abuse-new-asset").value || "").trim();
+      var wo = (document.getElementById("abuse-new-wo") && document.getElementById("abuse-new-wo").value || "").trim();
       var by = (document.getElementById("abuse-new-by").value || "").trim();
       var typ = document.getElementById("abuse-new-type").value;
-      if (!asset || !by) {
-        msg.textContent = "Asset ID and your name are required.";
+      if ((!asset && !wo) || !by) {
+        msg.textContent = "Enter work order ID or asset id, and your name.";
         return;
       }
       msg.textContent = "Creating…";
@@ -23100,13 +23123,15 @@ function renderDashboardHtml(): string {
         var r = await fetch("/api/abuse-tracker", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ caseType: typ, assetId: asset, createdBy: by }),
+          body: JSON.stringify({ caseType: typ, assetId: asset, workOrderId: wo, createdBy: by }),
         });
         var j = await r.json();
         if (!r.ok) throw new Error(j.error || "Create failed");
         msg.innerHTML = "Created <strong>" + esc(j.case.control_number) + "</strong>." +
           (j.ingestEmail ? " Ingest: <code>" + esc(j.ingestEmail) + "</code>" : "");
         document.getElementById("abuse-new-asset").value = "";
+        var nwo = document.getElementById("abuse-new-wo");
+        if (nwo) nwo.value = "";
         await abuseLoadList();
         await abuseLoadStats();
         await abuseSelectCase(j.case.id);
