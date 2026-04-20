@@ -4852,6 +4852,21 @@ function renderYardAppHtml(): string {
     .photo-add svg { width: 28px; height: 28px; }
     .photo-add input { display: none; }
 
+    .yard-upload-bar {
+      display: none; margin: 10px 0 0; padding: 10px 12px; border-radius: 8px;
+      background: var(--bg2); border: 1px solid var(--border);
+    }
+    .yard-upload-bar.show { display: block; }
+    .yard-upload-bar .yard-up-lbl { font-size: 11px; color: var(--muted); margin-bottom: 6px; font-weight: 600; }
+    .yard-upload-bar .yard-up-track {
+      height: 7px; border-radius: 999px; background: var(--bg3); overflow: hidden;
+    }
+    .yard-upload-bar .yard-up-fill {
+      height: 100%; width: 0%; background: var(--accent); border-radius: 999px;
+      transition: width 0.12s ease-out;
+    }
+    .find-upload-bar { margin-top: 10px; }
+
     .history { font-size: 13px; padding: 0; margin: 0; }
     .history li { padding: 8px 0; border-top: 1px solid var(--border); list-style: none; color: var(--muted); }
     .history li:first-child { border-top: none; }
@@ -5386,6 +5401,10 @@ function renderYardAppHtml(): string {
       <div class="sheet-title" id="sheet-title">Asset</div>
     </div>
     <div class="sheet-body" id="sheet-body"></div>
+    <div id="yard-upload-bar" class="yard-upload-bar" aria-live="polite">
+      <div class="yard-up-lbl" id="yard-up-lbl">Uploading…</div>
+      <div class="yard-up-track"><div class="yard-up-fill" id="yard-up-fill"></div></div>
+    </div>
     <div class="save-bar">
       <button class="save-btn" id="save-btn">✓ Mark checked</button>
     </div>
@@ -5436,6 +5455,10 @@ function renderYardAppHtml(): string {
       <label>Photos (optional)
         <input id="find-photos-input" type="file" accept="image/*" multiple />
       </label>
+      <div id="find-upload-bar" class="yard-upload-bar find-upload-bar" aria-live="polite">
+        <div class="yard-up-lbl" id="find-up-lbl">Uploading…</div>
+        <div class="yard-up-track"><div class="yard-up-fill" id="find-up-fill"></div></div>
+      </div>
       <div class="modal-actions">
         <button type="button" class="secondary" id="find-cancel">Cancel</button>
         <button type="button" class="primary" id="find-save">Log it</button>
@@ -5854,9 +5877,13 @@ function renderYardAppHtml(): string {
     }
 
     function openSheet(assetId){
+      hideYardUploadProgress("sheet");
       state.openId = assetId;
       var asset = state.assets.find(function(a){ return a.assetId === assetId; });
-      state.detail = { asset: asset, photos: state.photoCache[assetId] || [], checks: [], checkEdits: [], openWorkOrders: [] };
+      // Do not reuse photoCache for a different asset: stale thumbnails from
+      // the previous vehicle showed until the network fetch completed.
+      if (state.photoCache && state.photoCache[assetId]) delete state.photoCache[assetId];
+      state.detail = { asset: asset, photos: [], checks: [], checkEdits: [], openWorkOrders: [] };
       state.draft = {
         status: "present",
         location: (asset && asset.lastLocation) || "",
@@ -5885,6 +5912,66 @@ function renderYardAppHtml(): string {
       document.body.classList.remove("yard-desk-sheet-open");
       document.body.style.overflow = "";
       state.openId = null;
+      hideYardUploadProgress("sheet");
+    }
+
+    function showYardUploadProgress(which, pct, label) {
+      var bar = which === "find" ? $("find-upload-bar") : $("yard-upload-bar");
+      var fill = which === "find" ? $("find-up-fill") : $("yard-up-fill");
+      var lbl = which === "find" ? $("find-up-lbl") : $("yard-up-lbl");
+      if (!bar || !fill || !lbl) return;
+      bar.classList.add("show");
+      bar.removeAttribute("hidden");
+      fill.style.width = Math.max(0, Math.min(100, pct)) + "%";
+      lbl.textContent = label || "Uploading…";
+    }
+    function hideYardUploadProgress(which) {
+      var bar = which === "find" ? $("find-upload-bar") : $("yard-upload-bar");
+      var fill = which === "find" ? $("find-up-fill") : $("yard-up-fill");
+      if (bar) {
+        bar.classList.remove("show");
+        bar.setAttribute("hidden", "");
+      }
+      if (fill) fill.style.width = "0%";
+    }
+    function postYardPhotoMultipart(fd, which, fileLabel, onJson, onErr, onFinally) {
+      var xhr = new XMLHttpRequest();
+      xhr.open("POST", "/api/yard/photo");
+      xhr.upload.onprogress = function (ev) {
+        if (!ev.lengthComputable) {
+          showYardUploadProgress(which, 6, (fileLabel || "Photo") + " — sending…");
+          return;
+        }
+        var pct = ev.total ? Math.round((ev.loaded / ev.total) * 100) : 0;
+        showYardUploadProgress(which, pct, (fileLabel || "Photo") + " — " + pct + "%");
+      };
+      function done() {
+        if (typeof onFinally === "function") onFinally();
+      }
+      xhr.onload = function () {
+        hideYardUploadProgress(which);
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            onJson(JSON.parse(xhr.responseText || "{}"));
+          } catch (e) {
+            onErr(new Error("Invalid server response"));
+          }
+        } else {
+          try {
+            var j = JSON.parse(xhr.responseText || "{}");
+            onErr(new Error(j.error || ("HTTP " + xhr.status)));
+          } catch (e2) {
+            onErr(new Error("Upload failed (" + xhr.status + ")"));
+          }
+        }
+        done();
+      };
+      xhr.onerror = function () {
+        hideYardUploadProgress(which);
+        onErr(new Error("Network error"));
+        done();
+      };
+      xhr.send(fd);
     }
 
     function renderSheet(){
@@ -6320,30 +6407,24 @@ function renderYardAppHtml(): string {
       fd.append("photo", file, file.name || "photo.jpg");
       fd.append("uploadedBy", (state.walker || "").trim());
       var btn = input.parentElement;
-      btn.style.opacity = "0.5";
-      fetch("/api/yard/photo", { method: "POST", body: fd })
-        .then(function(r){
-          if (!r.ok) return r.json().then(function(j){ throw new Error(j.error || "upload failed"); });
-          return r.json();
-        })
-        .then(function(j){
-          if (!state.detail) state.detail = { asset: null, photos: [], checks: [], checkEdits: [] };
-          state.detail.photos = state.detail.photos || [];
-          state.detail.photos.unshift(j.photo);
-          if (state.openId) state.photoCache[state.openId] = state.detail.photos;
-          // bump asset photoCount
-          var a = state.assets.find(function(x){ return x.assetId === state.openId; });
-          if (a) a.photoCount = (a.photoCount || 0) + 1;
-          renderSheet();
-          showToast("Photo uploaded");
-        })
-        .catch(function(err){
-          showToast(err.message || "Upload failed", true);
-        })
-        .finally(function(){
-          btn.style.opacity = "";
-          input.value = "";
-        });
+      if (btn) btn.style.opacity = "0.5";
+      var label = (file.name || "photo") + " (" + Math.round(file.size / 1024) + " KB)";
+      showYardUploadProgress("sheet", 0, "Uploading " + label + "…");
+      postYardPhotoMultipart(fd, "sheet", label, function (j) {
+        if (!state.detail) state.detail = { asset: null, photos: [], checks: [], checkEdits: [] };
+        state.detail.photos = state.detail.photos || [];
+        if (j && j.photo) state.detail.photos.unshift(j.photo);
+        if (state.openId) state.photoCache[state.openId] = state.detail.photos;
+        var a = state.assets.find(function(x){ return x.assetId === state.openId; });
+        if (a) a.photoCount = (a.photoCount || 0) + 1;
+        renderSheet();
+        showToast("Photo uploaded");
+      }, function (err) {
+        showToast(err.message || "Upload failed", true);
+      }, function () {
+        if (btn) btn.style.opacity = "";
+        input.value = "";
+      });
     }
 
     function saveCheck(){
@@ -6408,6 +6489,7 @@ function renderYardAppHtml(): string {
 
     /* ----- find / floor-to-book modal ----- */
     function openFindModal(){
+      hideYardUploadProgress("find");
       var m = $("find-modal");
       m.classList.add("open");
       m.setAttribute("aria-hidden", "false");
@@ -6419,11 +6501,13 @@ function renderYardAppHtml(): string {
       setTimeout(function(){ $("find-asset-id").focus(); }, 50);
     }
     function closeFindModal(){
+      hideYardUploadProgress("find");
       var m = $("find-modal");
       m.classList.remove("open");
       m.setAttribute("aria-hidden", "true");
     }
     function saveFind(){
+      hideYardUploadProgress("find");
       var id = ($("find-asset-id").value || "").trim();
       if (!id) { showToast("Asset ID required", true); return; }
       if (!requireWalkerName()) return;
@@ -6467,24 +6551,26 @@ function renderYardAppHtml(): string {
           }
           function uploadAt(index){
             if (index >= files.length) {
+              hideYardUploadProgress("find");
               doneUi("Logged " + id + " \u00B7 " + files.length + " photo" + (files.length === 1 ? "" : "s"));
               return;
             }
+            var f = files[index];
             var fd = new FormData();
             fd.append("assetId", id);
-            fd.append("photo", files[index], files[index].name || "photo.jpg");
+            fd.append("photo", f, f.name || "photo.jpg");
             fd.append("uploadedBy", by);
             if (checkId != null) fd.append("checkId", String(checkId));
-            fetch("/api/yard/photo", { method: "POST", body: fd })
-              .then(function(r){
-                if (!r.ok) return r.json().then(function(x){ throw new Error(x.error || "upload failed"); });
-                return r.json();
-              })
-              .then(function(){ uploadAt(index + 1); })
-              .catch(function(e){
-                showToast(e.message || "Photo upload failed", true);
-                doneUi("Logged " + id);
-              });
+            var label = "Photo " + (index + 1) + "/" + files.length + ": " + (f.name || "photo") +
+              " (" + Math.round(f.size / 1024) + " KB)";
+            showYardUploadProgress("find", 0, "Uploading " + label + "…");
+            postYardPhotoMultipart(fd, "find", label, function () {
+              uploadAt(index + 1);
+            }, function (e) {
+              showToast(e.message || "Photo upload failed", true);
+              hideYardUploadProgress("find");
+              doneUi("Logged " + id);
+            });
           }
           uploadAt(0);
         })
