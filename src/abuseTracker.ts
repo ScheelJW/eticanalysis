@@ -100,13 +100,34 @@ export async function findCaseByEmailToken(env: Env, token: string): Promise<Abu
     .first<AbuseCaseRow>();
 }
 
-async function hydrateFleetFields(env: Env, assetId: string): Promise<{
+type FleetSnapshot = {
   owning_unit: string;
   shop: string;
   make_model: string;
   veh_nomen: string;
   mgmt_cd: string;
-}> {
+};
+
+/** Latest Fleet P&A row for an asset (refreshed each workbook ingest). */
+async function hydrateFromFleetAssetCurrent(env: Env, assetId: string): Promise<FleetSnapshot | null> {
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT owning_unit, shop, make_model, veh_nomen, mgmt_cd FROM fleet_asset_current WHERE asset_id = ?`,
+  )
+    .bind(assetId.trim())
+    .first<FleetSnapshot>();
+  if (!r) return null;
+  return {
+    owning_unit: r.owning_unit ?? "",
+    shop: r.shop ?? "",
+    make_model: r.make_model ?? "",
+    veh_nomen: r.veh_nomen ?? "",
+    mgmt_cd: r.mgmt_cd ?? "",
+  };
+}
+
+async function hydrateFleetFields(env: Env, assetId: string): Promise<FleetSnapshot> {
+  const fromFleet = await hydrateFromFleetAssetCurrent(env, assetId);
+  if (fromFleet) return fromFleet;
   const r = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT owning_unit, shop, make_model, veh_nomen, mgmt_cd
      FROM work_order_state WHERE asset_id = ?
@@ -163,10 +184,9 @@ export type CreateAbuseCaseInput = {
 export async function createAbuseCase(env: Env, input: CreateAbuseCaseInput): Promise<AbuseCaseRow> {
   const woTrim = (input.workOrderId ?? "").trim();
   const woRow = woTrim ? await hydrateFromWorkOrderId(env, woTrim) : null;
-  if (woTrim && !woRow) throw new Error("Work order not found in fleet data (check WO id).");
   let assetId = (input.assetId ?? "").trim();
   if (!assetId && woRow) assetId = (woRow.asset_id ?? "").trim();
-  if (!assetId) throw new Error("assetId or workOrderId required");
+  if (!assetId) throw new Error("Asset id is required (WO may be added later and does not need to match ingest yet).");
   if (woRow && (input.assetId ?? "").trim() && (woRow.asset_id ?? "").trim() !== assetId) {
     throw new Error("Asset id does not match that work order.");
   }
@@ -183,6 +203,7 @@ export async function createAbuseCase(env: Env, input: CreateAbuseCaseInput): Pr
   const control = await allocateControlNumber(env);
   const token = randomToken(16);
   const now = new Date().toISOString();
+  // Snapshot org fields at case creation only — never updated from later ingests.
   const fleet = woRow
     ? {
         owning_unit: woRow.owning_unit ?? "",
@@ -426,6 +447,31 @@ export async function getAbuseAttachmentMeta(
   return env.ETIC_SNAPSHOTS.prepare(`SELECT * FROM abuse_tracker_attachment WHERE id = ?`)
     .bind(attachmentId)
     .first<AbuseAttachmentRow>();
+}
+
+/** Typeahead for new abuse cases — reads `fleet_asset_current` (Fleet P&A ingest). */
+export async function searchFleetAssetsForPicker(
+  env: Env,
+  query: string,
+  limit: number,
+): Promise<Array<{ asset_id: string; owning_unit: string; shop: string; make_model: string }>> {
+  const raw = query.trim();
+  if (!raw) return [];
+  const safe = raw.replace(/[%_]/g, "").slice(0, 48);
+  if (!safe) return [];
+  const lim = Math.min(50, Math.max(1, limit || 20));
+  const like = `%${safe}%`;
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT asset_id, owning_unit, shop, make_model FROM fleet_asset_current
+     WHERE asset_id LIKE ?
+        OR owning_unit LIKE ?
+        OR shop LIKE ?
+        OR make_model LIKE ?
+     ORDER BY asset_id ASC LIMIT ?`,
+  )
+    .bind(like, like, like, like, lim)
+    .all<{ asset_id: string; owning_unit: string; shop: string; make_model: string }>();
+  return r.results ?? [];
 }
 
 export function abuseDamEmailLocalPart(token: string): string {

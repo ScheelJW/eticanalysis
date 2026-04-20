@@ -112,6 +112,7 @@ import {
   getAbuseTrackerStats,
   ingestAbuseDamEmailFiles,
   listAbuseCases,
+  searchFleetAssetsForPicker,
   parseAbuseDamTokenFromEmailTo,
   updateAbuseCase,
   abuseDamEmailLocalPart,
@@ -572,6 +573,9 @@ export default {
       return handleWaiverDetailApi(env, id);
     }
 
+    if (url.pathname === "/api/fleet/assets") {
+      return handleFleetAssetsSearchApi(env, request);
+    }
     if (url.pathname === "/api/abuse-tracker/stats") {
       return handleAbuseTrackerStatsApi(env, request);
     }
@@ -3664,6 +3668,15 @@ function isAbuseCaseStage(s: unknown): s is AbuseCaseStage {
 }
 function isAbuseAttachmentKind(s: unknown): s is AbuseAttachmentKind {
   return s === "damage_photo" || s === "release_letter" || s === "estimate" || s === "other";
+}
+
+async function handleFleetAssetsSearchApi(env: Env, request: Request): Promise<Response> {
+  if (request.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
+  const url = new URL(request.url);
+  const q = url.searchParams.get("q") ?? "";
+  const limit = Number.parseInt(url.searchParams.get("limit") ?? "20", 10) || 20;
+  const rows = await searchFleetAssetsForPicker(env, q, limit);
+  return Response.json({ assets: rows }, { headers: cacheHeaders() });
 }
 
 async function handleAbuseTrackerStatsApi(env: Env, request: Request): Promise<Response> {
@@ -13345,10 +13358,12 @@ function renderDashboardHtml(): string {
                 </select>
               </label>
               <label class="field"><span class="label">Asset ID</span>
-                <input type="text" id="abuse-new-asset" placeholder="e.g. AF08C00341 (or leave blank if WO below)" autocapitalize="characters" />
+                <input type="text" id="abuse-new-asset" list="abuse-asset-datalist" placeholder="Type to search fleet roster…" autocapitalize="characters" autocomplete="off" />
+                <datalist id="abuse-asset-datalist"></datalist>
               </label>
+              <p class="hint" style="grid-column:1/-1;margin:0">Unit / shop / make-model are copied from the latest Fleet roster <strong>once</strong> when you create the case and do not change if the vehicle moves later.</p>
               <label class="field" style="grid-column:1/-1"><span class="label">Work order ID</span>
-                <input type="text" id="abuse-new-wo" placeholder="Optional — fills asset from fleet data when known" />
+                <input type="text" id="abuse-new-wo" placeholder="Optional — add anytime; not required to open a case" />
               </label>
             </div>
             <button type="button" class="primary" id="abuse-new-btn" style="margin-top:10px">Create case</button>
@@ -23147,6 +23162,33 @@ function renderDashboardHtml(): string {
     function wireAbuseTrackerEvents() {
       if (abuseTrackerState.wired) return;
       abuseTrackerState.wired = true;
+      var abuseAssetPickTimer = null;
+      var abuseAssetInp = document.getElementById("abuse-new-asset");
+      var abuseAssetDl = document.getElementById("abuse-asset-datalist");
+      function refreshAbuseAssetDatalist() {
+        if (!abuseAssetInp || !abuseAssetDl) return;
+        var q = (abuseAssetInp.value || "").trim();
+        if (q.length < 2) {
+          abuseAssetDl.innerHTML = "";
+          return;
+        }
+        fetch("/api/fleet/assets?q=" + encodeURIComponent(q) + "&limit=25", { cache: "no-store" })
+          .then(function (r) { return r.ok ? r.json() : { assets: [] }; })
+          .then(function (j) {
+            var rows = (j && j.assets) || [];
+            abuseAssetDl.innerHTML = rows.map(function (a) {
+              var lab = a.asset_id + " — " + (a.make_model || "") + " · " + (a.shop || "") + " · " + (a.owning_unit || "");
+              return "<option value='" + esc(a.asset_id) + "' label='" + esc(lab) + "'></option>";
+            }).join("");
+          })
+          .catch(function () { abuseAssetDl.innerHTML = ""; });
+      }
+      if (abuseAssetInp && abuseAssetDl) {
+        abuseAssetInp.addEventListener("input", function () {
+          if (abuseAssetPickTimer) clearTimeout(abuseAssetPickTimer);
+          abuseAssetPickTimer = setTimeout(refreshAbuseAssetDatalist, 200);
+        });
+      }
       var rf = document.getElementById("abuse-refresh");
       if (rf) rf.addEventListener("click", function () { abuseLoadStats(); abuseLoadList(); if (abuseTrackerState.selectedId) abuseSelectCase(abuseTrackerState.selectedId); });
       var oo = document.getElementById("abuse-open-only");

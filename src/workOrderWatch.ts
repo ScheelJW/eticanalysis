@@ -351,6 +351,58 @@ export async function ingestWorkOrderSnapshot(
     await env.ETIC_SNAPSHOTS.batch(statements.slice(i, i + BATCH));
   }
 
+  // Rolling fleet roster (one row per asset) for apps that need an asset list
+  // without an open WO — e.g. abuse tracker snapshots org fields at case create.
+  const fleetByAsset = new Map<
+    string,
+    { owning_unit: string; shop: string; make_model: string; veh_nomen: string; mgmt_cd: string; mel_key: string }
+  >();
+  for (const c of workOrders) {
+    const aid = (c.assetId ?? "").trim();
+    if (!aid) continue;
+    fleetByAsset.set(aid, {
+      owning_unit: c.owningUnit,
+      shop: c.shop,
+      make_model: c.makeModel,
+      veh_nomen: c.vehNomen,
+      mgmt_cd: c.mgmtCd,
+      mel_key: c.melKey,
+    });
+  }
+  const fleetUpsert = env.ETIC_SNAPSHOTS.prepare(
+    `INSERT INTO fleet_asset_current (
+       asset_id, owning_unit, shop, make_model, veh_nomen, mgmt_cd, mel_key, last_seen_snapshot_date, updated_at_iso
+     ) VALUES (?,?,?,?,?,?,?,?,?)
+     ON CONFLICT(asset_id) DO UPDATE SET
+       owning_unit = excluded.owning_unit,
+       shop = excluded.shop,
+       make_model = excluded.make_model,
+       veh_nomen = excluded.veh_nomen,
+       mgmt_cd = excluded.mgmt_cd,
+       mel_key = excluded.mel_key,
+       last_seen_snapshot_date = excluded.last_seen_snapshot_date,
+       updated_at_iso = excluded.updated_at_iso`,
+  );
+  const fleetStmts: D1PreparedStatement[] = [];
+  for (const [aid, f] of fleetByAsset) {
+    fleetStmts.push(
+      fleetUpsert.bind(
+        aid,
+        f.owning_unit,
+        f.shop,
+        f.make_model,
+        f.veh_nomen,
+        f.mgmt_cd,
+        f.mel_key,
+        dateKey,
+        updatedAtIso,
+      ),
+    );
+  }
+  for (let i = 0; i < fleetStmts.length; i += BATCH) {
+    await env.ETIC_SNAPSHOTS.batch(fleetStmts.slice(i, i + BATCH));
+  }
+
   // Verify any pending FM&A actions against the changes we just wrote.
   // Soft-fails so a verifier bug never blocks an ingest.
   try {
