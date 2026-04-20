@@ -403,6 +403,8 @@ export type WatchRow = {
   scheduleMxBucket: ScheduleMxBucket;
   /** No fleet schedule-mx / due data — should be added in the workbook. */
   scheduleMxNeedsEntry: boolean;
+  /** Fleet / workbook "days down" style column when present in raw row JSON. */
+  daysDown: number | null;
 };
 
 type WatchReadRow = {
@@ -457,6 +459,18 @@ function pickRawValue(raw: Record<string, string>, candidates: string[]): string
     if (found && raw[found] && raw[found].trim()) return raw[found].trim();
   }
   return "";
+}
+
+function pickDaysDownFromRaw(raw: Record<string, string>): number | null {
+  const s = pickRawValue(raw, [
+    "days down",
+    "fleet.days down",
+    "day down",
+    "fleet.day down",
+  ]);
+  if (!s) return null;
+  const n = Number.parseFloat(String(s).replace(/[^\d.-]/g, ""));
+  return Number.isFinite(n) ? Math.round(n) : null;
 }
 
 function findScheduleMxStatus(raw: Record<string, string>): string {
@@ -634,6 +648,7 @@ function rowToWatchRow(
   const historyBounded =
     !!firstSeen && !!earliest && firstSeen === earliest && row.last_remark_change_date <= firstSeen;
   const rawCols = readRawColumns(row.raw_row_json);
+  const daysDown = pickDaysDownFromRaw(rawCols);
   return {
     workOrderId: row.work_order_id,
     assetId: row.asset_id,
@@ -659,6 +674,7 @@ function rowToWatchRow(
     vehNomen: row.veh_nomen ?? "",
     firstSeenDate: firstSeen,
     historyBounded,
+    daysDown,
     ...extractRawExtrasFromColumns(rawCols),
     ...analyzeScheduleMxFromRaw(rawCols, asOfDateKey),
   };

@@ -34,6 +34,8 @@ import {
   listMeetings,
   renderMeetingMinutesMarkdown,
   setMeetingCursor,
+  setMeetingPauseState,
+  setMeetingPresenterScale,
   setMeetingTimelineScroll,
   upsertMeetingNote,
   type CreateMeetingInput,
@@ -91,6 +93,7 @@ import {
   getMelLatest,
   getMelRollup,
   getMelSnapshotDates,
+  getAuthzManagerData,
   getMelSubdivisions,
   getStalenessThresholds,
   ingestMelSnapshot,
@@ -296,6 +299,14 @@ export default {
       return handleSnapshotsList(env);
     }
 
+    if (url.pathname === "/api/mc-series/dimensions") {
+      return handleMcSeriesDimensionsApi(env, url);
+    }
+
+    if (url.pathname === "/api/mc-series") {
+      return handleMcSeriesApi(env, url);
+    }
+
     if (url.pathname === "/api/latest") {
       let analysis = await readJson<AnalysisResult>(env, "analyses/latest.json");
       if (!analysis) return new Response("Not Found", { status: 404 });
@@ -324,6 +335,10 @@ export default {
 
     if (url.pathname === "/api/schedule-mx") {
       return handleScheduleMxApi(env, request);
+    }
+
+    if (url.pathname === "/api/authz-manager") {
+      return handleAuthzManagerApi(env, request);
     }
 
     if (url.pathname === "/api/work-order-changelog") {
@@ -471,7 +486,7 @@ export default {
     if (url.pathname === "/api/meeting") {
       return handleMeetingCreateApi(env, request);
     }
-    const meetingMatch = url.pathname.match(/^\/api\/meeting\/(\d+)(?:\/(notes|end|add|cursor))?$/);
+    const meetingMatch = url.pathname.match(/^\/api\/meeting\/(\d+)(?:\/(notes|end|add|cursor|pause|zoom))?$/);
     if (meetingMatch) {
       const id = Number.parseInt(meetingMatch[1] ?? "", 10);
       const action = meetingMatch[2] ?? "";
@@ -480,6 +495,8 @@ export default {
       if (action === "end") return handleMeetingEndApi(env, request, id);
       if (action === "add") return handleMeetingAddWosApi(env, request, id);
       if (action === "cursor") return handleMeetingCursorApi(env, request, id);
+      if (action === "pause") return handleMeetingPauseApi(env, request, id);
+      if (action === "zoom") return handleMeetingZoomApi(env, request, id);
       return handleMeetingGetApi(env, request, id);
     }
 
@@ -987,6 +1004,257 @@ async function handleSnapshotsList(env: Env): Promise<Response> {
   }));
 
   return Response.json({ updatedAtIso: new Date().toISOString(), snapshots: rows }, { headers: cacheHeaders() });
+}
+
+/** MC% time series for charts: fleet (etic_snapshots), unit (Asset Manager label), MEL key, mgmt code, or MEL unit column. */
+async function handleMcSeriesApi(env: Env, url: URL): Promise<Response> {
+  const from = url.searchParams.get("from") || "";
+  const to = url.searchParams.get("to") || "";
+  const mode = (url.searchParams.get("mode") || "fleet").toLowerCase();
+  const key = (url.searchParams.get("key") || "").trim();
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+    return Response.json({ error: "Invalid from/to (use YYYY-MM-DD)" }, { status: 400, headers: cacheHeaders() });
+  }
+  if (from > to) {
+    return Response.json({ error: "from must be <= to" }, { status: 400, headers: cacheHeaders() });
+  }
+
+  if (mode === "fleet") {
+    const r = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT date_key, mc_rate, fmc, nmc FROM etic_snapshots
+       WHERE date_key >= ? AND date_key <= ? ORDER BY date_key ASC`,
+    )
+      .bind(from, to)
+      .all<{ date_key: string; mc_rate: number | null; fmc: number | null; nmc: number | null }>();
+    const points = (r.results ?? []).map((row) => ({
+      dateKey: row.date_key,
+      mc: row.mc_rate,
+      fmc: row.fmc != null ? Number(row.fmc) : null,
+      nmc: row.nmc != null ? Number(row.nmc) : null,
+    }));
+    return Response.json({ mode: "fleet", points }, { headers: cacheHeaders() });
+  }
+
+  if (mode === "unit") {
+    if (!key) {
+      return Response.json(
+        { error: "key required (Asset Manager row label, e.g. unit name from MC by Unit)" },
+        { status: 400, headers: cacheHeaders() },
+      );
+    }
+    const keyLc = key.toLowerCase();
+    const r = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT date_key, asset_manager_breakdown FROM etic_snapshots
+       WHERE date_key >= ? AND date_key <= ? ORDER BY date_key ASC`,
+    )
+      .bind(from, to)
+      .all<{ date_key: string; asset_manager_breakdown: string | null }>();
+    const points: {
+      dateKey: string;
+      mc: number | null;
+      fmc: number | null;
+      nmc: number | null;
+    }[] = [];
+    for (const row of r.results ?? []) {
+      let mc: number | null = null;
+      let fmc: number | null = null;
+      let nmc: number | null = null;
+      try {
+        const raw = row.asset_manager_breakdown;
+        const arr = raw
+          ? (JSON.parse(raw) as {
+              label?: string;
+              mcRatePercent?: number | null;
+              fmc?: number | null;
+              nmc?: number | null;
+            }[])
+          : [];
+        if (Array.isArray(arr)) {
+          let hit = arr.find((x) => (x.label || "").trim().toLowerCase() === keyLc);
+          if (!hit) {
+            hit = arr.find((x) => (x.label || "").trim().toLowerCase().includes(keyLc));
+          }
+          if (hit) {
+            if (hit.mcRatePercent != null && typeof hit.mcRatePercent === "number") {
+              mc = hit.mcRatePercent;
+            }
+            if (hit.fmc != null && typeof hit.fmc === "number") fmc = hit.fmc;
+            if (hit.nmc != null && typeof hit.nmc === "number") nmc = hit.nmc;
+          }
+        }
+      } catch (_e) {
+        /* ignore corrupt JSON */
+      }
+      points.push({ dateKey: row.date_key, mc, fmc, nmc });
+    }
+    return Response.json({ mode: "unit", key, points }, { headers: cacheHeaders() });
+  }
+
+  if (mode === "mel") {
+    if (!key) {
+      return Response.json({ error: "key required (MEL key string)" }, { status: 400, headers: cacheHeaders() });
+    }
+    const r = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT snapshot_date_key,
+              SUM(fmc_count) AS f, SUM(nmc_count) AS n
+       FROM mel_snapshot
+       WHERE mel_key = ? AND snapshot_date_key >= ? AND snapshot_date_key <= ?
+       GROUP BY snapshot_date_key
+       ORDER BY snapshot_date_key ASC`,
+    )
+      .bind(key, from, to)
+      .all<{ snapshot_date_key: string; f: number | null; n: number | null }>();
+    const points = (r.results ?? []).map((row) => {
+      const f = Number(row.f) || 0;
+      const n = Number(row.n) || 0;
+      const t = f + n;
+      return {
+        dateKey: row.snapshot_date_key,
+        mc: t > 0 ? (f / t) * 100 : null,
+        fmc: f,
+        nmc: n,
+      };
+    });
+    return Response.json({ mode: "mel", key, points }, { headers: cacheHeaders() });
+  }
+
+  if (mode === "mgmt") {
+    if (!key) {
+      return Response.json(
+        { error: "key required (substring to match mgmt_code_name, e.g. B204)" },
+        { status: 400, headers: cacheHeaders() },
+      );
+    }
+    const like = "%" + key.replace(/[%_]/g, "") + "%";
+    const r = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT snapshot_date_key,
+              SUM(fmc_count) AS f, SUM(nmc_count) AS n
+       FROM mel_snapshot
+       WHERE mgmt_code_name LIKE ? AND snapshot_date_key >= ? AND snapshot_date_key <= ?
+       GROUP BY snapshot_date_key
+       ORDER BY snapshot_date_key ASC`,
+    )
+      .bind(like, from, to)
+      .all<{ snapshot_date_key: string; f: number | null; n: number | null }>();
+    const points = (r.results ?? []).map((row) => {
+      const f = Number(row.f) || 0;
+      const n = Number(row.n) || 0;
+      const t = f + n;
+      return {
+        dateKey: row.snapshot_date_key,
+        mc: t > 0 ? (f / t) * 100 : null,
+        fmc: f,
+        nmc: n,
+      };
+    });
+    return Response.json({ mode: "mgmt", key, points }, { headers: cacheHeaders() });
+  }
+
+  if (mode === "unit_mel") {
+    if (!key) {
+      return Response.json(
+        { error: "key required (MEL snapshot unit column — exact match)" },
+        { status: 400, headers: cacheHeaders() },
+      );
+    }
+    const r = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT snapshot_date_key,
+              SUM(fmc_count) AS f, SUM(nmc_count) AS n
+       FROM mel_snapshot
+       WHERE unit = ? AND snapshot_date_key >= ? AND snapshot_date_key <= ?
+       GROUP BY snapshot_date_key
+       ORDER BY snapshot_date_key ASC`,
+    )
+      .bind(key, from, to)
+      .all<{ snapshot_date_key: string; f: number | null; n: number | null }>();
+    const points = (r.results ?? []).map((row) => {
+      const f = Number(row.f) || 0;
+      const n = Number(row.n) || 0;
+      const t = f + n;
+      return {
+        dateKey: row.snapshot_date_key,
+        mc: t > 0 ? (f / t) * 100 : null,
+        fmc: f,
+        nmc: n,
+      };
+    });
+    return Response.json({ mode: "unit_mel", key, points }, { headers: cacheHeaders() });
+  }
+
+  return Response.json(
+    { error: "Unknown mode (use fleet, unit, mel, mgmt, unit_mel)" },
+    { status: 400, headers: cacheHeaders() },
+  );
+}
+
+/** Distinct slicer values for MC chart (union across snapshots in [from, to]). */
+async function handleMcSeriesDimensionsApi(env: Env, url: URL): Promise<Response> {
+  const from = url.searchParams.get("from") || "";
+  const to = url.searchParams.get("to") || "";
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+    return Response.json({ error: "Invalid from/to (YYYY-MM-DD)" }, { status: 400, headers: cacheHeaders() });
+  }
+  if (from > to) {
+    return Response.json({ error: "from must be <= to" }, { status: 400, headers: cacheHeaders() });
+  }
+
+  const [melKeys, melUnits, mgmtNames, amRows] = await Promise.all([
+    env.ETIC_SNAPSHOTS.prepare(
+      `SELECT DISTINCT mel_key AS v FROM mel_snapshot
+       WHERE snapshot_date_key >= ? AND snapshot_date_key <= ? AND TRIM(mel_key) != ''
+       ORDER BY mel_key`,
+    )
+      .bind(from, to)
+      .all<{ v: string }>(),
+    env.ETIC_SNAPSHOTS.prepare(
+      `SELECT DISTINCT unit AS v FROM mel_snapshot
+       WHERE snapshot_date_key >= ? AND snapshot_date_key <= ? AND TRIM(unit) != ''
+       ORDER BY unit`,
+    )
+      .bind(from, to)
+      .all<{ v: string }>(),
+    env.ETIC_SNAPSHOTS.prepare(
+      `SELECT DISTINCT mgmt_code_name AS v FROM mel_snapshot
+       WHERE snapshot_date_key >= ? AND snapshot_date_key <= ? AND TRIM(mgmt_code_name) != ''
+       ORDER BY mgmt_code_name`,
+    )
+      .bind(from, to)
+      .all<{ v: string }>(),
+    env.ETIC_SNAPSHOTS.prepare(
+      `SELECT asset_manager_breakdown AS j FROM etic_snapshots
+       WHERE date_key >= ? AND date_key <= ?
+         AND asset_manager_breakdown IS NOT NULL AND TRIM(asset_manager_breakdown) != ''`,
+    )
+      .bind(from, to)
+      .all<{ j: string }>(),
+  ]);
+
+  const unitAm = new Set<string>();
+  for (const row of amRows.results ?? []) {
+    try {
+      const arr = JSON.parse(row.j) as { label?: string }[];
+      if (!Array.isArray(arr)) continue;
+      for (const x of arr) {
+        const lb = (x.label || "").trim();
+        if (lb) unitAm.add(lb);
+      }
+    } catch (_e) {
+      /* skip bad JSON */
+    }
+  }
+
+  return Response.json(
+    {
+      from,
+      to,
+      unitAm: [...unitAm].sort((a, b) => a.localeCompare(b)),
+      melKey: (melKeys.results ?? []).map((r) => r.v),
+      melUnit: (melUnits.results ?? []).map((r) => r.v),
+      mgmtName: (mgmtNames.results ?? []).map((r) => r.v),
+    },
+    { headers: cacheHeaders() },
+  );
 }
 
 async function persistAnalysisIfChanged(env: Env, analysis: AnalysisResult): Promise<void> {
@@ -3412,6 +3680,39 @@ async function handleMeetingCursorApi(env: Env, request: Request, id: number): P
   return Response.json({ meeting: updated }, { headers: cacheHeaders() });
 }
 
+async function handleMeetingPauseApi(env: Env, request: Request, id: number): Promise<Response> {
+  if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+  const body = await readJsonBody<{ paused?: boolean }>(request);
+  const paused = !!body?.paused;
+  const updated = await setMeetingPauseState(env, id, paused);
+  if (!updated) return Response.json({ error: "Not found" }, { status: 404, headers: cacheHeaders() });
+  return Response.json({ meeting: updated }, { headers: cacheHeaders() });
+}
+
+async function handleMeetingZoomApi(env: Env, request: Request, id: number): Promise<Response> {
+  if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+  const body = await readJsonBody<{ scale?: number; delta?: number }>(request);
+  const cur = await env.ETIC_SNAPSHOTS.prepare(`SELECT presenter_scale FROM meeting WHERE id = ?`)
+    .bind(id)
+    .first<{ presenter_scale: number | null }>();
+  if (!cur) return Response.json({ error: "Not found" }, { status: 404, headers: cacheHeaders() });
+  let next = cur.presenter_scale != null ? Number(cur.presenter_scale) : 1;
+  if (!Number.isFinite(next)) next = 1;
+  if (typeof body?.delta === "number" && Number.isFinite(body.delta)) {
+    next = Math.round((next + body.delta) * 100) / 100;
+  } else if (typeof body?.scale === "number" && Number.isFinite(body.scale)) {
+    next = body.scale;
+  } else {
+    return Response.json(
+      { error: "JSON body must include scale: number and/or delta: number" },
+      { status: 400, headers: cacheHeaders() },
+    );
+  }
+  const updated = await setMeetingPresenterScale(env, id, next);
+  if (!updated) return Response.json({ error: "Not found" }, { status: 404, headers: cacheHeaders() });
+  return Response.json({ meeting: updated }, { headers: cacheHeaders() });
+}
+
 async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext): Promise<Response> {
   if (request.method === "POST") {
     const url = new URL(request.url);
@@ -3547,6 +3848,12 @@ async function handleScheduleMxApi(env: Env, request: Request): Promise<Response
     nceCritical: rows.filter((r) => r.scheduleMxNceCritical).length,
   };
   return Response.json({ dateKey, stats, rows }, { headers: cacheHeaders() });
+}
+
+async function handleAuthzManagerApi(env: Env, request: Request): Promise<Response> {
+  if (request.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
+  const data = await getAuthzManagerData(env);
+  return Response.json(data, { headers: cacheHeaders() });
 }
 
 async function handleWorkOrderTimelineApi(env: Env, request: Request): Promise<Response> {
@@ -6440,6 +6747,28 @@ function renderDashboardHtml(): string {
     }
     .main-nav button.active:hover { color: #ffffff; }
 
+    .construction-banner {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: 8px 14px;
+      margin: 0 0 20px;
+      padding: 12px 16px;
+      border-radius: var(--radius);
+      border: 1px solid rgba(160, 103, 10, 0.45);
+      background: linear-gradient(180deg, rgba(245, 199, 84, 0.22) 0%, rgba(245, 199, 84, 0.1) 100%);
+      color: var(--text);
+      font-size: 0.9rem;
+      line-height: 1.45;
+      box-shadow: var(--shadow-sm);
+    }
+    .construction-banner strong {
+      font-weight: 800;
+      color: #6b4a00;
+      letter-spacing: 0.02em;
+    }
+    .construction-banner span { color: var(--text-dim); }
+
     /* --- Hero page header ------------------------------------------------- */
     .hero {
       position: relative;
@@ -6551,6 +6880,123 @@ function renderDashboardHtml(): string {
     .kpi-val-nmc { color: var(--danger); }
     .kpi-val-surplus { color: var(--warn); }
     .kpi-missing .val { color: var(--subtle); font-weight: 500; font-size: 1.1rem; }
+
+    /* --- MC rate trend chart (snapshot tab) -------------------------------- */
+    .mc-chart-card { margin-bottom: 28px; }
+    .mc-chart-controls {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 12px 16px;
+      align-items: end;
+      margin-bottom: 16px;
+    }
+    .mc-chart-controls label span {
+      display: block;
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .mc-chart-controls select,
+    .mc-chart-controls input[type="text"] {
+      width: 100%;
+      font-size: 0.88rem;
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid var(--border-strong);
+      background: var(--bg-elev);
+      color: var(--text);
+    }
+    .mc-chart-controls .mc-chart-preset-strip {
+      grid-column: 1 / -1;
+      margin-top: 4px;
+      padding-top: 10px;
+      border-top: 1px solid var(--border);
+      align-items: center;
+    }
+    .mc-chart-wrap {
+      position: relative;
+      width: 100%;
+      height: min(340px, 42vh);
+      min-height: 240px;
+      border-radius: 10px;
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      overflow: hidden;
+    }
+    .mc-chart-wrap canvas { display: block; width: 100%; height: 100%; }
+    .mc-chart-legend {
+      margin: 10px 0 6px;
+      padding: 12px 14px;
+      border-radius: 10px;
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      font-size: 0.84rem;
+      line-height: 1.45;
+      color: var(--text-dim);
+    }
+    .mc-chart-legend.hidden { display: none; }
+    .mc-leg-head {
+      font-weight: 700;
+      color: var(--text);
+      margin-bottom: 8px;
+      font-size: 0.9rem;
+    }
+    .mc-leg-list { margin: 0; padding: 0; list-style: none; }
+    .mc-leg-list li {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      margin: 5px 0;
+    }
+    .mc-sw {
+      display: inline-block;
+      width: 14px;
+      height: 14px;
+      border-radius: 3px;
+      flex-shrink: 0;
+      margin-top: 2px;
+      border: 1px solid rgba(15,30,60,0.15);
+    }
+    .mc-sw-mc { background: #003a8c; }
+    .mc-sw-fmc { background: #157f3a; }
+    .mc-sw-nmc { background: #b00020; }
+    .mc-leg-notes,
+    .mc-leg-series { margin: 8px 0 0; font-size: 0.8rem; color: var(--muted); }
+    .mc-leg-series strong,
+    .mc-leg-notes strong { color: var(--text-dim); font-weight: 600; }
+    .mc-chart-status { margin-top: 10px; font-size: 0.82rem; color: var(--muted); min-height: 1.25em; }
+    .mc-chart-slicer-block {
+      grid-column: 1 / -1;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding-top: 4px;
+      border-top: 1px solid var(--border);
+      margin-top: 4px;
+    }
+    .mc-chart-slicer-block.hidden { display: none !important; }
+    .mc-chart-slicer-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-end;
+      gap: 12px 16px;
+    }
+    .mc-chart-slicer-row label.mc-chart-slicer-main {
+      flex: 1 1 320px;
+      min-width: 0;
+    }
+    .mc-chart-slicer-row #mc-chart-reload-slicers { flex: 0 0 auto; white-space: nowrap; }
+    #mc-chart-slicer {
+      max-height: 240px;
+      font-size: 0.88rem;
+    }
+    .mc-chart-dim-hint {
+      margin: 0;
+      font-size: 0.76rem;
+      color: var(--muted);
+      line-height: 1.35;
+    }
 
     /* --- Card primitive --------------------------------------------------- */
     .card {
@@ -8434,7 +8880,7 @@ function renderDashboardHtml(): string {
 
     /* View-mode toggle: list vs critical slide. */
     .mel-viewmode {
-      display: inline-flex; gap: 0; margin: 0 0 14px;
+      display: inline-flex; gap: 0;
       background: var(--bg1); border: 1px solid var(--border); border-radius: 10px; padding: 4px;
     }
     .mel-vm-btn {
@@ -8465,6 +8911,13 @@ function renderDashboardHtml(): string {
     .mel-card-star.on { color: #f7d96b; background: rgba(247,217,107,0.14); }
     .mel-card.critical { border-color: rgba(247,217,107,0.45); }
     .mel-card-type { font-size: 0.78rem; color: var(--text-dim); font-weight: 500; }
+    .mel-card-type-src {
+      display: block;
+      font-size: 0.72rem;
+      color: var(--muted);
+      font-weight: 400;
+      margin-top: 3px;
+    }
 
     /* ---- Critical slide view ---- */
     .mel-slide { display: block; }
@@ -8510,8 +8963,31 @@ function renderDashboardHtml(): string {
     .slide-table tr.slide-row.sub td { background: rgba(15,30,60,0.04); }
     .slide-table tr.slide-row.expanded td { background: var(--accent-soft); }
     .slide-table .td-type { font-weight: 600; white-space: normal; }
+    .slide-table .slide-type-workbook {
+      font-size: 0.72rem;
+      font-weight: 500;
+      color: var(--muted);
+      margin-top: 2px;
+    }
     .slide-table .td-type.sub { padding-left: 18px; color: var(--text-dim); font-weight: 500; }
     .slide-table .td-key { font-family: var(--font-mono); font-size: 0.82rem; }
+    .slide-table .td-unit { white-space: nowrap; }
+    .mel-slide-nce {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 1.25em;
+      height: 1.25em;
+      margin-left: 6px;
+      vertical-align: middle;
+      border-radius: 50%;
+      background: #e8c400;
+      color: #1a1a1a;
+      font-size: 0.72em;
+      line-height: 1;
+      font-weight: 800;
+      flex-shrink: 0;
+    }
     .slide-table .cell-bad  { background: rgba(176,0,32,0.18); color: var(--danger); font-weight: 700; }
     .slide-table .cell-warn { background: rgba(160,103,10,0.18); color: var(--warn); font-weight: 700; }
     .slide-table .cell-good { color: var(--success); }
@@ -9234,11 +9710,117 @@ function renderDashboardHtml(): string {
     }
     .mel-cmp-meta { color: var(--muted); font-size: 0.78rem; margin-left: auto; }
 
-    .mel-controls {
-      display: flex; flex-wrap: wrap; align-items: center; gap: 12px;
+    .mel-toolbar {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px 14px 14px;
       margin-bottom: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
     }
-    .mel-filter-tabs { display: inline-flex; gap: 6px; }
+    .mel-toolbar-head {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .mel-toolbar-strip {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px 12px;
+    }
+    .mel-toolbar-strip .mel-filter-tabs {
+      flex: 1 1 260px;
+      min-width: 0;
+    }
+    .mel-search-wrap {
+      flex: 1 1 220px;
+      min-width: min(100%, 200px);
+      position: relative;
+      display: flex;
+      align-items: center;
+    }
+    .mel-search-wrap .mel-search-icon {
+      position: absolute;
+      left: 11px;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 17px;
+      height: 17px;
+      pointer-events: none;
+      opacity: 0.5;
+      background-color: var(--muted);
+      mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='black' d='M15.5 14h-.79l-.28-.27A6.471 6.471 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z'/%3E%3C/svg%3E") center/contain no-repeat;
+      -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='black' d='M15.5 14h-.79l-.28-.27A6.471 6.471 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z'/%3E%3C/svg%3E") center/contain no-repeat;
+    }
+    .mel-search-wrap input[type="search"],
+    .mel-search-wrap input[type="text"] {
+      width: 100%;
+      box-sizing: border-box;
+      background: var(--bg1);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 8px 12px 8px 36px;
+      font-size: 0.84rem;
+    }
+    .mel-search-wrap input::placeholder { color: var(--muted); }
+    .mel-toolbar-refine {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px 12px;
+      padding-top: 4px;
+      border-top: 1px solid rgba(15, 30, 60, 0.08);
+    }
+    @media (max-width: 900px) {
+      .mel-toolbar-refine { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 480px) {
+      .mel-toolbar-refine { grid-template-columns: 1fr; }
+    }
+    .mel-select-field {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      min-width: 0;
+    }
+    .mel-select-field .mel-select-lbl {
+      font-size: 0.62rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      color: var(--muted);
+    }
+    .mel-select-inner {
+      position: relative;
+    }
+    .mel-select-inner select {
+      width: 100%;
+      box-sizing: border-box;
+      appearance: none;
+      -webkit-appearance: none;
+      background: var(--bg1);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 32px 8px 10px;
+      font-size: 0.82rem;
+      cursor: pointer;
+      min-height: 38px;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%235b6675' stroke-width='2.5'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 10px center;
+    }
+    .mel-select-inner select:hover { border-color: var(--accent); }
+    .mel-select-inner select:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(0, 58, 140, 0.12);
+    }
+    .mel-filter-tabs { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
     .mel-filter-btn {
       background: var(--bg1); color: var(--text);
       border: 1px solid var(--border); border-radius: 999px;
@@ -9249,13 +9831,6 @@ function renderDashboardHtml(): string {
     .mel-filter-btn.active { background: var(--accent); color: var(--bg); border-color: var(--accent); }
     .mel-filter-btn .count { color: var(--subtle); font-variant-numeric: tabular-nums; margin-left: 4px; }
     .mel-filter-btn.active .count { color: var(--bg); }
-    .mel-refine { display: inline-flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-left: auto; }
-    .mel-refine input[type="text"], .mel-refine select {
-      background: var(--bg1); color: var(--text);
-      border: 1px solid var(--border); border-radius: 8px;
-      padding: 6px 10px; font-size: 0.82rem;
-    }
-    .mel-refine input[type="text"] { min-width: 220px; }
 
     .mel-layout {
       display: grid; grid-template-columns: minmax(320px, 460px) 1fr;
@@ -9340,6 +9915,14 @@ function renderDashboardHtml(): string {
     }
     .mel-d-hero .pills { display: inline-flex; gap: 8px; flex-wrap: wrap; }
     .mel-d-hero .meta { color: var(--muted); font-size: 0.85rem; }
+    .mel-d-type-override {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      font-size: 0.9rem;
+    }
+    .mel-d-type-override .mel-d-type-disp { font-weight: 600; color: var(--text); }
+    .mel-d-type-override .mel-d-type-src { font-size: 0.8rem; color: var(--muted); font-weight: 400; }
     .mel-d-grid {
       display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 10px; margin-bottom: 22px;
@@ -9431,11 +10014,32 @@ function renderDashboardHtml(): string {
       background: var(--bg1); border: 1px solid var(--border);
       border-radius: 10px; overflow: hidden;
     }
-    .mel-cl-head {
-      display: flex; align-items: center; gap: 10px;
+    .mel-cl-group > summary.mel-cl-head {
+      list-style: none;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 10px;
       padding: 8px 12px;
       background: rgba(15,30,60,0.03);
+      user-select: none;
+    }
+    .mel-cl-group > summary.mel-cl-head::-webkit-details-marker { display: none; }
+    .mel-cl-group[open] > summary.mel-cl-head {
       border-bottom: 1px solid var(--border);
+    }
+    .mel-cl-chev {
+      display: inline-block;
+      width: 1.1em;
+      text-align: center;
+      color: var(--muted);
+      font-size: 0.75rem;
+      line-height: 1;
+      transition: transform 0.15s ease;
+      flex-shrink: 0;
+    }
+    .mel-cl-group[open] > summary.mel-cl-head .mel-cl-chev {
+      transform: rotate(90deg);
     }
     .mel-cl-head .d { font-variant-numeric: tabular-nums; font-weight: 700; font-size: 0.88rem; color: var(--text); letter-spacing: 0.02em; }
     .mel-cl-head .mel-cl-count { margin-left: auto; font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
@@ -9705,7 +10309,39 @@ function renderDashboardHtml(): string {
     .meeting-clock[data-state="overtime"] .meeting-clock-time { color: var(--danger); }
     .meeting-clock[data-state="overtime"] { border-color: rgba(255,138,138,0.4); background: rgba(255,138,138,0.08); }
     .meeting-clock[data-state="paused"] .meeting-clock-time { color: var(--muted); }
-    .meeting-live-actions { display: flex; gap: 8px; }
+    .meeting-live-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .meeting-tv-zoom {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 10px;
+      border-radius: 10px;
+      border: 1px solid var(--border, rgba(15,30,60,0.14));
+      background: var(--surface, #fff);
+    }
+    .meeting-tv-zoom-lbl {
+      font-size: 0.68rem;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted, #5b6675);
+    }
+    .meeting-zoom-btn {
+      min-width: 2.1rem;
+      padding: 4px 0;
+      font-weight: 800;
+      font-size: 1.05rem;
+      line-height: 1;
+      border-radius: 8px;
+    }
+    .meeting-tv-zoom-pct {
+      font-size: 0.8rem;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      min-width: 3.5ch;
+      text-align: center;
+      color: var(--text-dim, #2c3a55);
+    }
 
     .meeting-live-body {
       display: grid;
@@ -9725,7 +10361,13 @@ function renderDashboardHtml(): string {
       gap: 10px;
       min-height: 0;
     }
-    .meeting-queue-filters { display: grid; grid-template-columns: 1fr 120px; gap: 6px; }
+    .meeting-queue-filters {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      grid-template-rows: auto auto;
+      gap: 6px;
+    }
+    .meeting-queue-filters #meeting-queue-search { grid-column: 1 / -1; }
     .meeting-queue-filters input, .meeting-queue-filters select {
       font-size: 0.8rem;
       padding: 7px 10px;
@@ -9859,6 +10501,20 @@ function renderDashboardHtml(): string {
     .mf-tl-body { word-break: break-word; color: var(--text-dim); }
     .mf-tl-body del { text-decoration: line-through; color: var(--subtle); }
     .mf-tl-body ins { text-decoration: none; color: var(--text); font-weight: 600; }
+    /* Controller mini-timeline uses the same flat rows as the TV — compact sizing */
+    .mf-tl-list .p-tl-row {
+      display: grid;
+      grid-template-columns: 76px minmax(56px, 72px) 1fr;
+      gap: 6px 8px;
+      align-items: start;
+      padding: 5px 7px;
+      border-radius: 6px;
+      font-size: 0.76rem;
+      line-height: 1.35;
+      border: 1px solid var(--border, rgba(15,30,60,0.1));
+      border-left-width: 3px;
+    }
+    .mf-tl-list .p-tl-kind { font-size: 0.62rem; }
     .mf-tl-body .mfl-slip-pill {
       display: inline-block; margin-left: 4px; padding: 0 6px;
       border-radius: 999px; background: rgba(255,138,138,0.14); color: var(--danger);
@@ -9927,357 +10583,695 @@ function renderDashboardHtml(): string {
 
     /* --- Presenter view (conference room screen) ------------------------- */
     /* When ?present=<id> is in the URL we hide everything else and take over.
-       Designed to look great projected onto a TV from across the room. */
+       Light USAF palette (matches dashboard). Flex layout so timeline + notes
+       share the viewport — no fixed max-height clipping. */
     body.presenter-mode .app { display: none; }
-    body.presenter-mode { background: #0a0c12; overflow: hidden; }
+    body.presenter-mode .ask-fab,
+    body.presenter-mode .ask-dock {
+      display: none !important;
+      pointer-events: none;
+    }
+    body.presenter-mode {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg0, #f3f5f8);
+      overflow: hidden;
+    }
+    body.presenter-mode::before {
+      content: "";
+      display: block;
+      height: 4px;
+      background: linear-gradient(90deg, #003a8c 0%, #003a8c 60%, #b00020 60%, #b00020 100%);
+    }
     .presenter {
       position: fixed;
       inset: 0;
       display: flex;
       flex-direction: column;
-      background: radial-gradient(circle at 20% -10%, rgba(91,167,255,0.10), transparent 60%),
-                  radial-gradient(circle at 90% 110%, rgba(120,255,180,0.06), transparent 55%),
-                  #0a0c12;
-      color: #f1f4fb;
-      padding: 28px 40px;
-      gap: 18px;
+      padding: 16px 28px 14px;
+      gap: 12px;
+      background: var(--bg0, #f3f5f8);
+      color: var(--text, #0a1a3a);
+      font-family: var(--font, "Source Sans 3", system-ui, sans-serif);
     }
     .presenter.hidden { display: none; }
     .presenter-top {
       display: grid;
-      grid-template-columns: 1fr auto auto;
+      grid-template-columns: 1fr auto auto auto;
       align-items: center;
-      gap: 28px;
-      border-bottom: 1px solid rgba(255,255,255,0.10);
-      padding-bottom: 18px;
+      gap: 12px 16px;
+      flex: 0 0 auto;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border, rgba(15,30,60,0.12));
+    }
+    @media (max-width: 720px) {
+      .presenter-top {
+        grid-template-columns: 1fr 1fr;
+        grid-template-areas:
+          "meta meta"
+          "clock fs"
+          "pos pos";
+      }
+      .presenter-top .presenter-meta { grid-area: meta; }
+      .presenter-top .presenter-clock { grid-area: clock; }
+      .presenter-fs-btn { grid-area: fs; justify-self: end; }
+      .presenter-top .presenter-position-wrap { grid-area: pos; text-align: left; justify-self: stretch; }
+    }
+    .presenter-fs-btn {
+      justify-self: end;
+      padding: 8px 14px;
+      border-radius: 10px;
+      font: inherit;
+      font-size: clamp(0.82rem, 0.95vw, 0.9rem);
+      font-weight: 600;
+      cursor: pointer;
+      border: 1px solid var(--border-strong, rgba(15,30,60,0.22));
+      background: var(--surface, #fff);
+      color: var(--accent, #003a8c);
+      box-shadow: var(--shadow-sm, 0 1px 2px rgba(15,30,60,0.06));
+      white-space: nowrap;
+    }
+    .presenter-fs-btn:hover {
+      border-color: var(--accent);
+      background: rgba(0, 58, 140, 0.06);
+    }
+    .presenter:fullscreen {
+      padding: 20px 32px 18px;
+    }
+    .presenter:-webkit-full-screen {
+      padding: 20px 32px 18px;
     }
     .presenter-meeting-title {
-      font-size: clamp(1.6rem, 2.2vw, 2.6rem);
+      font-size: clamp(1.35rem, 2vw, 2rem);
       font-weight: 700;
       letter-spacing: -0.02em;
+      color: var(--text, #0a1a3a);
     }
     .presenter-meeting-sub {
-      font-size: clamp(0.95rem, 1.1vw, 1.2rem);
-      color: rgba(241,244,251,0.6);
-      margin-top: 4px;
+      font-size: clamp(0.88rem, 1.05vw, 1.05rem);
+      color: var(--muted, #5b6675);
+      margin-top: 2px;
+      line-height: 1.35;
     }
     .presenter-clock {
       text-align: center;
-      padding: 8px 22px;
-      border-radius: 16px;
-      background: rgba(255,255,255,0.04);
-      border: 1px solid rgba(255,255,255,0.10);
-      min-width: 220px;
+      padding: 8px 18px;
+      border-radius: 12px;
+      background: var(--surface, #fff);
+      border: 1px solid var(--border-strong, rgba(15,30,60,0.18));
+      min-width: 200px;
+      box-shadow: var(--shadow-sm, 0 1px 2px rgba(15,30,60,0.06));
     }
     .presenter-clock-time {
       font-variant-numeric: tabular-nums;
       font-weight: 700;
-      font-size: clamp(2.2rem, 3vw, 3.4rem);
+      font-size: clamp(1.85rem, 2.6vw, 2.75rem);
       letter-spacing: 0.02em;
       line-height: 1;
+      color: var(--accent-strong, #00276b);
     }
     .presenter-clock-sub {
-      font-size: clamp(0.85rem, 1vw, 1.05rem);
-      color: rgba(241,244,251,0.65);
-      margin-top: 6px;
+      font-size: clamp(0.8rem, 0.95vw, 0.95rem);
+      color: var(--muted, #5b6675);
+      margin-top: 4px;
     }
     .presenter-clock[data-state="warn"] .presenter-clock-time { color: var(--warn); }
     .presenter-clock[data-state="overtime"] .presenter-clock-time { color: var(--danger); }
-    .presenter-clock[data-state="paused"] .presenter-clock-time { color: rgba(241,244,251,0.4); }
-    .presenter-position {
-      text-align: right;
-      font-variant-numeric: tabular-nums;
-      font-size: clamp(1.1rem, 1.4vw, 1.5rem);
-      color: rgba(241,244,251,0.7);
+    .presenter-clock[data-state="paused"] .presenter-clock-time { color: var(--subtle, #8a94a4); }
+    .presenter-position-wrap {
+      justify-self: end;
+      min-width: 0;
+      max-width: 100%;
     }
+    .presenter-position {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 8px;
+    }
+    .presenter-pos-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: stretch;
+      justify-content: flex-end;
+      gap: 10px 12px;
+    }
+    .presenter-pos-chip {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 3px;
+      padding: 10px 16px;
+      border-radius: 12px;
+      background: linear-gradient(160deg, #ffffff 0%, var(--bg1, #e9edf3) 110%);
+      border: 1px solid var(--border, rgba(15,30,60,0.14));
+      box-shadow: 0 2px 8px rgba(15,30,60,0.07);
+      text-align: right;
+    }
+    .presenter-pos-chip .p-lbl {
+      font-size: clamp(0.58rem, 0.68vw, 0.7rem);
+      font-weight: 800;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--accent, #003a8c);
+      line-height: 1.2;
+    }
+    .presenter-pos-chip .p-val {
+      font-size: clamp(1.1rem, 1.5vw, 1.55rem);
+      font-weight: 800;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: -0.02em;
+      color: var(--text, #0a1a3a);
+      line-height: 1.05;
+    }
+    .presenter-pos-chip .p-val .p-sep {
+      font-weight: 600;
+      color: var(--subtle, #8a94a4);
+      margin: 0 0.12em;
+      font-size: 0.88em;
+    }
+    .presenter-pos-chip .p-sub {
+      font-size: clamp(0.74rem, 0.86vw, 0.88rem);
+      font-weight: 500;
+      color: var(--muted, #5b6675);
+      line-height: 1.25;
+      max-width: 28ch;
+    }
+    .presenter-pos-chip--cov .p-val { color: var(--success); }
 
     .presenter-stage {
-      flex: 1 1 auto;
+      position: relative;
+      flex: 1 1 0;
       min-height: 0;
       display: flex;
       align-items: stretch;
       justify-content: stretch;
     }
+    .presenter-scrim {
+      display: none;
+      position: absolute;
+      inset: 0;
+      z-index: 30;
+      align-items: center;
+      justify-content: center;
+      padding: 28px 20px;
+      background: linear-gradient(165deg, var(--surface, #fff) 0%, var(--bg2, #f0f3f8) 100%);
+      border-radius: var(--radius-lg, 12px);
+      border: 1px solid var(--border, rgba(15,30,60,0.12));
+      text-align: center;
+    }
+    .presenter-scrim:not(.hidden) { display: flex; }
+    .presenter-scrim-inner { max-width: 40ch; }
+    .presenter-scrim-title {
+      margin: 0 0 12px;
+      font-size: clamp(1.65rem, 3.2vw, 2.4rem);
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      color: var(--text, #0a1a3a);
+      line-height: 1.15;
+    }
+    .presenter-scrim-sub {
+      margin: 0;
+      font-size: clamp(1.05rem, 1.65vw, 1.35rem);
+      color: var(--muted, #5b6675);
+      line-height: 1.45;
+    }
     .presenter-empty {
       margin: auto;
-      font-size: clamp(1.4rem, 2vw, 2rem);
-      color: rgba(241,244,251,0.5);
+      font-size: clamp(1.2rem, 1.8vw, 1.65rem);
+      color: var(--muted, #5b6675);
       text-align: center;
-      padding: 40px;
+      padding: 32px 24px;
+      max-width: 42ch;
+      line-height: 1.45;
     }
     .presenter-card {
-      flex: 1 1 auto;
+      position: relative;
+      flex: 1 1 0;
+      min-height: 0;
       display: flex;
       flex-direction: column;
-      gap: 18px;
-      padding: 28px 32px;
-      border-radius: 22px;
-      background: rgba(22,25,34,0.85);
-      border: 1px solid rgba(255,255,255,0.10);
-      box-shadow: 0 30px 80px rgba(0,0,0,0.45);
-      overflow-y: auto;
+      gap: 12px;
+      padding: 18px 22px;
+      border-radius: var(--radius-lg, 12px);
+      background: var(--surface, #fff);
+      border: 1px solid var(--border, rgba(15,30,60,0.12));
+      box-shadow: var(--shadow-md, 0 2px 8px rgba(15,30,60,0.08));
+      overflow: hidden;
     }
     .presenter-card.hidden { display: none; }
-    .presenter-card { transition: opacity 180ms ease, transform 180ms ease; }
-    .presenter-card.presenter-card-flip { opacity: 0.35; transform: translateY(4px); }
+    @keyframes presenter-card-swoosh {
+      0% { opacity: 0.45; transform: translateY(16px) scale(0.99); }
+      100% { opacity: 1; transform: translateY(0) scale(1); }
+    }
+    .presenter-card.p-wo-swoosh {
+      animation: presenter-card-swoosh 0.58s cubic-bezier(0.22, 1, 0.36, 1) both;
+    }
+    .presenter-wo-flash {
+      position: absolute;
+      top: 16px;
+      right: 16px;
+      z-index: 5;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 18px 10px 16px;
+      border-radius: 12px;
+      background: linear-gradient(135deg, #e9f7ef 0%, #d8f0e4 100%);
+      border: 1px solid #9bd6b1;
+      box-shadow: 0 8px 26px rgba(21, 127, 58, 0.2);
+      pointer-events: none;
+      opacity: 0;
+      transform: translateY(-8px) scale(0.96);
+      transition: opacity 0.35s ease, transform 0.45s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+    .presenter-wo-flash.p-flash-on {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+    .presenter-wo-flash .p-flash-check {
+      font-size: clamp(1.5rem, 2vw, 1.85rem);
+      font-weight: 800;
+      color: var(--success);
+      line-height: 1;
+    }
+    .presenter-wo-flash .p-flash-txt {
+      font-weight: 800;
+      font-size: clamp(0.88rem, 1.1vw, 1.05rem);
+      color: #156034;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
     .presenter-fact .val,
     .presenter-text,
     #presenter-position,
     #presenter-clock-time { transition: color 220ms ease; }
-    .presenter-card-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 24px;
-    }
     .presenter-card-wid {
-      font-family: ui-monospace, "SF Mono", Consolas, monospace;
-      font-size: clamp(1.2rem, 1.5vw, 1.6rem);
-      color: rgba(241,244,251,0.65);
-      letter-spacing: 0.04em;
+      font-family: var(--font-mono, ui-monospace, monospace);
+      font-size: clamp(1.05rem, 1.25vw, 1.35rem);
+      color: var(--accent, #003a8c);
+      letter-spacing: 0.03em;
+      font-weight: 600;
     }
     .presenter-card-tier {
-      padding: 6px 14px;
+      padding: 5px 12px;
       border-radius: 999px;
       font-weight: 700;
-      font-size: clamp(0.95rem, 1.1vw, 1.15rem);
+      font-size: clamp(0.82rem, 0.95vw, 0.95rem);
       text-transform: uppercase;
-      letter-spacing: 0.08em;
-      border: 1px solid rgba(255,255,255,0.15);
+      letter-spacing: 0.06em;
+      border: 1px solid var(--border-strong, rgba(15,30,60,0.18));
     }
-    .presenter-card-tier[data-tier="below"] { background: rgba(255,138,138,0.18); color: #ffb4b4; border-color: rgba(255,138,138,0.55); }
-    .presenter-card-tier[data-tier="at"]    { background: rgba(245,199,84,0.16);  color: #f5d885; border-color: rgba(245,199,84,0.45); }
-    .presenter-card-tier[data-tier="above"] { background: rgba(120,255,180,0.14); color: #9ee9bf; border-color: rgba(120,255,180,0.45); }
+    .presenter-card-tier[data-tier="below"] { background: #fde8eb; color: var(--danger); border-color: #f1a3ab; }
+    .presenter-card-tier[data-tier="at"]    { background: #fff1dc; color: var(--warn); border-color: #f0c98a; }
+    .presenter-card-tier[data-tier="above"] { background: #e6f4ec; color: var(--success); border-color: #9bd6b1; }
     .presenter-card-tier[data-tier=""],
-    .presenter-card-tier[data-tier="unknown"] { background: rgba(255,255,255,0.06); color: rgba(241,244,251,0.6); }
+    .presenter-card-tier[data-tier="unknown"] { background: var(--bg1, #e9edf3); color: var(--muted); }
     .presenter-card-nce {
-      padding: 6px 14px;
+      padding: 5px 12px;
       border-radius: 999px;
-      font-size: 0.85rem;
+      font-size: 0.78rem;
       font-weight: 800;
-      letter-spacing: 0.14em;
-      background: rgba(138,180,255,0.18);
-      color: #b0c8ff;
-      border: 1px solid rgba(138,180,255,0.55);
+      letter-spacing: 0.12em;
+      background: rgba(0,58,140,0.10);
+      color: var(--accent-strong, #00276b);
+      border: 1px solid rgba(0,58,140,0.28);
     }
     .presenter-card-nce.hidden { display: none; }
     .p-opened {
-      margin-top: 10px;
-      font-size: 0.92rem;
-      color: rgba(241,244,251,0.55);
+      margin-top: 6px;
+      font-size: 0.88rem;
+      color: var(--muted, #5b6675);
       font-variant-numeric: tabular-nums;
     }
     .p-opened.hidden { display: none; }
     .p-reason-section.hidden { display: none; }
-    .p-reason-section h3 { color: #b0c8ff; }
+    .p-reason-section h3 { color: var(--accent, #003a8c); }
     .presenter-card-title {
       margin: 0;
-      font-size: clamp(2.4rem, 3.2vw, 3.6rem);
+      font-size: clamp(1.75rem, 2.6vw, 2.75rem);
       font-weight: 700;
       letter-spacing: -0.02em;
-      line-height: 1.1;
+      line-height: 1.12;
+      color: var(--text, #0a1a3a);
     }
-    /* Hero block: WID + tier on top, big asset title, then a tight identity strip */
-    .p-hero { display: flex; flex-direction: column; gap: 8px; }
-    .p-hero-line { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+    .p-hero { flex: 0 0 auto; display: flex; flex-direction: column; gap: 6px; }
+    .p-hero-line {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px 16px;
+      flex-wrap: nowrap;
+    }
+    .p-hero-line .presenter-card-wid {
+      flex: 1 1 auto;
+      min-width: 0;
+    }
+    .p-hero-badges {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      flex: 0 0 auto;
+    }
+    .p-shop-banner {
+      margin-top: 4px;
+      padding: 14px 18px;
+      border-radius: 12px;
+      background: linear-gradient(135deg, rgba(0, 58, 140, 0.07) 0%, rgba(0, 58, 140, 0.14) 100%);
+      border: 2px solid rgba(0, 58, 140, 0.38);
+      box-shadow: 0 2px 10px rgba(0, 58, 140, 0.08);
+    }
+    .p-shop-banner.hidden { display: none; }
+    .p-shop-banner .p-shop-eyebrow {
+      display: block;
+      font-size: clamp(0.62rem, 0.74vw, 0.76rem);
+      font-weight: 800;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--accent, #003a8c);
+      margin-bottom: 4px;
+    }
+    .p-shop-banner .p-shop-name {
+      display: block;
+      font-size: clamp(1.45rem, 2.35vw, 2.15rem);
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      line-height: 1.12;
+      color: var(--text, #0a1a3a);
+      word-break: break-word;
+    }
     .p-id-strip {
       display: flex;
       flex-wrap: wrap;
       gap: 6px 8px;
-      margin-top: 4px;
+      margin-top: 2px;
       align-items: center;
     }
-    /* Bump the sighting pill on the presenter so it reads from across the room. */
     .p-id-strip .sighting-badge,
     .p-id-strip .waiver-badge {
-      font-size: clamp(0.78rem, 0.95vw, 0.95rem);
-      padding: 3px 12px;
-      border-width: 1px;
+      font-size: clamp(0.78rem, 0.9vw, 0.92rem);
+      padding: 3px 10px;
     }
     .p-id-pill {
       display: inline-flex;
-      align-items: baseline;
-      gap: 6px;
-      padding: 4px 10px;
-      border-radius: 999px;
-      background: rgba(255,255,255,0.05);
-      border: 1px solid rgba(255,255,255,0.10);
-      font-size: clamp(0.78rem, 0.95vw, 0.95rem);
-      color: rgba(241,244,251,0.85);
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 2px;
+      padding: 6px 12px 8px;
+      border-radius: 10px;
+      background: linear-gradient(180deg, #fff 0%, var(--bg1, #e9edf3) 100%);
+      border: 1px solid var(--border, rgba(15,30,60,0.14));
+      box-shadow: 0 1px 2px rgba(15,30,60,0.05);
+      max-width: 100%;
     }
     .p-id-pill .lbl {
-      font-size: clamp(0.62rem, 0.7vw, 0.75rem);
+      font-size: clamp(0.62rem, 0.74vw, 0.76rem);
+      font-weight: 800;
       text-transform: uppercase;
-      letter-spacing: 0.1em;
-      color: rgba(241,244,251,0.45);
+      letter-spacing: 0.11em;
+      color: var(--accent, #003a8c);
+      line-height: 1.15;
     }
-    .p-id-pill .val { font-weight: 600; }
+    .p-id-pill .val {
+      font-size: clamp(0.88rem, 1.05vw, 1.08rem);
+      font-weight: 600;
+      color: var(--text, #0a1a3a);
+      line-height: 1.25;
+      word-break: break-word;
+    }
 
-    /* Status dashboard: 4 big tiles, vehicle-dashboard style */
+    /* 2×2 tiles — keeps each cell wide enough for long parts / ETIC strings */
     .p-dashboard {
+      flex: 0 0 auto;
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 14px;
-    }
-    @media (max-width: 1100px) {
-      .p-dashboard { grid-template-columns: repeat(2, 1fr); }
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
     }
     .p-tile {
       display: flex;
       flex-direction: column;
       gap: 4px;
-      padding: 16px 18px;
-      border-radius: 14px;
-      background: rgba(255,255,255,0.04);
-      border: 1px solid rgba(255,255,255,0.08);
-      min-height: 92px;
+      padding: 12px 14px;
+      border-radius: 10px;
+      background: var(--bg1, #e9edf3);
+      border: 1px solid var(--border, rgba(15,30,60,0.12));
+      min-height: 0;
+      min-width: 0;
     }
     .p-tile .lbl {
-      font-size: clamp(0.68rem, 0.8vw, 0.85rem);
+      font-size: clamp(0.62rem, 0.72vw, 0.72rem);
       text-transform: uppercase;
-      letter-spacing: 0.12em;
-      color: rgba(241,244,251,0.55);
+      letter-spacing: 0.1em;
+      color: var(--muted, #5b6675);
       font-weight: 600;
     }
     .p-tile .val {
-      font-size: clamp(1.6rem, 2.2vw, 2.4rem);
+      font-size: clamp(1.35rem, 1.85vw, 2rem);
       font-weight: 700;
-      line-height: 1.1;
+      line-height: 1.12;
       letter-spacing: -0.01em;
+      color: var(--text, #0a1a3a);
+      word-break: break-word;
+      overflow-wrap: anywhere;
     }
     .p-tile .sub {
-      font-size: clamp(0.78rem, 0.95vw, 1rem);
-      color: rgba(241,244,251,0.55);
+      font-size: clamp(0.78rem, 0.9vw, 0.95rem);
+      color: var(--muted, #5b6675);
+      line-height: 1.3;
+      word-break: break-word;
     }
-    .p-tile.ok    { background: rgba(94,227,151,0.08);  border-color: rgba(94,227,151,0.25); }
-    .p-tile.warn  { background: rgba(245,199,84,0.10); border-color: rgba(245,199,84,0.32); }
-    .p-tile.danger{ background: rgba(255,138,138,0.10); border-color: rgba(255,138,138,0.35); }
+    /* Parts status: always wrap — never clip long depot strings */
+    .p-tile[data-tile="parts"] .val {
+      font-size: clamp(1.05rem, 1.35vw, 1.45rem);
+      line-height: 1.25;
+      font-weight: 700;
+    }
+    .p-tile[data-tile="parts"] .sub {
+      font-size: clamp(0.76rem, 0.88vw, 0.9rem);
+    }
+    /* Days down / slipped: keep readable but not oversized vs ETIC + Parts */
+    .p-tile[data-tile="daysdown"] .val,
+    .p-tile[data-tile="slipped"] .val {
+      font-size: clamp(1.05rem, 1.32vw, 1.42rem);
+      line-height: 1.2;
+      font-weight: 700;
+    }
+    .p-tile[data-tile="daysdown"] .sub,
+    .p-tile[data-tile="slipped"] .sub {
+      font-size: clamp(0.74rem, 0.85vw, 0.88rem);
+    }
+    .p-tile.ok    { background: #e6f4ec; border-color: #9bd6b1; }
+    .p-tile.warn  { background: #fff8e6; border-color: #f0c98a; }
+    .p-tile.danger{ background: #fde8eb; border-color: #f1a3ab; }
     .p-tile.ok .val     { color: var(--success); }
     .p-tile.warn .val   { color: var(--warn); }
     .p-tile.danger .val { color: var(--danger); }
 
-    /* Section headers + bodies */
     .p-section {
-      padding: 14px 18px;
-      border-radius: 14px;
-      background: rgba(255,255,255,0.03);
-      border: 1px solid rgba(255,255,255,0.06);
+      padding: 12px 14px;
+      border-radius: 10px;
+      background: var(--bg2, #f0f3f8);
+      border: 1px solid var(--border, rgba(15,30,60,0.12));
     }
-    .p-section-fill { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; }
-    .presenter-card-section h3 {
-      margin: 0 0 8px;
-      font-size: clamp(0.78rem, 0.92vw, 0.95rem);
+    .p-section-compact { flex: 0 1 auto; max-height: min(16vh, 150px); display: flex; flex-direction: column; min-height: 0; }
+    .p-section-compact .presenter-text { overflow-y: auto; flex: 1 1 auto; min-height: 0; }
+    .p-remark-block { max-height: min(22vh, 220px); }
+    .p-remark-meta {
+      font-size: clamp(0.95rem, 1.2vw, 1.15rem);
+      font-weight: 700;
+      color: var(--text-dim, #2c3a55);
+      margin: -2px 0 10px;
+      line-height: 1.45;
+      letter-spacing: 0.01em;
+    }
+    .p-remark-meta .p-stale-badge {
+      display: inline-block;
+      margin-left: 8px;
+      padding: 3px 12px;
+      border-radius: 999px;
+      font-size: 0.82em;
+      font-weight: 800;
+      letter-spacing: 0.06em;
       text-transform: uppercase;
-      letter-spacing: 0.14em;
-      color: rgba(241,244,251,0.6);
+      vertical-align: middle;
+    }
+    .p-remark-meta .p-stale-badge.stale {
+      background: #fff8e6;
+      border: 1px solid #f0c98a;
+      color: var(--warn);
+    }
+    .p-remark-meta .p-stale-badge.ok {
+      background: #e6f4ec;
+      border: 1px solid #9bd6b1;
+      color: var(--success);
+    }
+    .p-section-grow {
+      flex: 1 1 0;
+      min-height: 120px;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+    }
+    .p-section-fill { flex: 1 1 0; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+    .presenter-card-section h3 {
+      margin: 0 0 6px;
+      font-size: clamp(0.68rem, 0.78vw, 0.78rem);
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      color: var(--muted, #5b6675);
       font-weight: 700;
     }
     .presenter-text {
       margin: 0;
-      font-size: clamp(1.1rem, 1.4vw, 1.5rem);
-      line-height: 1.4;
+      font-size: clamp(0.98rem, 1.2vw, 1.25rem);
+      line-height: 1.45;
       white-space: pre-wrap;
       word-break: break-word;
+      color: var(--text-dim, #2c3a55);
     }
     .presenter-list {
       margin: 0;
-      padding-left: 1.3em;
-      font-size: clamp(1.05rem, 1.3vw, 1.4rem);
+      padding-left: 1.2em;
+      font-size: clamp(0.95rem, 1.15vw, 1.15rem);
       line-height: 1.4;
+      color: var(--text-dim, #2c3a55);
     }
-    .presenter-list li { margin: 4px 0; }
+    .presenter-list li { margin: 3px 0; }
+    .p-due-empty { color: var(--subtle, #8a94a4); font-style: italic; }
 
-    /* Recent-changes timeline */
     .p-timeline {
+      flex: 1 1 auto;
+      min-height: 0;
       display: flex;
       flex-direction: column;
-      gap: 8px;
-      /* Show every change in history but cap the section height so the
-         dashboard / discussion below stay visible. The controller's scroll
-         position (sent via PATCH /cursor) is mirrored here. */
-      max-height: clamp(280px, 36vh, 520px);
+      gap: 6px;
       overflow-y: auto;
-      padding-right: 10px;
+      overflow-x: hidden;
+      padding-right: 8px;
       scrollbar-width: thin;
-      scrollbar-color: rgba(255,255,255,0.30) transparent;
+      scrollbar-color: rgba(15,30,60,0.28) transparent;
       scroll-behavior: smooth;
     }
-    .p-timeline::-webkit-scrollbar { width: 12px; }
+    .p-timeline::-webkit-scrollbar { width: 10px; }
     .p-timeline::-webkit-scrollbar-track { background: transparent; }
     .p-timeline::-webkit-scrollbar-thumb {
-      background: rgba(255,255,255,0.30); border-radius: 6px;
+      background: rgba(15,30,60,0.22); border-radius: 5px;
     }
-    .p-timeline::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.40); }
+    .p-timeline::-webkit-scrollbar-thumb:hover { background: rgba(15,30,60,0.35); }
     .p-tl-row {
       display: grid;
-      grid-template-columns: 130px 130px 1fr;
-      gap: 14px;
-      align-items: baseline;
+      grid-template-columns: minmax(72px, 92px) minmax(72px, 110px) 1fr;
+      gap: 10px 12px;
+      align-items: start;
       padding: 8px 10px;
-      border-radius: 10px;
-      background: rgba(255,255,255,0.03);
-      border-left: 3px solid rgba(255,255,255,0.18);
-      font-size: clamp(0.95rem, 1.15vw, 1.2rem);
+      border-radius: 8px;
+      background: var(--surface, #fff);
+      border: 1px solid var(--border, rgba(15,30,60,0.1));
+      border-left: 3px solid var(--border-strong, rgba(15,30,60,0.2));
+      font-size: clamp(0.88rem, 1.05vw, 1.05rem);
     }
-    .p-tl-row.tl-slip    { border-left-color: var(--danger); background: rgba(255,138,138,0.06); }
-    .p-tl-row.tl-remarks { border-left-color: var(--warn);   background: rgba(245,199,84,0.05); }
-    .p-tl-row.tl-mel     { border-left-color: var(--text);   background: rgba(255,255,255,0.04); }
-    .p-tl-row.tl-parts   { border-left-color: var(--success);background: rgba(94,227,151,0.05); }
-    .p-tl-row.tl-initial { border-left-color: rgba(255,255,255,0.25); color: rgba(241,244,251,0.65); }
-    .p-tl-date { font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: 0.02em; }
+    .p-tl-row.tl-slip    { border-left-color: var(--danger); background: #fff5f5; }
+    .p-tl-row.tl-remarks { border-left-color: var(--warn); background: #fffbf0; }
+    .p-tl-row.tl-mel     { border-left-color: var(--accent); background: #f5f8fc; }
+    .p-tl-row.tl-parts   { border-left-color: var(--success); background: #f4fbf7; }
+    .p-tl-row.tl-initial { border-left-color: var(--subtle); color: var(--muted); }
+    .p-tl-date { font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: 0.02em; color: var(--text-dim); }
     .p-tl-kind {
-      font-size: clamp(0.75rem, 0.85vw, 0.9rem);
+      font-size: clamp(0.68rem, 0.78vw, 0.78rem);
       text-transform: uppercase;
-      letter-spacing: 0.1em;
-      color: rgba(241,244,251,0.6);
+      letter-spacing: 0.08em;
+      color: var(--muted);
       font-weight: 600;
     }
-    .p-tl-body { line-height: 1.4; word-break: break-word; }
-    .p-tl-body del { text-decoration: line-through; color: rgba(241,244,251,0.45); }
+    .p-tl-body { line-height: 1.45; word-break: break-word; color: var(--text-dim); }
+    .p-tl-body del { text-decoration: line-through; color: var(--subtle); }
     .p-tl-body ins { text-decoration: none; color: var(--text); font-weight: 600; }
-    .p-tl-body .arrow { margin: 0 8px; color: rgba(241,244,251,0.4); }
+    .p-tl-body .arrow { margin: 0 6px; color: var(--subtle); }
     .p-tl-body .slip-pill {
       display: inline-block;
-      margin-left: 8px;
-      padding: 1px 8px;
+      margin-left: 6px;
+      padding: 1px 7px;
       border-radius: 999px;
-      background: rgba(255,138,138,0.15);
+      background: rgba(176,0,32,0.12);
       color: var(--danger);
       font-size: 0.85em;
       font-weight: 600;
     }
-    .p-tl-empty { color: rgba(241,244,251,0.5); font-size: clamp(0.95rem, 1.1vw, 1.15rem); padding: 4px 2px; }
+    .p-tl-empty { color: var(--muted); font-size: clamp(0.9rem, 1.05vw, 1.05rem); padding: 4px 2px; }
+    .p-tl-muted { color: var(--subtle); }
+    .p-tl-row.tl-opened { border-left-color: var(--subtle); background: #f7f8fa; }
+    .p-tl-row.tl-action { border-left-color: #5a3488; background: #faf7fc; }
+    .p-tl-row.tl-meeting { border-left-color: #5a3488; background: #faf7fc; }
+    .p-tl-row.tl-yard { border-left-color: var(--ok); background: #f4fbf7; }
+    .p-tl-row .fma-actor { font-weight: 600; margin-right: 8px; }
+    .p-tl-row .fma-status { font-size: 0.88em; color: var(--muted); }
+    .p-tl-row .fma-note { display: block; margin-top: 4px; color: var(--text-dim); }
 
-    /* Bottom split: notes + due-outs */
-    .p-discuss {
+    .p-main-split {
+      flex: 1 1 0;
+      min-height: 0;
       display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 14px;
+      grid-template-columns: minmax(0, 1fr) minmax(280px, 40%);
+      gap: 12px 18px;
+      align-items: stretch;
+    }
+    .p-main-col {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      min-width: 0;
+      min-height: 0;
+    }
+    .p-side-col {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      min-width: 0;
+      min-height: 0;
+    }
+    .p-side-col .p-section-fill {
+      flex: 1 1 0;
+      min-height: 120px;
+      display: flex;
+      flex-direction: column;
+    }
+    .p-side-col .presenter-text,
+    .p-side-col .presenter-list {
+      font-size: clamp(1.05rem, 1.35vw, 1.35rem);
+      line-height: 1.42;
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow-y: auto;
     }
     @media (max-width: 1100px) {
-      .p-discuss { grid-template-columns: 1fr; }
+      .p-main-split { grid-template-columns: 1fr; }
     }
     .presenter-foot {
+      flex: 0 0 auto;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 18px;
-      font-size: 0.95rem;
-      color: rgba(241,244,251,0.5);
-      border-top: 1px solid rgba(255,255,255,0.05);
-      padding-top: 14px;
+      gap: 16px;
+      font-size: 0.88rem;
+      color: var(--muted);
+      border-top: 1px solid var(--border);
+      padding-top: 10px;
     }
     .presenter-status::before {
       content: "● ";
-      color: #6dd28f;
+      color: var(--success);
       margin-right: 4px;
     }
     .presenter-status.stale::before { color: var(--warn); }
     .presenter-status.error::before { color: var(--danger); }
     .presenter-url {
-      font-family: ui-monospace, "SF Mono", Consolas, monospace;
-      font-size: 0.85rem;
-      color: rgba(241,244,251,0.4);
+      font-family: var(--font-mono, ui-monospace, monospace);
+      font-size: 0.8rem;
+      color: var(--subtle);
+      word-break: break-all;
+      text-align: right;
     }
 
     /* ─────────────────────── AI assistant (Ask) ─────────────────────── */
@@ -10613,6 +11607,49 @@ function renderDashboardHtml(): string {
     .smx-pill.ok { background: rgba(34,160,90,0.12); color: var(--success); }
     .smx-pill.no_due { background: rgba(15,30,60,0.06); color: var(--muted); }
 
+    .authz-header {
+      display: flex; justify-content: space-between; align-items: flex-start; gap: 16px;
+      flex-wrap: wrap; margin-bottom: 16px;
+    }
+    .authz-title { margin: 0 0 6px; font-size: 1.35rem; }
+    .authz-sub { margin: 0; color: var(--muted); font-size: 0.9rem; line-height: 1.45; max-width: 920px; }
+    .authz-split {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 16px;
+      align-items: start;
+    }
+    @media (max-width: 1100px) {
+      .authz-split { grid-template-columns: 1fr; }
+    }
+    .authz-panel {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px 16px 16px;
+      min-height: 200px;
+    }
+    .authz-panel h3 { margin: 0 0 10px; font-size: 1.05rem; }
+    .authz-toolbar { margin-bottom: 10px; }
+    .authz-toolbar input {
+      width: 100%; max-width: 360px; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border);
+      background: var(--bg); font: inherit;
+    }
+    .authz-table-wrap {
+      overflow: auto;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      max-height: min(62vh, 640px);
+    }
+    .authz-table { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
+    .authz-table th {
+      text-align: left; padding: 8px 10px; background: var(--bg2); position: sticky; top: 0; z-index: 1;
+      font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted);
+    }
+    .authz-table td { padding: 8px 10px; border-top: 1px solid var(--border); vertical-align: top; }
+    .authz-mono { font-family: var(--font-mono); font-weight: 600; font-size: 0.82rem; }
+    .authz-move-field { font-weight: 700; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--accent); }
+
     /* Full-tab "Ask AI" view — same components, more breathing room. */
     .ask-tab {
       max-width: 980px;
@@ -10657,6 +11694,7 @@ function renderDashboardHtml(): string {
       <button type="button" id="tab-snapshot" class="active">Snapshot</button>
       <button type="button" id="tab-work-orders">Work orders</button>
       <button type="button" id="tab-schedule-mx">Schedule Mx</button>
+      <button type="button" id="tab-authz">Authorization</button>
       <button type="button" id="tab-mel">MEL</button>
       <button type="button" id="tab-meeting">ETIC Meeting</button>
       <button type="button" id="tab-yard">Yard Check</button>
@@ -10670,6 +11708,10 @@ function renderDashboardHtml(): string {
     </div>
 
     <div id="view-main" class="hidden">
+      <div id="construction-banner" class="construction-banner hidden" role="status" aria-live="polite">
+        <strong>Under construction</strong>
+        <span>This tab is still being built. Work orders, MEL, ETIC Meeting, Yard Check, Waivers, and Ask AI are ready to use.</span>
+      </div>
       <div id="panel-snapshot">
         <div class="date-picker" role="group" aria-label="Pick a report date">
           <button type="button" id="date-jump-latest" class="date-pick-btn" title="Jump to the most recent snapshot">⤒ Latest</button>
@@ -10694,11 +11736,85 @@ function renderDashboardHtml(): string {
           <div class="kpi-row" id="kpi-row"></div>
         </div>
 
+        <details class="card mc-chart-card collapsible-card" id="mc-chart-card" open>
+          <summary class="collapsible-summary">
+            <div class="collapsible-summary-text">
+              <h3 style="margin:0">MC rate trend</h3>
+              <p class="hint">Mission-capable % over time.</p>
+            </div>
+            <span class="collapsible-chev" aria-hidden="true">▾</span>
+          </summary>
+          <div class="collapsible-body">
+            <div class="mc-chart-controls">
+              <label>
+                <span>From</span>
+                <select id="mc-chart-from" aria-label="Chart start date"></select>
+              </label>
+              <label>
+                <span>To</span>
+                <select id="mc-chart-to" aria-label="Chart end date"></select>
+              </label>
+              <label>
+                <span>Series</span>
+                <select id="mc-chart-mode" aria-label="What to plot">
+                  <option value="fleet">Fleet</option>
+                  <option value="unit">Unit</option>
+                  <option value="unit_mel">MEL unit</option>
+                  <option value="mel">MEL key</option>
+                  <option value="mgmt">Mgmt</option>
+                </select>
+              </label>
+              <label>
+                <span>Chart type</span>
+                <select id="mc-chart-viz" aria-label="Chart visualization">
+                  <option value="line">Line</option>
+                  <option value="area">Area</option>
+                  <option value="step">Step</option>
+                  <option value="column">Columns</option>
+                  <option value="stacked">Stacked</option>
+                </select>
+              </label>
+              <label>
+                <span>&nbsp;</span>
+                <button type="button" class="primary" id="mc-chart-refresh" style="width:100%">Update chart</button>
+              </label>
+              <div class="preset-chips mc-chart-preset-strip" id="mc-chart-preset-chips" role="group" aria-label="Chart date range presets">
+                <span class="preset-chips-label">Quick range</span>
+                <button type="button" class="preset-chip" data-preset="fytd" title="Fiscal year-to-date (1 OCT → latest)">FYTD</button>
+                <button type="button" class="preset-chip" data-preset="lastfy" title="Previous fiscal year (1 OCT → 30 SEP)">Last FY</button>
+                <button type="button" class="preset-chip" data-preset="cytd" title="Calendar year-to-date (1 JAN → latest)">CYTD</button>
+                <button type="button" class="preset-chip" data-preset="lastcy" title="Previous calendar year">Last CY</button>
+                <button type="button" class="preset-chip" data-preset="qtd" title="Calendar quarter-to-date">QTD</button>
+                <button type="button" class="preset-chip" data-preset="lastq" title="Previous calendar quarter">Last Q</button>
+                <button type="button" class="preset-chip" data-preset="mtd" title="Month-to-date">MTD</button>
+                <button type="button" class="preset-chip" data-preset="30d" title="~30 days of snapshots">30d</button>
+                <button type="button" class="preset-chip" data-preset="90d" title="~90 days of snapshots">90d</button>
+                <button type="button" class="preset-chip" data-preset="1y" title="~365 days of snapshots">1y</button>
+              </div>
+            </div>
+            <div class="mc-chart-slicer-block hidden" id="mc-chart-slicer-block" aria-live="polite">
+              <div class="mc-chart-slicer-row">
+                <label class="mc-chart-slicer-main">
+                  <span id="mc-chart-slicer-lbl">Slice</span>
+                  <select id="mc-chart-slicer" aria-label="Slicer value" size="8"></select>
+                </label>
+                <button type="button" class="ghost" id="mc-chart-reload-slicers">Refresh lists</button>
+              </div>
+              <p class="mc-chart-dim-hint" id="mc-chart-dim-hint">
+                Pick a value for this date range.
+              </p>
+            </div>
+            <div class="mc-chart-wrap"><canvas id="mc-chart-canvas" aria-label="MC rate chart"></canvas></div>
+            <div class="mc-chart-legend hidden" id="mc-chart-legend" role="group" aria-label="Chart key"></div>
+            <p class="mc-chart-status" id="mc-chart-status"></p>
+          </div>
+        </details>
+
         <details class="card breakdown-card collapsible-card" id="breakdown-card" style="display:none">
           <summary class="collapsible-summary">
             <div class="collapsible-summary-text">
               <h3 style="margin:0">MC rate by Unit</h3>
-              <p class="hint" id="breakdown-hint">Per-unit and NCE breakdown from the Asset Manager sheet.</p>
+              <p class="hint" id="breakdown-hint">Per unit and NCE.</p>
             </div>
             <button type="button" class="ai-ask-btn" id="ai-ask-bd" title="Ask the AI about MC rate by unit" onclick="event.stopPropagation()">Ask AI</button>
             <span class="collapsible-chev" aria-hidden="true">▾</span>
@@ -10941,6 +12057,61 @@ function renderDashboardHtml(): string {
         </div>
       </div>
 
+      <div id="panel-authz" class="hidden">
+        <div class="authz-header">
+          <div>
+            <h2 class="authz-title">Authorization manager</h2>
+            <p class="authz-sub">Data comes from the <strong>MEL Calculator</strong> sheet (one row per MEL key), not work orders. The roster is the latest MEL snapshot; the move log records <strong>unit</strong>, <strong>user unit</strong>, and <strong>detail doc number</strong> changes when each ETIC was ingested.</p>
+          </div>
+          <span class="smx-asof-pill" id="authz-asof-pill" title="Latest MEL snapshot date in the database">Latest</span>
+        </div>
+        <div class="authz-split">
+          <section class="authz-panel" aria-labelledby="authz-assets-heading">
+            <h3 id="authz-assets-heading">All MEL keys</h3>
+            <div class="authz-toolbar">
+              <label class="smx-search"><span class="sr-only">Filter MEL keys</span>
+                <input type="text" id="authz-asset-query" placeholder="Filter MEL key, unit, detail doc, mgmt…" autocomplete="off" />
+              </label>
+            </div>
+            <p class="hint" id="authz-assets-meta" style="margin:0 0 8px"></p>
+            <div class="authz-table-wrap">
+              <table class="authz-table" aria-label="MEL keys on latest snapshot">
+                <thead>
+                  <tr>
+                    <th>MEL key</th>
+                    <th>Unit</th>
+                    <th>User unit</th>
+                    <th>Detail doc #</th>
+                    <th>Mgmt</th>
+                    <th>Tier</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody id="authz-assets-tbody"><tr><td colspan="7">Loading…</td></tr></tbody>
+              </table>
+            </div>
+          </section>
+          <section class="authz-panel" aria-labelledby="authz-moves-heading">
+            <h3 id="authz-moves-heading">Move log</h3>
+            <p class="hint" id="authz-moves-meta" style="margin:0 0 8px">Unit, user unit, and detail doc # changes from MEL ingest (newest first).</p>
+            <div class="authz-table-wrap">
+              <table class="authz-table" aria-label="Authorization move changelog">
+                <thead>
+                  <tr>
+                    <th>Date</th>
+                    <th>Field</th>
+                    <th>MEL key</th>
+                    <th>From</th>
+                    <th>To</th>
+                  </tr>
+                </thead>
+                <tbody id="authz-moves-tbody"><tr><td colspan="5">Loading…</td></tr></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </div>
+
       <div id="panel-mel" class="hidden">
         <div class="mel-header">
           <div>
@@ -10995,34 +12166,60 @@ function renderDashboardHtml(): string {
 
         <div class="mel-totals" id="mel-totals" aria-label="MEL totals"></div>
 
-        <div class="mel-viewmode" role="tablist" aria-label="MEL view mode">
-          <button type="button" class="mel-vm-btn active" data-mel-view="list">Detail list</button>
-          <button type="button" class="mel-vm-btn" data-mel-view="slide">Critical slide</button>
-        </div>
-
-        <div class="mel-controls">
-          <div class="mel-filter-tabs" role="tablist" aria-label="MEL status filter">
-            <button type="button" class="mel-filter-btn active" data-mel-filter="all">All <span class="count" data-mel-count="all">·</span></button>
-            <button type="button" class="mel-filter-btn" data-mel-filter="below">Below <span class="count" data-mel-count="below">·</span></button>
-            <button type="button" class="mel-filter-btn" data-mel-filter="at">At <span class="count" data-mel-count="at">·</span></button>
-            <button type="button" class="mel-filter-btn" data-mel-filter="above">Above <span class="count" data-mel-count="above">·</span></button>
-            <button type="button" class="mel-filter-btn critical" data-mel-filter="critical">★ Critical <span class="count" data-mel-count="critical">·</span></button>
+        <div class="mel-toolbar">
+          <div class="mel-toolbar-head">
+            <div class="mel-viewmode" role="tablist" aria-label="MEL view mode">
+              <button type="button" class="mel-vm-btn active" data-mel-view="list">Detail list</button>
+              <button type="button" class="mel-vm-btn" data-mel-view="slide">Critical slide</button>
+            </div>
           </div>
-          <div class="mel-refine">
-            <input type="text" id="mel-search" placeholder="Search MEL key, doc #, mgmt code…" aria-label="Search MEL keys" />
-            <select id="mel-unit" aria-label="Filter by unit"><option value="">All units</option></select>
-            <select id="mel-mgmt" aria-label="Filter by mgmt code"><option value="">All mgmt codes</option></select>
-            <select id="mel-tier" aria-label="Filter by priority tier"><option value="">All tiers</option></select>
-            <select id="mel-sort" aria-label="Sort">
-              <option value="deficit">Sort: Most assets needed</option>
-              <option value="status">Sort: Status (worst first)</option>
-              <option value="nmc">Sort: Most NMC</option>
-              <option value="recall">Sort: Most recall loans</option>
-              <option value="key">Sort: MEL key</option>
-              <option value="unit">Sort: Unit</option>
-              <option value="mc-asc">Sort: MC% (lowest)</option>
-              <option value="mc-desc">Sort: MC% (highest)</option>
-            </select>
+          <div class="mel-toolbar-strip">
+            <div class="mel-filter-tabs" role="tablist" aria-label="MEL status filter">
+              <button type="button" class="mel-filter-btn active" data-mel-filter="all">All <span class="count" data-mel-count="all">·</span></button>
+              <button type="button" class="mel-filter-btn" data-mel-filter="below">Below <span class="count" data-mel-count="below">·</span></button>
+              <button type="button" class="mel-filter-btn" data-mel-filter="at">At <span class="count" data-mel-count="at">·</span></button>
+              <button type="button" class="mel-filter-btn" data-mel-filter="above">Above <span class="count" data-mel-count="above">·</span></button>
+              <button type="button" class="mel-filter-btn critical" data-mel-filter="critical">★ Critical <span class="count" data-mel-count="critical">·</span></button>
+            </div>
+            <div class="mel-search-wrap">
+              <span class="mel-search-icon" aria-hidden="true"></span>
+              <input type="search" id="mel-search" placeholder="Search key, unit, mgmt, doc #…" autocomplete="off" aria-label="Search MEL keys" />
+            </div>
+          </div>
+          <div class="mel-toolbar-refine" aria-label="Narrow the list">
+            <label class="mel-select-field">
+              <span class="mel-select-lbl">Unit</span>
+              <div class="mel-select-inner">
+                <select id="mel-unit" aria-label="Filter by unit"><option value="">All units</option></select>
+              </div>
+            </label>
+            <label class="mel-select-field">
+              <span class="mel-select-lbl">Mgmt code</span>
+              <div class="mel-select-inner">
+                <select id="mel-mgmt" aria-label="Filter by mgmt code"><option value="">All mgmt codes</option></select>
+              </div>
+            </label>
+            <label class="mel-select-field">
+              <span class="mel-select-lbl">Priority tier</span>
+              <div class="mel-select-inner">
+                <select id="mel-tier" aria-label="Filter by priority tier"><option value="">All tiers</option></select>
+              </div>
+            </label>
+            <label class="mel-select-field">
+              <span class="mel-select-lbl">Sort</span>
+              <div class="mel-select-inner">
+                <select id="mel-sort" aria-label="Sort list">
+                  <option value="deficit">Most assets needed</option>
+                  <option value="status">Worst status first</option>
+                  <option value="nmc">Most NMC</option>
+                  <option value="recall">Most recall loans</option>
+                  <option value="key">MEL key A–Z</option>
+                  <option value="unit">Unit A–Z</option>
+                  <option value="mc-asc">MC% lowest</option>
+                  <option value="mc-desc">MC% highest</option>
+                </select>
+              </div>
+            </label>
           </div>
         </div>
 
@@ -11140,6 +12337,12 @@ function renderDashboardHtml(): string {
             </div>
             <div class="meeting-live-actions">
               <button type="button" id="meeting-present" class="ghost" title="Open the conference-room view in a new window. Anyone (including the projector) can also load this meeting via the displayed URL.">📺 Present on TV…</button>
+              <div class="meeting-tv-zoom" role="group" aria-label="Presenter screen text size">
+                <span class="meeting-tv-zoom-lbl">TV</span>
+                <button type="button" id="meeting-zoom-out" class="ghost meeting-zoom-btn" title="Smaller text on the presenter screen">−</button>
+                <span id="meeting-zoom-pct" class="meeting-tv-zoom-pct">100%</span>
+                <button type="button" id="meeting-zoom-in" class="ghost meeting-zoom-btn" title="Larger text on the presenter screen">+</button>
+              </div>
               <button type="button" id="meeting-pause" class="ghost">Pause</button>
               <button type="button" id="meeting-stop" class="danger">Stop &amp; summarize</button>
             </div>
@@ -11148,12 +12351,17 @@ function renderDashboardHtml(): string {
             <aside class="meeting-queue">
               <div class="meeting-queue-filters">
                 <input type="text" id="meeting-queue-search" placeholder="Search this meeting…" />
-                <select id="meeting-queue-status">
+                <select id="meeting-queue-status" aria-label="Filter by status">
                   <option value="">All status</option>
                   <option value="pending">Pending</option>
                   <option value="covered">Covered</option>
                   <option value="deferred">Deferred</option>
                   <option value="skipped">Skipped</option>
+                </select>
+                <select id="meeting-queue-sort" aria-label="Sort queue">
+                  <option value="order">Meeting order</option>
+                  <option value="shop_asc">Shop A→Z</option>
+                  <option value="shop_desc">Shop Z→A</option>
                 </select>
               </div>
               <div class="meeting-queue-list" id="meeting-queue-list"></div>
@@ -11505,19 +12713,32 @@ function renderDashboardHtml(): string {
         <div class="presenter-clock-time" id="presenter-clock-time">00:00</div>
         <div class="presenter-clock-sub" id="presenter-clock-sub"></div>
       </div>
-      <div class="presenter-position" id="presenter-position">— / —</div>
+      <button type="button" class="presenter-fs-btn" id="presenter-fullscreen" aria-pressed="false" title="Fill the screen (browser fullscreen)">Fullscreen</button>
+      <div class="presenter-position-wrap" id="presenter-position-wrap">
+        <div class="presenter-position" id="presenter-position"></div>
+      </div>
     </header>
     <main class="presenter-stage" id="presenter-stage">
+      <div id="presenter-scrim" class="presenter-scrim hidden" aria-live="polite">
+        <div class="presenter-scrim-inner">
+          <h2 class="presenter-scrim-title" id="presenter-scrim-title">ETIC Meeting</h2>
+          <p class="presenter-scrim-sub" id="presenter-scrim-sub"></p>
+        </div>
+      </div>
       <div class="presenter-empty" id="presenter-empty">Waiting for the controller to pick a work order…</div>
       <article class="presenter-card hidden" id="presenter-card">
+        <div class="presenter-wo-flash" id="presenter-wo-flash" hidden></div>
         <!-- 1. WHO + WHAT -->
         <header class="p-hero">
           <div class="p-hero-line">
             <div class="presenter-card-wid" id="p-wid"></div>
-            <div class="presenter-card-nce hidden" id="p-nce">NCE</div>
-            <div class="presenter-card-tier" id="p-tier"></div>
+            <div class="p-hero-badges">
+              <div class="presenter-card-tier" id="p-tier"></div>
+              <div class="presenter-card-nce hidden" id="p-nce">NCE</div>
+            </div>
           </div>
           <h2 class="presenter-card-title" id="p-title"></h2>
+          <div class="p-shop-banner hidden" id="p-shop-banner"></div>
           <div class="p-id-strip" id="p-id-strip"></div>
           <div class="p-opened hidden" id="p-opened"></div>
         </header>
@@ -11526,38 +12747,39 @@ function renderDashboardHtml(): string {
         <section class="p-dashboard" id="p-dashboard"></section>
 
         <!-- 3. WO REASON (from workbook) -->
-        <section class="presenter-card-section p-section p-reason-section hidden" id="p-reason-section">
+        <section class="presenter-card-section p-section p-section-compact p-reason-section hidden" id="p-reason-section">
           <h3>Reason</h3>
           <p class="presenter-text" id="p-reason">—</p>
         </section>
 
-        <!-- 4. LATEST REMARK -->
-        <section class="presenter-card-section p-section">
-          <h3>Latest workbook remark</h3>
-          <p class="presenter-text" id="p-remark">—</p>
-        </section>
-
-        <!-- 4. CHANGE TIMELINE -->
-        <section class="presenter-card-section p-section">
-          <h3>Recent changes</h3>
-          <div class="p-timeline" id="p-timeline"></div>
-        </section>
-
-        <!-- 5. LIVE DISCUSSION (notes + due-outs side-by-side) -->
-        <div class="p-discuss">
-          <section class="presenter-card-section p-section p-section-fill">
-            <h3>Meeting notes</h3>
-            <p class="presenter-text" id="p-notes">—</p>
-          </section>
-          <section class="presenter-card-section p-section p-section-fill">
-            <h3>Due-outs</h3>
-            <ul class="presenter-list" id="p-dueouts"></ul>
-          </section>
+        <!-- Main column + right rail: timeline + live meeting notes / due-outs -->
+        <div class="p-main-split">
+          <div class="p-main-col">
+            <section class="presenter-card-section p-section p-section-compact p-remark-block">
+              <h3>Latest workbook remark</h3>
+              <div class="p-remark-meta" id="p-remark-meta"></div>
+              <p class="presenter-text" id="p-remark">—</p>
+            </section>
+            <section class="presenter-card-section p-section p-section-grow">
+              <h3>Change timeline</h3>
+              <div class="p-timeline" id="p-timeline"></div>
+            </section>
+          </div>
+          <aside class="p-side-col">
+            <section class="presenter-card-section p-section p-section-fill p-side-notes">
+              <h3>Meeting notes</h3>
+              <p class="presenter-text" id="p-notes">—</p>
+            </section>
+            <section class="presenter-card-section p-section p-section-fill p-side-dueouts">
+              <h3>Due-outs</h3>
+              <ul class="presenter-list" id="p-dueouts"></ul>
+            </section>
+          </aside>
         </div>
       </article>
     </main>
     <footer class="presenter-foot">
-      <span id="presenter-status" class="presenter-status">Connected · auto-refreshing every 2s</span>
+      <span id="presenter-status" class="presenter-status">Connected · auto-refreshing every 1s</span>
       <span id="presenter-url" class="presenter-url"></span>
     </footer>
   </div>
@@ -11813,13 +13035,18 @@ function renderDashboardHtml(): string {
         const id = decodeURIComponent(raw.slice(3).trim());
         return { tab: "wo", dateKey: null, workOrderId: id || null };
       }
-      if (/^\\d{4}-\\d{2}-\\d{2}$/.test(raw)) {
+      if (raw === "authz") return { tab: "authz", dateKey: null, workOrderId: null };
+      if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
         return { tab: "snapshot", dateKey: raw, workOrderId: null };
       }
       return { tab: "snapshot", dateKey: null, workOrderId: null };
     }
 
     let historyEntries = [];
+    let mcChartLastPoints = null;
+    let mcChartLastSeriesPoints = null;
+    let mcChartLastApiResponse = null;
+    let mcChartDimensions = null;
     let selectedDate = null;
     let snapshotRows = [];
     const watchCacheByDate = new Map();
@@ -12417,6 +13644,586 @@ function renderDashboardHtml(): string {
       refreshPresetChipsState("bd-preset-chips", breakdownCompareDate, selectedDate || "");
     }
 
+    function populateMcChartDateSelects() {
+      const from = document.getElementById("mc-chart-from");
+      const to = document.getElementById("mc-chart-to");
+      if (!from || !to) return;
+      const asc = sortDesc(historyEntries)
+        .slice()
+        .reverse();
+      const opts = asc
+        .map(function (e) {
+          return "<option value='" + esc(e.dateKey) + "'>" + esc(fmtKeyShort(e.dateKey)) + "</option>";
+        })
+        .join("");
+      from.innerHTML = opts;
+      to.innerHTML = opts;
+    }
+
+    function setMcChartDefaultRange() {
+      const sorted = sortDesc(historyEntries);
+      if (!sorted.length) return;
+      const fromEl = document.getElementById("mc-chart-from");
+      const toEl = document.getElementById("mc-chart-to");
+      if (!fromEl || !toEl) return;
+      toEl.value = sorted[0].dateKey;
+      const idx = Math.min(sorted.length - 1, 89);
+      fromEl.value = sorted[idx].dateKey;
+    }
+
+    function mcChartSeriesLineHtml(j) {
+      if (!j || !j.mode) return "—";
+      const k = j.key != null && String(j.key) !== "" ? esc(String(j.key)) : "";
+      if (j.mode === "fleet") return "Fleet";
+      if (j.mode === "unit") return k || "—";
+      if (j.mode === "unit_mel") return k || "—";
+      if (j.mode === "mel") return k || "—";
+      if (j.mode === "mgmt") return k || "—";
+      return esc(String(j.mode));
+    }
+
+    function updateMcChartLegend() {
+      const el = document.getElementById("mc-chart-legend");
+      if (!el) return;
+      const j = mcChartLastApiResponse;
+      if (!j) {
+        el.innerHTML = "";
+        el.classList.add("hidden");
+        return;
+      }
+      const vizEl = document.getElementById("mc-chart-viz");
+      const viz = vizEl ? vizEl.value : "line";
+      const seriesLine = mcChartSeriesLineHtml(j);
+      const vizNames = {
+        line: "Line",
+        area: "Area",
+        step: "Step",
+        column: "Columns",
+        stacked: "Stacked",
+      };
+      const head = vizNames[viz] || viz;
+      if (viz === "stacked") {
+        el.innerHTML =
+          '<div class="mc-leg-head">' +
+          esc(head) +
+          "</div>" +
+          '<ul class="mc-leg-list">' +
+          '<li><span class="mc-sw mc-sw-nmc"></span><span><strong>NMC</strong></span></li>' +
+          '<li><span class="mc-sw mc-sw-fmc"></span><span><strong>FMC</strong></span></li>' +
+          "</ul>" +
+          '<p class="mc-leg-notes"><strong>Y:</strong> total assets. <strong>X:</strong> snapshot date.</p>' +
+          '<p class="mc-leg-series"><strong>Series:</strong> ' +
+          seriesLine +
+          "</p>";
+      } else {
+        el.innerHTML =
+          '<div class="mc-leg-head">' +
+          esc(head) +
+          "</div>" +
+          '<ul class="mc-leg-list">' +
+          '<li><span class="mc-sw mc-sw-mc"></span><span><strong>MC %</strong></span></li>' +
+          "</ul>" +
+          '<p class="mc-leg-notes"><strong>Y:</strong> mission capable %. <strong>X:</strong> snapshot date.</p>' +
+          '<p class="mc-leg-series"><strong>Series:</strong> ' +
+          seriesLine +
+          "</p>";
+      }
+      el.classList.remove("hidden");
+    }
+
+    function drawMcChartAxisBottom(ctx, H, padL, plotW, text) {
+      ctx.save();
+      ctx.fillStyle = "#5b6675";
+      ctx.font = "11px system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(text, padL + plotW / 2, H - 6);
+      ctx.restore();
+    }
+
+    function drawMcChartAxisLeft(ctx, padT, plotH, text) {
+      ctx.save();
+      ctx.fillStyle = "#5b6675";
+      ctx.font = "11px system-ui, sans-serif";
+      ctx.translate(16, padT + plotH / 2);
+      ctx.rotate(-Math.PI / 2);
+      ctx.textAlign = "center";
+      ctx.fillText(text, 0, 0);
+      ctx.restore();
+    }
+
+    function drawMcChartStackedVisualization(ctx, W, H, points, status) {
+      const muted = "#5b6675";
+      const axis = "rgba(15,30,60,0.12)";
+      const colFmc = "#157f3a";
+      const colNmc = "#b00020";
+      const rows = (points || []).filter(function (p) {
+        const f = p.fmc != null ? Number(p.fmc) : 0;
+        const n = p.nmc != null ? Number(p.nmc) : 0;
+        return f + n > 0;
+      });
+      if (!rows.length) {
+        ctx.fillStyle = muted;
+        ctx.font = "14px system-ui, sans-serif";
+        ctx.fillText("No FMC/NMC data in this range.", 16, 40);
+        ctx.fillText("Try another series or chart type.", 16, 62);
+        if (status) {
+          status.textContent = "Stacked view needs FMC and NMC counts for each snapshot.";
+        }
+        return;
+      }
+      let maxT = 0;
+      rows.forEach(function (p) {
+        const f = Number(p.fmc) || 0;
+        const n = Number(p.nmc) || 0;
+        maxT = Math.max(maxT, f + n);
+      });
+      const padL = 58;
+      const padR = 12;
+      const padT = 28;
+      const padB = 44;
+      const plotW = W - padL - padR;
+      const plotH = H - padT - padB;
+      const span = maxT || 1;
+
+      ctx.strokeStyle = axis;
+      ctx.lineWidth = 1;
+      for (let i = 0; i <= 4; i++) {
+        const y = padT + (plotH * i) / 4;
+        ctx.beginPath();
+        ctx.moveTo(padL, y);
+        ctx.lineTo(padL + plotW, y);
+        ctx.stroke();
+        const val = maxT - (span * i) / 4;
+        ctx.fillStyle = muted;
+        ctx.font = "11px system-ui, sans-serif";
+        ctx.textAlign = "right";
+        ctx.fillText(String(Math.round(val)), padL - 6, y + 4);
+      }
+
+      function xAt(i) {
+        return padL + (plotW * i) / Math.max(1, rows.length - 1);
+      }
+      function yCount(c) {
+        return padT + plotH * (1 - c / span);
+      }
+      const bw = Math.min(32, (plotW / rows.length) * 0.72);
+      rows.forEach(function (p, i) {
+        const f = Number(p.fmc) || 0;
+        const n = Number(p.nmc) || 0;
+        const xc = xAt(i);
+        const x0 = xc - bw / 2;
+        const y0 = yCount(n);
+        const y1 = yCount(n + f);
+        const base = padT + plotH;
+        ctx.fillStyle = colNmc;
+        ctx.fillRect(x0, y0, bw, base - y0);
+        ctx.fillStyle = colFmc;
+        ctx.fillRect(x0, y1, bw, y0 - y1);
+      });
+
+      ctx.fillStyle = colNmc;
+      ctx.fillRect(padL, 8, 10, 10);
+      ctx.fillStyle = muted;
+      ctx.font = "11px system-ui, sans-serif";
+      ctx.textAlign = "left";
+      ctx.fillText("NMC", padL + 14, 17);
+      ctx.fillStyle = colFmc;
+      ctx.fillRect(padL + 100, 8, 10, 10);
+      ctx.fillStyle = muted;
+      ctx.fillText("FMC", padL + 114, 17);
+
+      ctx.fillStyle = "#2c3a55";
+      ctx.font = "10px system-ui, sans-serif";
+      ctx.textAlign = "center";
+      const step = Math.max(1, Math.ceil(rows.length / 10));
+      for (let i = 0; i < rows.length; i += step) {
+        ctx.save();
+        ctx.translate(xAt(i), H - 10);
+        ctx.rotate(-0.4);
+        ctx.fillText(fmtKeyShort(rows[i].dateKey), 0, 0);
+        ctx.restore();
+      }
+      drawMcChartAxisLeft(ctx, padT, plotH, "Total assets");
+      drawMcChartAxisBottom(ctx, H, padL, plotW, "ETIC snapshot date");
+      if (status) {
+        status.textContent =
+          rows.length + " bar(s) · max stack " + maxT + " assets";
+      }
+    }
+
+    function drawMcChartSeries(points) {
+      mcChartLastSeriesPoints = points;
+      mcChartLastPoints = points;
+      const canvas = document.getElementById("mc-chart-canvas");
+      const status = document.getElementById("mc-chart-status");
+      const vizEl = document.getElementById("mc-chart-viz");
+      const viz = vizEl ? vizEl.value : "line";
+      if (!canvas) return;
+      const wrap = canvas.parentElement;
+      if (!wrap) return;
+      const rect = wrap.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      const W = Math.max(280, Math.floor(rect.width));
+      const H = Math.max(200, Math.floor(rect.height));
+      canvas.width = W * dpr;
+      canvas.height = H * dpr;
+      canvas.style.width = W + "px";
+      canvas.style.height = H + "px";
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, W, H);
+
+      if (viz === "stacked") {
+        drawMcChartStackedVisualization(ctx, W, H, points, status);
+        updateMcChartLegend();
+        return;
+      }
+
+      const muted = "#5b6675";
+      const axis = "rgba(15,30,60,0.12)";
+      const lineCol = "#003a8c";
+      const data = (points || []).filter(function (p) {
+        return p.mc != null && !isNaN(Number(p.mc));
+      });
+      if (!data.length) {
+        ctx.fillStyle = muted;
+        ctx.font = "14px system-ui, sans-serif";
+        ctx.fillText("No MC% data in this range for the selected filter.", 16, 40);
+        if (status) status.textContent = "No points to plot.";
+        updateMcChartLegend();
+        return;
+      }
+      const padL = 52;
+      const padR = 12;
+      const padT = 12;
+      const padB = 44;
+      const plotW = W - padL - padR;
+      const plotH = H - padT - padB;
+      let minY = 100;
+      let maxY = 0;
+      data.forEach(function (p) {
+        const v = Number(p.mc);
+        minY = Math.min(minY, v);
+        maxY = Math.max(maxY, v);
+      });
+      let span = maxY - minY;
+      const padY = Math.max(1, span * 0.1);
+      minY = Math.max(0, minY - padY);
+      maxY = Math.min(100, maxY + padY);
+      if (maxY - minY < 0.5) {
+        minY = Math.max(0, minY - 0.5);
+        maxY = Math.min(100, maxY + 0.5);
+      }
+      span = maxY - minY || 1;
+
+      ctx.strokeStyle = axis;
+      ctx.lineWidth = 1;
+      for (let i = 0; i <= 4; i++) {
+        const y = padT + (plotH * i) / 4;
+        ctx.beginPath();
+        ctx.moveTo(padL, y);
+        ctx.lineTo(padL + plotW, y);
+        ctx.stroke();
+        const val = maxY - (span * i) / 4;
+        ctx.fillStyle = muted;
+        ctx.font = "11px system-ui, sans-serif";
+        ctx.textAlign = "right";
+        ctx.fillText(val.toFixed(0) + "%", padL - 6, y + 4);
+      }
+
+      function xAt(i) {
+        return padL + (plotW * i) / Math.max(1, data.length - 1);
+      }
+      function yAt(v) {
+        return padT + plotH * (1 - (v - minY) / span);
+      }
+      const baseY = padT + plotH;
+
+      if (viz === "column") {
+        const bw = Math.min(28, (plotW / data.length) * 0.75);
+        data.forEach(function (p, i) {
+          const xc = xAt(i);
+          const x0 = xc - bw / 2;
+          const yt = yAt(Number(p.mc));
+          ctx.fillStyle = "rgba(0, 58, 140, 0.88)";
+          ctx.fillRect(x0, yt, bw, baseY - yt);
+        });
+      } else if (viz === "area") {
+        ctx.fillStyle = "rgba(0, 58, 140, 0.2)";
+        ctx.beginPath();
+        ctx.moveTo(xAt(0), baseY);
+        data.forEach(function (p, i) {
+          ctx.lineTo(xAt(i), yAt(Number(p.mc)));
+        });
+        ctx.lineTo(xAt(data.length - 1), baseY);
+        ctx.closePath();
+        ctx.fill();
+        ctx.strokeStyle = lineCol;
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        data.forEach(function (p, i) {
+          const x = xAt(i);
+          const y = yAt(Number(p.mc));
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+        ctx.fillStyle = lineCol;
+        data.forEach(function (p, i) {
+          ctx.beginPath();
+          ctx.arc(xAt(i), yAt(Number(p.mc)), 3, 0, Math.PI * 2);
+          ctx.fill();
+        });
+      } else if (viz === "step") {
+        ctx.strokeStyle = lineCol;
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        ctx.moveTo(xAt(0), yAt(Number(data[0].mc)));
+        for (let i = 1; i < data.length; i++) {
+          ctx.lineTo(xAt(i), yAt(Number(data[i - 1].mc)));
+          ctx.lineTo(xAt(i), yAt(Number(data[i].mc)));
+        }
+        ctx.stroke();
+        ctx.fillStyle = lineCol;
+        data.forEach(function (p, i) {
+          ctx.beginPath();
+          ctx.arc(xAt(i), yAt(Number(p.mc)), 3.5, 0, Math.PI * 2);
+          ctx.fill();
+        });
+      } else {
+        ctx.strokeStyle = lineCol;
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        data.forEach(function (p, i) {
+          const x = xAt(i);
+          const y = yAt(Number(p.mc));
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+        ctx.fillStyle = lineCol;
+        data.forEach(function (p, i) {
+          ctx.beginPath();
+          ctx.arc(xAt(i), yAt(Number(p.mc)), 3.5, 0, Math.PI * 2);
+          ctx.fill();
+        });
+      }
+
+      ctx.fillStyle = "#2c3a55";
+      ctx.font = "10px system-ui, sans-serif";
+      ctx.textAlign = "center";
+      const step = Math.max(1, Math.ceil(data.length / 10));
+      for (let i = 0; i < data.length; i += step) {
+        ctx.save();
+        ctx.translate(xAt(i), H - 10);
+        ctx.rotate(-0.4);
+        ctx.fillText(fmtKeyShort(data[i].dateKey), 0, 0);
+        ctx.restore();
+      }
+      drawMcChartAxisLeft(ctx, padT, plotH, "Mission capable %");
+      drawMcChartAxisBottom(ctx, H, padL, plotW, "ETIC snapshot date");
+      if (status) {
+        status.textContent =
+          data.length +
+          " point(s) · MC% " +
+          minY.toFixed(1) +
+          " – " +
+          maxY.toFixed(1) +
+          (viz === "column" ? " · columns" : viz === "area" ? " · area" : viz === "step" ? " · step" : " · line");
+      }
+      updateMcChartLegend();
+    }
+
+    function applyMcChartSlicerOptions() {
+      const modeEl = document.getElementById("mc-chart-mode");
+      const sel = document.getElementById("mc-chart-slicer");
+      const lbl = document.getElementById("mc-chart-slicer-lbl");
+      const block = document.getElementById("mc-chart-slicer-block");
+      if (!modeEl || !sel || !block) return;
+      const mode = modeEl.value || "fleet";
+      if (mode === "fleet") {
+        block.classList.add("hidden");
+        return;
+      }
+      block.classList.remove("hidden");
+      const lab = {
+        unit: "Unit",
+        unit_mel: "MEL unit",
+        mel: "MEL key",
+        mgmt: "Mgmt",
+      };
+      if (lbl) lbl.textContent = lab[mode] || "Select";
+      let arr = [];
+      if (mcChartDimensions) {
+        if (mode === "unit") arr = mcChartDimensions.unitAm || [];
+        else if (mode === "unit_mel") arr = mcChartDimensions.melUnit || [];
+        else if (mode === "mel") arr = mcChartDimensions.melKey || [];
+        else if (mode === "mgmt") arr = mcChartDimensions.mgmtName || [];
+      }
+      const prev = sel.value;
+      sel.innerHTML =
+        "<option value=''>— Select a value —</option>" +
+        arr
+          .map(function (x) {
+            return "<option value='" + esc(x) + "'>" + esc(x) + "</option>";
+          })
+          .join("");
+      if (prev && arr.indexOf(prev) >= 0) sel.value = prev;
+    }
+
+    function refreshMcChartPresetChips() {
+      const fromEl = document.getElementById("mc-chart-from");
+      const toEl = document.getElementById("mc-chart-to");
+      if (!fromEl || !toEl) return;
+      refreshPresetChipsState("mc-chart-preset-chips", fromEl.value, toEl.value);
+    }
+
+    async function loadMcChartDimensions() {
+      const fromEl = document.getElementById("mc-chart-from");
+      const toEl = document.getElementById("mc-chart-to");
+      const hint = document.getElementById("mc-chart-dim-hint");
+      if (!fromEl || !toEl) return;
+      const from = fromEl.value;
+      const to = toEl.value;
+      if (from > to) {
+        if (hint) hint.textContent = "Set “From” on or before “To” to load slicer lists.";
+        mcChartDimensions = null;
+        applyMcChartSlicerOptions();
+        return;
+      }
+      if (hint) hint.textContent = "Loading lists for this date range…";
+      try {
+        const res = await fetch(
+          "/api/mc-series/dimensions?from=" + encodeURIComponent(from) + "&to=" + encodeURIComponent(to),
+        );
+        const j = await res.json();
+        if (!res.ok) throw new Error((j && j.error) || "Could not load dimensions");
+        mcChartDimensions = j;
+        const nu = (j.unitAm && j.unitAm.length) || 0;
+        const nk = (j.melKey && j.melKey.length) || 0;
+        const nm = (j.mgmtName && j.mgmtName.length) || 0;
+        const nmu = (j.melUnit && j.melUnit.length) || 0;
+        if (hint) {
+          hint.textContent =
+            "In this range: " +
+            nu +
+            " unit · " +
+            nk +
+            " MEL key · " +
+            nm +
+            " mgmt · " +
+            nmu +
+            " MEL unit.";
+        }
+        applyMcChartSlicerOptions();
+      } catch (e) {
+        mcChartDimensions = null;
+        if (hint) hint.textContent = String(e && e.message ? e.message : e);
+        applyMcChartSlicerOptions();
+      }
+    }
+
+    async function refreshMcChart() {
+      const st = document.getElementById("mc-chart-status");
+      const fromEl = document.getElementById("mc-chart-from");
+      const toEl = document.getElementById("mc-chart-to");
+      const modeEl = document.getElementById("mc-chart-mode");
+      const slicer = document.getElementById("mc-chart-slicer");
+      if (!fromEl || !toEl || !modeEl) return;
+      const from = fromEl.value;
+      const to = toEl.value;
+      const mode = modeEl.value || "fleet";
+      const key = mode === "fleet" ? "" : (slicer ? (slicer.value || "").trim() : "");
+      if (from > to) {
+        if (st) st.textContent = "“From” must be on or before “To”.";
+        mcChartLastApiResponse = null;
+        drawMcChartSeries([]);
+        return;
+      }
+      if (mode !== "fleet" && !key) {
+        if (st) st.textContent = "Pick a value or switch to Fleet.";
+        mcChartLastApiResponse = null;
+        drawMcChartSeries([]);
+        return;
+      }
+      if (st) st.textContent = "Loading…";
+      try {
+        let url =
+          "/api/mc-series?from=" +
+          encodeURIComponent(from) +
+          "&to=" +
+          encodeURIComponent(to) +
+          "&mode=" +
+          encodeURIComponent(mode);
+        if (key) url += "&key=" + encodeURIComponent(key);
+        const res = await fetch(url);
+        const j = await res.json();
+        if (!res.ok) throw new Error((j && j.error) || "Request failed");
+        mcChartLastApiResponse = j;
+        drawMcChartSeries(j.points || []);
+        const n = (j.points || []).filter(function (p) {
+          return p.mc != null;
+        }).length;
+        const label = j.mode === "fleet" ? "Fleet" : j.key || j.mode || "—";
+        if (st) st.textContent = label + " · " + n + " snapshot(s) with data";
+      } catch (e) {
+        mcChartLastApiResponse = null;
+        if (st) st.textContent = String(e && e.message ? e.message : e);
+        drawMcChartSeries([]);
+      }
+    }
+
+    function wireMcChartPanel() {
+      const btn = document.getElementById("mc-chart-refresh");
+      const mode = document.getElementById("mc-chart-mode");
+      const from = document.getElementById("mc-chart-from");
+      const to = document.getElementById("mc-chart-to");
+      const rel = document.getElementById("mc-chart-reload-slicers");
+      const presetRoot = document.getElementById("mc-chart-preset-chips");
+      let dimTimer = null;
+      function scheduleDimReload() {
+        if (dimTimer) clearTimeout(dimTimer);
+        refreshMcChartPresetChips();
+        dimTimer = setTimeout(function () {
+          loadMcChartDimensions();
+        }, 350);
+      }
+      if (btn) btn.addEventListener("click", function () { refreshMcChart(); });
+      if (mode) {
+        mode.addEventListener("change", function () {
+          applyMcChartSlicerOptions();
+        });
+      }
+      if (from) from.addEventListener("change", scheduleDimReload);
+      if (to) to.addEventListener("change", scheduleDimReload);
+      if (rel) rel.addEventListener("click", function () { loadMcChartDimensions(); });
+      const vizSel = document.getElementById("mc-chart-viz");
+      if (vizSel) {
+        vizSel.addEventListener("change", function () {
+          if (mcChartLastSeriesPoints) drawMcChartSeries(mcChartLastSeriesPoints);
+        });
+      }
+      if (presetRoot) {
+        presetRoot.addEventListener("click", function (ev) {
+          const chip = ev.target.closest(".preset-chip");
+          if (!chip || chip.disabled) return;
+          const key = chip.getAttribute("data-preset");
+          const latest = (historyEntries[0] && historyEntries[0].dateKey) || "";
+          const snap = snapPresetToSnapshots(presetRange(key, latest));
+          if (!snap) return;
+          const fromEl = document.getElementById("mc-chart-from");
+          const toEl = document.getElementById("mc-chart-to");
+          if (fromEl) fromEl.value = snap.from;
+          if (toEl) toEl.value = snap.to;
+          refreshMcChartPresetChips();
+          void loadMcChartDimensions().then(function () {
+            refreshMcChart();
+          });
+        });
+      }
+    }
+
     /**
      * Switch the per-Unit compare date. Empty string disables. Fetches and
      * caches the comparison breakdown, then re-renders the card.
@@ -12521,6 +14328,7 @@ function renderDashboardHtml(): string {
       const snapBtn = document.getElementById("tab-snapshot");
       const woBtn = document.getElementById("tab-work-orders");
       const smxBtn = document.getElementById("tab-schedule-mx");
+      const authzBtn = document.getElementById("tab-authz");
       const melBtn = document.getElementById("tab-mel");
       const meetBtn = document.getElementById("tab-meeting");
       const yardBtn = document.getElementById("tab-yard");
@@ -12530,6 +14338,7 @@ function renderDashboardHtml(): string {
       const panelSnap = document.getElementById("panel-snapshot");
       const panelWo = document.getElementById("panel-work-orders");
       const panelSmx = document.getElementById("panel-schedule-mx");
+      const panelAuthz = document.getElementById("panel-authz");
       const panelMel = document.getElementById("panel-mel");
       const panelMeet = document.getElementById("panel-meeting");
       const panelYard = document.getElementById("panel-yard");
@@ -12540,16 +14349,18 @@ function renderDashboardHtml(): string {
       const fab = document.getElementById("ask-fab");
       const isWo = which === "wo";
       const isSmx = which === "smx";
+      const isAuthz = which === "authz";
       const isMel = which === "mel";
       const isMeet = which === "meeting";
       const isYard = which === "yard";
       const isWv = which === "waivers";
       const isAsk = which === "ask";
       const isSet = which === "settings";
-      const isSnap = !isWo && !isSmx && !isMel && !isMeet && !isYard && !isWv && !isAsk && !isSet;
+      const isSnap = !isWo && !isSmx && !isAuthz && !isMel && !isMeet && !isYard && !isWv && !isAsk && !isSet;
       snapBtn.classList.toggle("active", isSnap);
       woBtn.classList.toggle("active", isWo);
       if (smxBtn) smxBtn.classList.toggle("active", isSmx);
+      if (authzBtn) authzBtn.classList.toggle("active", isAuthz);
       if (melBtn) melBtn.classList.toggle("active", isMel);
       if (meetBtn) meetBtn.classList.toggle("active", isMeet);
       if (yardBtn) yardBtn.classList.toggle("active", isYard);
@@ -12559,6 +14370,7 @@ function renderDashboardHtml(): string {
       panelSnap.classList.toggle("hidden", !isSnap);
       panelWo.classList.toggle("hidden", !isWo);
       if (panelSmx) panelSmx.classList.toggle("hidden", !isSmx);
+      if (panelAuthz) panelAuthz.classList.toggle("hidden", !isAuthz);
       if (panelMel) panelMel.classList.toggle("hidden", !isMel);
       if (panelMeet) panelMeet.classList.toggle("hidden", !isMeet);
       if (panelYard) panelYard.classList.toggle("hidden", !isYard);
@@ -12566,10 +14378,17 @@ function renderDashboardHtml(): string {
       if (panelAsk) panelAsk.classList.toggle("hidden", !isAsk);
       if (panelSet) panelSet.classList.toggle("hidden", !isSet);
       if (fab) fab.classList.toggle("hidden", isAsk);
+      const constructionBanner = document.getElementById("construction-banner");
+      if (constructionBanner) {
+        const showConstruction = isSnap || isSmx || isAuthz || isSet;
+        constructionBanner.classList.toggle("hidden", !showConstruction);
+      }
       brandSub.textContent = isWo
         ? "Browse, filter, and inspect work orders. Select one to see its change timeline."
         : isSmx
         ? "Fleet schedule maintenance from ETIC — overdue NCE rows are highest priority."
+        : isAuthz
+        ? "MEL Calculator authorizations: every MEL key with unit and detail doc #, plus moves on those fields."
         : isMel
         ? "Per-MEL-key status, recall loans, and history. NMC ≥ MEL required = below."
         : isMeet
@@ -12588,6 +14407,8 @@ function renderDashboardHtml(): string {
         if (asOf) loadAndRenderWoList(asOf, { force: true });
       } else if (isSmx) {
         loadScheduleMxTab();
+      } else if (isAuthz) {
+        loadAuthzManagerTab();
       } else if (isMel) {
         onEnterMelTab();
       } else if (isMeet) {
@@ -12633,6 +14454,127 @@ function renderDashboardHtml(): string {
       } catch (e) {
         if (statsEl) statsEl.textContent = "Could not load schedule maintenance.";
         if (tbody) tbody.innerHTML = "<tr><td colspan='6'>Could not load.</td></tr>";
+      }
+    }
+
+    var authzPayload = null;
+
+    function authzRowMatch(row, q) {
+      if (!q) return true;
+      const ql = q.toLowerCase();
+      const blob = [
+        row.melKey,
+        row.unit,
+        row.userUnit,
+        row.detailDocNumber,
+        row.mgmtCodeName,
+        row.priorityTier,
+        row.melStatus,
+      ].join(" ").toLowerCase();
+      return blob.indexOf(ql) !== -1;
+    }
+
+    function authzMoveFieldLabel(f) {
+      if (f === "Detail doc number") return "Detail doc #";
+      return f || "—";
+    }
+
+    function renderAuthzAssets() {
+      const tbody = document.getElementById("authz-assets-tbody");
+      const meta = document.getElementById("authz-assets-meta");
+      if (!tbody || !authzPayload) return;
+      const qel = document.getElementById("authz-asset-query");
+      const q = (qel && qel.value) ? qel.value.trim() : "";
+      const rows = (authzPayload.assets || []).filter(function (r) { return authzRowMatch(r, q); });
+      if (meta) {
+        meta.textContent =
+          rows.length +
+          " MEL key" +
+          (rows.length === 1 ? "" : "s") +
+          " (snapshot " +
+          (authzPayload.asOfDateKey ? fmtKeyLong(authzPayload.asOfDateKey) : "—") +
+          ").";
+      }
+      if (!rows.length) {
+        tbody.innerHTML = "<tr><td colspan='7'>No rows match.</td></tr>";
+        return;
+      }
+      tbody.innerHTML = rows
+        .map(function (row) {
+          return (
+            "<tr>" +
+            "<td><span class='authz-mono'>" + esc(row.melKey) + "</span></td>" +
+            "<td>" + esc(row.unit || "—") + "</td>" +
+            "<td>" + esc(row.userUnit || "—") + "</td>" +
+            "<td>" + esc(row.detailDocNumber || "—") + "</td>" +
+            "<td>" + esc(row.mgmtCodeName || "—") + "</td>" +
+            "<td>" + esc(row.priorityTier || "—") + "</td>" +
+            "<td>" + esc(row.melStatus || "—") + "</td>" +
+            "</tr>"
+          );
+        })
+        .join("");
+    }
+
+    function renderAuthzMoves() {
+      const tbody = document.getElementById("authz-moves-tbody");
+      const meta = document.getElementById("authz-moves-meta");
+      if (!tbody || !authzPayload) return;
+      const moves = authzPayload.moves || [];
+      if (meta) {
+        meta.textContent =
+          "Newest first · showing " +
+          moves.length +
+          " entr" +
+          (moves.length === 1 ? "y" : "ies") +
+          " (max 500).";
+      }
+      if (!moves.length) {
+        tbody.innerHTML = "<tr><td colspan='5'>No unit or detail-doc moves logged yet. After the next ETIC ingest, changes to those MEL columns will appear here. Existing history only includes dates ingested after unit/detail-doc tracking was added.</td></tr>";
+        return;
+      }
+      tbody.innerHTML = moves
+        .map(function (m) {
+          const dk = m.snapshotDateKey || "";
+          const t = (m.createdAtIso || "").replace("T", " ").replace(/\.\d{3}Z?$/, "");
+          return (
+            "<tr>" +
+            "<td><span class='authz-mono'>" + esc(dk) + "</span>" +
+            (t ? "<div class='remark-snippet'>" + esc(t) + "</div>" : "") +
+            "</td>" +
+            "<td><span class='authz-move-field'>" + esc(authzMoveFieldLabel(m.field)) + "</span></td>" +
+            "<td><span class='authz-mono'>" + esc(m.melKey || "—") + "</span></td>" +
+            "<td>" + esc(m.oldValue || "—") + "</td>" +
+            "<td>" + esc(m.newValue || "—") + "</td>" +
+            "</tr>"
+          );
+        })
+        .join("");
+    }
+
+    async function loadAuthzManagerTab() {
+      const pill = document.getElementById("authz-asof-pill");
+      const tbodyA = document.getElementById("authz-assets-tbody");
+      const tbodyM = document.getElementById("authz-moves-tbody");
+      const metaA = document.getElementById("authz-assets-meta");
+      if (pill) pill.textContent = "…";
+      if (metaA) metaA.textContent = "";
+      if (tbodyA) tbodyA.innerHTML = "<tr><td colspan='7'>Loading…</td></tr>";
+      if (tbodyM) tbodyM.innerHTML = "<tr><td colspan='5'>Loading…</td></tr>";
+      try {
+        const r = await fetch("/api/authz-manager", { cache: "no-store" });
+        const j = await r.json();
+        authzPayload = j;
+        if (pill) pill.textContent = j.asOfDateKey ? fmtKeyLong(j.asOfDateKey) : "—";
+        if (!j.asOfDateKey && metaA) metaA.textContent = "No MEL snapshots in the database yet — ingest an ETIC that includes the MEL Calculator sheet.";
+        renderAuthzAssets();
+        renderAuthzMoves();
+      } catch (e) {
+        authzPayload = null;
+        if (pill) pill.textContent = "—";
+        if (tbodyA) tbodyA.innerHTML = "<tr><td colspan='7'>Could not load.</td></tr>";
+        if (tbodyM) tbodyM.innerHTML = "<tr><td colspan='5'>Could not load.</td></tr>";
+        if (metaA) metaA.textContent = String(e && e.message ? e.message : e);
       }
     }
 
@@ -13568,6 +15510,85 @@ function renderDashboardHtml(): string {
       el.innerHTML = days;
     }
 
+    /**
+     * Same merge + sort as the Work Orders change timeline (newest day first,
+     * then events within the day by time), but flattened to one row per event
+     * for the presenter TV view.
+     */
+    function buildPresenterTimelineFlat(payload, woRow) {
+      if (payload == null) return [];
+      function tlSortKey(it) {
+        if (it.kind === "opened") return (it.ev.date || "") + "T00:00:00";
+        if (it.kind === "action") return it.ev.createdAtIso || "";
+        if (it.kind === "system") return it.ev.changed_at_iso || ((it.ev.snapshot_date_key || "") + "T12:00:00");
+        if (it.kind === "meeting") return it.ev.updatedAtIso || "";
+        if (it.kind === "yard") return it.ev.checkedAtIso || "";
+        return "";
+      }
+      function dedupeEticGrp(grp) {
+        const slipKeys = new Set();
+        grp.forEach(function (item) {
+          if (item.kind !== "system") return;
+          const ev = item.ev;
+          if ((ev.field || "").toLowerCase() !== "etic_date_slip") return;
+          slipKeys.add(eticChangelogPairKey(ev.old_value, ev.new_value));
+        });
+        return grp.filter(function (item) {
+          if (item.kind !== "system") return true;
+          const ev = item.ev;
+          if ((ev.field || "").toLowerCase() !== "etic") return true;
+          return !slipKeys.has(eticChangelogPairKey(ev.old_value, ev.new_value));
+        });
+      }
+      const entries = Array.isArray(payload) ? payload : ((payload && payload.entries) || []);
+      const actions = (payload && Array.isArray(payload.actions)) ? payload.actions : [];
+      const meetingNotes = (payload && Array.isArray(payload.meetingNotes)) ? payload.meetingNotes : [];
+      const yardWalks = (payload && Array.isArray(payload.yardWalks)) ? payload.yardWalks : [];
+      if (!entries.length && !actions.length && !(woRow && woRow.establishedDateIso) && !meetingNotes.length && !yardWalks.length) {
+        return [];
+      }
+      const byKey = new Map();
+      entries.forEach(function (e) {
+        const k = e.snapshot_date_key || "";
+        if (!byKey.has(k)) byKey.set(k, []);
+        byKey.get(k).push({ kind: "system", ev: e });
+      });
+      actions.forEach(function (a) {
+        const k = (a.createdAtIso || "").slice(0, 10);
+        if (!k) return;
+        if (!byKey.has(k)) byKey.set(k, []);
+        byKey.get(k).push({ kind: "action", ev: a });
+      });
+      meetingNotes.forEach(function (m) {
+        const k = (m.updatedAtIso || "").slice(0, 10);
+        if (!k) return;
+        if (!byKey.has(k)) byKey.set(k, []);
+        byKey.get(k).push({ kind: "meeting", ev: m });
+      });
+      yardWalks.forEach(function (y) {
+        const k = (y.checkedAtIso || "").slice(0, 10);
+        if (!k) return;
+        if (!byKey.has(k)) byKey.set(k, []);
+        byKey.get(k).push({ kind: "yard", ev: y });
+      });
+      if (woRow && woRow.establishedDateIso) {
+        const k = woRow.establishedDateIso;
+        if (!byKey.has(k)) byKey.set(k, []);
+        byKey.get(k).push({ kind: "opened", ev: { date: k, raw: woRow.establishedDate } });
+      }
+      const keys = Array.from(byKey.keys()).sort(function (a, b) { return a < b ? 1 : a > b ? -1 : 0; });
+      const out = [];
+      keys.forEach(function (k) {
+        let grp = byKey.get(k);
+        grp.sort(function (a, b) { return tlSortKey(a).localeCompare(tlSortKey(b)); });
+        grp = dedupeEticGrp(grp);
+        grp.forEach(function (item) {
+          out.push({ dateKey: k, item: item });
+        });
+      });
+      return out;
+    }
+
     function renderWoDetailFull(data) {
       const empty = document.getElementById("wo-detail-empty");
       const wrap = document.getElementById("wo-detail");
@@ -13684,10 +15705,18 @@ function renderDashboardHtml(): string {
         await selectWo(r.workOrderId, false);
         return;
       }
+      if (r.tab === "authz") {
+        setMainTab("authz");
+        return;
+      }
       setMainTab("snapshot");
       if (r.dateKey && historyEntries.some((e) => e.dateKey === r.dateKey)) {
         await selectDate(r.dateKey, false);
-      } else if (!selectedDate) {
+      } else if (selectedDate) {
+        // init() already set selectedDate to the latest (or hash date) — we must
+        // load analysis; otherwise the UI stays blank until the user changes date.
+        await selectDate(selectedDate, false);
+      } else {
         const sorted = sortDesc(historyEntries);
         if (sorted.length) await selectDate(sorted[0].dateKey, false);
       }
@@ -14222,6 +16251,13 @@ function renderDashboardHtml(): string {
       populateBreakdownCompareSelect();
       await applyHashRoute();
 
+      populateMcChartDateSelects();
+      setMcChartDefaultRange();
+      wireMcChartPanel();
+      refreshMcChartPresetChips();
+      await loadMcChartDimensions();
+      refreshMcChart();
+
       // Date picker controls.
       document.getElementById("date-select").addEventListener("change", function (ev) {
         const dk = ev.target.value;
@@ -14333,6 +16369,15 @@ function renderDashboardHtml(): string {
       });
       const smxTabBtn = document.getElementById("tab-schedule-mx");
       if (smxTabBtn) smxTabBtn.addEventListener("click", function () { setMainTab("smx"); });
+      const authzTabBtn = document.getElementById("tab-authz");
+      if (authzTabBtn) {
+        authzTabBtn.addEventListener("click", function () {
+          setMainTab("authz");
+          location.hash = "#authz";
+        });
+      }
+      const authzQ = document.getElementById("authz-asset-query");
+      if (authzQ) authzQ.addEventListener("input", function () { renderAuthzAssets(); });
       const smxFilt = document.getElementById("smx-filters");
       if (smxFilt) {
         smxFilt.addEventListener("click", function (e) {
@@ -14609,11 +16654,26 @@ function renderDashboardHtml(): string {
     function melIsCritical(r) {
       return !!(r && r.config && r.config.isCritical);
     }
-    function melTypeLabelOf(r) {
-      if (r && r.config && r.config.typeLabel) return r.config.typeLabel;
+    /** Short TYPE from workbook mgmt line (text after " - "); unchanged by Settings overrides. */
+    function melDefaultTypeLabelOf(r) {
+      if (!r) return "";
       const s = (r.mgmt_code_name || "").trim();
       const i = s.indexOf(" - ");
       return i > 0 ? s.slice(i + 3).trim() : s;
+    }
+    /** Display TYPE: custom label from Settings when set, else workbook default. */
+    function melTypeLabelOf(r) {
+      if (r && r.config && r.config.typeLabel) {
+        const t = String(r.config.typeLabel).trim();
+        if (t) return t;
+      }
+      return melDefaultTypeLabelOf(r);
+    }
+    function melTypeLabelIsOverridden(r) {
+      if (!r || !r.config || !r.config.typeLabel) return false;
+      const t = String(r.config.typeLabel).trim();
+      if (!t) return false;
+      return t !== melDefaultTypeLabelOf(r);
     }
 
     /** Pull "B204" out of "B204 - TRUCK 1/2T REG CAB 4X2". */
@@ -15449,6 +17509,16 @@ function renderDashboardHtml(): string {
         const isActive = melState.selectedKey === r.mel_key;
         const critical = melIsCritical(r);
         const typeLabel = melTypeLabelOf(r);
+        var typeLine = "";
+        if (typeLabel) {
+          typeLine =
+            "<div class='mel-card-type'>" +
+            esc(typeLabel) +
+            (melTypeLabelIsOverridden(r)
+              ? "<span class='mel-card-type-src' title='Workbook type'>" + esc(melDefaultTypeLabelOf(r) || "—") + "</span>"
+              : "") +
+            "</div>";
+        }
         return (
           "<div class='mel-card-wrap" + (isActive ? " active" : "") + "' data-status='" + esc(r.mel_status) + "' data-mel-key='" + esc(r.mel_key) + "'>" +
           "<button type='button' class='mel-card-star" + (critical ? " on" : "") + "' data-toggle-critical='" + esc(r.mel_key) + "' title='" + (critical ? "Unflag critical" : "Flag as critical") + "'>★</button>" +
@@ -15457,7 +17527,7 @@ function renderDashboardHtml(): string {
               "<span class='mel-key'>" + esc(r.mel_key) + "</span>" +
               "<div class='mel-card-pills'>" + pills.join("") + "</div>" +
             "</div>" +
-            (typeLabel ? "<div class='mel-card-type'>" + esc(typeLabel) + "</div>" : "") +
+            typeLine +
             "<div class='mel-card-meta'>" +
               "<span><span class='b'>" + esc(r.unit || "—") + "</span></span>" +
               (mgmt ? "<span><span class='b'>" + esc(mgmt) + "</span></span>" : "") +
@@ -15545,6 +17615,31 @@ function renderDashboardHtml(): string {
       } catch (e) {
         console.warn("saveMelConfig failed", e);
       }
+    }
+
+    /** MEL keys that show the NCE marker on the Critical slide (matches base ETIC workbook). */
+    var MEL_SLIDE_NCE_KEYS = new Set([
+      "C359", "C001", "C004",
+      "B301MUNS", "E831MUNS", "U102", "U101", "U105",
+      "MB4705", "7.5TON", "DP33", "DP30", "DP13",
+      "PT791",
+    ]);
+    function melSlideKeyIsNce(melKey) {
+      var k = (melKey || "").trim();
+      if (!k) return false;
+      return MEL_SLIDE_NCE_KEYS.has(k.toUpperCase());
+    }
+    function melSlideNceUnitCell(unit, melKey) {
+      var u = unit || "—";
+      if (!melSlideKeyIsNce(melKey)) {
+        return "<td class='td-unit'>" + esc(u) + "</td>";
+      }
+      return (
+        "<td class='td-unit'>" +
+        esc(u) +
+        " <span class='mel-slide-nce' title='Nuclear Certified Equipment'>☢</span>" +
+        "</td>"
+      );
     }
 
     /** Critical-slide view: one big dense table grouped by unit, with a
@@ -15657,6 +17752,15 @@ function renderDashboardHtml(): string {
       const need = r.mel_required || 0;
       const mgmt = melMgmtCodeOf(r);
       const typeLabel = melTypeLabelOf(r);
+      const typeWorkbook = melDefaultTypeLabelOf(r);
+      var typeInner = esc(typeLabel || "—");
+      var typeTitle = typeLabel || "";
+      if (melTypeLabelIsOverridden(r)) {
+        typeInner =
+          "<div>" + esc(typeLabel) + "</div>" +
+          "<div class='slide-type-workbook'>" + esc(typeWorkbook || "—") + "</div>";
+        typeTitle = (typeLabel || "") + " · workbook: " + (typeWorkbook || "");
+      }
       // FMC = Fully Mission Capable, always a "good" number (green when >0).
       // NMC = down vehicles, amber whenever there are any.
       // MEL is the target; Need = how many more FMC vehicles to hit it.
@@ -15672,8 +17776,8 @@ function renderDashboardHtml(): string {
         "<tr class='" + statusCls + (isSub ? " sub" : "") +
             "' data-mel-key='" + esc(r.mel_key || "") +
             "' data-unit='" + esc(r.unit || "") + "'>" +
-          "<td class='td-type' title='" + esc(typeLabel || "") + "'>" + esc(typeLabel || "—") + "</td>" +
-          "<td>" + esc(r.unit || "—") + "</td>" +
+          "<td class='td-type' title='" + esc(typeTitle) + "'>" + typeInner + "</td>" +
+          melSlideNceUnitCell(r.unit, r.mel_key) +
           "<td>" + esc(mgmt || "—") + "</td>" +
           "<td class='td-key'>" + esc(r.mel_key || "—") + "</td>" +
           "<td class='num'>" + (r.mel_assigned_total || 0) + "</td>" +
@@ -15702,7 +17806,7 @@ function renderDashboardHtml(): string {
         "<tr class='slide-row sub' data-mel-key='" + esc(parent.mel_key || "") +
             "' data-unit='" + esc(parent.unit || "") + "'>" +
           "<td class='td-type sub' title='" + esc(sub.type_label || "") + "'>\u21B3 " + esc(sub.type_label || "—") + "</td>" +
-          "<td>" + esc(parent.unit || "—") + "</td>" +
+          melSlideNceUnitCell(parent.unit, parent.mel_key) +
           "<td>" + esc(sub.mgmt_code || "—") + "</td>" +
           "<td class='td-key'>" + esc(parent.mel_key || "—") + "</td>" +
           "<td class='num'>" + (sub.assigned || 0) + "</td>" +
@@ -15868,7 +17972,7 @@ function renderDashboardHtml(): string {
     function exportMelSlideToCsv() {
       const scoped = melState.rows.filter(melMatchesScope);
       const filtered = melFilterForSlide(scoped);
-      const headers = ["Type","Unit","Mgmt","MEL Key","Asgnd","FMC","NMC","MEL","Need","Acc","Abus","Status","Critical"];
+      const headers = ["Type","Type (workbook)","Unit","Mgmt","MEL Key","Asgnd","FMC","NMC","MEL","Need","Acc","Abus","NCE","Status","Critical"];
       const lines = [headers.join(",")];
       const csvField = function (v) {
         const s = v == null ? "" : String(v);
@@ -15886,13 +17990,15 @@ function renderDashboardHtml(): string {
         }).forEach(function (r) {
           const mgmt = melMgmtCodeOf(r);
           const typeLabel = melTypeLabelOf(r);
+          const typeWb = melDefaultTypeLabelOf(r);
           const need = r.mel_required || 0;
           const fmc = r.fmc_count || 0;
           const gap = Math.max(0, need - fmc);
           lines.push([
-            typeLabel || "", r.unit || "", mgmt || "", r.mel_key || "",
+            typeLabel || "", typeWb || "", r.unit || "", mgmt || "", r.mel_key || "",
             r.mel_assigned_total || 0, fmc, r.nmc_count || 0,
             need, gap, r.acc_abus || 0, "",
+            melSlideKeyIsNce(r.mel_key) ? "yes" : "",
             r.mel_status || "", melIsCritical(r) ? "yes" : "",
           ].map(csvField).join(","));
           (r.subdivisions || []).forEach(function (s) {
@@ -15900,9 +18006,10 @@ function renderDashboardHtml(): string {
             const sFmc = s.fmc || 0;
             const sGap = Math.max(0, sNeed - sFmc);
             lines.push([
-              "↳ " + (s.type_label || ""), r.unit || "", s.mgmt_code || "", r.mel_key || "",
+              "↳ " + (s.type_label || ""), melDefaultTypeLabelOf(r) || "", r.unit || "", s.mgmt_code || "", r.mel_key || "",
               s.assigned || 0, sFmc, s.nmc || 0,
               sNeed, sGap, s.accidents || 0, s.abuses || 0,
+              melSlideKeyIsNce(r.mel_key) ? "yes" : "",
               "", "",
             ].map(csvField).join(","));
           });
@@ -15967,7 +18074,7 @@ function renderDashboardHtml(): string {
       detail_doc_number: "Detail doc",
       unit: "Unit",
       user_unit: "User unit",
-      initial: "tracking",
+      initial: "Tracking",
     };
     function melFieldLabel(f) { return MEL_FIELD_LABELS[f] || f; }
 
@@ -16006,6 +18113,7 @@ function renderDashboardHtml(): string {
       });
       // Newest first.
       const dates = Array.from(groups.keys()).sort(function (a, b) { return a < b ? 1 : -1; });
+      const manyEntries = changelog.length > 8 || dates.length > 3;
       const FIELD_ORDER = [
         "initial", "mel_status", "fmc_count", "nmc_count", "mel_required",
         "mel_assigned_total", "recall_delta", "acc_abus", "priority_tier",
@@ -16015,10 +18123,11 @@ function renderDashboardHtml(): string {
         const i = FIELD_ORDER.indexOf(f);
         return i < 0 ? 99 : i;
       }
-      return dates.map(function (d) {
+      return dates.map(function (d, idx) {
         const items = groups.get(d).slice().sort(function (a, b) {
           return fieldRank(a.field) - fieldRank(b.field);
         });
+        const openAttr = !manyEntries || idx === 0 ? " open" : "";
 
         // Detect the common FMC↔NMC swap: same magnitude, opposite direction.
         let summary = "";
@@ -16045,7 +18154,7 @@ function renderDashboardHtml(): string {
           const oldV = c.old_value == null || c.old_value === "" ? "—" : c.old_value;
           const newV = c.new_value == null || c.new_value === "" ? "—" : c.new_value;
           const body = c.field === "initial"
-            ? "<ins>tracking starts (" + esc(String(newV)) + ")</ins>"
+            ? '<ins title="' + esc(String(newV)) + '">Tracking started</ins>'
             : "<del>" + esc(String(oldV)) + "</del><span class='arrow'>→</span><ins>" + esc(String(newV)) + "</ins>";
           const cls = melDeltaClass(c.field, oldV, newV);
           return "<div class='mel-cl-item " + cls + "'>" +
@@ -16054,14 +18163,17 @@ function renderDashboardHtml(): string {
           "</div>";
         }).join("");
 
-        return "<div class='mel-cl-group'>" +
-          "<div class='mel-cl-head'>" +
-            "<span class='d'>" + esc(fmtKeyShort(d)) + "</span>" +
-            (summary ? "<span class='mel-cl-summary-wrap'>" + summary + "</span>" : "") +
-            "<span class='mel-cl-count'>" + items.length + " field" + (items.length === 1 ? "" : "s") + "</span>" +
-          "</div>" +
+        return (
+          "<details class='mel-cl-group'" + openAttr + ">" +
+          "<summary class='mel-cl-head'>" +
+          "<span class='mel-cl-chev' aria-hidden='true'>▸</span>" +
+          "<span class='d'>" + esc(fmtKeyShort(d)) + "</span>" +
+          (summary ? "<span class='mel-cl-summary-wrap'>" + summary + "</span>" : "") +
+          "<span class='mel-cl-count'>" + items.length + " field" + (items.length === 1 ? "" : "s") + "</span>" +
+          "</summary>" +
           "<div class='mel-cl-items'>" + itemsHtml + "</div>" +
-        "</div>";
+          "</details>"
+        );
       }).join("");
     }
 
@@ -16113,9 +18225,20 @@ function renderDashboardHtml(): string {
 
       const cl = renderMelChangelogGrouped(changelog);
 
+      const cfgRow = melState.rows.find(function (x) { return x.mel_key === melKey; });
+      var typeOverrideBlock = "";
+      if (cfgRow && melTypeLabelIsOverridden(cfgRow)) {
+        typeOverrideBlock =
+          "<div class='mel-d-type-override'>" +
+          "<span class='mel-d-type-disp'>" + esc(melTypeLabelOf(cfgRow)) + "</span>" +
+          "<span class='mel-d-type-src'>Workbook: " + esc(melDefaultTypeLabelOf(cfgRow) || "—") + "</span>" +
+          "</div>";
+      }
+
       detail.innerHTML =
         "<div class='mel-d-hero'>" +
           "<div><span class='key'>" + esc(melKey) + "</span></div>" +
+          typeOverrideBlock +
           "<div class='pills'>" +
             "<span class='mel-pill " + esc(status) + "'>" + esc(melStatusLabel(status)) + "</span>" +
             (recall !== 0 ? "<span class='mel-pill recall'>Recall " + esc(recallStr) + "</span>" : "") +
@@ -16378,11 +18501,7 @@ function renderDashboardHtml(): string {
             rows.map(function (r) {
               const cfg = r.config || {};
               const mgmt = melMgmtCodeOf(r);
-              const defaultType = (function () {
-                const s = (r.mgmt_code_name || "").trim();
-                const i = s.indexOf(" - ");
-                return i > 0 ? s.slice(i + 3).trim() : s;
-              })();
+              const defaultType = melDefaultTypeLabelOf(r);
               return "<tr data-cfg-key='" + esc(r.mel_key) + "'>" +
                 "<td><button type='button' class='mel-card-star" + (cfg.isCritical ? " on" : "") + "' data-cfg-star='" + esc(r.mel_key) + "'>★</button></td>" +
                 "<td>" + esc(r.unit || "—") + "</td>" +
@@ -18270,9 +20389,8 @@ function renderDashboardHtml(): string {
         meetingState.notes = fj.notes || [];
         meetingState.selectedWid = meetingState.notes.length ? meetingState.notes[0].work_order_id : null;
         meetingState.startedAt = new Date(meetingState.meeting.started_at_iso).getTime();
-        meetingState.pausedAt = null;
-        meetingState.pausedAccumMs = 0;
         meetingState.targetMs = meetingState.meeting.target_minutes * 60 * 1000;
+        syncMeetingPauseFromRow(meetingState.meeting);
         statusEl.textContent = "";
         enterLiveView();
       } catch (e) {
@@ -18309,6 +20427,21 @@ function renderDashboardHtml(): string {
       if (m.filter_summary) sub.push(m.filter_summary);
       document.getElementById("meeting-live-sub").textContent = sub.join(" · ");
       document.getElementById("meeting-clock-target").textContent = "of " + formatClock(meetingState.targetMs);
+      const zp = document.getElementById("meeting-zoom-pct");
+      if (zp) {
+        const sc = m.presenter_scale != null ? Number(m.presenter_scale) : 1;
+        const pct = Math.round((Number.isFinite(sc) && sc > 0 ? sc : 1) * 100);
+        zp.textContent = pct + "%";
+      }
+    }
+
+    /** Keep local pause bookkeeping aligned with D1 (presenter polls the same row). */
+    function syncMeetingPauseFromRow(m) {
+      if (!m) return;
+      meetingState.pausedAt = m.paused_at_iso ? new Date(m.paused_at_iso).getTime() : null;
+      meetingState.pausedAccumMs = Number(m.paused_accum_ms) || 0;
+      const btn = document.getElementById("meeting-pause");
+      if (btn) btn.textContent = meetingState.pausedAt != null ? "Resume" : "Pause";
     }
 
     function meetingElapsedMs() {
@@ -18346,7 +20479,9 @@ function renderDashboardHtml(): string {
     function filterMeetingNotesForQueue() {
       const search = (document.getElementById("meeting-queue-search").value || "").trim().toLowerCase();
       const statusFilter = document.getElementById("meeting-queue-status").value || "";
-      return meetingState.notes.filter(function (n) {
+      const sortEl = document.getElementById("meeting-queue-sort");
+      const sortKey = sortEl ? sortEl.value : "order";
+      const filtered = meetingState.notes.filter(function (n) {
         if (statusFilter && n.status !== statusFilter) return false;
         if (search) {
           const hay = (n.work_order_id + " " + n.asset_id + " " + n.owning_unit + " " + n.mel_key + " " + n.shop + " " + (n.mgmt_cd || "") + " " + (n.make_model || "") + " " + (n.veh_nomen || "")).toLowerCase();
@@ -18354,6 +20489,18 @@ function renderDashboardHtml(): string {
         }
         return true;
       });
+      if (sortKey === "order") return filtered;
+      if (sortKey === "shop_asc" || sortKey === "shop_desc") {
+        const mul = sortKey === "shop_asc" ? 1 : -1;
+        return filtered.slice().sort(function (a, b) {
+          const sa = (a.shop || "").trim().toLowerCase();
+          const sb = (b.shop || "").trim().toLowerCase();
+          const c = sa.localeCompare(sb, undefined, { sensitivity: "base" });
+          if (c !== 0) return mul * c;
+          return String(a.work_order_id).localeCompare(String(b.work_order_id), undefined, { numeric: true });
+        });
+      }
+      return filtered;
     }
 
     function renderMeetingQueue() {
@@ -18397,43 +20544,6 @@ function renderDashboardHtml(): string {
 
     function getCurrentNote() {
       return meetingState.notes.find(function (n) { return n.work_order_id === meetingState.selectedWid; }) || null;
-    }
-
-    function renderControllerTimelineRow(e) {
-      const fld = (e.field || "").toLowerCase();
-      let cls = "mfl-other", kind = prettyFieldName(fld), body = "";
-      if (fld === "etic_date_slip" || fld === "etic") {
-        cls = "mfl-slip"; kind = "ETIC slip";
-        const oldV = e.old_value ? fmtKeyShort(e.old_value) : "—";
-        const newV = e.new_value ? fmtKeyShort(e.new_value) : "—";
-        body = "<del>" + esc(oldV) + "</del> → <ins>" + esc(newV) + "</ins>";
-        const slip = daysBetweenKeys(e.new_value, e.old_value);
-        if (slip != null && slip > 0) body += " <span class='mfl-slip-pill'>+" + slip + "d</span>";
-      } else if (fld === "remarks") {
-        cls = "mfl-remarks"; kind = "Remarks";
-        const newV = (e.new_value || "").trim();
-        const trunc = newV.length > 90 ? newV.slice(0, 90) + "…" : newV;
-        body = trunc ? esc(trunc) : "<span class='muted'>cleared</span>";
-      } else if (fld === "mel_tier") {
-        cls = "mfl-mel"; kind = "MEL";
-        body = "<del>" + esc(e.old_value || "—") + "</del> → <ins>" + esc(e.new_value || "—") + "</ins>";
-      } else if (fld === "parts_status") {
-        cls = "mfl-parts"; kind = "Parts";
-        const newV = e.new_value || "—";
-        const trunc = newV.length > 60 ? newV.slice(0, 60) + "…" : newV;
-        body = esc(trunc);
-      } else if (fld === "initial") {
-        cls = "mfl-initial"; kind = "Opened"; body = "First seen";
-      } else {
-        const oldV = e.old_value == null || e.old_value === "" ? "—" : String(e.old_value);
-        const newV = e.new_value == null || e.new_value === "" ? "—" : String(e.new_value);
-        body = "<del>" + esc(oldV) + "</del> → <ins>" + esc(newV) + "</ins>";
-      }
-      return "<div class='mf-tl-row " + cls + "'>" +
-        "<span class='mf-tl-date'>" + esc(fmtKeyShort(e.snapshot_date_key || "")) + "</span>" +
-        "<span class='mf-tl-kind'>" + esc(kind) + "</span>" +
-        "<span class='mf-tl-body'>" + body + "</span>" +
-        "</div>";
     }
 
     function getWatchRowForWid(wid) {
@@ -18489,15 +20599,18 @@ function renderDashboardHtml(): string {
           if (meetingState.selectedWid !== wid) return;
           const listEl = document.getElementById("mf-tl-list");
           if (!listEl) return;
-          // loadChangelog now returns { entries, actions }; meeting controller
-          // only cares about the snapshot-derived entries here.
-          const events = (payload && payload.entries) || (Array.isArray(payload) ? payload : []);
-          if (!events.length) {
+          const row = getWatchRowForWid(wid);
+          const woForTl = row && (row.establishedDateIso || row.establishedDate)
+            ? { establishedDateIso: row.establishedDateIso || null, establishedDate: row.establishedDate || "" }
+            : null;
+          const pay = payload && typeof payload === "object" ? payload : { entries: [] };
+          const flat = buildPresenterTimelineFlat(pay, woForTl);
+          if (!flat.length) {
             listEl.innerHTML = "<div class='muted' style='font-size:0.82rem'>No changes recorded yet.</div>";
             attachControllerTimelineScrollSync(listEl);
             return;
           }
-          listEl.innerHTML = events.map(renderControllerTimelineRow).join("");
+          listEl.innerHTML = flat.map(renderPresenterFlatTimelineRow).join("");
           // If we're re-rendering the SAME work order (e.g. meeting refresh),
           // restore the controller's scroll position so they don't lose place.
           if (wid === prevWid) {
@@ -18546,7 +20659,10 @@ function renderDashboardHtml(): string {
         });
         if (resp.ok) {
           const j = await resp.json();
-          if (j.meeting) meetingState.meeting = j.meeting;
+          if (j.meeting) {
+            meetingState.meeting = j.meeting;
+            syncMeetingPauseFromRow(j.meeting);
+          }
           const hint = document.getElementById("meeting-cursor-hint");
           if (hint) {
             hint.textContent = "📺 on big screen";
@@ -18696,16 +20812,40 @@ function renderDashboardHtml(): string {
       if (next) selectMeetingWo(next.work_order_id);
     }
 
-    function toggleMeetingPause() {
-      if (!meetingState.startedAt) return;
-      if (meetingState.pausedAt != null) {
-        meetingState.pausedAccumMs += Date.now() - meetingState.pausedAt;
-        meetingState.pausedAt = null;
-        document.getElementById("meeting-pause").textContent = "Pause";
-      } else {
-        meetingState.pausedAt = Date.now();
-        document.getElementById("meeting-pause").textContent = "Resume";
-      }
+    async function meetingPresenterZoomAdjust(delta) {
+      if (!meetingState.meeting) return;
+      try {
+        const resp = await fetch("/api/meeting/" + meetingState.meeting.id + "/zoom", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ delta: delta }),
+        });
+        if (!resp.ok) return;
+        const j = await resp.json();
+        if (j.meeting) {
+          meetingState.meeting = j.meeting;
+          syncMeetingPauseFromRow(j.meeting);
+          renderMeetingHead();
+        }
+      } catch (_e) { /* swallow */ }
+    }
+
+    async function toggleMeetingPause() {
+      if (!meetingState.startedAt || !meetingState.meeting) return;
+      const nextPaused = meetingState.pausedAt == null;
+      try {
+        const resp = await fetch("/api/meeting/" + meetingState.meeting.id + "/pause", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ paused: nextPaused }),
+        });
+        if (!resp.ok) return;
+        const j = await resp.json();
+        if (j.meeting) {
+          meetingState.meeting = j.meeting;
+          syncMeetingPauseFromRow(j.meeting);
+        }
+      } catch (_e) { /* swallow */ }
       tickMeetingClock();
     }
 
@@ -18807,10 +20947,9 @@ function renderDashboardHtml(): string {
           meetingShowView("summary");
         } else {
           meetingState.startedAt = new Date(j.meeting.started_at_iso).getTime();
-          meetingState.pausedAt = null;
-          meetingState.pausedAccumMs = 0;
           meetingState.targetMs = j.meeting.target_minutes * 60 * 1000;
           meetingState.selectedWid = meetingState.notes.length ? meetingState.notes[0].work_order_id : null;
+          syncMeetingPauseFromRow(j.meeting);
           const asOf = j.meeting.snapshot_date_key;
           if (asOf) {
             let rows = watchCacheByDate.get(asOf);
@@ -18828,7 +20967,7 @@ function renderDashboardHtml(): string {
     // PRESENTER MODE
     // ---------------------------------------------------------------------
     // The conference-room screen opens /?present=<meetingId>. We hide the
-    // normal app, show the .presenter card, and poll the meeting every 2s.
+    // normal app, show the .presenter card, and poll the meeting every 1s.
     // Whatever WO the controller has selected (current_wid) we render large.
     // ---------------------------------------------------------------------
     var presenterState = {
@@ -18850,10 +20989,12 @@ function renderDashboardHtml(): string {
       watchPending: false,
       watchLastFetchedAt: 0,
       changelogWid: null,
-      changelog: null,
+      changelogPayload: null,
       changelogPending: false,
       // Last timeline scroll fraction we applied to #p-timeline. -1 = "force apply".
       lastAppliedScroll: -1,
+      presenterLastWid: null,
+      lastPositionKey: "",
     };
 
     function pSetText(el, value) {
@@ -18866,18 +21007,54 @@ function renderDashboardHtml(): string {
       if (el.getAttribute(name) !== value) el.setAttribute(name, value);
     }
 
+    function wirePresenterFullscreen() {
+      var btn = document.getElementById("presenter-fullscreen");
+      var shell = document.getElementById("presenter");
+      if (!btn || !shell || btn._presenterFsWired) return;
+      btn._presenterFsWired = true;
+      function isFs() {
+        return !!(document.fullscreenElement || document.webkitFullscreenElement);
+      }
+      function syncBtn() {
+        var on = isFs();
+        btn.setAttribute("aria-pressed", on ? "true" : "false");
+        btn.setAttribute("aria-label", on ? "Exit fullscreen" : "Enter fullscreen");
+        btn.textContent = on ? "Exit fullscreen" : "Fullscreen";
+      }
+      function onFsChange() {
+        syncBtn();
+      }
+      document.addEventListener("fullscreenchange", onFsChange);
+      document.addEventListener("webkitfullscreenchange", onFsChange);
+      btn.addEventListener("click", function () {
+        if (isFs()) {
+          var ex = document.exitFullscreen || document.webkitExitFullscreen;
+          if (ex) ex.call(document);
+        } else {
+          var req = shell.requestFullscreen || shell.webkitRequestFullscreen;
+          if (req) {
+            req.call(shell).catch(function () {});
+          }
+        }
+      });
+      syncBtn();
+    }
+
     function startPresenterMode(meetingId) {
       presenterState.meetingId = meetingId;
+      presenterState.presenterLastWid = null;
+      presenterState.lastPositionKey = "";
       document.body.classList.add("presenter-mode");
       const root = document.getElementById("presenter");
       if (root) {
         root.classList.remove("hidden");
         root.setAttribute("aria-hidden", "false");
       }
+      wirePresenterFullscreen();
       const urlEl = document.getElementById("presenter-url");
       if (urlEl) urlEl.textContent = window.location.host + window.location.pathname + "?present=" + meetingId;
       pollPresenter();
-      presenterState.pollTimer = setInterval(pollPresenter, 2000);
+      presenterState.pollTimer = setInterval(pollPresenter, 1000);
       presenterState.tickTimer = setInterval(renderPresenterClock, 500);
     }
 
@@ -18901,7 +21078,7 @@ function renderDashboardHtml(): string {
         const st = document.getElementById("presenter-status");
         if (st) {
           st.classList.remove("stale", "error");
-          st.textContent = "Connected · auto-refreshing every 2s";
+          st.textContent = "Connected · auto-refreshing every 1s";
         }
       } catch (e) {
         presenterState.consecFail += 1;
@@ -18914,9 +21091,75 @@ function renderDashboardHtml(): string {
       }
     }
 
+    /** Conference-room view follows meeting.presenter_scale (set from live meeting TV − / +). */
+    function applyPresenterZoomToDom(m) {
+      const el = document.getElementById("presenter");
+      if (!el) return;
+      if (!m) {
+        el.style.zoom = "";
+        return;
+      }
+      const raw = m.presenter_scale != null ? Number(m.presenter_scale) : 1;
+      const z = Number.isFinite(raw) && raw > 0 ? raw : 1;
+      if (z <= 1.001 && z >= 0.999) el.style.zoom = "";
+      else el.style.zoom = String(z);
+    }
+
+    function buildPresenterProgressHtml(idx, notesLen, covered) {
+      if (idx >= 0) {
+        return (
+          '<div class="presenter-pos-row">' +
+            '<div class="presenter-pos-chip">' +
+              '<span class="p-lbl">On screen</span>' +
+              '<div class="p-val">' + esc(String(idx + 1)) + '<span class="p-sep">of</span>' + esc(String(notesLen)) + "</div>" +
+              '<span class="p-sub">Position in this meeting agenda</span>' +
+            "</div>" +
+            '<div class="presenter-pos-chip presenter-pos-chip--cov">' +
+              '<span class="p-lbl">Completed</span>' +
+              '<div class="p-val">' + esc(String(covered)) + "</div>" +
+              '<span class="p-sub">Marked covered so far</span>' +
+            "</div>" +
+          "</div>"
+        );
+      }
+      return (
+        '<div class="presenter-pos-row">' +
+          '<div class="presenter-pos-chip presenter-pos-chip--cov">' +
+            '<span class="p-lbl">Queue progress</span>' +
+            '<div class="p-val">' + esc(String(covered)) + '<span class="p-sep">/</span>' + esc(String(notesLen)) + "</div>" +
+            '<span class="p-sub">Covered vs total on agenda</span>' +
+          "</div>" +
+        "</div>"
+      );
+    }
+
+    function applyPresenterScrim(mode) {
+      const scrim = document.getElementById("presenter-scrim");
+      const tEl = document.getElementById("presenter-scrim-title");
+      const sEl = document.getElementById("presenter-scrim-sub");
+      if (!scrim || !tEl || !sEl) return;
+      scrim.classList.remove("hidden");
+      if (mode === "ended") {
+        tEl.textContent = "Meeting ended";
+        sEl.textContent = "Thank you — you can close this window when you’re done.";
+      } else if (mode === "paused") {
+        tEl.textContent = "Paused";
+        sEl.textContent = "The timer is on hold until the controller resumes the meeting.";
+      } else if (mode === "waiting") {
+        tEl.textContent = "ETIC Meeting";
+        sEl.textContent = "Waiting for the facilitator to select a work order…";
+      }
+    }
+
+    function clearPresenterScrim() {
+      const scrim = document.getElementById("presenter-scrim");
+      if (scrim) scrim.classList.add("hidden");
+    }
+
     function renderPresenterAll() {
       const m = presenterState.meeting;
       if (!m) return;
+      applyPresenterZoomToDom(m);
 
       // Header + subline only re-render if changed.
       const headerKey = (m.title || "") + "|" + (m.snapshot_date_key || "") +
@@ -18936,33 +21179,103 @@ function renderDashboardHtml(): string {
       const wid = (m.current_wid || "").trim();
       let idx = -1;
       if (wid) idx = notes.findIndex(function (n) { return n.work_order_id === wid; });
-      pSetText(
-        document.getElementById("presenter-position"),
-        idx >= 0
-          ? "WO " + (idx + 1) + " of " + notes.length + " · " + covered + " covered"
-          : covered + " / " + notes.length + " covered",
-      );
+
+      const posKey = idx + "|" + notes.length + "|" + covered + "|" + (m.status || "") + "|" + (m.paused_at_iso || "");
+      const posEl = document.getElementById("presenter-position");
+      if (posEl && posKey !== presenterState.lastPositionKey) {
+        posEl.innerHTML = buildPresenterProgressHtml(idx, notes.length, covered);
+        presenterState.lastPositionKey = posKey;
+      }
 
       const card = document.getElementById("presenter-card");
       const empty = document.getElementById("presenter-empty");
-      if (idx < 0) {
+      const posWrap = document.getElementById("presenter-position-wrap");
+
+      if (m.status === "ended") {
+        applyPresenterScrim("ended");
         if (card && !card.classList.contains("hidden")) card.classList.add("hidden");
-        if (empty) {
-          if (empty.classList.contains("hidden")) empty.classList.remove("hidden");
-          pSetText(empty, wid
-            ? "Loading work order " + wid + "…"
-            : (notes.length
-                ? "Waiting for the controller to pick a work order… (" + notes.length + " on the agenda)"
-                : "No work orders on the agenda yet."));
-        }
-        // Reset card-level fingerprints so the next switch always renders.
+        if (empty && !empty.classList.contains("hidden")) empty.classList.add("hidden");
+        if (posWrap) posWrap.classList.add("hidden");
+        presenterState.presenterLastWid = null;
         presenterState.lastCardKey = "";
         presenterState.lastFactsKey = "";
         presenterState.lastDueKey = "";
+        renderPresenterClock();
+        return;
+      }
+      if (posWrap) posWrap.classList.remove("hidden");
+
+      if (m.paused_at_iso) {
+        applyPresenterScrim("paused");
+        if (card && !card.classList.contains("hidden")) card.classList.add("hidden");
+        if (empty && !empty.classList.contains("hidden")) empty.classList.add("hidden");
+        presenterState.presenterLastWid = null;
+        presenterState.lastCardKey = "";
+        presenterState.lastFactsKey = "";
+        presenterState.lastDueKey = "";
+        renderPresenterClock();
+        return;
+      }
+
+      clearPresenterScrim();
+
+      if (idx < 0) {
+        presenterState.presenterLastWid = null;
+        if (card && !card.classList.contains("hidden")) card.classList.add("hidden");
+        if (wid) {
+          if (empty) {
+            empty.classList.remove("hidden");
+            pSetText(empty, "Loading work order " + wid + "…");
+          }
+        } else if (notes.length > 0) {
+          applyPresenterScrim("waiting");
+          if (empty && !empty.classList.contains("hidden")) empty.classList.add("hidden");
+        } else {
+          if (empty) {
+            empty.classList.remove("hidden");
+            pSetText(empty, "No work orders on the agenda yet.");
+          }
+        }
+        presenterState.lastCardKey = "";
+        presenterState.lastFactsKey = "";
+        presenterState.lastDueKey = "";
+        renderPresenterClock();
         return;
       }
       if (empty && !empty.classList.contains("hidden")) empty.classList.add("hidden");
       if (card && card.classList.contains("hidden")) card.classList.remove("hidden");
+
+      const thisWid = notes[idx].work_order_id;
+      const prevWid = presenterState.presenterLastWid;
+      if (prevWid && prevWid !== thisWid) {
+        const prevNote = notes.find(function (n) { return n.work_order_id === prevWid; });
+        const fromCovered = prevNote && prevNote.status === "covered";
+        if (card) {
+          card.classList.remove("p-wo-swoosh");
+          void card.offsetWidth;
+          card.classList.add("p-wo-swoosh");
+          setTimeout(function () {
+            const c = document.getElementById("presenter-card");
+            if (c) c.classList.remove("p-wo-swoosh");
+          }, 720);
+        }
+        if (fromCovered) {
+          const flash = document.getElementById("presenter-wo-flash");
+          if (flash) {
+            flash.innerHTML = '<span class="p-flash-check" aria-hidden="true">✓</span><span class="p-flash-txt">Covered</span>';
+            flash.hidden = false;
+            flash.classList.remove("p-flash-on");
+            void flash.offsetWidth;
+            flash.classList.add("p-flash-on");
+            setTimeout(function () {
+              flash.classList.remove("p-flash-on");
+              setTimeout(function () { flash.hidden = true; }, 380);
+            }, 1300);
+          }
+        }
+      }
+      presenterState.presenterLastWid = thisWid;
+
       renderPresenterCard(notes[idx]);
       renderPresenterClock();
       // Mirror the controller's timeline scroll. Done after card render so the
@@ -19006,24 +21319,32 @@ function renderDashboardHtml(): string {
         presenterState.watchExtra = null;
         presenterState.watchPending = false;
         presenterState.watchLastFetchedAt = 0;
-        presenterState.changelog = null;
+        presenterState.changelogPayload = null;
         presenterState.lastIdStripKey = "";
         presenterState.lastDashboardKey = "";
         presenterState.lastTimelineKey = "";
         presenterState.lastDueKey = "";
         presenterState.lastCardKey = "";
         presenterState.lastAppliedScroll = -1;
-        const cardEl = document.getElementById("presenter-card");
-        if (cardEl) {
-          cardEl.classList.add("presenter-card-flip");
-          setTimeout(function () { cardEl.classList.remove("presenter-card-flip"); }, 350);
-        }
       }
 
       const m = presenterState.meeting;
       const extra = presenterState.watchExtra;
       const dateKey = (m && m.snapshot_date_key) || "";
-      const cl = presenterState.changelog;
+      const pay = presenterState.changelogPayload;
+      const woForTl = extra && (extra.establishedDateIso || extra.establishedDate)
+        ? { establishedDateIso: extra.establishedDateIso || null, establishedDate: extra.establishedDate || "" }
+        : null;
+      const tlFlat = buildPresenterTimelineFlat(pay, woForTl);
+      const tlSig = tlFlat.map(function (row) {
+        const it = row.item;
+        if (it.kind === "opened") return "o:" + row.dateKey;
+        if (it.kind === "system") return "s:" + (it.ev.id || "") + ":" + row.dateKey + ":" + (it.ev.field || "");
+        if (it.kind === "action") return "a:" + (it.ev.id || "") + ":" + row.dateKey;
+        if (it.kind === "meeting") return "m:" + (it.ev.id || "") + ":" + row.dateKey;
+        if (it.kind === "yard") return "y:" + (it.ev.id || "") + ":" + row.dateKey;
+        return "?";
+      }).join("|");
 
       // Card-level fingerprint — skip whole render if nothing changed.
       const cardKey = [
@@ -19044,8 +21365,10 @@ function renderDashboardHtml(): string {
                  extra.cumulativeEticSlipDays + "|" + extra.lastRemarkChangeDate + "|" +
                  (extra.daysDown == null ? "" : extra.daysDown) + "|" + (extra.remarks || "") + "|" +
                  (extra.woReason || "") + "|" + (extra.establishedDateIso || extra.establishedDate || "") + "|" +
-                 (extra.nce ? "1" : "0")) : "",
-        cl ? cl.length + ":" + (cl[0] ? cl[0].id : "") : "",
+                 (extra.nce ? "1" : "0") + "|" + (extra.remarkStale ? "stale" : "ok") + "|" +
+                 (extra.daysSinceRemarkChange != null ? extra.daysSinceRemarkChange : "") + "|" +
+                 (extra.requiredIntervalDays != null ? extra.requiredIntervalDays : "")) : "",
+        pay == null ? "" : tlSig,
         dateKey,
       ].join("\u241F");
 
@@ -19067,6 +21390,20 @@ function renderDashboardHtml(): string {
         document.getElementById("p-title"),
         (note.asset_id || "—") + (note.veh_nomen ? " · " + note.veh_nomen : ""),
       );
+
+      const shopBanner = document.getElementById("p-shop-banner");
+      if (shopBanner) {
+        const shopTxt = (note.shop || "").trim();
+        if (shopTxt) {
+          shopBanner.classList.remove("hidden");
+          shopBanner.innerHTML =
+            '<span class="p-shop-eyebrow">Responding shop</span>' +
+            '<span class="p-shop-name">' + esc(shopTxt) + "</span>";
+        } else {
+          shopBanner.classList.add("hidden");
+          shopBanner.innerHTML = "";
+        }
+      }
 
       // NCE chip
       const nceEl = document.getElementById("p-nce");
@@ -19106,7 +21443,6 @@ function renderDashboardHtml(): string {
           ids.push({ lbl: lbl, val: String(val) });
         };
         addId("Unit", note.owning_unit);
-        addId("Shop", note.shop);
         addId("Mgmt", note.mgmt_cd);
         addId("Make/Model", note.make_model);
         // Yard-sighting + waiver pills lead the strip so the room sees
@@ -19156,7 +21492,9 @@ function renderDashboardHtml(): string {
         if (parts === "—" || partsLow.indexOf("on shelf") >= 0 || partsLow.indexOf("on hand") >= 0) partsCls = "ok";
         else if (partsLow.indexOf("ordered") >= 0 || partsLow.indexOf("edd") >= 0 || partsLow.indexOf("eta") >= 0) partsCls = "warn";
         else if (partsLow.indexOf("backorder") >= 0 || partsLow.indexOf("nis") >= 0 || partsLow.indexOf("not in stock") >= 0) partsCls = "danger";
-        const partsLines = parts.split(/[:•·]/).map(function (s) { return s.trim(); }).filter(Boolean);
+        // Split only on middle-dot / bullet — not ":" (free text often has "latest: 10/7/25"
+        // which was breaking the big/small line styling mid-parenthesis).
+        const partsLines = parts.split(/[•·]/).map(function (s) { return s.trim(); }).filter(Boolean);
         const partsHead = partsLines[0] || parts || "—";
         const partsSub = partsLines.slice(1).join(" · ");
 
@@ -19170,9 +21508,13 @@ function renderDashboardHtml(): string {
         }
         const ddSub = dd == null || isNaN(dd) ? "" : (dd === 1 ? "day down" : "days down");
 
-        // Tile 4: ETIC slips combined
-        const pushes = extra && extra.eticPushCount != null ? Number(extra.eticPushCount) : 0;
-        const slipDays = extra && extra.cumulativeEticSlipDays != null ? Number(extra.cumulativeEticSlipDays) : 0;
+        // Tile 4: ETIC slips combined (API JSON uses camelCase; coerce defensively)
+        const pushes = extra && extra.eticPushCount != null && extra.eticPushCount !== ""
+          ? Number(extra.eticPushCount) || 0
+          : 0;
+        const slipDays = extra && extra.cumulativeEticSlipDays != null && extra.cumulativeEticSlipDays !== ""
+          ? Number(extra.cumulativeEticSlipDays) || 0
+          : 0;
         let slipCls = pushes > 0 || slipDays > 0 ? (slipDays >= 7 ? "danger" : "warn") : "ok";
         const slipVal = String(slipDays || 0);
         const slipSub = pushes > 0
@@ -19180,15 +21522,15 @@ function renderDashboardHtml(): string {
           : "no slips · on track";
 
         const tiles = [
-          { lbl: "ETIC due",       val: eticVal,   sub: eticSub,  cls: eticCls },
-          { lbl: "Parts status",   val: partsHead, sub: partsSub, cls: partsCls },
-          { lbl: "Days down",      val: ddVal,     sub: ddSub,    cls: ddCls },
-          { lbl: "Days slipped",   val: slipVal,   sub: slipSub,  cls: slipCls },
+          { lbl: "ETIC due",       val: eticVal,   sub: eticSub,  cls: eticCls, tile: "" },
+          { lbl: "Parts status",   val: partsHead, sub: partsSub, cls: partsCls, tile: "parts" },
+          { lbl: "Days down",      val: ddVal,     sub: ddSub,    cls: ddCls, tile: "daysdown" },
+          { lbl: "Days slipped",   val: slipVal,   sub: slipSub,  cls: slipCls, tile: "slipped" },
         ];
         const dashKey = tiles.map(function (t) { return t.lbl + "=" + t.val + "/" + t.sub + "/" + t.cls; }).join("|");
         if (dashKey !== presenterState.lastDashboardKey) {
           dashEl.innerHTML = tiles.map(function (t) {
-            return '<div class="p-tile ' + esc(t.cls) + '">' +
+            return '<div class="p-tile ' + esc(t.cls) + '"' + (t.tile ? ' data-tile="' + esc(t.tile) + '"' : "") + ">" +
               '<span class="lbl">' + esc(t.lbl) + '</span>' +
               '<span class="val">' + esc(t.val) + '</span>' +
               (t.sub ? '<span class="sub">' + esc(t.sub) + '</span>' : '') +
@@ -19198,34 +21540,52 @@ function renderDashboardHtml(): string {
         }
       }
 
-      // ---- LATEST REMARK ----
+      // ---- LATEST REMARK + staleness (matches Work Orders KPIs) ----
       const remarkEl = document.getElementById("p-remark");
+      const remarkMetaEl = document.getElementById("p-remark-meta");
       if (remarkEl) {
         if (extra) pSetText(remarkEl, extra.remarks || "—");
         else if (widChanged) pSetText(remarkEl, "Loading workbook remark…");
       }
+      if (remarkMetaEl) {
+        if (!extra) {
+          remarkMetaEl.innerHTML = widChanged ? "Loading remark metadata…" : "";
+        } else {
+          const when = extra.lastRemarkChangeDate
+            ? (extra.historyBounded
+                ? "Unchanged since first observed " + fmtKeyLong(extra.firstSeenDate || "") + " (history limited)"
+                : "Last remark change " + fmtKeyLong(extra.lastRemarkChangeDate))
+            : "No remark change date on record";
+          const age = extra.daysSinceRemarkChange != null
+            ? ((extra.historyBounded ? "≥" : "") + extra.daysSinceRemarkChange + "d since last change")
+            : "";
+          const intv = extra.requiredIntervalDays != null
+            ? (" · " + (note.mel_tier || "MEL").toUpperCase() + " expects ≤ " + extra.requiredIntervalDays + "d")
+            : "";
+          const badge = extra.remarkStale
+            ? '<span class="p-stale-badge stale">Stale</span>'
+            : '<span class="p-stale-badge ok">On cadence</span>';
+          remarkMetaEl.innerHTML = esc(when) + (age ? " · " + esc(age) : "") + esc(intv) + " " + badge;
+        }
+      }
 
-      // ---- RECENT CHANGES TIMELINE ----
+      // ---- CHANGE TIMELINE (full merged list — same order as Work Orders tab) ----
       const tlEl = document.getElementById("p-timeline");
       if (tlEl) {
-        if (cl == null) {
+        if (pay == null) {
           if (widChanged) {
-            tlEl.innerHTML = '<div class="p-tl-empty">Loading recent changes…</div>';
+            tlEl.innerHTML = '<div class="p-tl-empty">Loading change timeline…</div>';
             presenterState.lastTimelineKey = "__loading__";
           }
-        } else if (cl.length === 0) {
+        } else if (!tlFlat.length) {
           if (presenterState.lastTimelineKey !== "__none__") {
             tlEl.innerHTML = '<div class="p-tl-empty">No changes recorded yet.</div>';
             presenterState.lastTimelineKey = "__none__";
           }
         } else {
-          // Show ALL events — the section is scrollable and the controller
-          // can scroll us through history (see applyPresenterTimelineScroll).
-          const tlKey = cl.map(function (e) { return e.id + ":" + e.field + ":" + (e.new_value || ""); }).join("|");
-          if (tlKey !== presenterState.lastTimelineKey) {
-            tlEl.innerHTML = cl.map(function (e) { return renderPresenterTimelineRow(e); }).join("");
-            presenterState.lastTimelineKey = tlKey;
-            // Force re-apply since scrollHeight changed.
+          if (tlSig !== presenterState.lastTimelineKey) {
+            tlEl.innerHTML = tlFlat.map(renderPresenterFlatTimelineRow).join("");
+            presenterState.lastTimelineKey = tlSig;
             presenterState.lastAppliedScroll = -1;
           }
         }
@@ -19244,7 +21604,7 @@ function renderDashboardHtml(): string {
         const dueKey = lines.join("\u241E");
         if (dueKey !== presenterState.lastDueKey) {
           if (!lines.length) {
-            dueEl.innerHTML = '<li class="muted" style="color:rgba(241,244,251,0.4)">(none)</li>';
+            dueEl.innerHTML = '<li class="p-due-empty">(none)</li>';
           } else {
             dueEl.innerHTML = lines.map(function (l) { return "<li>" + esc(l) + "</li>"; }).join("");
           }
@@ -19274,16 +21634,21 @@ function renderDashboardHtml(): string {
               presenterState.watchExtra = {
                 partsStatus: w.partsStatus,
                 eticRaw: w.eticRaw,
-                eticPushCount: w.eticPushCount,
-                cumulativeEticSlipDays: w.cumulativeEticSlipDays,
+                eticPushCount: w.eticPushCount != null ? Number(w.eticPushCount) || 0 : 0,
+                cumulativeEticSlipDays: w.cumulativeEticSlipDays != null ? Number(w.cumulativeEticSlipDays) || 0 : 0,
                 lastRemarkChangeDate: w.lastRemarkChangeDate,
-                daysDown: (w.raw && (w.raw["days down"] || w.raw["fleet.days down"])) || null,
+                daysDown: w.daysDown != null && w.daysDown !== "" ? Number(w.daysDown) : null,
                 remarks: w.remarks || "—",
                 woReason: w.woReason || "",
                 establishedDate: w.establishedDate || "",
                 establishedDateIso: w.establishedDateIso || null,
                 nce: !!w.nce,
                 nceStatus: w.nceStatus || "",
+                remarkStale: !!w.remarkStale,
+                daysSinceRemarkChange: w.daysSinceRemarkChange,
+                requiredIntervalDays: w.requiredIntervalDays,
+                historyBounded: !!w.historyBounded,
+                firstSeenDate: w.firstSeenDate || "",
               };
             }
             presenterState.watchLastFetchedAt = Date.now();
@@ -19309,22 +21674,99 @@ function renderDashboardHtml(): string {
           .then(function (r) { return r.ok ? r.json() : null; })
           .then(function (j) {
             if (presenterState.watchWid !== fetchWid) return;
-            const events = j && Array.isArray(j.entries) ? j.entries
-              : j && Array.isArray(j.events) ? j.events
-              : j && Array.isArray(j.changelog) ? j.changelog
-              : Array.isArray(j) ? j : [];
-            presenterState.changelog = events;
+            presenterState.changelogPayload = j && typeof j === "object" ? j : { entries: [] };
             presenterState.lastCardKey = "";
             renderPresenterCard(note);
           })
           .catch(function () {
-            if (presenterState.watchWid === fetchWid) presenterState.changelog = [];
+            if (presenterState.watchWid === fetchWid) presenterState.changelogPayload = { entries: [] };
           })
           .then(function () { presenterState.changelogPending = false; });
       }
     }
 
-    function renderPresenterTimelineRow(e) {
+    function renderPresenterFlatTimelineRow(row) {
+      const date = fmtKeyShort(row.dateKey || "");
+      const item = row.item;
+      if (item.kind === "opened") {
+        const rawPretty = fmtMaybeDate(item.ev.raw);
+        const rawExtra = rawPretty && rawPretty !== fmtKeyShort(item.ev.date)
+          ? " <span class='p-tl-muted'>" + esc(rawPretty) + "</span>"
+          : "";
+        return (
+          '<div class="p-tl-row tl-opened">' +
+          '<span class="p-tl-date">' + esc(date) + '</span>' +
+          '<span class="p-tl-kind">Opened</span>' +
+          '<span class="p-tl-body"><span class="p-tl-muted">Established per workbook</span>' + rawExtra + "</span></div>"
+        );
+      }
+      if (item.kind === "action") {
+        const a = item.ev;
+        const status = (a.status || "pending").toLowerCase();
+        const statusLabel =
+          status === "confirmed" ? "Confirmed in next ETIC"
+          : status === "missed" ? "Didn't make it into next ETIC"
+          : "Pending verification";
+        const actor = (a.actorName || "").trim();
+        const note = (a.note || "").trim();
+        const verifiedSnap = a.verifiedInSnapshot ? " (" + esc(fmtKeyShort(a.verifiedInSnapshot)) + ")" : "";
+        const body =
+          (actor ? "<span class='fma-actor'>" + esc(actor) + "</span>" : "") +
+          "<span class='fma-status " + esc(status) + "'>" + esc(statusLabel) + "</span>" +
+          (status !== "pending" ? "<span class='p-tl-muted' style='font-size:0.88em'>" + verifiedSnap + "</span>" : "") +
+          (note ? "<span class='fma-note'>" + esc(note) + "</span>" : "");
+        return (
+          '<div class="p-tl-row tl-action">' +
+          '<span class="p-tl-date">' + esc(date) + '</span>' +
+          '<span class="p-tl-kind">' + esc(actionTypeLabel(a.actionType)) + '</span>' +
+          '<span class="p-tl-body">' + body + "</span></div>"
+        );
+      }
+      if (item.kind === "meeting") {
+        const m = item.ev;
+        const title = (m.meetingTitle || "ETIC meeting").trim();
+        let inner = "";
+        if ((m.notes || "").trim()) {
+          inner += "<div><strong>Notes</strong> " + esc(m.notes.trim()) + "</div>";
+        }
+        if ((m.dueOuts || "").trim()) {
+          inner += "<div><strong>Due-outs</strong> " + esc(m.dueOuts.trim()) + "</div>";
+        }
+        const sub = (m.startedAtIso || "").slice(0, 10);
+        const head =
+          "<div style='margin-bottom:6px'><strong>" + esc(title) + "</strong>" +
+          (sub ? " <span class='p-tl-muted'>" + esc(fmtKeyLong(sub)) + "</span>" : "") + "</div>";
+        return (
+          '<div class="p-tl-row tl-meeting">' +
+          '<span class="p-tl-date">' + esc(date) + '</span>' +
+          '<span class="p-tl-kind">ETIC meeting</span>' +
+          '<span class="p-tl-body">' + head + (inner || "<span class='p-tl-muted'>(empty)</span>") + "</span></div>"
+        );
+      }
+      if (item.kind === "yard") {
+        const y = item.ev;
+        const disc = (y.discrepancies || "").trim();
+        const loc = (y.location || "").trim();
+        let inner = "";
+        if (loc) inner += "<div><strong>Location</strong> " + esc(loc) + "</div>";
+        if (disc) inner += "<div><strong>Discrepancies</strong> " + esc(disc) + "</div>";
+        else inner += "<div class='p-tl-muted'>(no discrepancies)</div>";
+        inner += (
+          "<div class='p-tl-muted' style='margin-top:4px;font-size:0.88em'>Walker " + esc(y.checkedBy || "—") +
+          " · " + esc(y.status || "—") +
+          (y.sourceDateKey ? " · snap " + esc(fmtKeyLong(y.sourceDateKey)) : "") + "</div>"
+        );
+        return (
+          '<div class="p-tl-row tl-yard">' +
+          '<span class="p-tl-date">' + esc(date) + '</span>' +
+          '<span class="p-tl-kind">Yard check</span>' +
+          '<span class="p-tl-body">' + inner + "</span></div>"
+        );
+      }
+      return renderPresenterTimelineRow(item.ev, row.dateKey);
+    }
+
+    function renderPresenterTimelineRow(e, dateKeyOverride) {
       const fld = (e.field || "").toLowerCase();
       let cls = "tl-other", kind = prettyFieldName(fld), body = "";
       if (fld === "etic_date_slip" || fld === "etic") {
@@ -19342,7 +21784,7 @@ function renderDashboardHtml(): string {
         const newV = (e.new_value || "").trim();
         const truncN = newV.length > 220 ? newV.slice(0, 220) + "…" : newV;
         const truncO = oldV.length > 120 ? oldV.slice(0, 120) + "…" : oldV;
-        if (!newV && !oldV) body = "<span style='color:rgba(241,244,251,0.5)'>cleared</span>";
+        if (!newV && !oldV) body = "<span class='p-tl-muted'>cleared</span>";
         else if (!oldV) body = "<ins>" + esc(truncN) + "</ins>";
         else if (!newV) body = "<del>" + esc(truncO) + "</del>";
         else body = "<ins>" + esc(truncN) + "</ins>";
@@ -19367,12 +21809,25 @@ function renderDashboardHtml(): string {
         const newV = e.new_value == null || e.new_value === "" ? "—" : String(e.new_value);
         body = "<del>" + esc(oldV) + "</del><span class='arrow'>→</span><ins>" + esc(newV) + "</ins>";
       }
-      const date = fmtKeyShort(e.snapshot_date_key || "");
+      const date = fmtKeyShort(dateKeyOverride || e.snapshot_date_key || "");
       return '<div class="p-tl-row ' + cls + '">' +
         '<span class="p-tl-date">' + esc(date) + '</span>' +
         '<span class="p-tl-kind">' + esc(kind) + '</span>' +
         '<span class="p-tl-body">' + body + '</span>' +
         '</div>';
+    }
+
+    function presenterActiveElapsedMs(meeting, nowMs) {
+      if (!meeting || !meeting.started_at_iso) return 0;
+      const started = new Date(meeting.started_at_iso).getTime();
+      const ended = meeting.ended_at_iso ? new Date(meeting.ended_at_iso).getTime() : null;
+      const now = ended != null ? ended : nowMs;
+      const accum = Number(meeting.paused_accum_ms) || 0;
+      if (meeting.paused_at_iso) {
+        const pStart = new Date(meeting.paused_at_iso).getTime();
+        return Math.max(0, pStart - started - accum);
+      }
+      return Math.max(0, now - started - accum);
     }
 
     function renderPresenterClock() {
@@ -19383,21 +21838,28 @@ function renderDashboardHtml(): string {
       const subEl = document.getElementById("presenter-clock-sub");
       if (!timeEl) return;
       const target = (m.target_minutes || 0) * 60000;
-      const ended = m.ended_at_iso ? new Date(m.ended_at_iso).getTime() : null;
-      const started = m.started_at_iso ? new Date(m.started_at_iso).getTime() : null;
-      if (!started) { timeEl.textContent = "00:00"; return; }
-      const now = ended || Date.now();
-      const elapsed = Math.max(0, now - started);
-      timeEl.textContent = formatClock(elapsed);
+      // Match the controller: primary display is time REMAINING (countdown), not elapsed.
+      if (!m.started_at_iso) {
+        timeEl.textContent = formatClockSigned(target);
+        if (subEl) subEl.textContent = "Scheduled length · waiting to start";
+        if (clockEl) clockEl.setAttribute("data-state", "idle");
+        return;
+      }
+      const elapsed = presenterActiveElapsedMs(m, Date.now());
+      const remaining = target - elapsed;
+      timeEl.textContent = formatClockSigned(remaining);
+      const cov = presenterState.notes.filter(function (n) { return n.status === "covered"; }).length;
+      const tot = presenterState.notes.length;
       let state = "ok";
       if (m.status === "ended") state = "paused";
-      else if (target && elapsed > target) state = "overtime";
-      else if (target && elapsed > target * 0.85) state = "warn";
+      else if (m.paused_at_iso) state = "paused";
+      else if (remaining <= 0) state = "overtime";
+      else if (remaining <= 5 * 60 * 1000) state = "warn";
       if (clockEl) clockEl.setAttribute("data-state", state);
       if (subEl) {
         if (m.status === "ended") subEl.textContent = "Meeting ended";
-        else if (target) subEl.textContent = "of " + formatClock(target);
-        else subEl.textContent = "";
+        else if (m.paused_at_iso) subEl.textContent = "Paused · of " + formatClock(target);
+        else subEl.textContent = "of " + formatClock(target) + " · " + cov + " / " + tot + " covered";
       }
     }
 
@@ -19426,11 +21888,17 @@ function renderDashboardHtml(): string {
 
       const qSearch = document.getElementById("meeting-queue-search");
       const qStatus = document.getElementById("meeting-queue-status");
+      const qSort = document.getElementById("meeting-queue-sort");
       if (qSearch) qSearch.addEventListener("input", renderMeetingQueue);
       if (qStatus) qStatus.addEventListener("change", renderMeetingQueue);
+      if (qSort) qSort.addEventListener("change", renderMeetingQueue);
 
       const pause = document.getElementById("meeting-pause");
       if (pause) pause.addEventListener("click", toggleMeetingPause);
+      const zOut = document.getElementById("meeting-zoom-out");
+      const zIn = document.getElementById("meeting-zoom-in");
+      if (zOut) zOut.addEventListener("click", function () { meetingPresenterZoomAdjust(-0.08); });
+      if (zIn) zIn.addEventListener("click", function () { meetingPresenterZoomAdjust(0.08); });
       const stop = document.getElementById("meeting-stop");
       if (stop) stop.addEventListener("click", function () {
         if (confirm("Stop meeting and generate minutes?")) stopMeeting();

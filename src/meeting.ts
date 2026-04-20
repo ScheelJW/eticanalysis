@@ -31,6 +31,12 @@ export type MeetingRow = {
   /** Normalized scroll fraction (0..1) of the recent-changes timeline.
    *  Lets the controller scroll the TV's timeline section remotely. */
   timeline_scroll: number;
+  /** When set, the meeting timer is frozen for everyone (presenter + controller). */
+  paused_at_iso: string | null;
+  /** Milliseconds of completed pause intervals (excludes the current open pause). */
+  paused_accum_ms: number;
+  /** Presenter TV UI scale (1.0 = 100%). Set from the live meeting controller. */
+  presenter_scale?: number;
 };
 
 export type MeetingNoteRow = {
@@ -148,7 +154,8 @@ export async function createMeeting(env: Env, input: CreateMeetingInput): Promis
 export async function listMeetings(env: Env, limit = 100): Promise<MeetingRow[]> {
   const r = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT id, started_at_iso, ended_at_iso, title, attendees, filter_summary, target_minutes,
-            snapshot_date_key, status, '' AS notes_md, current_wid, cursor_updated_at, timeline_scroll
+            snapshot_date_key, status, '' AS notes_md, current_wid, cursor_updated_at, timeline_scroll,
+            paused_at_iso, paused_accum_ms, presenter_scale
      FROM meeting ORDER BY started_at_iso DESC LIMIT ?`,
   )
     .bind(Math.max(1, Math.min(500, limit)))
@@ -194,6 +201,63 @@ export async function setMeetingCursor(
  * Update only the controller's recent-changes timeline scroll position.
  * (Cheap call — fires a lot while the controller is dragging the scrollbar.)
  */
+/**
+ * Pause or resume the meeting timer. Persists so the presenter view stays in sync.
+ */
+export async function setMeetingPauseState(
+  env: Env,
+  meetingId: number,
+  paused: boolean,
+): Promise<MeetingRow | null> {
+  const row = await env.ETIC_SNAPSHOTS.prepare(`SELECT * FROM meeting WHERE id = ?`)
+    .bind(meetingId)
+    .first<MeetingRow>();
+  if (!row) return null;
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  let accum = Number(row.paused_accum_ms) || 0;
+  const curPause = row.paused_at_iso ?? null;
+
+  if (paused) {
+    if (!curPause) {
+      await env.ETIC_SNAPSHOTS.prepare(`UPDATE meeting SET paused_at_iso = ? WHERE id = ?`)
+        .bind(nowIso, meetingId)
+        .run();
+    }
+  } else {
+    if (curPause) {
+      const pStart = new Date(curPause).getTime();
+      accum += Math.max(0, nowMs - pStart);
+      await env.ETIC_SNAPSHOTS.prepare(
+        `UPDATE meeting SET paused_at_iso = NULL, paused_accum_ms = ? WHERE id = ?`,
+      )
+        .bind(Math.round(accum), meetingId)
+        .run();
+    }
+  }
+  return env.ETIC_SNAPSHOTS.prepare(`SELECT * FROM meeting WHERE id = ?`)
+    .bind(meetingId)
+    .first<MeetingRow>();
+}
+
+const PRESENTER_SCALE_MIN = 0.75;
+const PRESENTER_SCALE_MAX = 1.5;
+
+export async function setMeetingPresenterScale(
+  env: Env,
+  meetingId: number,
+  scale: number,
+): Promise<MeetingRow | null> {
+  if (!Number.isFinite(scale)) return null;
+  const s = Math.min(PRESENTER_SCALE_MAX, Math.max(PRESENTER_SCALE_MIN, scale));
+  await env.ETIC_SNAPSHOTS.prepare(`UPDATE meeting SET presenter_scale = ? WHERE id = ?`)
+    .bind(s, meetingId)
+    .run();
+  return env.ETIC_SNAPSHOTS.prepare(`SELECT * FROM meeting WHERE id = ?`)
+    .bind(meetingId)
+    .first<MeetingRow>();
+}
+
 export async function setMeetingTimelineScroll(
   env: Env,
   meetingId: number,
@@ -320,11 +384,19 @@ export async function endMeeting(
   id: number,
   notesMd: string,
 ): Promise<MeetingRow | null> {
+  const row = await env.ETIC_SNAPSHOTS.prepare(`SELECT * FROM meeting WHERE id = ?`)
+    .bind(id)
+    .first<MeetingRow>();
   const endedAt = new Date().toISOString();
+  let accum = row ? Number(row.paused_accum_ms) || 0 : 0;
+  if (row?.paused_at_iso) {
+    const pStart = new Date(row.paused_at_iso).getTime();
+    accum += Math.max(0, Date.now() - pStart);
+  }
   await env.ETIC_SNAPSHOTS.prepare(
-    `UPDATE meeting SET status = 'ended', ended_at_iso = ?, notes_md = ? WHERE id = ?`,
+    `UPDATE meeting SET status = 'ended', ended_at_iso = ?, notes_md = ?, paused_at_iso = NULL, paused_accum_ms = ? WHERE id = ?`,
   )
-    .bind(endedAt, notesMd, id)
+    .bind(endedAt, notesMd, Math.round(accum), id)
     .run();
   return env.ETIC_SNAPSHOTS.prepare(`SELECT * FROM meeting WHERE id = ?`)
     .bind(id)

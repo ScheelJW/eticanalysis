@@ -253,6 +253,8 @@ export async function ingestMelSnapshot(
     ["mel_status", "melStatus", "MEL status"],
     ["recall_delta", "recallDelta", "Recall +/-"],
     ["unit", "unit", "Unit"],
+    ["user_unit", "userUnit", "User unit"],
+    ["detail_doc_number", "detailDocNumber", "Detail doc number"],
     ["priority_tier", "priorityTier", "Priority tier"],
   ];
 
@@ -624,4 +626,98 @@ export async function getMelRollup(env: Env): Promise<MelRollupRow[]> {
        ORDER BY snapshot_date_key ASC`,
   ).all<MelRollupRow>();
   return r.results ?? [];
+}
+
+/** Authorization manager: latest MEL Calculator rows + unit / detail-doc move log (not work orders). */
+export type AuthzManagerRow = {
+  melKey: string;
+  unit: string;
+  userUnit: string;
+  detailDocNumber: string;
+  mgmtCodeName: string;
+  priorityTier: string;
+  melStatus: string;
+};
+
+export type AuthzManagerMoveRow = {
+  id: number;
+  melKey: string;
+  snapshotDateKey: string;
+  field: string;
+  oldValue: string;
+  newValue: string;
+  createdAtIso: string;
+};
+
+export async function getAuthzManagerData(env: Env): Promise<{
+  asOfDateKey: string;
+  assets: AuthzManagerRow[];
+  moves: AuthzManagerMoveRow[];
+}> {
+  const dateRow = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT MAX(snapshot_date_key) AS k FROM mel_snapshot`,
+  ).first<{ k: string | null }>();
+  const asOfDateKey = (dateRow?.k ?? "").trim();
+  if (!asOfDateKey) {
+    return { asOfDateKey: "", assets: [], moves: [] };
+  }
+
+  const snap = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT mel_key, unit, user_unit, detail_doc_number, mgmt_code_name, priority_tier, mel_status
+       FROM mel_snapshot
+      WHERE snapshot_date_key = ?
+   ORDER BY mel_status, unit, mel_key`,
+  )
+    .bind(asOfDateKey)
+    .all<{
+      mel_key: string;
+      unit: string;
+      user_unit: string;
+      detail_doc_number: string;
+      mgmt_code_name: string;
+      priority_tier: string;
+      mel_status: string;
+    }>();
+
+  const assets: AuthzManagerRow[] = (snap.results ?? []).map((r) => ({
+    melKey: (r.mel_key ?? "").trim(),
+    unit: (r.unit ?? "").trim(),
+    userUnit: (r.user_unit ?? "").trim(),
+    detailDocNumber: (r.detail_doc_number ?? "").trim(),
+    mgmtCodeName: (r.mgmt_code_name ?? "").trim(),
+    priorityTier: (r.priority_tier ?? "").trim(),
+    melStatus: (r.mel_status ?? "").trim(),
+  }));
+
+  const AUTHZ_MOVE_FIELDS = ["Unit", "User unit", "Detail doc number"];
+  const placeholders = AUTHZ_MOVE_FIELDS.map(() => "?").join(",");
+  const movesR = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT id, mel_key, snapshot_date_key, field, old_value, new_value, created_at_iso
+       FROM mel_changelog
+      WHERE field IN (${placeholders})
+   ORDER BY id DESC
+      LIMIT 500`,
+  )
+    .bind(...AUTHZ_MOVE_FIELDS)
+    .all<{
+      id: number;
+      mel_key: string;
+      snapshot_date_key: string;
+      field: string;
+      old_value: string | null;
+      new_value: string | null;
+      created_at_iso: string;
+    }>();
+
+  const moves: AuthzManagerMoveRow[] = (movesR.results ?? []).map((r) => ({
+    id: r.id,
+    melKey: (r.mel_key ?? "").trim(),
+    snapshotDateKey: r.snapshot_date_key,
+    field: r.field,
+    oldValue: r.old_value ?? "",
+    newValue: r.new_value ?? "",
+    createdAtIso: r.created_at_iso,
+  }));
+
+  return { asOfDateKey, assets, moves };
 }
