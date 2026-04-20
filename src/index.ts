@@ -6715,6 +6715,12 @@ function renderDashboardHtml(): string {
       color: var(--text);
     }
 
+    /* Keyboard focus — many controls hide outline on :focus; restore a clear ring for keyboard users. */
+    :where(button, a, summary, input, textarea, select, [tabindex]:not([tabindex="-1"])):focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
     /* --- Segmented nav ---------------------------------------------------- */
     .main-nav {
       display: inline-flex;
@@ -11710,7 +11716,7 @@ function renderDashboardHtml(): string {
     <div id="view-main" class="hidden">
       <div id="construction-banner" class="construction-banner hidden" role="status" aria-live="polite">
         <strong>Under construction</strong>
-        <span>This tab is still being built. Work orders, MEL, ETIC Meeting, Yard Check, Waivers, and Ask AI are ready to use.</span>
+        <span>This tab is still being built. Work orders, MEL, ETIC Meeting, yard check, waivers, Ask AI, schedule maintenance, and authorization are ready to use.</span>
       </div>
       <div id="panel-snapshot">
         <div class="date-picker" role="group" aria-label="Pick a report date">
