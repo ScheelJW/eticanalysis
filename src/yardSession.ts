@@ -1115,6 +1115,27 @@ export async function getLatestSightings(env: Env): Promise<Map<string, YardSigh
   return out;
 }
 
+type LatestPhotoRow = { asset_id: string; id: number };
+
+/**
+ * One row per asset: id of the most recently uploaded yard_photo (any check).
+ * Used for cross-cutting "latest yard photo" thumbnails on WO / MEL / meeting.
+ */
+export async function getLatestYardPhotoIdsByAsset(env: Env): Promise<Map<string, number>> {
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT asset_id, id FROM (
+       SELECT asset_id, id,
+         ROW_NUMBER() OVER (PARTITION BY asset_id ORDER BY uploaded_at_iso DESC, id DESC) AS rn
+       FROM yard_photo
+     ) WHERE rn = 1`,
+  ).all<LatestPhotoRow>();
+  const out = new Map<string, number>();
+  for (const row of r.results ?? []) {
+    if (row.asset_id && Number.isFinite(row.id)) out.set(row.asset_id, row.id);
+  }
+  return out;
+}
+
 export async function deleteCheck(env: Env, checkId: number): Promise<boolean> {
   const r = await env.ETIC_SNAPSHOTS.prepare(
     `DELETE FROM yard_check WHERE id = ?`,

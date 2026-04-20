@@ -50,6 +50,7 @@ import {
   getAssetDetail as getYardAssetDetail,
   getPhoto as getYardPhoto,
   getLatestSightings as getYardLatestSightings,
+  getLatestYardPhotoIdsByAsset,
   getRecentActivity as getYardRecentActivity,
   getRollingRoster,
   getYardRosterForDate,
@@ -441,6 +442,9 @@ export default {
     }
     if (url.pathname === "/api/yard/sightings") {
       return handleYardSightingsApi(env);
+    }
+    if (url.pathname === "/api/yard/photo-latest") {
+      return handleYardPhotoLatestApi(env);
     }
     if (url.pathname === "/api/yard/findings") {
       return handleYardFindingsApi(env);
@@ -1776,6 +1780,17 @@ async function handleYardSightingsApi(env: Env): Promise<Response> {
   for (const [assetId, s] of sightings) out[assetId] = s;
   return Response.json(
     { generatedAtIso: new Date().toISOString(), sightings: out },
+    { headers: cacheHeaders() },
+  );
+}
+
+/** GET /api/yard/photo-latest — assetId → latest yard_photo row id (for thumbnails). */
+async function handleYardPhotoLatestApi(env: Env): Promise<Response> {
+  const map = await getLatestYardPhotoIdsByAsset(env);
+  const photos: Record<string, number> = {};
+  for (const [assetId, id] of map) photos[assetId] = id;
+  return Response.json(
+    { generatedAtIso: new Date().toISOString(), photos },
     { headers: cacheHeaders() },
   );
 }
@@ -9571,6 +9586,90 @@ function renderDashboardHtml(): string {
     .waiver-badge.overdue  { background: rgba(255,138,138,0.12); color: #e69b9b; border-color: rgba(255,138,138,0.35); }
     .waiver-badge.pending  { background: rgba(192,132,252,0.12); color: #c4a3ff; border-color: rgba(192,132,252,0.30); }
 
+    /* Latest yard photo thumbnail (opens lightbox on click). */
+    .yard-photo-thumb {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 28px;
+      height: 28px;
+      padding: 0;
+      margin: 0 2px 0 0;
+      border-radius: 6px;
+      border: 1px solid rgba(15,30,60,0.18);
+      background: var(--bg-elev);
+      cursor: zoom-in;
+      vertical-align: middle;
+      overflow: hidden;
+      flex-shrink: 0;
+    }
+    .yard-photo-thumb img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+    .yard-photo-thumb:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .mel-wo-head .yard-photo-thumb { width: 26px; height: 26px; }
+    .p-id-strip .yard-photo-thumb {
+      width: clamp(32px, 2.8vw, 40px);
+      height: clamp(32px, 2.8vw, 40px);
+      border-radius: 8px;
+    }
+
+    .yard-photo-lightbox {
+      position: fixed;
+      inset: 0;
+      z-index: 200000;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: rgba(8, 14, 28, 0.72);
+      box-sizing: border-box;
+    }
+    .yard-photo-lightbox.open { display: flex; }
+    .yard-photo-lightbox-inner {
+      position: relative;
+      max-width: min(96vw, 1100px);
+      max-height: 92vh;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .yard-photo-lightbox-inner img {
+      max-width: 100%;
+      max-height: calc(92vh - 72px);
+      object-fit: contain;
+      border-radius: 10px;
+      box-shadow: 0 8px 40px rgba(0,0,0,0.35);
+      background: #111;
+    }
+    .yard-photo-lightbox-cap {
+      color: #e8ecf4;
+      font-size: 0.88rem;
+      line-height: 1.45;
+      max-width: 100%;
+    }
+    .yard-photo-lightbox-close {
+      position: absolute;
+      top: -8px;
+      right: -8px;
+      width: 40px;
+      height: 40px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.35);
+      background: rgba(20,28,44,0.92);
+      color: #fff;
+      font-size: 1.35rem;
+      line-height: 1;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .yard-photo-lightbox-close:hover { background: rgba(40,50,70,0.95); }
+
     /* ---- Settings tab ---- */
     #panel-settings .hidden { display: none; }
     .settings-wrap { display: flex; flex-direction: column; gap: 18px; max-width: 1100px; margin: 0 auto; }
@@ -11014,6 +11113,7 @@ function renderDashboardHtml(): string {
       font-size: clamp(0.78rem, 0.9vw, 0.92rem);
       padding: 3px 10px;
     }
+    .p-id-strip .yard-photo-thumb { align-self: center; }
     .p-id-pill {
       display: inline-flex;
       flex-direction: column;
@@ -12824,6 +12924,14 @@ function renderDashboardHtml(): string {
     </footer>
   </div>
 
+  <div id="yard-photo-lightbox" class="yard-photo-lightbox" role="dialog" aria-modal="true" aria-label="Yard photo preview">
+    <div class="yard-photo-lightbox-inner">
+      <button type="button" class="yard-photo-lightbox-close" id="yard-photo-lightbox-close" aria-label="Close photo">×</button>
+      <img id="yard-photo-lightbox-img" alt="" />
+      <div class="yard-photo-lightbox-cap" id="yard-photo-lightbox-cap"></div>
+    </div>
+  </div>
+
   <script>
     function esc(s) {
       if (s == null || s === undefined) return "";
@@ -13002,6 +13110,91 @@ function renderDashboardHtml(): string {
       return "";
     }
 
+    var yardPhotoState = {
+      map: new Map(),
+      loadedAt: 0,
+      inflight: null,
+    };
+    var YARD_PHOTO_TTL_MS = 45 * 1000;
+
+    function loadYardPhotoLatest(force) {
+      var now = Date.now();
+      if (!force && yardPhotoState.loadedAt && (now - yardPhotoState.loadedAt) < YARD_PHOTO_TTL_MS) {
+        return Promise.resolve(yardPhotoState.map);
+      }
+      if (yardPhotoState.inflight) return yardPhotoState.inflight;
+      var url = "/api/yard/photo-latest" + (force ? ("?_=" + now) : "");
+      yardPhotoState.inflight = fetch(url, force ? { cache: "no-store" } : undefined)
+        .then(function (r) { return r.ok ? r.json() : { photos: {} }; })
+        .then(function (data) {
+          var src = (data && data.photos) || {};
+          var m = new Map();
+          for (var k in src) {
+            if (!Object.prototype.hasOwnProperty.call(src, k)) continue;
+            var id = Number(src[k]);
+            if (isFinite(id) && id > 0) m.set(k, id);
+          }
+          yardPhotoState.map = m;
+          yardPhotoState.loadedAt = Date.now();
+          return m;
+        })
+        .catch(function () { return yardPhotoState.map; })
+        .then(function (m) { yardPhotoState.inflight = null; return m; });
+      return yardPhotoState.inflight;
+    }
+
+    function renderYardPhotoThumb(assetId) {
+      if (!assetId) return "";
+      var pid = yardPhotoState.map.get(assetId);
+      if (!pid) return "";
+      var src = "/api/yard/photo/" + pid;
+      var cap = "Latest yard check photo — click to enlarge";
+      return (
+        "<button type='button' class='yard-photo-thumb' data-yard-photo-asset='" + esc(assetId) + "' data-yard-photo-id='" + esc(String(pid)) + "' title='" + esc(cap) + "' aria-label='View yard photo for " + esc(assetId) + "'>" +
+          "<img src='" + esc(src) + "' alt='' loading='lazy' decoding='async' />" +
+        "</button>"
+      );
+    }
+
+    var yardPhotoLightboxWired = false;
+    function wireYardPhotoLightboxOnce() {
+      if (yardPhotoLightboxWired) return;
+      yardPhotoLightboxWired = true;
+      var lb = document.getElementById("yard-photo-lightbox");
+      var img = document.getElementById("yard-photo-lightbox-img");
+      var capEl = document.getElementById("yard-photo-lightbox-cap");
+      var btnClose = document.getElementById("yard-photo-lightbox-close");
+      function closeLb() {
+        if (!lb) return;
+        lb.classList.remove("open");
+        if (img) img.src = "";
+      }
+      function openLb(url, caption, asset) {
+        if (!lb || !img) return;
+        img.src = url;
+        img.alt = asset ? ("Yard photo " + asset) : "Yard photo";
+        if (capEl) capEl.textContent = caption || "";
+        lb.classList.add("open");
+      }
+      document.addEventListener("click", function (ev) {
+        var t = ev.target;
+        var btn = t && t.closest ? t.closest("[data-yard-photo-id]") : null;
+        if (btn && btn.getAttribute("data-yard-photo-id")) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          var id = btn.getAttribute("data-yard-photo-id");
+          var aid = btn.getAttribute("data-yard-photo-asset") || "";
+          openLb("/api/yard/photo/" + id, aid ? ("Asset " + aid) : "", aid);
+          return;
+        }
+        if (t === lb) closeLb();
+      });
+      if (btnClose) btnClose.addEventListener("click", function (e) { e.preventDefault(); closeLb(); });
+      document.addEventListener("keydown", function (e) {
+        if (e.key === "Escape" && lb && lb.classList.contains("open")) closeLb();
+      });
+    }
+
     function fmtKpi(n) {
       if (n === null || n === undefined || typeof n !== "number") return "—";
       return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
@@ -13157,6 +13350,7 @@ function renderDashboardHtml(): string {
       // are no-ops when warm.
       loadSightings(force);
       loadWaiverCounts(force);
+      loadYardPhotoLatest(force);
       if (!force && watchCacheByDate.has(dateKey)) return watchCacheByDate.get(dateKey);
       // Use scope=snapshot (default) so the list shows ONLY the work orders
       // that were actually present in the .xlsx for this date. scope=all would
@@ -14959,6 +15153,7 @@ function renderDashboardHtml(): string {
               (openedLine || "") +
               renderSightingBadge(r.assetId) +
               renderWaiverBadge(r.assetId) +
+              renderYardPhotoThumb(r.assetId) +
             "</div>"
           ) : "") +
           reasonChip +
@@ -14992,6 +15187,7 @@ function renderDashboardHtml(): string {
           loadWatchForDate(dateKey, opts),
           loadSightings(!!(opts && opts.force)),
           loadWaiverCounts(!!(opts && opts.force)),
+          loadYardPhotoLatest(!!(opts && opts.force)),
         ]);
         renderWoList(rows);
       } catch (e) {
@@ -15083,7 +15279,8 @@ function renderDashboardHtml(): string {
         primaryParts.push(
           "<span class='wo-hero-asset'>" + esc(r.assetId) + "</span>" +
           " " + renderSightingBadge(r.assetId) +
-          " " + renderWaiverBadge(r.assetId)
+          " " + renderWaiverBadge(r.assetId) +
+          " " + renderYardPhotoThumb(r.assetId)
         );
       }
       const metaParts = [];
@@ -15693,6 +15890,7 @@ function renderDashboardHtml(): string {
           fetchWoById(woId, asOf),
           loadSightings(),
           loadWaiverCounts(),
+          loadYardPhotoLatest(),
         ]);
         renderWoDetailFull(data);
       } catch (e) {
@@ -16269,6 +16467,7 @@ function renderDashboardHtml(): string {
       }
 
       document.getElementById("view-main").classList.remove("hidden");
+      wireYardPhotoLightboxOnce();
 
       snapshotRows = await loadSnapshots();
       await syncSnapshotsOnce();
@@ -17034,6 +17233,7 @@ function renderDashboardHtml(): string {
       melState.rows = data.rows || [];
       melState.availableDates = data.availableDates || [];
       if (!melState.asOfDate) melState.asOfDate = data.asOfDate || data.latestDate || "";
+      loadYardPhotoLatest(false);
 
       // Populate date select
       const sel = document.getElementById("mel-date");
@@ -18330,7 +18530,7 @@ function renderDashboardHtml(): string {
       }
       let wos = [];
       try {
-        const [_wos] = await Promise.all([loadWatchForDate(asOf), loadSightings(), loadWaiverCounts()]);
+        const [_wos] = await Promise.all([loadWatchForDate(asOf), loadSightings(), loadWaiverCounts(), loadYardPhotoLatest(false)]);
         wos = _wos;
       } catch (e) {
         if (meta) meta.textContent = "failed to load";
@@ -18370,6 +18570,7 @@ function renderDashboardHtml(): string {
             "<span class='wo-asset'>" + esc(w.assetId || "—") + "</span>" +
             renderSightingBadge(w.assetId, { compact: true }) +
             renderWaiverBadge(w.assetId) +
+            renderYardPhotoThumb(w.assetId) +
             "<span class='wo-tier " + esc(tier) + "'>" + esc(tierTxt) + "</span>" +
             "<span class='wo-arrow' aria-hidden='true'>›</span>" +
           "</div>" +
@@ -20450,7 +20651,7 @@ function renderDashboardHtml(): string {
       // for the next selection click.
       const hadSightings = sightingsState.loadedAt > 0;
       const hadWaivers = waiverCountState.loadedAt > 0;
-      Promise.all([loadSightings(), loadWaiverCounts()]).then(function () {
+      Promise.all([loadSightings(), loadWaiverCounts(), loadYardPhotoLatest()]).then(function () {
         if (!hadSightings || !hadWaivers) {
           renderMeetingQueue();
           renderMeetingFocus();
@@ -20560,8 +20761,9 @@ function renderDashboardHtml(): string {
         if (n.mel_key) sub.push("MEL " + esc(n.mel_key));
         const sightingHtml = n.asset_id ? renderSightingBadge(n.asset_id, { compact: true }) : "";
         const waiverHtml = n.asset_id ? renderWaiverBadge(n.asset_id) : "";
-        const badges = (sightingHtml || waiverHtml)
-          ? " " + sightingHtml + (sightingHtml && waiverHtml ? " " : "") + waiverHtml
+        const yardPh = n.asset_id ? renderYardPhotoThumb(n.asset_id) : "";
+        const badges = (sightingHtml || waiverHtml || yardPh)
+          ? " " + [sightingHtml, waiverHtml, yardPh].filter(Boolean).join(" ")
           : "";
         return (
           "<button type='button' class='mq-item" + active + "' data-status='" + esc(n.status) + "' data-wid='" + esc(n.work_order_id) + "'>" +
@@ -20620,11 +20822,13 @@ function renderDashboardHtml(): string {
       const remarks = row && row.remarks ? row.remarks : "";
       const sightingHtml = note.asset_id ? renderSightingBadge(note.asset_id) : "";
       const waiverHtml = note.asset_id ? renderWaiverBadge(note.asset_id) : "";
+      const yardPhHtml = note.asset_id ? renderYardPhotoThumb(note.asset_id) : "";
       head.innerHTML =
         "<div class='mf-id'>" + esc(note.work_order_id) + "</div>" +
         "<div class='mf-sub'>" + tags.join("") +
           (sightingHtml ? " " + sightingHtml : "") +
           (waiverHtml ? " " + waiverHtml : "") +
+          (yardPhHtml ? " " + yardPhHtml : "") +
         "</div>" +
         (remarks ? "<div class='mf-remarks'>" + esc(remarks) + "</div>" : "") +
         "<div class='mf-tl' id='mf-tl'>" +
@@ -21081,6 +21285,7 @@ function renderDashboardHtml(): string {
     }
 
     function startPresenterMode(meetingId) {
+      wireYardPhotoLightboxOnce();
       presenterState.meetingId = meetingId;
       presenterState.presenterLastWid = null;
       presenterState.lastPositionKey = "";
@@ -21108,6 +21313,7 @@ function renderDashboardHtml(): string {
           fetch("/api/meeting/" + presenterState.meetingId, { cache: "no-store" }),
           loadSightings(),
           loadWaiverCounts(),
+          loadYardPhotoLatest(false),
         ]);
         if (!resp.ok) throw new Error("HTTP " + resp.status);
         const j = await resp.json();
@@ -21495,10 +21701,13 @@ function renderDashboardHtml(): string {
         const waiverObj = note.asset_id ? waiverCountState.map.get(note.asset_id) : null;
         const waiverHtml = note.asset_id ? renderWaiverBadge(note.asset_id) : "";
         const waiverKey = waiverObj ? (waiverObj.approved + "/" + waiverObj.pending + "/" + waiverObj.overdueVerify) : "none";
+        const yardPhotoHtml = note.asset_id ? renderYardPhotoThumb(note.asset_id) : "";
+        const photoPid = note.asset_id ? (yardPhotoState.map.get(note.asset_id) || 0) : 0;
         const idKey = ids.map(function (it) { return it.lbl + "=" + it.val; }).join("|") +
-          "||sight=" + sightingKey + "||wv=" + waiverKey;
+          "||sight=" + sightingKey + "||wv=" + waiverKey + "||photo=" + photoPid;
         if (idKey !== presenterState.lastIdStripKey) {
-          stripEl.innerHTML = sightingHtml + (sightingHtml && waiverHtml ? " " : "") + waiverHtml + ids.map(function (it) {
+          var lead = [sightingHtml, waiverHtml, yardPhotoHtml].filter(Boolean).join(" ");
+          stripEl.innerHTML = (lead ? lead + " " : "") + ids.map(function (it) {
             return '<span class="p-id-pill"><span class="lbl">' + esc(it.lbl) +
                    '</span><span class="val">' + esc(it.val) + '</span></span>';
           }).join("");
