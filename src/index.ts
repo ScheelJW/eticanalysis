@@ -7097,21 +7097,28 @@ function renderDashboardHtml(): string {
        .app column. Sits flush under the 4px accent strap. */
     .top {
       display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      justify-content: space-between;
-      gap: 20px;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 0;
       margin-left: calc(50% - 50vw);
       margin-right: calc(50% - 50vw);
       margin-top: 0;
-      margin-bottom: 24px;
-      padding: 14px max(32px, calc(50vw - 528px));
+      margin-bottom: 20px;
+      padding: 0;
       background: var(--accent);
       color: #ffffff;
       border-bottom: 3px solid var(--accent-strong);
     }
+    .top-shell {
+      padding: 14px max(32px, calc(50vw - 528px)) 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      box-sizing: border-box;
+    }
     @media (max-width: 640px) {
-      .top { padding: 12px 20px; margin-bottom: 18px; }
+      .top { margin-bottom: 16px; }
+      .top-shell { padding: 12px 20px 14px; }
     }
     .brand { display: flex; align-items: center; gap: 14px; min-width: 0; }
     .brand-mark {
@@ -7181,37 +7188,63 @@ function renderDashboardHtml(): string {
       color: var(--text);
     }
 
-    /* --- Segmented nav ---------------------------------------------------- */
+    /* --- Main nav (sits on blue header; horizontal scroll on narrow viewports) */
     .main-nav {
-      display: inline-flex;
-      gap: 2px;
-      padding: 4px;
-      margin-bottom: 24px;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      box-shadow: var(--shadow-sm);
+      display: flex;
+      flex-wrap: nowrap;
+      align-items: stretch;
+      gap: 4px;
+      padding: 6px;
+      margin: 0;
+      width: 100%;
+      max-width: 100%;
+      box-sizing: border-box;
+      overflow-x: auto;
+      overflow-y: hidden;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(255,255,255,0.45) transparent;
+      background: rgba(255, 255, 255, 0.12);
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      border-radius: 10px;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+    }
+    .main-nav::-webkit-scrollbar { height: 6px; }
+    .main-nav::-webkit-scrollbar-thumb {
+      background: rgba(255, 255, 255, 0.35);
+      border-radius: 999px;
     }
     .main-nav button {
       font-family: var(--font);
-      font-size: 0.88rem;
-      font-weight: 500;
-      padding: 9px 18px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      line-height: 1.2;
+      padding: 9px 14px;
+      min-height: 38px;
       border-radius: 8px;
       border: 1px solid transparent;
       background: transparent;
-      color: var(--muted);
+      color: rgba(255, 255, 255, 0.88);
       cursor: pointer;
-      transition: color 0.15s ease, background 0.15s ease;
+      white-space: nowrap;
+      flex: 0 0 auto;
+      transition: color 0.12s ease, background 0.12s ease, border-color 0.12s ease;
     }
-    .main-nav button:hover { color: var(--text); }
-    .main-nav button.active {
-      background: var(--accent);
+    .main-nav button:hover {
       color: #ffffff;
-      border-color: var(--accent);
-      box-shadow: 0 1px 2px rgba(0,0,0,0.08);
+      background: rgba(255, 255, 255, 0.12);
+      border-color: rgba(255, 255, 255, 0.2);
     }
-    .main-nav button.active:hover { color: #ffffff; }
+    .main-nav button.active {
+      background: #ffffff;
+      color: var(--accent);
+      border-color: rgba(255, 255, 255, 0.95);
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+    }
+    .main-nav button.active:hover {
+      color: var(--accent);
+      background: #ffffff;
+    }
 
     .construction-banner {
       display: flex;
@@ -12325,28 +12358,29 @@ function renderDashboardHtml(): string {
 <body>
   <div class="app">
     <header class="top">
-      <div class="brand">
-        <div class="brand-mark" aria-hidden="true">USAF</div>
-        <div class="brand-text">
-          <h1>${escapedTitle}</h1>
-          <p id="brand-sub">Fleet readiness at a glance.</p>
+      <div class="top-shell">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">USAF</div>
+          <div class="brand-text">
+            <h1>${escapedTitle}</h1>
+            <p id="brand-sub">Fleet readiness at a glance.</p>
+          </div>
         </div>
+        <nav class="main-nav" id="main-nav" aria-label="Main sections">
+          <button type="button" id="tab-snapshot" class="active">Snapshot</button>
+          <button type="button" id="tab-work-orders">Work&nbsp;orders</button>
+          <button type="button" id="tab-schedule-mx">Schedule&nbsp;Mx</button>
+          <button type="button" id="tab-authz">Authorization</button>
+          <button type="button" id="tab-mel">MEL</button>
+          <button type="button" id="tab-meeting">ETIC&nbsp;Meeting</button>
+          <button type="button" id="tab-yard">Yard&nbsp;Check</button>
+          <button type="button" id="tab-waivers">Waivers</button>
+          <button type="button" id="tab-abuse-tracker">A/A&nbsp;tracker</button>
+          <button type="button" id="tab-ask">Ask&nbsp;AI</button>
+          <button type="button" id="tab-settings">Settings</button>
+        </nav>
       </div>
     </header>
-
-    <nav class="main-nav" id="main-nav" aria-label="Main sections">
-      <button type="button" id="tab-snapshot" class="active">Snapshot</button>
-      <button type="button" id="tab-work-orders">Work orders</button>
-      <button type="button" id="tab-schedule-mx">Schedule Mx</button>
-      <button type="button" id="tab-authz">Authorization</button>
-      <button type="button" id="tab-mel">MEL</button>
-      <button type="button" id="tab-meeting">ETIC Meeting</button>
-      <button type="button" id="tab-yard">Yard Check</button>
-      <button type="button" id="tab-waivers">Waivers</button>
-      <button type="button" id="tab-abuse-tracker">A/A tracker</button>
-      <button type="button" id="tab-ask">Ask AI</button>
-      <button type="button" id="tab-settings">Settings</button>
-    </nav>
 
     <div id="view-empty" class="empty-state hidden">
       <p><strong>No ETIC files yet.</strong><br />Email the Vehicle ETIC workbook to your ingest address to get dates here.</p>
