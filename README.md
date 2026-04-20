@@ -52,11 +52,21 @@ history/index.json                   -- rolling index with day-over-day deltas
 - R2 bucket: `eticanalysis`
 - Email Routing catch-all on `2t3.app` → this Worker
 
-## Development
+## Development (Cursor / laptop — fast local)
+
+Use this when you want instant iteration without deploying. The Worker runs on your machine with **local** R2 and D1 (data lives under `.wrangler/state`, gitignored).
 
 ```bash
 npm install
-npm run check     # types + tests
-npm run dev       # local wrangler dev
-npm run deploy    # production deploy
+npm run check          # types + tests
+npm run dev            # http://127.0.0.1:8787 — local bindings only
+```
+
+- Open **http://127.0.0.1:8787** for the dashboard. The history/APIs will be empty until you put objects into **local** R2 or run flows that write there.
+- **Email ingest** still targets Cloudflare in production; locally you mainly exercise **HTTP** (`fetch` handler). To test with real cloud R2/D1 (slower), use `npm run dev:remote` (requires `wrangler login` / token as Wrangler expects).
+
+Production deploy (optional):
+
+```bash
+npm run deploy    # uses .env.cloudflare if present (gitignored)
 ```

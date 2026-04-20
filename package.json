@@ -4,12 +4,13 @@
   "description": "Vehicle ETIC email-to-R2 analysis automation on Cloudflare Workers",
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
+    "dev": "wrangler dev --local --persist-to .wrangler/state",
+    "dev:remote": "wrangler dev --remote",
     "cf-typegen": "wrangler types",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "check": "npm run cf-typegen && npm run typecheck && npm run test",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy --env-file .env.cloudflare"
   },
   "repository": {
     "type": "git",
