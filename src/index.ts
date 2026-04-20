@@ -112,6 +112,7 @@ import {
   getAbuseTrackerStats,
   ingestAbuseDamEmailFiles,
   listAbuseCases,
+  listOpenAbuseCasesForWorkOrder,
   searchFleetAssetsForPicker,
   parseAbuseEmailIngestFromTo,
   updateAbuseCase,
@@ -582,6 +583,10 @@ export default {
     }
     if (url.pathname === "/api/abuse-tracker") {
       return handleAbuseTrackerListApi(env, request);
+    }
+    const abuseByWoMatch = url.pathname.match(/^\/api\/abuse-tracker\/by-work-order\/(.+)$/);
+    if (abuseByWoMatch) {
+      return handleAbuseTrackerByWorkOrderApi(env, request, abuseByWoMatch[1] ?? "");
     }
     const abuseAttMatch = url.pathname.match(/^\/api\/abuse-tracker\/attachments\/(\d+)$/);
     if (abuseAttMatch) {
@@ -3686,6 +3691,14 @@ async function handleAbuseTrackerStatsApi(env: Env, request: Request): Promise<R
   return Response.json(s, { headers: cacheHeaders() });
 }
 
+async function handleAbuseTrackerByWorkOrderApi(env: Env, request: Request, workOrderId: string): Promise<Response> {
+  if (request.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
+  const wid = decodeURIComponent(workOrderId || "").trim();
+  if (!wid) return Response.json({ cases: [] }, { headers: cacheHeaders() });
+  const cases = await listOpenAbuseCasesForWorkOrder(env, wid);
+  return Response.json({ cases }, { headers: cacheHeaders() });
+}
+
 async function handleAbuseTrackerListApi(env: Env, request: Request): Promise<Response> {
   if (request.method === "GET") {
     const url = new URL(request.url);
@@ -3749,7 +3762,7 @@ async function handleAbuseTrackerListApi(env: Env, request: Request): Promise<Re
       });
     }
     const openOnly = url.searchParams.get("open") === "1" || url.searchParams.get("open") === "true";
-    const limit = Number.parseInt(url.searchParams.get("limit") ?? "200", 10) || 200;
+    const limit = Number.parseInt(url.searchParams.get("limit") ?? "2500", 10) || 2500;
     const rows = await listAbuseCases(env, { openOnly, limit });
     return Response.json({ cases: rows }, { headers: cacheHeaders() });
   }
@@ -8891,6 +8904,20 @@ function renderDashboardHtml(): string {
       padding: 2px 0 0;
       border-bottom: none;
     }
+    .wo-abuse-strip {
+      display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+      margin: 10px 0 4px; padding: 10px 12px; border-radius: 10px;
+      border: 1px solid var(--border); background: rgba(0,58,140,0.05); font-size: 0.82rem;
+    }
+    .wo-abuse-strip.hidden { display: none; }
+    .wo-abuse-strip .lbl { font-weight: 700; color: var(--text); margin-right: 4px; }
+    .wo-abuse-strip .wo-abuse-btn {
+      font: inherit; font-size: 0.78rem; font-weight: 600; cursor: pointer;
+      padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border);
+      background: var(--surface); color: var(--accent);
+    }
+    .wo-abuse-strip .wo-abuse-btn:hover { border-color: var(--accent); }
+    .wo-abuse-strip .wo-abuse-btn.abuse { color: var(--danger); }
     .wo-hero-row {
       display: flex;
       align-items: center;
@@ -9823,13 +9850,20 @@ function renderDashboardHtml(): string {
 
     /* ---- Accident / abuse tracker tab ---- */
     #panel-abuse-tracker .hidden { display: none; }
-    .abuse-wrap { max-width: 1280px; margin: 0 auto; padding: 0 0 48px; }
+    .abuse-wrap { max-width: 1400px; margin: 0 auto; padding: 0 0 48px; }
     .abuse-head {
       display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between;
       gap: 14px; margin-bottom: 16px; padding-bottom: 14px; border-bottom: 1px solid var(--border);
     }
-    .abuse-head-actions { display: flex; gap: 8px; flex-wrap: wrap; }
-    .abuse-stats {
+    .abuse-head-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .abuse-view-toggle { display: inline-flex; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+    .abuse-view-toggle button {
+      font: inherit; font-size: 0.82rem; font-weight: 600; padding: 8px 14px; border: 0; cursor: pointer;
+      background: var(--bg-elev); color: var(--muted);
+    }
+    .abuse-view-toggle button:hover { color: var(--text); }
+    .abuse-view-toggle button.active { background: var(--surface); color: var(--accent); box-shadow: inset 0 -2px 0 var(--accent); }
+    .abuse-stats-full {
       display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px;
     }
     .abuse-stat-pill {
@@ -9837,24 +9871,28 @@ function renderDashboardHtml(): string {
       font-size: 0.85rem;
     }
     .abuse-stat-pill b { color: var(--accent); }
-    .abuse-split {
-      display: grid; grid-template-columns: minmax(260px, 340px) 1fr; gap: 16px; align-items: start;
+    .abuse-cases-layout {
+      display: grid; grid-template-columns: 1fr minmax(300px, 400px); gap: 16px; align-items: start;
     }
-    @media (max-width: 960px) { .abuse-split { grid-template-columns: 1fr; } }
-    .abuse-list-card, .abuse-detail-card, .abuse-new-card {
+    @media (max-width: 1100px) { .abuse-cases-layout { grid-template-columns: 1fr; } }
+    .abuse-table-card, .abuse-detail-card, .abuse-new-card {
       background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 14px 16px;
     }
-    .abuse-list-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; gap: 8px; }
+    .abuse-table-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; gap: 8px; flex-wrap: wrap; }
     .abuse-filter { font-size: 0.82rem; color: var(--muted); display: flex; align-items: center; gap: 6px; cursor: pointer; }
-    .abuse-list { display: flex; flex-direction: column; gap: 6px; max-height: 62vh; overflow-y: auto; }
-    .abuse-row {
-      text-align: left; width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border);
-      background: var(--bg-elev); cursor: pointer; font: inherit;
+    .abuse-table-scroll { overflow: auto; max-height: min(70vh, 720px); border: 1px solid var(--border); border-radius: 10px; }
+    .abuse-case-table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+    .abuse-case-table thead th {
+      position: sticky; top: 0; z-index: 1;
+      background: var(--surface); border-bottom: 1px solid var(--border);
+      text-align: left; padding: 8px 10px; font-weight: 700; white-space: nowrap;
     }
-    .abuse-row:hover { border-color: var(--accent); }
-    .abuse-row.active { border-color: var(--accent); background: rgba(0,58,140,0.06); }
-    .abuse-row .r1 { font-weight: 700; font-size: 0.88rem; }
-    .abuse-row .r2 { font-size: 0.78rem; color: var(--muted); margin-top: 2px; }
+    .abuse-case-table tbody td { border-bottom: 1px solid var(--border); padding: 7px 10px; vertical-align: top; }
+    .abuse-case-table tbody tr { cursor: pointer; }
+    .abuse-case-table tbody tr:hover { background: rgba(0,58,140,0.04); }
+    .abuse-case-table tbody tr.active { background: rgba(0,58,140,0.08); }
+    .abuse-case-table .cn { font-weight: 800; white-space: nowrap; }
+    .abuse-case-table .muted-cell { color: var(--muted); font-size: 0.76rem; max-width: 14rem; }
     .abuse-cn { font-size: 1.05rem; font-weight: 800; letter-spacing: 0.02em; }
     .abuse-detail-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
     .abuse-type-pill {
@@ -12621,6 +12659,7 @@ function renderDashboardHtml(): string {
             <div id="wo-detail" class="hidden wo-detail-inner">
               <section class="wo-detail-overview" aria-label="Work order summary">
                 <div class="wo-hero" id="wo-hero"></div>
+                <div id="wo-abuse-strip" class="wo-abuse-strip hidden" aria-label="Open accident or abuse cases for this work order"></div>
                 <div class="wo-kpis" id="wo-kpis"></div>
               </section>
               <div id="wo-stale-banner" class="wo-stale-banner hidden"></div>
@@ -13265,18 +13304,35 @@ function renderDashboardHtml(): string {
               </p>
             </div>
             <div class="abuse-head-actions">
+              <div class="abuse-view-toggle" role="group" aria-label="A/A tracker view">
+                <button type="button" class="active" id="abuse-view-cases">Cases</button>
+                <button type="button" id="abuse-view-stats">Stats</button>
+              </div>
               <button type="button" class="ghost" id="abuse-export-csv">Export CSV</button>
               <button type="button" class="ghost" id="abuse-refresh">Refresh</button>
             </div>
           </header>
-          <div class="abuse-stats" id="abuse-stats"></div>
-          <div class="abuse-split">
-            <div class="abuse-list-card">
-              <div class="abuse-list-head">
+          <div id="abuse-view-cases-wrap">
+            <div class="abuse-cases-layout">
+            <div class="abuse-table-card">
+              <div class="abuse-table-head">
                 <h3 style="margin:0;font-size:0.95rem">Cases</h3>
                 <label class="abuse-filter"><input type="checkbox" id="abuse-open-only" checked /> Open only</label>
               </div>
-              <div id="abuse-list" class="abuse-list">Loading…</div>
+              <div class="abuse-table-scroll">
+                <table class="abuse-case-table" aria-label="Accident and abuse cases">
+                  <thead><tr>
+                    <th>Control</th>
+                    <th>Type</th>
+                    <th>Asset</th>
+                    <th>WO</th>
+                    <th>Stage</th>
+                    <th>Location</th>
+                    <th>Updated</th>
+                  </tr></thead>
+                  <tbody id="abuse-list-tbody"><tr><td colspan="7" class="muted" style="padding:12px">Loading…</td></tr></tbody>
+                </table>
+              </div>
             </div>
             <div class="abuse-detail-card" id="abuse-detail-card">
               <div id="abuse-detail-empty" class="muted" style="padding:24px">Select a case or create a new one.</div>
@@ -13292,16 +13348,19 @@ function renderDashboardHtml(): string {
                 <div class="abuse-grid">
                   <label class="field"><span class="label">Stage</span>
                     <select id="abuse-d-stage">
-                      <option value="intake">Intake</option>
-                      <option value="estimates">3 estimates</option>
+                      <option value="intake">Initial — awaiting documents</option>
+                      <option value="estimates">Awaiting estimates</option>
                       <option value="release_pending">Release letter (commander review)</option>
                       <option value="approved_work">Approved — work in progress</option>
                       <option value="closed">Closed</option>
                     </select>
                   </label>
                   <label class="field"><span class="label">Vehicle location</span>
-                    <input type="text" id="abuse-d-loc" placeholder="e.g. Bldg 123 bay 2" />
+                    <input type="text" id="abuse-d-loc" placeholder="e.g. Bldg 123 bay 2 — also writes yard check" />
                   </label>
+                  <p class="hint" style="grid-column:1/-1;margin:0;font-size:0.78rem">
+                    Saving location records a yard check as present for this asset (same as walker last-seen data) so the work order tab stays aligned.
+                  </p>
                   <label class="field" style="grid-column:1/-1"><span class="label">Determination (VFM/VMS)</span>
                     <input type="text" id="abuse-d-det" placeholder="Accident vs abuse, brief rationale" />
                   </label>
@@ -13365,11 +13424,15 @@ function renderDashboardHtml(): string {
                   <h4 style="margin:18px 0 8px;font-size:0.9rem">Attachments</h4>
                   <div id="abuse-atts-list" class="abuse-atts-list"></div>
                 </div>
-                <div class="abuse-charts">
-                  <h4 style="margin:18px 0 8px;font-size:0.9rem">Charts</h4>
-                  <canvas id="abuse-chart-stage" width="360" height="200" aria-label="Open cases by stage"></canvas>
-                </div>
               </div>
+            </div>
+            </div>
+          </div>
+          <div id="abuse-view-stats-wrap" class="hidden">
+            <div class="abuse-stats-full" id="abuse-stats-full"></div>
+            <div class="abuse-table-card" style="margin-top:12px">
+              <h3 style="margin:0 0 10px;font-size:0.95rem">Open cases by stage</h3>
+              <canvas id="abuse-chart-stage" width="520" height="220" aria-label="Open cases by stage"></canvas>
             </div>
           </div>
           <div class="abuse-new-card">
@@ -13955,19 +14018,28 @@ function renderDashboardHtml(): string {
 
     function readHashRoute() {
       const raw = (location.hash || "").replace(/^#/, "");
-      if (!raw) return { tab: "snapshot", dateKey: null, workOrderId: null };
+      if (!raw) return { tab: "snapshot", dateKey: null, workOrderId: null, abuseCaseId: null };
       if (raw.indexOf("wo=") === 0) {
         const id = decodeURIComponent(raw.slice(3).trim());
-        return { tab: "wo", dateKey: null, workOrderId: id || null };
+        return { tab: "wo", dateKey: null, workOrderId: id || null, abuseCaseId: null };
       }
-      if (raw === "authz") return { tab: "authz", dateKey: null, workOrderId: null };
+      if (raw === "authz") return { tab: "authz", dateKey: null, workOrderId: null, abuseCaseId: null };
+      if (raw.indexOf("abuse-case=") === 0) {
+        const cid = parseInt(decodeURIComponent(raw.slice("abuse-case=".length).trim()), 10);
+        return {
+          tab: "abuse-tracker",
+          dateKey: null,
+          workOrderId: null,
+          abuseCaseId: Number.isFinite(cid) ? cid : null,
+        };
+      }
       if (raw === "abuse-tracker" || raw === "aa-tracker") {
-        return { tab: "abuse-tracker", dateKey: null, workOrderId: null };
+        return { tab: "abuse-tracker", dateKey: null, workOrderId: null, abuseCaseId: null };
       }
       if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
-        return { tab: "snapshot", dateKey: raw, workOrderId: null };
+        return { tab: "snapshot", dateKey: raw, workOrderId: null, abuseCaseId: null };
       }
-      return { tab: "snapshot", dateKey: null, workOrderId: null };
+      return { tab: "snapshot", dateKey: null, workOrderId: null, abuseCaseId: null };
     }
 
     let historyEntries = [];
@@ -14006,6 +14078,15 @@ function renderDashboardHtml(): string {
       const t = (woId || "").trim();
       if (!t) { location.hash = ""; return; }
       location.hash = "#wo=" + encodeURIComponent(t);
+    }
+
+    function setHashAbuseCase(caseId) {
+      const n = parseInt(String(caseId || ""), 10);
+      if (!Number.isFinite(n) || n <= 0) {
+        location.hash = "#abuse-tracker";
+        return;
+      }
+      location.hash = "#abuse-case=" + encodeURIComponent(String(n));
     }
 
     async function loadHistory() {
@@ -16541,6 +16622,7 @@ function renderDashboardHtml(): string {
         empty.classList.remove("hidden");
         wrap.classList.add("hidden");
         empty.innerHTML = "No work order <strong>" + esc(data.workOrderId || "") + "</strong> in the index yet.";
+        loadWoAbuseStrip("");
         return;
       }
       const r = data.row;
@@ -16551,6 +16633,7 @@ function renderDashboardHtml(): string {
       st.className = "status";
       st.textContent = "";
       renderWoHero(r, data.asOfDateKey);
+      loadWoAbuseStrip(r.workOrderId);
       renderWoKpis(r, data.asOfDateKey);
       renderWoRemarks(r);
       renderWoFacts(r);
@@ -16654,6 +16737,11 @@ function renderDashboardHtml(): string {
       }
       if (r.tab === "abuse-tracker") {
         setMainTab("abuse-tracker");
+        if (r.abuseCaseId) {
+          setTimeout(function () {
+            if (typeof abuseSelectCase === "function") abuseSelectCase(r.abuseCaseId, false);
+          }, 80);
+        }
         return;
       }
       setMainTab("snapshot");
@@ -22828,8 +22916,25 @@ function renderDashboardHtml(): string {
       selectedId: null,
       detail: null,
       stats: null,
+      view: "cases",
       wired: false,
     };
+
+    function abuseSetView(which) {
+      abuseTrackerState.view = which === "stats" ? "stats" : "cases";
+      var bCases = document.getElementById("abuse-view-cases");
+      var bStats = document.getElementById("abuse-view-stats");
+      var wrapCases = document.getElementById("abuse-view-cases-wrap");
+      var wrapStats = document.getElementById("abuse-view-stats-wrap");
+      if (bCases) bCases.classList.toggle("active", abuseTrackerState.view === "cases");
+      if (bStats) bStats.classList.toggle("active", abuseTrackerState.view === "stats");
+      if (wrapCases) wrapCases.classList.toggle("hidden", abuseTrackerState.view !== "cases");
+      if (wrapStats) wrapStats.classList.toggle("hidden", abuseTrackerState.view !== "stats");
+      if (abuseTrackerState.view === "stats") {
+        abuseLoadStats();
+        setTimeout(function () { abuseDrawStageChart(); }, 50);
+      }
+    }
 
     function abusePostMultipart(url, fd, fillEl, lblEl, onOk, onErr) {
       var xhr = new XMLHttpRequest();
@@ -22872,8 +22977,8 @@ function renderDashboardHtml(): string {
     }
 
     function abuseStageLabel(s) {
-      if (s === "intake") return "Intake";
-      if (s === "estimates") return "3 estimates";
+      if (s === "intake") return "Initial — awaiting documents";
+      if (s === "estimates") return "Awaiting estimates";
       if (s === "release_pending") return "Release letter";
       if (s === "approved_work") return "Approved / work";
       if (s === "closed") return "Closed";
@@ -22916,21 +23021,20 @@ function renderDashboardHtml(): string {
       ctx.clearRect(0, 0, w, h);
       var st = abuseTrackerState.stats;
       var by = (st && st.byStage) || {};
-      var labels = ["intake", "estimates", "release_pending", "approved_work"];
-      var vals = labels.map(function (k) { return by[k] || 0; });
+      var keys = ["intake", "estimates", "release_pending", "approved_work"];
+      var shortLabs = ["Initial", "Estimates", "Release", "Work"];
+      var vals = keys.map(function (k) { return by[k] || 0; });
       var max = Math.max.apply(null, vals.concat([1]));
-      var pad = 28;
-      var bw = (w - pad * 2) / labels.length - 8;
-      ctx.fillStyle = "#5b6675";
+      var pad = 32;
+      var bw = (w - pad * 2) / keys.length - 10;
       ctx.font = "11px system-ui,sans-serif";
-      for (var i = 0; i < labels.length; i++) {
-        var x = pad + i * ((w - pad * 2) / labels.length) + 4;
-        var vh = (vals[i] / max) * (h - pad - 36);
+      for (var i = 0; i < keys.length; i++) {
+        var x = pad + i * ((w - pad * 2) / keys.length) + 5;
+        var vh = (vals[i] / max) * (h - pad - 40);
         ctx.fillStyle = "rgba(0,58,140,0.85)";
         ctx.fillRect(x, h - pad - vh, bw, vh);
         ctx.fillStyle = "#5b6675";
-        var lab = labels[i].replace("_", " ");
-        ctx.fillText(lab.slice(0, 10), x, h - 10);
+        ctx.fillText(shortLabs[i], x, h - 12);
         ctx.fillText(String(vals[i]), x, h - pad - vh - 6);
       }
     }
@@ -22940,59 +23044,61 @@ function renderDashboardHtml(): string {
         var r = await fetch("/api/abuse-tracker/stats", { cache: "no-store" });
         var j = await r.json();
         abuseTrackerState.stats = j;
-        var el = document.getElementById("abuse-stats");
-        if (!el) return;
-        var bs = j.byStage || {};
-        el.innerHTML =
-          "<span class='abuse-stat-pill'><b>" + (j.open || 0) + "</b> open cases</span>" +
-          "<span class='abuse-stat-pill'><b>" + (j.closed || 0) + "</b> closed total</span>" +
-          "<span class='abuse-stat-pill'>Intake <b>" + (bs.intake || 0) + "</b></span>" +
-          "<span class='abuse-stat-pill'>Estimates <b>" + (bs.estimates || 0) + "</b></span>" +
-          "<span class='abuse-stat-pill'>Release <b>" + (bs.release_pending || 0) + "</b></span>" +
-          "<span class='abuse-stat-pill'>Work <b>" + (bs.approved_work || 0) + "</b></span>";
+        var elFull = document.getElementById("abuse-stats-full");
+        if (elFull) {
+          var bs = j.byStage || {};
+          elFull.innerHTML =
+            "<span class='abuse-stat-pill'><b>" + (j.open || 0) + "</b> open cases</span>" +
+            "<span class='abuse-stat-pill'>Initial <b>" + (bs.intake || 0) + "</b></span>" +
+            "<span class='abuse-stat-pill'>Awaiting estimates <b>" + (bs.estimates || 0) + "</b></span>" +
+            "<span class='abuse-stat-pill'>Release <b>" + (bs.release_pending || 0) + "</b></span>" +
+            "<span class='abuse-stat-pill'>Approved / work <b>" + (bs.approved_work || 0) + "</b></span>";
+        }
         abuseDrawStageChart();
       } catch (e) {
-        var el2 = document.getElementById("abuse-stats");
+        var el2 = document.getElementById("abuse-stats-full");
         if (el2) el2.textContent = "Could not load stats.";
       }
     }
 
     async function abuseLoadList() {
       var openOnly = document.getElementById("abuse-open-only");
-      var q = openOnly && openOnly.checked ? "?open=1" : "";
-      var list = document.getElementById("abuse-list");
-      if (list) list.innerHTML = "Loading…";
+      var q = openOnly && openOnly.checked ? "?open=1&limit=3000" : "?limit=3000";
+      var tbody = document.getElementById("abuse-list-tbody");
+      if (tbody) tbody.innerHTML = "<tr><td colspan='7' class='muted' style='padding:12px'>Loading…</td></tr>";
       try {
         var r = await fetch("/api/abuse-tracker" + q, { cache: "no-store" });
         var j = await r.json();
         abuseTrackerState.cases = j.cases || [];
-        if (!list) return;
+        if (!tbody) return;
         if (!abuseTrackerState.cases.length) {
-          list.innerHTML = "<div class='muted' style='padding:12px'>No cases yet.</div>";
+          tbody.innerHTML = "<tr><td colspan='7' class='muted' style='padding:12px'>No cases yet.</td></tr>";
           return;
         }
-        list.innerHTML = abuseTrackerState.cases.map(function (c) {
-          var closed = !!c.closed_at_iso;
+        tbody.innerHTML = abuseTrackerState.cases.map(function (c) {
           var wo = (c.work_order_id || "").trim();
-          var sub = (c.make_model || "—") +
-            (wo ? " · WO " + wo : "") +
-            " · " + abuseStageLabel(c.stage) + (closed ? " · CLOSED" : "");
-          var active = c.id === abuseTrackerState.selectedId ? " active" : "";
+          var loc = (c.vehicle_location || "").trim();
+          var active = c.id === abuseTrackerState.selectedId ? " class='active'" : "";
           return (
-            "<button type='button' class='abuse-row" + active + "' data-abuse-id='" + esc(String(c.id)) + "'>" +
-              "<div class='r1'>" + esc(c.control_number) + " · " + esc(c.asset_id) + " · " + esc(c.case_type) + "</div>" +
-              "<div class='r2'>" + esc(sub) + "</div>" +
-            "</button>"
+            "<tr" + active + " data-abuse-id='" + esc(String(c.id)) + "'>" +
+              "<td class='cn'>" + esc(c.control_number) + "</td>" +
+              "<td>" + esc(c.case_type) + "</td>" +
+              "<td>" + esc(c.asset_id) + "</td>" +
+              "<td>" + esc(wo || "—") + "</td>" +
+              "<td>" + esc(abuseStageLabel(c.stage)) + "</td>" +
+              "<td class='muted-cell'>" + esc(loc || "—") + "</td>" +
+              "<td class='muted-cell'>" + esc((c.updated_at_iso || "").slice(0, 10)) + "</td>" +
+            "</tr>"
           );
         }).join("");
-        list.querySelectorAll("[data-abuse-id]").forEach(function (btn) {
-          btn.addEventListener("click", function () {
-            var id = parseInt(btn.getAttribute("data-abuse-id"), 10);
-            if (Number.isFinite(id)) abuseSelectCase(id);
+        tbody.querySelectorAll("tr[data-abuse-id]").forEach(function (row) {
+          row.addEventListener("click", function () {
+            var id = parseInt(row.getAttribute("data-abuse-id"), 10);
+            if (Number.isFinite(id)) abuseSelectCase(id, true);
           });
         });
       } catch (e) {
-        if (list) list.innerHTML = "<div class='problem-empty'>Could not load cases.</div>";
+        if (tbody) tbody.innerHTML = "<tr><td colspan='7' class='problem-empty' style='padding:12px'>Could not load cases.</td></tr>";
       }
     }
 
@@ -23039,10 +23145,11 @@ function renderDashboardHtml(): string {
       return out;
     }
 
-    async function abuseSelectCase(id) {
+    async function abuseSelectCase(id, pushHash) {
       abuseTrackerState.selectedId = id;
-      document.querySelectorAll(".abuse-row").forEach(function (b) {
-        b.classList.toggle("active", parseInt(b.getAttribute("data-abuse-id"), 10) === id);
+      if (pushHash !== false) setHashAbuseCase(id);
+      document.querySelectorAll("#abuse-list-tbody tr[data-abuse-id]").forEach(function (row) {
+        row.classList.toggle("active", parseInt(row.getAttribute("data-abuse-id"), 10) === id);
       });
       var empty = document.getElementById("abuse-detail-empty");
       var det = document.getElementById("abuse-detail");
@@ -23100,6 +23207,47 @@ function renderDashboardHtml(): string {
       }
     }
 
+    async function loadWoAbuseStrip(woId) {
+      var strip = document.getElementById("wo-abuse-strip");
+      if (!strip) return;
+      var wid = (woId || "").trim();
+      if (!wid) {
+        strip.classList.add("hidden");
+        strip.innerHTML = "";
+        return;
+      }
+      try {
+        var r = await fetch("/api/abuse-tracker/by-work-order/" + encodeURIComponent(wid), { cache: "no-store" });
+        var j = await r.json();
+        var cases = (j && j.cases) || [];
+        if (!cases.length) {
+          strip.classList.add("hidden");
+          strip.innerHTML = "";
+          return;
+        }
+        strip.classList.remove("hidden");
+        var btns = cases.map(function (c) {
+          var lab = esc(c.control_number) + " · " + esc(c.case_type);
+          var cls = "wo-abuse-btn" + (c.case_type === "abuse" ? " abuse" : "");
+          return (
+            "<button type='button' class='" + cls + "' data-abuse-open-id='" + esc(String(c.id)) + "'>" + lab + "</button>"
+          );
+        }).join("");
+        strip.innerHTML = "<span class='lbl'>A/A case</span>" + btns;
+        strip.querySelectorAll("[data-abuse-open-id]").forEach(function (btn) {
+          btn.addEventListener("click", function () {
+            var cid = parseInt(btn.getAttribute("data-abuse-open-id"), 10);
+            if (!Number.isFinite(cid)) return;
+            setMainTab("abuse-tracker");
+            abuseSelectCase(cid, true);
+          });
+        });
+      } catch (e) {
+        strip.classList.add("hidden");
+        strip.innerHTML = "";
+      }
+    }
+
     async function abuseSaveCase() {
       var id = abuseTrackerState.selectedId;
       if (!id) return;
@@ -23121,15 +23269,20 @@ function renderDashboardHtml(): string {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
         });
+        var saved = await r.json().catch(function () { return {}; });
         if (!r.ok) {
-          var ej = await r.json().catch(function () { return {}; });
-          throw new Error(ej.error || "Save failed");
+          throw new Error(saved.error || "Save failed");
         }
         st.textContent = "Saved.";
         setTimeout(function () { if (st.textContent === "Saved.") st.textContent = ""; }, 1500);
         await abuseLoadList();
-        await abuseLoadStats();
-        await abuseSelectCase(id);
+        if (abuseTrackerState.view === "stats") await abuseLoadStats();
+        await abuseSelectCase(id, false);
+        var woAfter = (saved.case && saved.case.work_order_id) ? String(saved.case.work_order_id).trim() : "";
+        if (woAfter && selectedWoId === woAfter) {
+          await loadWoAbuseStrip(woAfter);
+          await loadSightings();
+        }
       } catch (e) {
         st.textContent = e.message || "Save failed";
       }
@@ -23151,7 +23304,7 @@ function renderDashboardHtml(): string {
         document.getElementById("abuse-detail").classList.add("hidden");
         document.getElementById("abuse-detail-empty").classList.remove("hidden");
         await abuseLoadList();
-        await abuseLoadStats();
+        if (abuseTrackerState.view === "stats") await abuseLoadStats();
       } catch (e) {
         st.textContent = e.message || "Could not close";
       }
@@ -23169,7 +23322,7 @@ function renderDashboardHtml(): string {
       });
       if (!r.ok) return;
       document.getElementById("abuse-note-body").value = "";
-      await abuseSelectCase(id);
+      await abuseSelectCase(id, false);
     }
 
     async function abuseCreateCase() {
@@ -23198,8 +23351,10 @@ function renderDashboardHtml(): string {
         var nwo = document.getElementById("abuse-new-wo");
         if (nwo) nwo.value = "";
         await abuseLoadList();
-        await abuseLoadStats();
-        await abuseSelectCase(j.case.id);
+        if (abuseTrackerState.view === "stats") await abuseLoadStats();
+        await abuseSelectCase(j.case.id, true);
+        var woNew = (j.case && j.case.work_order_id) ? String(j.case.work_order_id).trim() : "";
+        if (woNew && selectedWoId === woNew) await loadWoAbuseStrip(woNew);
       } catch (e) {
         msg.textContent = e.message || "Could not create";
       }
@@ -23210,8 +23365,9 @@ function renderDashboardHtml(): string {
     }
 
     function onEnterAbuseTrackerTab() {
-      abuseLoadStats();
+      abuseSetView(abuseTrackerState.view || "cases");
       abuseLoadList();
+      if (abuseTrackerState.view === "stats") abuseLoadStats();
     }
 
     function wireAbuseTrackerEvents() {
@@ -23245,7 +23401,17 @@ function renderDashboardHtml(): string {
         });
       }
       var rf = document.getElementById("abuse-refresh");
-      if (rf) rf.addEventListener("click", function () { abuseLoadStats(); abuseLoadList(); if (abuseTrackerState.selectedId) abuseSelectCase(abuseTrackerState.selectedId); });
+      if (rf) {
+        rf.addEventListener("click", function () {
+          if (abuseTrackerState.view === "stats") abuseLoadStats();
+          abuseLoadList();
+          if (abuseTrackerState.selectedId) abuseSelectCase(abuseTrackerState.selectedId, false);
+        });
+      }
+      var bCasesV = document.getElementById("abuse-view-cases");
+      var bStatsV = document.getElementById("abuse-view-stats");
+      if (bCasesV) bCasesV.addEventListener("click", function () { abuseSetView("cases"); });
+      if (bStatsV) bStatsV.addEventListener("click", function () { abuseSetView("stats"); });
       var oo = document.getElementById("abuse-open-only");
       if (oo) oo.addEventListener("change", abuseLoadList);
       var ex = document.getElementById("abuse-export-csv");
@@ -23286,7 +23452,7 @@ function renderDashboardHtml(): string {
           var lbl = document.getElementById("abuse-up-lbl");
           abusePostMultipart("/api/abuse-tracker/" + id + "/attachments", fd, fill, lbl, function () {
             document.getElementById("abuse-up-file").value = "";
-            abuseSelectCase(id);
+            abuseSelectCase(id, false);
           }, function (err) {
             document.getElementById("abuse-case-status").textContent = err.message || "Upload failed";
           });

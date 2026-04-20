@@ -4,6 +4,8 @@
  * R2 keys: abuse-tracker/<caseId>/<uuid>-<safeName>
  */
 
+import { recordCheck } from "./yardSession";
+
 type Env = { ETIC_SNAPSHOTS: D1Database; ETIC_BUCKET: R2Bucket };
 
 export const ABUSE_TRACKER_R2_PREFIX = "abuse-tracker/";
@@ -150,6 +152,19 @@ async function hydrateFleetFields(env: Env, assetId: string): Promise<FleetSnaps
   };
 }
 
+/** Latest open WO row for an asset (for linking A/A cases to the active work order). */
+export async function resolveLatestWorkOrderIdForAsset(env: Env, assetId: string): Promise<string | null> {
+  const aid = assetId.trim();
+  if (!aid) return null;
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT work_order_id FROM work_order_state WHERE asset_id = ? ORDER BY datetime(updated_at_iso) DESC LIMIT 1`,
+  )
+    .bind(aid)
+    .first<{ work_order_id: string }>();
+  const wid = (r?.work_order_id ?? "").trim();
+  return wid || null;
+}
+
 async function hydrateFromWorkOrderId(
   env: Env,
   workOrderId: string,
@@ -243,6 +258,14 @@ export async function createAbuseCase(env: Env, input: CreateAbuseCaseInput): Pr
     .run();
   const id = Number(ins.meta.last_row_id ?? 0);
   if (!id) throw new Error("failed to create case");
+  if (!woTrim) {
+    const linked = await resolveLatestWorkOrderIdForAsset(env, assetId);
+    if (linked) {
+      await env.ETIC_SNAPSHOTS.prepare(`UPDATE abuse_tracker_case SET work_order_id = ?, updated_at_iso = ? WHERE id = ?`)
+        .bind(linked, now, id)
+        .run();
+    }
+  }
   const row = await env.ETIC_SNAPSHOTS.prepare(`SELECT * FROM abuse_tracker_case WHERE id = ?`)
     .bind(id)
     .first<AbuseCaseRow>();
@@ -289,11 +312,21 @@ export async function updateAbuseCase(
   const stage = patch.stage !== undefined ? patch.stage : cur.stage;
   const vehicleLocation =
     patch.vehicleLocation !== undefined ? patch.vehicleLocation.trim() : cur.vehicle_location;
-  const workOrderId =
+  let workOrderId =
     patch.workOrderId !== undefined ? patch.workOrderId.trim() : cur.work_order_id ?? "";
   let closedAt = cur.closed_at_iso;
   if (patch.closed === true) closedAt = now;
   if (patch.closed === false) closedAt = null;
+
+  if (!workOrderId && !closedAt) {
+    const linked = await resolveLatestWorkOrderIdForAsset(env, cur.asset_id);
+    if (linked) workOrderId = linked;
+  }
+
+  const locChanged =
+    patch.vehicleLocation !== undefined &&
+    patch.vehicleLocation.trim() !== (cur.vehicle_location ?? "").trim();
+  const newLoc = patch.vehicleLocation !== undefined ? patch.vehicleLocation.trim() : cur.vehicle_location;
 
   await env.ETIC_SNAPSHOTS.prepare(
     `UPDATE abuse_tracker_case SET
@@ -317,6 +350,28 @@ export async function updateAbuseCase(
       caseId,
     )
     .run();
+
+  if (locChanged && newLoc.trim() && !closedAt) {
+    try {
+      await recordCheck(env, {
+        assetId: cur.asset_id,
+        location: newLoc.trim(),
+        discrepancies: "A/A tracker (manager location update)",
+        status: "present",
+        checkedBy: "A/A program",
+      });
+    } catch (e) {
+      console.warn(
+        JSON.stringify({
+          level: "warn",
+          message: "abuse case vehicle_location yard_check sync failed",
+          caseId,
+          assetId: cur.asset_id,
+          err: e instanceof Error ? e.message : String(e),
+        }),
+      );
+    }
+  }
 
   return env.ETIC_SNAPSHOTS.prepare(`SELECT * FROM abuse_tracker_case WHERE id = ?`).bind(caseId).first<AbuseCaseRow>();
 }
@@ -381,14 +436,10 @@ export async function addAbuseAttachment(
 
 export async function getAbuseTrackerStats(env: Env): Promise<{
   open: number;
-  closed: number;
   byStage: Record<string, number>;
 }> {
   const openR = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT COUNT(*) AS c FROM abuse_tracker_case WHERE closed_at_iso IS NULL`,
-  ).first<{ c: number }>();
-  const closedR = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT COUNT(*) AS c FROM abuse_tracker_case WHERE closed_at_iso IS NOT NULL`,
   ).first<{ c: number }>();
   const stages = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT stage, COUNT(*) AS c FROM abuse_tracker_case WHERE closed_at_iso IS NULL GROUP BY stage`,
@@ -397,16 +448,26 @@ export async function getAbuseTrackerStats(env: Env): Promise<{
   for (const s of stages.results ?? []) byStage[s.stage] = s.c ?? 0;
   return {
     open: openR?.c ?? 0,
-    closed: closedR?.c ?? 0,
     byStage,
   };
+}
+
+export async function listOpenAbuseCasesForWorkOrder(env: Env, workOrderId: string): Promise<AbuseCaseRow[]> {
+  const wid = workOrderId.trim();
+  if (!wid) return [];
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT * FROM abuse_tracker_case WHERE closed_at_iso IS NULL AND work_order_id = ? ORDER BY datetime(updated_at_iso) DESC`,
+  )
+    .bind(wid)
+    .all<AbuseCaseRow>();
+  return r.results ?? [];
 }
 
 export async function listAbuseCases(
   env: Env,
   opts: { openOnly?: boolean; limit?: number },
 ): Promise<AbuseCaseRow[]> {
-  const limit = Math.min(500, Math.max(1, opts.limit ?? 200));
+  const limit = Math.min(5000, Math.max(1, opts.limit ?? 1000));
   let sql = `SELECT * FROM abuse_tracker_case`;
   const binds: unknown[] = [];
   if (opts.openOnly) {
