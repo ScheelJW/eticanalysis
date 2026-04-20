@@ -230,44 +230,84 @@ export default {
       },
     });
 
-    const analysis = await analyzeWorkbook({
-      binary: workbookBytes,
-      fileName: safeName,
-      receivedAtIso: now.toISOString(),
+    const ingestContext = {
       dateKey,
+      workbookKey,
+      analysisKey,
+      safeName,
       from: message.from,
       to: message.to,
       subject,
-    });
+    };
 
-    await env.ETIC_BUCKET.put(analysisKey, JSON.stringify(analysis, null, 2), {
-      httpMetadata: { contentType: "application/json; charset=utf-8" },
-    });
+    try {
+      const analysis = await analyzeWorkbook({
+        binary: workbookBytes,
+        fileName: safeName,
+        receivedAtIso: now.toISOString(),
+        dateKey,
+        from: message.from,
+        to: message.to,
+        subject,
+      });
 
-    await upsertSnapshotRow(env, analysis, workbookKey);
-
-    const rawWos = await extractRawWorkOrdersFromBinary(workbookBytes);
-    await ingestWorkOrderSnapshot(env, dateKey, rawWos, now.toISOString());
-
-    const melRows = await extractMelRowsFromBinary(workbookBytes);
-    await ingestMelSnapshot(env, dateKey, melRows, now.toISOString());
-
-    const history = await loadHistory(env);
-    const upsertedHistory = upsertHistoryEntry(history, analysis, workbookKey, analysisKey);
-    await env.ETIC_BUCKET.put(
-      "history/index.json",
-      JSON.stringify(upsertedHistory, null, 2),
-      {
+      await env.ETIC_BUCKET.put(analysisKey, JSON.stringify(analysis, null, 2), {
         httpMetadata: { contentType: "application/json; charset=utf-8" },
-      },
-    );
-    await env.ETIC_BUCKET.put(
-      "analyses/latest.json",
-      JSON.stringify(analysis, null, 2),
-      {
-        httpMetadata: { contentType: "application/json; charset=utf-8" },
-      },
-    );
+      });
+
+      await upsertSnapshotRow(env, analysis, workbookKey);
+
+      const rawWos = await extractRawWorkOrdersFromBinary(workbookBytes);
+      await ingestWorkOrderSnapshot(env, dateKey, rawWos, now.toISOString());
+
+      const melRows = await extractMelRowsFromBinary(workbookBytes);
+      await ingestMelSnapshot(env, dateKey, melRows, now.toISOString());
+
+      const history = await loadHistory(env);
+      const upsertedHistory = upsertHistoryEntry(history, analysis, workbookKey, analysisKey);
+      await env.ETIC_BUCKET.put(
+        "history/index.json",
+        JSON.stringify(upsertedHistory, null, 2),
+        {
+          httpMetadata: { contentType: "application/json; charset=utf-8" },
+        },
+      );
+      await env.ETIC_BUCKET.put(
+        "analyses/latest.json",
+        JSON.stringify(analysis, null, 2),
+        {
+          httpMetadata: { contentType: "application/json; charset=utf-8" },
+        },
+      );
+    } catch (err) {
+      const messageText = err instanceof Error ? err.message : String(err);
+      const stack = err instanceof Error ? err.stack : undefined;
+      const failedAtIso = new Date().toISOString();
+      const record = {
+        ...ingestContext,
+        failedAtIso,
+        error: messageText,
+        stack,
+      };
+      const stamp = failedAtIso.replace(/[:.]/g, "-");
+      try {
+        await env.ETIC_BUCKET.put(`ingest-errors/${dateKey}_${stamp}.json`, JSON.stringify(record, null, 2), {
+          httpMetadata: { contentType: "application/json; charset=utf-8" },
+        });
+        await env.ETIC_BUCKET.put("ingest-errors/latest.json", JSON.stringify(record, null, 2), {
+          httpMetadata: { contentType: "application/json; charset=utf-8" },
+        });
+      } catch (_persistErr) {
+        /* best-effort — still log below */
+      }
+      console.error(
+        JSON.stringify({
+          level: "error",
+          message: "email ingest failed after workbook was stored (see R2 ingest-errors/)",
+          ...record,
+        }),
+      );
+    }
   },
 
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
