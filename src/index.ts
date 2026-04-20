@@ -102,6 +102,23 @@ import {
   upsertMelConfig,
   upsertMelSubdivision,
 } from "./melWatch";
+import {
+  addAbuseAttachment,
+  addAbuseNote,
+  createAbuseCase,
+  findCaseByEmailToken,
+  getAbuseAttachmentMeta,
+  getAbuseCaseDetail,
+  getAbuseTrackerStats,
+  ingestAbuseDamEmailFiles,
+  listAbuseCases,
+  parseAbuseDamTokenFromEmailTo,
+  updateAbuseCase,
+  abuseDamEmailLocalPart,
+  type AbuseAttachmentKind,
+  type AbuseCaseStage,
+  type AbuseCaseType,
+} from "./abuseTracker";
 
 const DEFAULT_MAX_ATTACHMENT_BYTES = 30 * 1024 * 1024;
 const SITE_TITLE = "Minot AFB Vehicle Management";
@@ -191,6 +208,37 @@ export default {
     }
 
     const parsed = await PostalMime.parse(message.raw, { attachmentEncoding: "arraybuffer" });
+    const damToken = parseAbuseDamTokenFromEmailTo(message.to || "");
+    if (damToken) {
+      const caseRow = await findCaseByEmailToken(env, damToken);
+      if (!caseRow) {
+        console.warn(
+          JSON.stringify({
+            level: "warn",
+            message: "abuse-dam email: unknown token",
+            to: message.to,
+            from: message.from,
+          }),
+        );
+        return;
+      }
+      const atts = (parsed.attachments || []).map((a) => ({
+        filename: a.filename ?? undefined,
+        mimeType: a.mimeType,
+        content: normalizeAttachmentBinary(a.content),
+      }));
+      const n = await ingestAbuseDamEmailFiles(env, caseRow, atts, message.from);
+      if (n > 0) {
+        await addAbuseNote(
+          env,
+          caseRow.id,
+          "Email ingest: " + n + " file(s) attached from " + (message.from || "unknown"),
+          "system-email",
+        );
+      }
+      return;
+    }
+
     const workbookAttachment = pickWorkbookAttachment(parsed.attachments, env.EXPECTED_ATTACHMENT_NAME);
     if (!workbookAttachment) {
       console.warn(
@@ -522,6 +570,33 @@ export default {
         return handleWaiverActionApi(env, request, id, "delete");
       }
       return handleWaiverDetailApi(env, id);
+    }
+
+    if (url.pathname === "/api/abuse-tracker/stats") {
+      return handleAbuseTrackerStatsApi(env, request);
+    }
+    if (url.pathname === "/api/abuse-tracker") {
+      return handleAbuseTrackerListApi(env, request);
+    }
+    const abuseAttMatch = url.pathname.match(/^\/api\/abuse-tracker\/attachments\/(\d+)$/);
+    if (abuseAttMatch) {
+      const aid = Number.parseInt(abuseAttMatch[1] ?? "", 10);
+      if (!Number.isFinite(aid)) return new Response("Invalid attachment id", { status: 400 });
+      return handleAbuseTrackerAttachmentApi(env, request, aid);
+    }
+    const abuseCaseUploadMatch = url.pathname.match(/^\/api\/abuse-tracker\/(\d+)\/attachments$/);
+    if (abuseCaseUploadMatch) {
+      const cid = Number.parseInt(abuseCaseUploadMatch[1] ?? "", 10);
+      if (!Number.isFinite(cid)) return new Response("Invalid case id", { status: 400 });
+      return handleAbuseTrackerAttachmentUploadApi(env, request, cid);
+    }
+    const abuseCaseMatch = url.pathname.match(/^\/api\/abuse-tracker\/(\d+)(?:\/(notes))?$/);
+    if (abuseCaseMatch) {
+      const cid = Number.parseInt(abuseCaseMatch[1] ?? "", 10);
+      const sub = abuseCaseMatch[2] ?? "";
+      if (!Number.isFinite(cid)) return new Response("Invalid case id", { status: 400 });
+      if (sub === "notes") return handleAbuseTrackerNoteApi(env, request, cid);
+      return handleAbuseTrackerCaseApi(env, request, cid);
     }
 
     if (url.pathname === "/api/meetings") {
@@ -3577,6 +3652,265 @@ async function handleWaiverDetailApi(env: Env, id: number): Promise<Response> {
   ]);
   if (!waiver) return new Response("Not Found", { status: 404 });
   return Response.json({ waiver, verifications }, { headers: cacheHeaders() });
+}
+
+/* -------------------- Accident / abuse tracker -------------------- */
+
+function isAbuseCaseType(s: unknown): s is AbuseCaseType {
+  return s === "accident" || s === "abuse";
+}
+function isAbuseCaseStage(s: unknown): s is AbuseCaseStage {
+  return s === "intake" || s === "estimates" || s === "release_pending" || s === "approved_work" || s === "closed";
+}
+function isAbuseAttachmentKind(s: unknown): s is AbuseAttachmentKind {
+  return s === "damage_photo" || s === "release_letter" || s === "estimate" || s === "other";
+}
+
+async function handleAbuseTrackerStatsApi(env: Env, request: Request): Promise<Response> {
+  if (request.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
+  const s = await getAbuseTrackerStats(env);
+  return Response.json(s, { headers: cacheHeaders() });
+}
+
+async function handleAbuseTrackerListApi(env: Env, request: Request): Promise<Response> {
+  if (request.method === "GET") {
+    const url = new URL(request.url);
+    if (url.searchParams.get("format") === "csv") {
+      const rows = await listAbuseCases(env, { openOnly: false, limit: 5000 });
+      const escCsv = (v: string) => '"' + String(v ?? "").replace(/"/g, '""') + '"';
+      const header = [
+        "control_number",
+        "case_type",
+        "asset_id",
+        "owning_unit",
+        "shop",
+        "make_model",
+        "stage",
+        "determination",
+        "responsible_party",
+        "reimbursed_to_vm",
+        "reimbursed_at_iso",
+        "vehicle_location",
+        "created_at_iso",
+        "closed_at_iso",
+        "email_ingest_address",
+      ].join(",");
+      const host = url.host || "your-domain";
+      const lines = rows.map((r) =>
+        [
+          escCsv(r.control_number),
+          escCsv(r.case_type),
+          escCsv(r.asset_id),
+          escCsv(r.owning_unit),
+          escCsv(r.shop),
+          escCsv(r.make_model),
+          escCsv(r.stage),
+          escCsv(r.determination),
+          escCsv(r.responsible_party),
+          r.reimbursed_to_vm ? "1" : "0",
+          escCsv(r.reimbursed_at_iso ?? ""),
+          escCsv(r.vehicle_location),
+          escCsv(r.created_at_iso),
+          escCsv(r.closed_at_iso ?? ""),
+          escCsv(`${abuseDamEmailLocalPart(r.email_token)}@${host}`),
+        ].join(","),
+      );
+      const csv = [header, ...lines].join("\n");
+      return new Response(csv, {
+        headers: {
+          "Content-Type": "text/csv; charset=utf-8",
+          "Content-Disposition": 'attachment; filename="abuse-tracker-export.csv"',
+          "Cache-Control": "no-store",
+        },
+      });
+    }
+    const openOnly = url.searchParams.get("open") === "1" || url.searchParams.get("open") === "true";
+    const limit = Number.parseInt(url.searchParams.get("limit") ?? "200", 10) || 200;
+    const rows = await listAbuseCases(env, { openOnly, limit });
+    return Response.json({ cases: rows }, { headers: cacheHeaders() });
+  }
+  if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+  const body = await readJsonBody<{
+    caseType?: unknown;
+    assetId?: unknown;
+    determination?: unknown;
+    responsibleParty?: unknown;
+    vehicleLocation?: unknown;
+    createdBy?: unknown;
+  }>(request);
+  if (!body || !isAbuseCaseType(body.caseType)) {
+    return Response.json({ error: "caseType must be accident or abuse" }, { status: 400, headers: cacheHeaders() });
+  }
+  const assetId = String(body.assetId ?? "").trim();
+  if (!assetId) return Response.json({ error: "assetId required" }, { status: 400, headers: cacheHeaders() });
+  const createdBy = String(body.createdBy ?? "").trim();
+  if (!createdBy) return Response.json({ error: "createdBy (your name) required" }, { status: 400, headers: cacheHeaders() });
+  try {
+    const c = await createAbuseCase(env, {
+      caseType: body.caseType,
+      assetId,
+      determination: String(body.determination ?? ""),
+      responsibleParty: String(body.responsibleParty ?? ""),
+      vehicleLocation: String(body.vehicleLocation ?? ""),
+      createdBy,
+    });
+    const url = new URL(request.url);
+    const host = url.host || "";
+    const ingestEmail = host ? `${abuseDamEmailLocalPart(c.email_token)}@${host}` : "";
+    return Response.json({ case: c, ingestEmail }, { headers: cacheHeaders() });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return Response.json({ error: msg }, { status: 400, headers: cacheHeaders() });
+  }
+}
+
+async function handleAbuseTrackerCaseApi(env: Env, request: Request, caseId: number): Promise<Response> {
+  if (request.method === "GET") {
+    const d = await getAbuseCaseDetail(env, caseId);
+    if (!d) return new Response("Not Found", { status: 404 });
+    let estimates: unknown[] = [];
+    try {
+      estimates = JSON.parse(d.case.estimates_json || "[]");
+      if (!Array.isArray(estimates)) estimates = [];
+    } catch {
+      estimates = [];
+    }
+    const url = new URL(request.url);
+    const host = url.host || "";
+    const ingestEmail = host ? `${abuseDamEmailLocalPart(d.case.email_token)}@${host}` : "";
+    return Response.json({ ...d, estimates, ingestEmail }, { headers: cacheHeaders() });
+  }
+  if (request.method !== "PATCH") return new Response("Method Not Allowed", { status: 405 });
+  const body = await readJsonBody<{
+    determination?: unknown;
+    responsibleParty?: unknown;
+    reimbursedToVm?: unknown;
+    reimbursedAtIso?: unknown;
+    reimbursedNote?: unknown;
+    stage?: unknown;
+    vehicleLocation?: unknown;
+    estimates?: unknown;
+    closed?: unknown;
+  }>(request);
+  if (!body) return Response.json({ error: "JSON body required" }, { status: 400, headers: cacheHeaders() });
+  const patch: Parameters<typeof updateAbuseCase>[2] = {};
+  if (body.determination !== undefined) patch.determination = String(body.determination);
+  if (body.responsibleParty !== undefined) patch.responsibleParty = String(body.responsibleParty);
+  if (body.reimbursedToVm !== undefined) patch.reimbursedToVm = !!body.reimbursedToVm;
+  if (body.reimbursedAtIso !== undefined) {
+    const v = body.reimbursedAtIso;
+    patch.reimbursedAtIso = v === null || v === "" ? null : String(v);
+  }
+  if (body.reimbursedNote !== undefined) patch.reimbursedNote = String(body.reimbursedNote);
+  if (body.stage !== undefined) {
+    if (!isAbuseCaseStage(body.stage)) {
+      return Response.json({ error: "invalid stage" }, { status: 400, headers: cacheHeaders() });
+    }
+    patch.stage = body.stage;
+  }
+  if (body.vehicleLocation !== undefined) patch.vehicleLocation = String(body.vehicleLocation);
+  if (body.estimates !== undefined) {
+    if (!Array.isArray(body.estimates)) {
+      return Response.json({ error: "estimates must be an array" }, { status: 400, headers: cacheHeaders() });
+    }
+    patch.estimates = body.estimates.map((row: unknown) => {
+      const o = row && typeof row === "object" ? (row as Record<string, unknown>) : {};
+      const amt = o.amount;
+      let amount: number | null = null;
+      if (typeof amt === "number" && Number.isFinite(amt)) amount = amt;
+      else if (amt !== null && amt !== undefined && amt !== "") {
+        const n = Number(amt);
+        if (Number.isFinite(n)) amount = n;
+      }
+      return {
+        vendor: String(o.vendor ?? "").trim(),
+        amount,
+        note: String(o.note ?? "").trim(),
+      };
+    });
+  }
+  if (body.closed !== undefined) patch.closed = !!body.closed;
+  const updated = await updateAbuseCase(env, caseId, patch);
+  if (!updated) return new Response("Not Found", { status: 404 });
+  return Response.json({ case: updated }, { headers: cacheHeaders() });
+}
+
+async function handleAbuseTrackerNoteApi(env: Env, request: Request, caseId: number): Promise<Response> {
+  if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+  const body = await readJsonBody<{ body?: unknown; author?: unknown }>(request);
+  const text = String(body?.body ?? "").trim();
+  const author = String(body?.author ?? "").trim();
+  if (!text) return Response.json({ error: "body required" }, { status: 400, headers: cacheHeaders() });
+  if (!author) return Response.json({ error: "author required" }, { status: 400, headers: cacheHeaders() });
+  const note = await addAbuseNote(env, caseId, text, author);
+  if (!note) return new Response("Not Found", { status: 404 });
+  return Response.json({ note }, { headers: cacheHeaders() });
+}
+
+async function handleAbuseTrackerAttachmentUploadApi(env: Env, request: Request, caseId: number): Promise<Response> {
+  if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+  const ct = request.headers.get("content-type") || "";
+  if (!ct.startsWith("multipart/form-data")) {
+    return Response.json({ error: "expected multipart/form-data" }, { status: 415, headers: cacheHeaders() });
+  }
+  let form: FormData;
+  try {
+    form = await request.formData();
+  } catch (e) {
+    return Response.json(
+      { error: "could not parse form: " + (e instanceof Error ? e.message : String(e)) },
+      { status: 400, headers: cacheHeaders() },
+    );
+  }
+  const file = form.get("file");
+  if (!(file instanceof File) || file.size <= 0) {
+    return Response.json({ error: "file field required" }, { status: 400, headers: cacheHeaders() });
+  }
+  const MAX_BYTES = 25 * 1024 * 1024;
+  if (file.size > MAX_BYTES) {
+    return Response.json({ error: "file too large (max 25MB)" }, { status: 413, headers: cacheHeaders() });
+  }
+  const kindRaw = String(form.get("kind") ?? "other");
+  if (!isAbuseAttachmentKind(kindRaw)) {
+    return Response.json({ error: "invalid kind" }, { status: 400, headers: cacheHeaders() });
+  }
+  const uploadedBy = String(form.get("uploadedBy") ?? "").trim();
+  if (!uploadedBy) {
+    return Response.json({ error: "uploadedBy (your name) required" }, { status: 400, headers: cacheHeaders() });
+  }
+  const c = await getAbuseCaseDetail(env, caseId);
+  if (!c) return new Response("Not Found", { status: 404 });
+  const buf = await file.arrayBuffer();
+  try {
+    const att = await addAbuseAttachment(env, {
+      caseId,
+      kind: kindRaw,
+      body: buf,
+      filename: file.name || "upload",
+      contentType: file.type || "application/octet-stream",
+      uploadedBy,
+      source: "web",
+    });
+    return Response.json({ attachment: att }, { headers: cacheHeaders() });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return Response.json({ error: msg }, { status: 400, headers: cacheHeaders() });
+  }
+}
+
+async function handleAbuseTrackerAttachmentApi(env: Env, request: Request, attachmentId: number): Promise<Response> {
+  if (request.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
+  const meta = await getAbuseAttachmentMeta(env, attachmentId);
+  if (!meta) return new Response("Not Found", { status: 404 });
+  const obj = await env.ETIC_BUCKET.get(meta.r2_key);
+  if (!obj || !obj.body) return new Response("Not Found", { status: 404 });
+  return new Response(obj.body, {
+    headers: {
+      "Content-Type": meta.content_type || "application/octet-stream",
+      "Cache-Control": "public, max-age=86400, immutable",
+      "Content-Disposition": `inline; filename="${meta.filename || "file"}"`,
+    },
+  });
 }
 
 /* -------------------- ETIC live-meeting endpoints -------------------- */
@@ -9447,6 +9781,73 @@ function renderDashboardHtml(): string {
       .yard-head h2, .yard-session-title h2 { font-size: 1.15rem; }
     }
 
+    /* ---- Accident / abuse tracker tab ---- */
+    #panel-abuse-tracker .hidden { display: none; }
+    .abuse-wrap { max-width: 1280px; margin: 0 auto; padding: 0 0 48px; }
+    .abuse-head {
+      display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between;
+      gap: 14px; margin-bottom: 16px; padding-bottom: 14px; border-bottom: 1px solid var(--border);
+    }
+    .abuse-head-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .abuse-stats {
+      display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px;
+    }
+    .abuse-stat-pill {
+      padding: 8px 14px; border-radius: 10px; background: var(--surface); border: 1px solid var(--border);
+      font-size: 0.85rem;
+    }
+    .abuse-stat-pill b { color: var(--accent); }
+    .abuse-split {
+      display: grid; grid-template-columns: minmax(260px, 340px) 1fr; gap: 16px; align-items: start;
+    }
+    @media (max-width: 960px) { .abuse-split { grid-template-columns: 1fr; } }
+    .abuse-list-card, .abuse-detail-card, .abuse-new-card {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 14px 16px;
+    }
+    .abuse-list-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; gap: 8px; }
+    .abuse-filter { font-size: 0.82rem; color: var(--muted); display: flex; align-items: center; gap: 6px; cursor: pointer; }
+    .abuse-list { display: flex; flex-direction: column; gap: 6px; max-height: 62vh; overflow-y: auto; }
+    .abuse-row {
+      text-align: left; width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border);
+      background: var(--bg-elev); cursor: pointer; font: inherit;
+    }
+    .abuse-row:hover { border-color: var(--accent); }
+    .abuse-row.active { border-color: var(--accent); background: rgba(0,58,140,0.06); }
+    .abuse-row .r1 { font-weight: 700; font-size: 0.88rem; }
+    .abuse-row .r2 { font-size: 0.78rem; color: var(--muted); margin-top: 2px; }
+    .abuse-cn { font-size: 1.05rem; font-weight: 800; letter-spacing: 0.02em; }
+    .abuse-detail-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+    .abuse-type-pill {
+      font-size: 0.68rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.08em;
+      padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border);
+    }
+    .abuse-type-pill.accident { background: rgba(0,58,140,0.1); color: var(--accent); }
+    .abuse-type-pill.abuse { background: rgba(176,0,32,0.08); color: var(--danger); }
+    .abuse-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; margin-top: 8px; }
+    @media (max-width: 640px) { .abuse-grid { grid-template-columns: 1fr; } }
+    .abuse-check { display: flex; align-items: center; gap: 8px; padding-top: 22px; }
+    .abuse-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 14px; }
+    .abuse-up-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    @media (max-width: 640px) { .abuse-up-grid { grid-template-columns: 1fr; } }
+    #abuse-up-bar { display: none; }
+    #abuse-up-bar.show { display: block; }
+    .abuse-notes-list {
+      max-height: 220px; overflow-y: auto; border: 1px solid var(--border); border-radius: 10px;
+      padding: 8px 10px; margin-bottom: 10px; background: var(--bg-elev); font-size: 0.85rem;
+    }
+    .abuse-note { padding: 8px 0; border-bottom: 1px dashed var(--border); }
+    .abuse-note:last-child { border-bottom: none; }
+    .abuse-note .when { font-size: 0.72rem; color: var(--muted); }
+    .abuse-atts-list { display: flex; flex-direction: column; gap: 6px; }
+    .abuse-att-row { font-size: 0.84rem; }
+    .abuse-att-row a { color: var(--accent); font-weight: 600; }
+    .abuse-est-row { display: grid; grid-template-columns: 1fr 100px 1fr auto; gap: 8px; margin-bottom: 8px; align-items: end; }
+    @media (max-width: 720px) { .abuse-est-row { grid-template-columns: 1fr; } }
+    .abuse-new-card { margin-top: 16px; }
+    .abuse-new-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    @media (max-width: 640px) { .abuse-new-grid { grid-template-columns: 1fr; } }
+    .abuse-charts canvas { max-width: 100%; height: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-elev); }
+
     /* ---- Waivers tab ---- */
     #panel-waivers .hidden { display: none; }
     /* .wv-pending-zero sets display:flex — must not override the [hidden] attribute. */
@@ -11925,6 +12326,7 @@ function renderDashboardHtml(): string {
       <button type="button" id="tab-meeting">ETIC Meeting</button>
       <button type="button" id="tab-yard">Yard Check</button>
       <button type="button" id="tab-waivers">Waivers</button>
+      <button type="button" id="tab-abuse-tracker">A/A tracker</button>
       <button type="button" id="tab-ask">Ask AI</button>
       <button type="button" id="tab-settings">Settings</button>
     </nav>
@@ -12808,6 +13210,142 @@ function renderDashboardHtml(): string {
         </div>
       </div>
 
+      <div id="panel-abuse-tracker" class="hidden">
+        <div class="abuse-wrap">
+          <header class="abuse-head">
+            <div>
+              <h2 style="margin:0">Accident / abuse tracker</h2>
+              <p class="hint" style="margin:6px 0 0;max-width:52rem">
+                VFM/VMS cost recovery: open one accident and one abuse case per asset at a time. Email photos or PDFs to the ingest address on each case (no upload button required for field units).
+              </p>
+            </div>
+            <div class="abuse-head-actions">
+              <button type="button" class="ghost" id="abuse-export-csv">Export CSV</button>
+              <button type="button" class="ghost" id="abuse-refresh">Refresh</button>
+            </div>
+          </header>
+          <div class="abuse-stats" id="abuse-stats"></div>
+          <div class="abuse-split">
+            <div class="abuse-list-card">
+              <div class="abuse-list-head">
+                <h3 style="margin:0;font-size:0.95rem">Cases</h3>
+                <label class="abuse-filter"><input type="checkbox" id="abuse-open-only" checked /> Open only</label>
+              </div>
+              <div id="abuse-list" class="abuse-list">Loading…</div>
+            </div>
+            <div class="abuse-detail-card" id="abuse-detail-card">
+              <div id="abuse-detail-empty" class="muted" style="padding:24px">Select a case or create a new one.</div>
+              <div id="abuse-detail" class="hidden">
+                <div class="abuse-detail-top">
+                  <div>
+                    <div class="abuse-cn" id="abuse-d-cn"></div>
+                    <div class="muted" id="abuse-d-assetline"></div>
+                  </div>
+                  <span class="abuse-type-pill" id="abuse-d-type"></span>
+                </div>
+                <p class="hint" id="abuse-d-ingest"></p>
+                <div class="abuse-grid">
+                  <label class="field"><span class="label">Stage</span>
+                    <select id="abuse-d-stage">
+                      <option value="intake">Intake</option>
+                      <option value="estimates">3 estimates</option>
+                      <option value="release_pending">Release letter (commander review)</option>
+                      <option value="approved_work">Approved — work in progress</option>
+                      <option value="closed">Closed</option>
+                    </select>
+                  </label>
+                  <label class="field"><span class="label">Vehicle location</span>
+                    <input type="text" id="abuse-d-loc" placeholder="e.g. Bldg 123 bay 2" />
+                  </label>
+                  <label class="field" style="grid-column:1/-1"><span class="label">Determination (VFM/VMS)</span>
+                    <input type="text" id="abuse-d-det" placeholder="Accident vs abuse, brief rationale" />
+                  </label>
+                  <label class="field" style="grid-column:1/-1"><span class="label">Responsible for cost</span>
+                    <input type="text" id="abuse-d-resp" placeholder="Unit / individual / org" />
+                  </label>
+                  <label class="field abuse-check"><input type="checkbox" id="abuse-d-reimb" /> Reimbursed to VM</label>
+                  <label class="field"><span class="label">Reimbursement note</span>
+                    <input type="text" id="abuse-d-reimb-note" />
+                  </label>
+                </div>
+                <div class="abuse-estimates">
+                  <h4 style="margin:16px 0 8px;font-size:0.9rem">Three estimates</h4>
+                  <div id="abuse-est-rows"></div>
+                  <button type="button" class="ghost" id="abuse-est-add">+ Add estimate row</button>
+                </div>
+                <div class="abuse-actions">
+                  <button type="button" class="primary" id="abuse-save-case">Save case</button>
+                  <button type="button" class="ghost" id="abuse-close-case">Close case</button>
+                  <span class="status" id="abuse-case-status"></span>
+                </div>
+                <div class="abuse-upload">
+                  <h4 style="margin:18px 0 8px;font-size:0.9rem">Upload from browser</h4>
+                  <div class="abuse-up-grid">
+                    <label class="field"><span class="label">Kind</span>
+                      <select id="abuse-up-kind">
+                        <option value="damage_photo">Damage photo</option>
+                        <option value="release_letter">Release letter (PDF)</option>
+                        <option value="estimate">Estimate scan</option>
+                        <option value="other">Other</option>
+                      </select>
+                    </label>
+                    <label class="field"><span class="label">Your name</span>
+                      <input type="text" id="abuse-up-by" autocomplete="name" />
+                    </label>
+                    <label class="field" style="grid-column:1/-1"><span class="label">File</span>
+                      <input type="file" id="abuse-up-file" />
+                    </label>
+                  </div>
+                  <div id="abuse-up-bar" class="yard-upload-bar" style="margin-top:10px">
+                    <div class="yard-up-lbl" id="abuse-up-lbl">Uploading…</div>
+                    <div class="yard-up-track"><div class="yard-up-fill" id="abuse-up-fill"></div></div>
+                  </div>
+                  <button type="button" class="ghost" id="abuse-up-btn">Upload file</button>
+                </div>
+                <div class="abuse-notes">
+                  <h4 style="margin:18px 0 8px;font-size:0.9rem">Notes</h4>
+                  <div id="abuse-notes-list" class="abuse-notes-list"></div>
+                  <label class="field"><span class="label">Add note</span>
+                    <textarea id="abuse-note-body" rows="3" placeholder="Program notes…"></textarea>
+                  </label>
+                  <div style="display:flex;gap:8px;align-items:center;">
+                    <input type="text" id="abuse-note-author" placeholder="Your name" style="flex:1" />
+                    <button type="button" class="primary" id="abuse-note-add">Add note</button>
+                  </div>
+                </div>
+                <div class="abuse-atts">
+                  <h4 style="margin:18px 0 8px;font-size:0.9rem">Attachments</h4>
+                  <div id="abuse-atts-list" class="abuse-atts-list"></div>
+                </div>
+                <div class="abuse-charts">
+                  <h4 style="margin:18px 0 8px;font-size:0.9rem">Charts</h4>
+                  <canvas id="abuse-chart-stage" width="360" height="200" aria-label="Open cases by stage"></canvas>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="abuse-new-card">
+            <h3 style="margin:0 0 10px;font-size:0.95rem">New case</h3>
+            <div class="abuse-new-grid">
+              <label class="field"><span class="label">Case type</span>
+                <select id="abuse-new-type">
+                  <option value="accident">Accident</option>
+                  <option value="abuse">Abuse / neglect</option>
+                </select>
+              </label>
+              <label class="field"><span class="label">Asset ID</span>
+                <input type="text" id="abuse-new-asset" placeholder="e.g. AF08C00341" autocapitalize="characters" />
+              </label>
+              <label class="field" style="grid-column:1/-1"><span class="label">Your name</span>
+                <input type="text" id="abuse-new-by" autocomplete="name" />
+              </label>
+            </div>
+            <button type="button" class="primary" id="abuse-new-btn" style="margin-top:10px">Create case</button>
+            <p class="hint" id="abuse-new-msg" style="margin:8px 0 0"></p>
+          </div>
+        </div>
+      </div>
+
       <!-- AI assistant panel (full-tab view). The same chat state is shared
            with the floating bubble so the user can switch between modes. -->
       <div id="panel-ask" class="hidden">
@@ -13373,6 +13911,9 @@ function renderDashboardHtml(): string {
         return { tab: "wo", dateKey: null, workOrderId: id || null };
       }
       if (raw === "authz") return { tab: "authz", dateKey: null, workOrderId: null };
+      if (raw === "abuse-tracker" || raw === "aa-tracker") {
+        return { tab: "abuse-tracker", dateKey: null, workOrderId: null };
+      }
       if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
         return { tab: "snapshot", dateKey: raw, workOrderId: null };
       }
@@ -14671,6 +15212,7 @@ function renderDashboardHtml(): string {
       const meetBtn = document.getElementById("tab-meeting");
       const yardBtn = document.getElementById("tab-yard");
       const wvBtn = document.getElementById("tab-waivers");
+      const abuseBtn = document.getElementById("tab-abuse-tracker");
       const askBtn = document.getElementById("tab-ask");
       const setBtn = document.getElementById("tab-settings");
       const panelSnap = document.getElementById("panel-snapshot");
@@ -14681,6 +15223,7 @@ function renderDashboardHtml(): string {
       const panelMeet = document.getElementById("panel-meeting");
       const panelYard = document.getElementById("panel-yard");
       const panelWv = document.getElementById("panel-waivers");
+      const panelAbuse = document.getElementById("panel-abuse-tracker");
       const panelAsk = document.getElementById("panel-ask");
       const panelSet = document.getElementById("panel-settings");
       const brandSub = document.getElementById("brand-sub");
@@ -14692,9 +15235,10 @@ function renderDashboardHtml(): string {
       const isMeet = which === "meeting";
       const isYard = which === "yard";
       const isWv = which === "waivers";
+      const isAbuse = which === "abuse-tracker";
       const isAsk = which === "ask";
       const isSet = which === "settings";
-      const isSnap = !isWo && !isSmx && !isAuthz && !isMel && !isMeet && !isYard && !isWv && !isAsk && !isSet;
+      const isSnap = !isWo && !isSmx && !isAuthz && !isMel && !isMeet && !isYard && !isWv && !isAbuse && !isAsk && !isSet;
       snapBtn.classList.toggle("active", isSnap);
       woBtn.classList.toggle("active", isWo);
       if (smxBtn) smxBtn.classList.toggle("active", isSmx);
@@ -14703,6 +15247,7 @@ function renderDashboardHtml(): string {
       if (meetBtn) meetBtn.classList.toggle("active", isMeet);
       if (yardBtn) yardBtn.classList.toggle("active", isYard);
       if (wvBtn) wvBtn.classList.toggle("active", isWv);
+      if (abuseBtn) abuseBtn.classList.toggle("active", isAbuse);
       if (askBtn) askBtn.classList.toggle("active", isAsk);
       if (setBtn) setBtn.classList.toggle("active", isSet);
       panelSnap.classList.toggle("hidden", !isSnap);
@@ -14713,6 +15258,7 @@ function renderDashboardHtml(): string {
       if (panelMeet) panelMeet.classList.toggle("hidden", !isMeet);
       if (panelYard) panelYard.classList.toggle("hidden", !isYard);
       if (panelWv) panelWv.classList.toggle("hidden", !isWv);
+      if (panelAbuse) panelAbuse.classList.toggle("hidden", !isAbuse);
       if (panelAsk) panelAsk.classList.toggle("hidden", !isAsk);
       if (panelSet) panelSet.classList.toggle("hidden", !isSet);
       if (fab) fab.classList.toggle("hidden", isAsk);
@@ -14735,6 +15281,8 @@ function renderDashboardHtml(): string {
         ? "Walk the lot with your phone. Confirm each asset's location and log discrepancies."
         : isWv
         ? "Approve mechanic-submitted waivers, look up a vehicle's card, and print it."
+        : isAbuse
+        ? "Track accident and abuse cost-recovery cases, estimates, release letters, and reimbursements."
         : isAsk
         ? "Ask plain-English questions about your fleet data."
         : isSet
@@ -14755,6 +15303,9 @@ function renderDashboardHtml(): string {
         onEnterYardTab();
       } else if (isWv) {
         onEnterWaiversTab();
+      } else if (isAbuse) {
+        wireAbuseTrackerEvents();
+        onEnterAbuseTrackerTab();
       } else if (isAsk) {
         askRenderInto("ask-log-tab");
         setTimeout(function () { const t = document.getElementById("ask-input-tab"); if (t) t.focus(); }, 30);
@@ -16051,6 +16602,10 @@ function renderDashboardHtml(): string {
         setMainTab("authz");
         return;
       }
+      if (r.tab === "abuse-tracker") {
+        setMainTab("abuse-tracker");
+        return;
+      }
       setMainTab("snapshot");
       if (r.dateKey && historyEntries.some((e) => e.dateKey === r.dateKey)) {
         await selectDate(r.dateKey, false);
@@ -16743,6 +17298,8 @@ function renderDashboardHtml(): string {
       if (yardTabBtn) yardTabBtn.addEventListener("click", function () { setMainTab("yard"); });
       const wvTabBtn = document.getElementById("tab-waivers");
       if (wvTabBtn) wvTabBtn.addEventListener("click", function () { setMainTab("waivers"); });
+      const abuseTabBtn = document.getElementById("tab-abuse-tracker");
+      if (abuseTabBtn) abuseTabBtn.addEventListener("click", function () { setMainTab("abuse-tracker"); });
       const askTabBtn = document.getElementById("tab-ask");
       if (askTabBtn) askTabBtn.addEventListener("click", function () { setMainTab("ask"); });
       const setTabBtn = document.getElementById("tab-settings");
@@ -22213,6 +22770,410 @@ function renderDashboardHtml(): string {
         if (m.status === "ended") subEl.textContent = "Meeting ended";
         else if (m.paused_at_iso) subEl.textContent = "Paused · of " + formatClock(target);
         else subEl.textContent = "of " + formatClock(target) + " · " + cov + " / " + tot + " covered";
+      }
+    }
+
+    const abuseTrackerState = {
+      cases: [],
+      selectedId: null,
+      detail: null,
+      stats: null,
+      wired: false,
+    };
+
+    function abusePostMultipart(url, fd, fillEl, lblEl, onOk, onErr) {
+      var xhr = new XMLHttpRequest();
+      xhr.open("POST", url);
+      xhr.upload.onprogress = function (ev) {
+        if (!fillEl || !lblEl) return;
+        fillEl.parentElement.classList.add("show");
+        if (!ev.lengthComputable) {
+          lblEl.textContent = "Uploading…";
+          fillEl.style.width = "8%";
+          return;
+        }
+        var pct = ev.total ? Math.round((ev.loaded / ev.total) * 100) : 0;
+        lblEl.textContent = "Uploading " + pct + "%";
+        fillEl.style.width = pct + "%";
+      };
+      xhr.onload = function () {
+        if (fillEl) fillEl.parentElement.classList.remove("show");
+        if (fillEl) fillEl.style.width = "0%";
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            onOk(JSON.parse(xhr.responseText || "{}"));
+          } catch (e) {
+            onErr(new Error("Bad response"));
+          }
+        } else {
+          try {
+            var j = JSON.parse(xhr.responseText || "{}");
+            onErr(new Error(j.error || ("HTTP " + xhr.status)));
+          } catch (e2) {
+            onErr(new Error("Upload failed"));
+          }
+        }
+      };
+      xhr.onerror = function () {
+        if (fillEl) fillEl.parentElement.classList.remove("show");
+        onErr(new Error("Network error"));
+      };
+      xhr.send(fd);
+    }
+
+    function abuseStageLabel(s) {
+      if (s === "intake") return "Intake";
+      if (s === "estimates") return "3 estimates";
+      if (s === "release_pending") return "Release letter";
+      if (s === "approved_work") return "Approved / work";
+      if (s === "closed") return "Closed";
+      return s || "";
+    }
+
+    function abuseDrawStageChart() {
+      var c = document.getElementById("abuse-chart-stage");
+      if (!c || !c.getContext) return;
+      var ctx = c.getContext("2d");
+      if (!ctx) return;
+      var w = c.width;
+      var h = c.height;
+      ctx.clearRect(0, 0, w, h);
+      var st = abuseTrackerState.stats;
+      var by = (st && st.byStage) || {};
+      var labels = ["intake", "estimates", "release_pending", "approved_work"];
+      var vals = labels.map(function (k) { return by[k] || 0; });
+      var max = Math.max.apply(null, vals.concat([1]));
+      var pad = 28;
+      var bw = (w - pad * 2) / labels.length - 8;
+      ctx.fillStyle = "#5b6675";
+      ctx.font = "11px system-ui,sans-serif";
+      for (var i = 0; i < labels.length; i++) {
+        var x = pad + i * ((w - pad * 2) / labels.length) + 4;
+        var vh = (vals[i] / max) * (h - pad - 36);
+        ctx.fillStyle = "rgba(0,58,140,0.85)";
+        ctx.fillRect(x, h - pad - vh, bw, vh);
+        ctx.fillStyle = "#5b6675";
+        var lab = labels[i].replace("_", " ");
+        ctx.fillText(lab.slice(0, 10), x, h - 10);
+        ctx.fillText(String(vals[i]), x, h - pad - vh - 6);
+      }
+    }
+
+    async function abuseLoadStats() {
+      try {
+        var r = await fetch("/api/abuse-tracker/stats", { cache: "no-store" });
+        var j = await r.json();
+        abuseTrackerState.stats = j;
+        var el = document.getElementById("abuse-stats");
+        if (!el) return;
+        var bs = j.byStage || {};
+        el.innerHTML =
+          "<span class='abuse-stat-pill'><b>" + (j.open || 0) + "</b> open cases</span>" +
+          "<span class='abuse-stat-pill'><b>" + (j.closed || 0) + "</b> closed total</span>" +
+          "<span class='abuse-stat-pill'>Intake <b>" + (bs.intake || 0) + "</b></span>" +
+          "<span class='abuse-stat-pill'>Estimates <b>" + (bs.estimates || 0) + "</b></span>" +
+          "<span class='abuse-stat-pill'>Release <b>" + (bs.release_pending || 0) + "</b></span>" +
+          "<span class='abuse-stat-pill'>Work <b>" + (bs.approved_work || 0) + "</b></span>";
+        abuseDrawStageChart();
+      } catch (e) {
+        var el2 = document.getElementById("abuse-stats");
+        if (el2) el2.textContent = "Could not load stats.";
+      }
+    }
+
+    async function abuseLoadList() {
+      var openOnly = document.getElementById("abuse-open-only");
+      var q = openOnly && openOnly.checked ? "?open=1" : "";
+      var list = document.getElementById("abuse-list");
+      if (list) list.innerHTML = "Loading…";
+      try {
+        var r = await fetch("/api/abuse-tracker" + q, { cache: "no-store" });
+        var j = await r.json();
+        abuseTrackerState.cases = j.cases || [];
+        if (!list) return;
+        if (!abuseTrackerState.cases.length) {
+          list.innerHTML = "<div class='muted' style='padding:12px'>No cases yet.</div>";
+          return;
+        }
+        list.innerHTML = abuseTrackerState.cases.map(function (c) {
+          var closed = !!c.closed_at_iso;
+          var sub = (c.make_model || "—") + " · " + abuseStageLabel(c.stage) + (closed ? " · CLOSED" : "");
+          var active = c.id === abuseTrackerState.selectedId ? " active" : "";
+          return (
+            "<button type='button' class='abuse-row" + active + "' data-abuse-id='" + esc(String(c.id)) + "'>" +
+              "<div class='r1'>" + esc(c.control_number) + " · " + esc(c.asset_id) + " · " + esc(c.case_type) + "</div>" +
+              "<div class='r2'>" + esc(sub) + "</div>" +
+            "</button>"
+          );
+        }).join("");
+        list.querySelectorAll("[data-abuse-id]").forEach(function (btn) {
+          btn.addEventListener("click", function () {
+            var id = parseInt(btn.getAttribute("data-abuse-id"), 10);
+            if (Number.isFinite(id)) abuseSelectCase(id);
+          });
+        });
+      } catch (e) {
+        if (list) list.innerHTML = "<div class='problem-empty'>Could not load cases.</div>";
+      }
+    }
+
+    function abuseRenderEstimates(est) {
+      var wrap = document.getElementById("abuse-est-rows");
+      if (!wrap) return;
+      var rows = Array.isArray(est) ? est : [];
+      if (!rows.length) rows = [{ vendor: "", amount: null, note: "" }, { vendor: "", amount: null, note: "" }, { vendor: "", amount: null, note: "" }];
+      wrap.innerHTML = rows.map(function (e, idx) {
+        var amt = e.amount == null || e.amount === "" ? "" : String(e.amount);
+        return (
+          "<div class='abuse-est-row' data-est-idx='" + idx + "'>" +
+            "<label class='field' style='margin:0'><span class='label'>Vendor</span>" +
+              "<input type='text' class='abuse-est-v' value='" + esc(e.vendor || "") + "' /></label>" +
+            "<label class='field' style='margin:0'><span class='label'>$</span>" +
+              "<input type='number' step='0.01' class='abuse-est-a' value='" + esc(amt) + "' /></label>" +
+            "<label class='field' style='margin:0;grid-column:span 2'><span class='label'>Note</span>" +
+              "<input type='text' class='abuse-est-n' value='" + esc(e.note || "") + "' /></label>" +
+            "<button type='button' class='ghost abuse-est-del' title='Remove row'>✕</button>" +
+          "</div>"
+        );
+      }).join("");
+      wrap.querySelectorAll(".abuse-est-del").forEach(function (b) {
+        b.addEventListener("click", function () {
+          var row = b.closest(".abuse-est-row");
+          if (row && row.parentElement) row.remove();
+        });
+      });
+    }
+
+    function abuseCollectEstimates() {
+      var wrap = document.getElementById("abuse-est-rows");
+      if (!wrap) return [];
+      var out = [];
+      wrap.querySelectorAll(".abuse-est-row").forEach(function (row) {
+        var v = (row.querySelector(".abuse-est-v") && row.querySelector(".abuse-est-v").value) || "";
+        var aRaw = (row.querySelector(".abuse-est-a") && row.querySelector(".abuse-est-a").value) || "";
+        var n = (row.querySelector(".abuse-est-n") && row.querySelector(".abuse-est-n").value) || "";
+        var amt = aRaw === "" ? null : Number(aRaw);
+        var amtOk = amt !== null && Number.isFinite(amt);
+        if (!v.trim() && !amtOk && !n.trim()) return;
+        out.push({ vendor: v.trim(), amount: amtOk ? amt : null, note: n.trim() });
+      });
+      return out;
+    }
+
+    async function abuseSelectCase(id) {
+      abuseTrackerState.selectedId = id;
+      document.querySelectorAll(".abuse-row").forEach(function (b) {
+        b.classList.toggle("active", parseInt(b.getAttribute("data-abuse-id"), 10) === id);
+      });
+      var empty = document.getElementById("abuse-detail-empty");
+      var det = document.getElementById("abuse-detail");
+      if (empty) empty.classList.add("hidden");
+      if (det) det.classList.remove("hidden");
+      try {
+        var r = await fetch("/api/abuse-tracker/" + id, { cache: "no-store" });
+        var j = await r.json();
+        abuseTrackerState.detail = j;
+        var c = j.case;
+        document.getElementById("abuse-d-cn").textContent = c.control_number;
+        document.getElementById("abuse-d-assetline").textContent =
+          c.asset_id + (c.make_model ? " · " + c.make_model : "") +
+          (c.owning_unit ? " · " + c.owning_unit : "") + (c.shop ? " · " + c.shop : "");
+        var tp = document.getElementById("abuse-d-type");
+        tp.textContent = c.case_type === "abuse" ? "Abuse / neglect" : "Accident";
+        tp.className = "abuse-type-pill " + (c.case_type === "abuse" ? "abuse" : "accident");
+        var ing = document.getElementById("abuse-d-ingest");
+        if (ing) {
+          ing.innerHTML = j.ingestEmail
+            ? "<strong>Email ingest:</strong> <code style='font-size:0.85rem'>" + esc(j.ingestEmail) + "</code> — attach photos or PDFs; subject line is ignored."
+            : "";
+        }
+        document.getElementById("abuse-d-stage").value = c.stage || "intake";
+        document.getElementById("abuse-d-loc").value = c.vehicle_location || "";
+        document.getElementById("abuse-d-det").value = c.determination || "";
+        document.getElementById("abuse-d-resp").value = c.responsible_party || "";
+        document.getElementById("abuse-d-reimb").checked = !!c.reimbursed_to_vm;
+        document.getElementById("abuse-d-reimb-note").value = c.reimbursed_note || "";
+        abuseRenderEstimates(j.estimates || []);
+        var nl = document.getElementById("abuse-notes-list");
+        nl.innerHTML = (j.notes || []).map(function (n) {
+          return (
+            "<div class='abuse-note'><div class='when'>" + esc(n.author || "") + " · " + esc(n.at_iso || "") + "</div>" +
+            "<div>" + esc(n.body || "") + "</div></div>"
+          );
+        }).join("") || "<div class='muted'>No notes yet.</div>";
+        var al = document.getElementById("abuse-atts-list");
+        al.innerHTML = (j.attachments || []).map(function (a) {
+          var link = "/api/abuse-tracker/attachments/" + a.id;
+          return (
+            "<div class='abuse-att-row'><a href='" + esc(link) + "' target='_blank' rel='noopener'>" +
+              esc(a.kind) + "</a> · " + esc(a.filename || "") + " · " + esc(a.uploaded_by || "") + "</div>"
+          );
+        }).join("") || "<div class='muted'>No attachments yet.</div>";
+        document.getElementById("abuse-case-status").textContent = "";
+      } catch (e) {
+        document.getElementById("abuse-case-status").textContent = "Could not load case.";
+      }
+    }
+
+    async function abuseSaveCase() {
+      var id = abuseTrackerState.selectedId;
+      if (!id) return;
+      var st = document.getElementById("abuse-case-status");
+      st.textContent = "Saving…";
+      try {
+        var body = {
+          stage: document.getElementById("abuse-d-stage").value,
+          vehicleLocation: document.getElementById("abuse-d-loc").value,
+          determination: document.getElementById("abuse-d-det").value,
+          responsibleParty: document.getElementById("abuse-d-resp").value,
+          reimbursedToVm: document.getElementById("abuse-d-reimb").checked,
+          reimbursedNote: document.getElementById("abuse-d-reimb-note").value,
+          estimates: abuseCollectEstimates(),
+        };
+        var r = await fetch("/api/abuse-tracker/" + id, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) {
+          var ej = await r.json().catch(function () { return {}; });
+          throw new Error(ej.error || "Save failed");
+        }
+        st.textContent = "Saved.";
+        setTimeout(function () { if (st.textContent === "Saved.") st.textContent = ""; }, 1500);
+        await abuseLoadList();
+        await abuseLoadStats();
+        await abuseSelectCase(id);
+      } catch (e) {
+        st.textContent = e.message || "Save failed";
+      }
+    }
+
+    async function abuseCloseCase() {
+      var id = abuseTrackerState.selectedId;
+      if (!id) return;
+      if (!confirm("Close this case? You can still view it in the full list (turn off Open only).")) return;
+      var st = document.getElementById("abuse-case-status");
+      try {
+        var r = await fetch("/api/abuse-tracker/" + id, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ closed: true, stage: "closed" }),
+        });
+        if (!r.ok) throw new Error("Close failed");
+        abuseTrackerState.selectedId = null;
+        document.getElementById("abuse-detail").classList.add("hidden");
+        document.getElementById("abuse-detail-empty").classList.remove("hidden");
+        await abuseLoadList();
+        await abuseLoadStats();
+      } catch (e) {
+        st.textContent = e.message || "Could not close";
+      }
+    }
+
+    async function abuseAddNote() {
+      var id = abuseTrackerState.selectedId;
+      var body = (document.getElementById("abuse-note-body").value || "").trim();
+      var author = (document.getElementById("abuse-note-author").value || "").trim();
+      if (!id || !body || !author) return;
+      var r = await fetch("/api/abuse-tracker/" + id + "/notes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ body: body, author: author }),
+      });
+      if (!r.ok) return;
+      document.getElementById("abuse-note-body").value = "";
+      await abuseSelectCase(id);
+    }
+
+    async function abuseCreateCase() {
+      var msg = document.getElementById("abuse-new-msg");
+      var asset = (document.getElementById("abuse-new-asset").value || "").trim();
+      var by = (document.getElementById("abuse-new-by").value || "").trim();
+      var typ = document.getElementById("abuse-new-type").value;
+      if (!asset || !by) {
+        msg.textContent = "Asset ID and your name are required.";
+        return;
+      }
+      msg.textContent = "Creating…";
+      try {
+        var r = await fetch("/api/abuse-tracker", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ caseType: typ, assetId: asset, createdBy: by }),
+        });
+        var j = await r.json();
+        if (!r.ok) throw new Error(j.error || "Create failed");
+        msg.innerHTML = "Created <strong>" + esc(j.case.control_number) + "</strong>." +
+          (j.ingestEmail ? " Ingest: <code>" + esc(j.ingestEmail) + "</code>" : "");
+        document.getElementById("abuse-new-asset").value = "";
+        await abuseLoadList();
+        await abuseLoadStats();
+        await abuseSelectCase(j.case.id);
+      } catch (e) {
+        msg.textContent = e.message || "Could not create";
+      }
+    }
+
+    function abuseExportCsv() {
+      window.location.href = "/api/abuse-tracker?format=csv";
+    }
+
+    function onEnterAbuseTrackerTab() {
+      abuseLoadStats();
+      abuseLoadList();
+    }
+
+    function wireAbuseTrackerEvents() {
+      if (abuseTrackerState.wired) return;
+      abuseTrackerState.wired = true;
+      var rf = document.getElementById("abuse-refresh");
+      if (rf) rf.addEventListener("click", function () { abuseLoadStats(); abuseLoadList(); if (abuseTrackerState.selectedId) abuseSelectCase(abuseTrackerState.selectedId); });
+      var oo = document.getElementById("abuse-open-only");
+      if (oo) oo.addEventListener("change", abuseLoadList);
+      var ex = document.getElementById("abuse-export-csv");
+      if (ex) ex.addEventListener("click", abuseExportCsv);
+      var sv = document.getElementById("abuse-save-case");
+      if (sv) sv.addEventListener("click", abuseSaveCase);
+      var cl = document.getElementById("abuse-close-case");
+      if (cl) cl.addEventListener("click", abuseCloseCase);
+      var nb = document.getElementById("abuse-note-add");
+      if (nb) nb.addEventListener("click", abuseAddNote);
+      var nw = document.getElementById("abuse-new-btn");
+      if (nw) nw.addEventListener("click", abuseCreateCase);
+      var addEst = document.getElementById("abuse-est-add");
+      if (addEst) {
+        addEst.addEventListener("click", function () {
+          var cur = abuseCollectEstimates();
+          cur.push({ vendor: "", amount: null, note: "" });
+          abuseRenderEstimates(cur);
+        });
+      }
+      var upBtn = document.getElementById("abuse-up-btn");
+      if (upBtn) {
+        upBtn.addEventListener("click", function () {
+          var id = abuseTrackerState.selectedId;
+          if (!id) return;
+          var f = document.getElementById("abuse-up-file").files && document.getElementById("abuse-up-file").files[0];
+          if (!f) return;
+          var by = (document.getElementById("abuse-up-by").value || "").trim();
+          if (!by) {
+            document.getElementById("abuse-case-status").textContent = "Enter your name for upload.";
+            return;
+          }
+          var fd = new FormData();
+          fd.append("file", f, f.name);
+          fd.append("kind", document.getElementById("abuse-up-kind").value);
+          fd.append("uploadedBy", by);
+          var fill = document.getElementById("abuse-up-fill");
+          var lbl = document.getElementById("abuse-up-lbl");
+          abusePostMultipart("/api/abuse-tracker/" + id + "/attachments", fd, fill, lbl, function () {
+            document.getElementById("abuse-up-file").value = "";
+            abuseSelectCase(id);
+          }, function (err) {
+            document.getElementById("abuse-case-status").textContent = err.message || "Upload failed";
+          });
+        });
       }
     }
 
