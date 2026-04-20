@@ -2,9 +2,11 @@ import PostalMime from "postal-mime";
 import type { Attachment } from "postal-mime";
 import ExcelJS from "exceljs";
 import {
+  extractRawWorkOrdersFromBinary,
   extractYardCheckSource,
   generateYardCheckWorkbookBuffer,
 } from "./yardCheck";
+import { getChangelog, getWatchRowsLatest, ingestWorkOrderSnapshot } from "./workOrderWatch";
 
 const DEFAULT_MAX_ATTACHMENT_BYTES = 30 * 1024 * 1024;
 const SITE_TITLE = "Minot Vehicle ETIC";
@@ -19,6 +21,16 @@ type SheetSummary = {
   melMentions: number;
 };
 
+/** KPIs from worksheet "Asset Manager" row 2: F2–J2 (MC rate, fleet total, FMC, NMC, surplus). */
+type AssetManagerKpis = {
+  sheetFound: boolean;
+  mcRatePercent: number | null;
+  fleetTotal: number | null;
+  fmc: number | null;
+  nmc: number | null;
+  surplus: number | null;
+};
+
 type AnalysisResult = {
   workbookFileName: string;
   receivedAtIso: string;
@@ -27,6 +39,7 @@ type AnalysisResult = {
   to: string;
   subject: string;
   workbookBytes: number;
+  assetManager: AssetManagerKpis;
   sheetSummaries: SheetSummary[];
   totalVisibleSheets: number;
   totalHiddenSheets: number;
@@ -60,13 +73,6 @@ type HistoryIndex = {
   entries: HistoryEntry[];
 };
 
-interface Env {
-  ETIC_BUCKET: R2Bucket;
-  ALLOWED_SENDERS?: string;
-  EXPECTED_ATTACHMENT_NAME?: string;
-  MAX_ATTACHMENT_BYTES?: string;
-}
-
 export default {
   async email(message: ForwardableEmailMessage, env: Env, _ctx: ExecutionContext): Promise<void> {
     if (!isAuthorizedSender(message.from, env)) {
@@ -96,7 +102,8 @@ export default {
     }
 
     const now = new Date();
-    const dateKey = isoDateKey(now);
+    const subject = parsed.subject ?? "";
+    const dateKey = resolveAnalysisDateKey(subject, now);
     const safeName = sanitizeFileName(workbookAttachment.filename ?? "vehicle-etic.xlsx");
     const workbookKey = `workbooks/${dateKey}/${safeName}`;
     const analysisKey = `analyses/${dateKey}.json`;
@@ -110,7 +117,7 @@ export default {
       customMetadata: {
         from: message.from,
         to: message.to,
-        subject: parsed.subject ?? "",
+        subject,
       },
     });
 
@@ -121,12 +128,17 @@ export default {
       dateKey,
       from: message.from,
       to: message.to,
-      subject: parsed.subject ?? "",
+      subject,
     });
 
     await env.ETIC_BUCKET.put(analysisKey, JSON.stringify(analysis, null, 2), {
       httpMetadata: { contentType: "application/json; charset=utf-8" },
     });
+
+    await upsertSnapshotRow(env, analysis, workbookKey);
+
+    const rawWos = await extractRawWorkOrdersFromBinary(workbookBytes);
+    await ingestWorkOrderSnapshot(env, dateKey, rawWos, now.toISOString());
 
     const history = await loadHistory(env);
     const upsertedHistory = upsertHistoryEntry(history, analysis, workbookKey, analysisKey);
@@ -146,7 +158,7 @@ export default {
     );
   },
 
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     if (url.pathname === "/healthz") {
@@ -158,9 +170,22 @@ export default {
       return Response.json(history, { headers: cacheHeaders() });
     }
 
+    if (url.pathname === "/api/snapshots") {
+      const sync = url.searchParams.get("sync");
+      if (request.method === "POST" && sync === "1") {
+        ctx.waitUntil(backfillSnapshotsFromHistory(env));
+        return Response.json(
+          { ok: true, message: "Rebuilding snapshot index from R2 (runs in background)." },
+          { headers: cacheHeaders() },
+        );
+      }
+      return handleSnapshotsList(env);
+    }
+
     if (url.pathname === "/api/latest") {
-      const analysis = await readJson<AnalysisResult>(env, "analyses/latest.json");
+      let analysis = await readJson<AnalysisResult>(env, "analyses/latest.json");
       if (!analysis) return new Response("Not Found", { status: 404 });
+      analysis = await enrichAnalysisAssetManagerFromR2(env, analysis);
       return Response.json(analysis, { headers: cacheHeaders() });
     }
 
@@ -169,20 +194,41 @@ export default {
       if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) {
         return new Response("Invalid date key", { status: 400 });
       }
-      const analysis = await readJson<AnalysisResult>(env, `analyses/${dateKey}.json`);
+      let analysis = await readJson<AnalysisResult>(env, `analyses/${dateKey}.json`);
       if (!analysis) return new Response("Not Found", { status: 404 });
+      analysis = await enrichAnalysisAssetManagerFromR2(env, analysis);
       return Response.json(analysis, { headers: cacheHeaders() });
     }
 
+    if (url.pathname === "/api/workbook.xlsx") {
+      return handleWorkbookDownload(env, request);
+    }
+
+    if (url.pathname === "/api/watch") {
+      return handleWatchApi(env, request, ctx);
+    }
+
+    if (url.pathname === "/api/work-order-changelog") {
+      return handleWorkOrderChangelogApi(env, request);
+    }
+
     if (url.pathname === "/api/yard-check.xlsx") {
-      return handleYardCheckDownload(env);
+      return handleYardCheckDownload(env, request);
+    }
+
+    if (url.pathname === "/api/yard-check-meta") {
+      return handleYardCheckMeta(env, request);
     }
 
     if (url.pathname === "/" || url.pathname === "/index.html") {
       return new Response(renderDashboardHtml(), {
         headers: {
           "Content-Type": "text/html; charset=utf-8",
-          "Cache-Control": "no-store",
+          "Cache-Control": "private, no-store, no-cache, must-revalidate, max-age=0",
+          Pragma: "no-cache",
+          Expires: "0",
+          "CDN-Cache-Control": "no-store",
+          "Vary": "*",
         },
       });
     }
@@ -191,24 +237,59 @@ export default {
   },
 } satisfies ExportedHandler<Env>;
 
-async function handleYardCheckDownload(env: Env): Promise<Response> {
+function parseYardCheckDateParam(request: Request): string | null {
+  const url = new URL(request.url);
+  const d = url.searchParams.get("date");
+  return d && /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : null;
+}
+
+async function resolveYardCheckWorkbook(
+  env: Env,
+  dateKey: string | null,
+): Promise<
+  | { ok: true; workbookKey: string; sourceFileName: string; sourceDateKey: string }
+  | { ok: false; error: string }
+> {
   const history = await loadHistory(env);
+  const latest = await readJson<AnalysisResult>(env, "analyses/latest.json");
+
+  if (dateKey) {
+    const entry = history.entries.find((e) => e.dateKey === dateKey);
+    if (entry) {
+      return {
+        ok: true,
+        workbookKey: entry.workbookKey,
+        sourceFileName: entry.workbookFileName,
+        sourceDateKey: entry.dateKey,
+      };
+    }
+    return {
+      ok: false,
+      error: `No ETIC snapshot for ${dateKey}. Pick another date or ingest that workbook.`,
+    };
+  }
+
   const latestEntry = history.entries.length
     ? [...history.entries].sort((a, b) => a.dateKey.localeCompare(b.dateKey)).pop() ?? null
     : null;
-
-  const latest = await readJson<AnalysisResult>(env, "analyses/latest.json");
-
   const workbookKey = latestEntry?.workbookKey ?? null;
   const sourceFileName = latestEntry?.workbookFileName ?? latest?.workbookFileName ?? "vehicle-etic.xlsx";
   const sourceDateKey = latestEntry?.dateKey ?? latest?.dateKey ?? "latest";
 
   if (!workbookKey) {
-    return Response.json(
-      { ok: false, error: "No source workbook found yet. Send the ETIC email to ingest first." },
-      { status: 404 },
-    );
+    return { ok: false, error: "No source workbook found yet. Send the ETIC email to ingest first." };
   }
+
+  return { ok: true, workbookKey, sourceFileName, sourceDateKey };
+}
+
+async function handleYardCheckDownload(env: Env, request: Request): Promise<Response> {
+  const paramDate = parseYardCheckDateParam(request);
+  const resolved = await resolveYardCheckWorkbook(env, paramDate);
+  if (!resolved.ok) {
+    return Response.json({ ok: false, error: resolved.error }, { status: 404 });
+  }
+  const { workbookKey, sourceFileName, sourceDateKey } = resolved;
 
   const object = await env.ETIC_BUCKET.get(workbookKey);
   if (!object) {
@@ -254,10 +335,338 @@ async function handleYardCheckDownload(env: Env): Promise<Response> {
   });
 }
 
+type YardCheckMetaOk = {
+  ok: true;
+  sourceDateKey: string;
+  sourceFileName: string;
+  workbookKey: string;
+};
+
+type YardCheckMetaErr = { ok: false; error: string };
+
+async function handleYardCheckMeta(env: Env, request: Request): Promise<Response> {
+  const meta = await buildYardCheckMeta(env, request);
+  const status = meta.ok ? 200 : 404;
+  return Response.json(meta, { status, headers: cacheHeaders() });
+}
+
+async function buildYardCheckMeta(env: Env, request: Request): Promise<YardCheckMetaOk | YardCheckMetaErr> {
+  const paramDate = parseYardCheckDateParam(request);
+  const resolved = await resolveYardCheckWorkbook(env, paramDate);
+  if (!resolved.ok) {
+    return { ok: false, error: resolved.error };
+  }
+  const { workbookKey, sourceFileName, sourceDateKey } = resolved;
+
+  const object = await env.ETIC_BUCKET.get(workbookKey);
+  if (!object) {
+    return { ok: false, error: `Source workbook not found in R2: ${workbookKey}` };
+  }
+
+  return {
+    ok: true,
+    sourceDateKey,
+    sourceFileName,
+    workbookKey,
+  };
+}
+
 function cacheHeaders(): HeadersInit {
   return {
     "Cache-Control": "no-store",
   };
+}
+
+function assetManagerFromAnalysis(analysis: AnalysisResult): AssetManagerKpis {
+  const am = analysis.assetManager;
+  if (am && typeof am === "object") return am;
+  return {
+    sheetFound: false,
+    mcRatePercent: null,
+    fleetTotal: null,
+    fmc: null,
+    nmc: null,
+    surplus: null,
+  };
+}
+
+async function upsertSnapshotRow(env: Env, analysis: AnalysisResult, workbookKey: string): Promise<void> {
+  const am = assetManagerFromAnalysis(analysis);
+  const now = new Date().toISOString();
+  await env.ETIC_SNAPSHOTS.prepare(
+    `INSERT INTO etic_snapshots (
+      date_key, workbook_key, workbook_file_name, received_at_iso,
+      mc_rate, fleet_total, fmc, nmc, surplus, asset_manager_ok,
+      total_rows, mel_total, visible_sheets, hidden_sheets, updated_at_iso
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(date_key) DO UPDATE SET
+      workbook_key = excluded.workbook_key,
+      workbook_file_name = excluded.workbook_file_name,
+      received_at_iso = excluded.received_at_iso,
+      mc_rate = excluded.mc_rate,
+      fleet_total = excluded.fleet_total,
+      fmc = excluded.fmc,
+      nmc = excluded.nmc,
+      surplus = excluded.surplus,
+      asset_manager_ok = excluded.asset_manager_ok,
+      total_rows = excluded.total_rows,
+      mel_total = excluded.mel_total,
+      visible_sheets = excluded.visible_sheets,
+      hidden_sheets = excluded.hidden_sheets,
+      updated_at_iso = excluded.updated_at_iso`,
+  )
+    .bind(
+      analysis.dateKey,
+      workbookKey,
+      analysis.workbookFileName,
+      analysis.receivedAtIso,
+      am.mcRatePercent,
+      am.fleetTotal,
+      am.fmc,
+      am.nmc,
+      am.surplus,
+      am.sheetFound ? 1 : 0,
+      analysis.totalRowsAcrossSheets,
+      analysis.melMentionsTotal,
+      analysis.totalVisibleSheets,
+      analysis.totalHiddenSheets,
+      now,
+    )
+    .run();
+}
+
+type SnapshotListRow = {
+  dateKey: string;
+  workbookFileName: string;
+  workbookKey: string;
+  receivedAtIso: string;
+  mcRatePercent: number | null;
+  fleetTotal: number | null;
+  fmc: number | null;
+  nmc: number | null;
+  surplus: number | null;
+  assetManagerOk: boolean;
+  totalRows: number | null;
+  melTotal: number | null;
+  visibleSheets: number | null;
+  hiddenSheets: number | null;
+  updatedAtIso: string;
+};
+
+async function handleSnapshotsList(env: Env): Promise<Response> {
+  const result = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT date_key, workbook_key, workbook_file_name, received_at_iso,
+            mc_rate, fleet_total, fmc, nmc, surplus, asset_manager_ok,
+            total_rows, mel_total, visible_sheets, hidden_sheets, updated_at_iso
+     FROM etic_snapshots ORDER BY date_key DESC`,
+  ).all<{
+    date_key: string;
+    workbook_key: string;
+    workbook_file_name: string;
+    received_at_iso: string;
+    mc_rate: number | null;
+    fleet_total: number | null;
+    fmc: number | null;
+    nmc: number | null;
+    surplus: number | null;
+    asset_manager_ok: number;
+    total_rows: number | null;
+    mel_total: number | null;
+    visible_sheets: number | null;
+    hidden_sheets: number | null;
+    updated_at_iso: string;
+  }>();
+
+  const rows: SnapshotListRow[] = (result.results ?? []).map((r) => ({
+    dateKey: r.date_key,
+    workbookKey: r.workbook_key,
+    workbookFileName: r.workbook_file_name,
+    receivedAtIso: r.received_at_iso,
+    mcRatePercent: r.mc_rate,
+    fleetTotal: r.fleet_total,
+    fmc: r.fmc,
+    nmc: r.nmc,
+    surplus: r.surplus,
+    assetManagerOk: Boolean(r.asset_manager_ok),
+    totalRows: r.total_rows,
+    melTotal: r.mel_total,
+    visibleSheets: r.visible_sheets,
+    hiddenSheets: r.hidden_sheets,
+    updatedAtIso: r.updated_at_iso,
+  }));
+
+  return Response.json({ updatedAtIso: new Date().toISOString(), snapshots: rows }, { headers: cacheHeaders() });
+}
+
+async function persistAnalysisIfChanged(env: Env, analysis: AnalysisResult): Promise<void> {
+  await env.ETIC_BUCKET.put(
+    `analyses/${analysis.dateKey}.json`,
+    JSON.stringify(analysis, null, 2),
+    { httpMetadata: { contentType: "application/json; charset=utf-8" } },
+  );
+  const history = await loadHistory(env);
+  const entry = history.entries.find((e) => e.dateKey === analysis.dateKey);
+  if (entry) {
+    await upsertSnapshotRow(env, analysis, entry.workbookKey);
+  }
+  const latest = await readJson<AnalysisResult>(env, "analyses/latest.json");
+  if (latest?.dateKey === analysis.dateKey) {
+    await env.ETIC_BUCKET.put("analyses/latest.json", JSON.stringify(analysis, null, 2), {
+      httpMetadata: { contentType: "application/json; charset=utf-8" },
+    });
+  }
+}
+
+async function enrichAnalysisAssetManagerFromR2(env: Env, analysis: AnalysisResult): Promise<AnalysisResult> {
+  let am = assetManagerFromAnalysis(analysis);
+  if (am.sheetFound) return { ...analysis, assetManager: am };
+
+  const history = await loadHistory(env);
+  const entry = history.entries.find((e) => e.dateKey === analysis.dateKey);
+  if (entry) {
+    const obj = await env.ETIC_BUCKET.get(entry.workbookKey);
+    if (obj) {
+      const bytes = await obj.arrayBuffer();
+      const workbook = new ExcelJS.Workbook();
+      await workbook.xlsx.load(bytes);
+      am = extractAssetManagerKpis(workbook);
+    }
+  }
+
+  if (!am.sheetFound) {
+    const row = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT mc_rate, fleet_total, fmc, nmc, surplus, asset_manager_ok FROM etic_snapshots WHERE date_key = ?`,
+    )
+      .bind(analysis.dateKey)
+      .first<{
+        mc_rate: number | null;
+        fleet_total: number | null;
+        fmc: number | null;
+        nmc: number | null;
+        surplus: number | null;
+        asset_manager_ok: number;
+      }>();
+    if (row && row.asset_manager_ok) {
+      am = {
+        sheetFound: true,
+        mcRatePercent: row.mc_rate,
+        fleetTotal: row.fleet_total,
+        fmc: row.fmc,
+        nmc: row.nmc,
+        surplus: row.surplus,
+      };
+    }
+  }
+
+  const merged = { ...analysis, assetManager: am };
+  if (am.sheetFound && JSON.stringify(analysis.assetManager) !== JSON.stringify(am)) {
+    await persistAnalysisIfChanged(env, merged);
+  }
+  return merged;
+}
+
+async function backfillSnapshotsFromHistory(env: Env): Promise<void> {
+  const history = await loadHistory(env);
+  for (const entry of history.entries) {
+    let analysis = await readJson<AnalysisResult>(env, entry.analysisKey);
+    if (!analysis) continue;
+    analysis = await enrichAnalysisAssetManagerFromR2(env, analysis);
+    await upsertSnapshotRow(env, analysis, entry.workbookKey);
+  }
+}
+
+/** Replay all workbooks in date order so changelog + ETIC push counts are correct. */
+async function rebuildWorkOrderWatchFromHistory(env: Env): Promise<void> {
+  await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM work_order_changelog`).run();
+  await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM work_order_state`).run();
+  const history = await loadHistory(env);
+  const sorted = [...history.entries].sort((a, b) => a.dateKey.localeCompare(b.dateKey));
+  const nowIso = new Date().toISOString();
+  for (const entry of sorted) {
+    const obj = await env.ETIC_BUCKET.get(entry.workbookKey);
+    if (!obj) continue;
+    const bytes = await obj.arrayBuffer();
+    const raw = await extractRawWorkOrdersFromBinary(bytes);
+    await ingestWorkOrderSnapshot(env, entry.dateKey, raw, nowIso);
+  }
+}
+
+async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext): Promise<Response> {
+  if (request.method === "POST") {
+    const url = new URL(request.url);
+    if (url.searchParams.get("rebuild") === "1") {
+      ctx.waitUntil(rebuildWorkOrderWatchFromHistory(env));
+      return Response.json(
+        {
+          ok: true,
+          message:
+            "Work order watch is rebuilding from R2 in chronological order (clears prior changelog). Takes a few minutes for large history.",
+        },
+        { headers: cacheHeaders() },
+      );
+    }
+    return new Response("Use POST /api/watch?rebuild=1", { status: 400 });
+  }
+
+  const url = new URL(request.url);
+  let asOf = url.searchParams.get("date");
+  if (asOf && !/^\d{4}-\d{2}-\d{2}$/.test(asOf)) {
+    return new Response("Invalid date", { status: 400 });
+  }
+  if (!asOf) {
+    const history = await loadHistory(env);
+    const latest = history.entries.length
+      ? [...history.entries].sort((a, b) => b.dateKey.localeCompare(a.dateKey))[0]
+      : null;
+    asOf = latest?.dateKey ?? null;
+  }
+  if (!asOf) {
+    return Response.json({ asOfDateKey: null, rows: [], staleCount: 0 }, { headers: cacheHeaders() });
+  }
+
+  const rows = await getWatchRowsLatest(env, asOf);
+  const staleOnly = url.searchParams.get("stale") === "1";
+  const filtered = staleOnly ? rows.filter((r) => r.remarkStale) : rows;
+  const staleCount = rows.filter((r) => r.remarkStale).length;
+  return Response.json(
+    { asOfDateKey: asOf, staleCount, total: rows.length, rows: filtered },
+    { headers: cacheHeaders() },
+  );
+}
+
+async function handleWorkOrderChangelogApi(env: Env, request: Request): Promise<Response> {
+  const url = new URL(request.url);
+  const wo = url.searchParams.get("workOrderId")?.trim();
+  if (!wo) {
+    return Response.json({ ok: false, error: "Missing workOrderId query parameter." }, { status: 400 });
+  }
+  const entries = await getChangelog(env, wo, 500);
+  return Response.json({ workOrderId: wo, entries }, { headers: cacheHeaders() });
+}
+
+async function handleWorkbookDownload(env: Env, request: Request): Promise<Response> {
+  const paramDate = parseYardCheckDateParam(request);
+  const resolved = await resolveYardCheckWorkbook(env, paramDate);
+  if (!resolved.ok) {
+    return Response.json({ ok: false, error: resolved.error }, { status: 404 });
+  }
+  const { workbookKey, sourceFileName, sourceDateKey } = resolved;
+  const object = await env.ETIC_BUCKET.get(workbookKey);
+  if (!object) {
+    return Response.json({ ok: false, error: `Workbook not found: ${workbookKey}` }, { status: 404 });
+  }
+  const body = await object.arrayBuffer();
+  const safe = sourceFileName.replace(/[^A-Za-z0-9._-]/g, "_") || "Vehicle_ETIC.xlsx";
+  const downloadName = `etic_${sourceDateKey}_${safe}`;
+  return new Response(body, {
+    headers: {
+      "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "Content-Disposition": `attachment; filename="${downloadName}"`,
+      "Cache-Control": "no-store",
+      "X-Source-Date": sourceDateKey,
+      "X-Source-Key": workbookKey,
+    },
+  });
 }
 
 async function readJson<T>(env: Env, key: string): Promise<T | null> {
@@ -390,6 +799,46 @@ function isoDateKey(date: Date): string {
   return `${date.getUTCFullYear()}-${p(date.getUTCMonth() + 1)}-${p(date.getUTCDate())}`;
 }
 
+const MONTH_TOKEN: Record<string, number> = {
+  jan: 1,
+  feb: 2,
+  mar: 3,
+  apr: 4,
+  may: 5,
+  jun: 6,
+  jul: 7,
+  aug: 8,
+  sep: 9,
+  oct: 10,
+  nov: 11,
+  dec: 12,
+};
+
+/** Last DD-MMM-YY (or DD-MMM-YYYY) token in the subject → YYYY-MM-DD for R2 paths. */
+function parseReportDateKeyFromSubject(subject: string): string | null {
+  const s = subject.trim();
+  let reportDateKey: string | null = null;
+  const dateRe = /\b(\d{1,2})-([A-Za-z]{3})\.?-(\d{2,4})\b/g;
+  let dm: RegExpExecArray | null;
+  while ((dm = dateRe.exec(s)) !== null) {
+    const day = Number.parseInt(dm[1] ?? "", 10);
+    const monToken = (dm[2] ?? "").toLowerCase().replace(/\.$/, "").slice(0, 3);
+    const month = MONTH_TOKEN[monToken];
+    if (!month || !Number.isFinite(day) || day < 1 || day > 31) continue;
+    const yRaw = dm[3] ?? "";
+    const yNum = Number.parseInt(yRaw, 10);
+    if (!Number.isFinite(yNum)) continue;
+    const year = yRaw.length <= 2 ? (yNum >= 70 ? 1900 + yNum : 2000 + yNum) : yNum;
+    reportDateKey = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  }
+  return reportDateKey;
+}
+
+/** Prefer report date from subject (forwarded ETICs); else UTC day of receipt. */
+function resolveAnalysisDateKey(subject: string, receivedAt: Date): string {
+  return parseReportDateKeyFromSubject(subject) ?? isoDateKey(receivedAt);
+}
+
 async function analyzeWorkbook(input: {
   binary: ArrayBuffer;
   fileName: string;
@@ -426,6 +875,7 @@ async function analyzeWorkbook(input: {
   const totalRowsAcrossSheets = sheetSummaries.reduce((sum, s) => sum + s.rowCount, 0);
   const melMentionsBySheet = Object.fromEntries(sheetSummaries.map((s) => [s.name, s.melMentions]));
   const melMentionsTotal = sheetSummaries.reduce((sum, s) => sum + s.melMentions, 0);
+  const assetManager = extractAssetManagerKpis(workbook);
 
   return {
     workbookFileName: input.fileName,
@@ -435,12 +885,84 @@ async function analyzeWorkbook(input: {
     to: input.to,
     subject: input.subject,
     workbookBytes: input.binary.byteLength,
+    assetManager,
     sheetSummaries,
     totalVisibleSheets,
     totalHiddenSheets,
     totalRowsAcrossSheets,
     melMentionsBySheet,
     melMentionsTotal,
+  };
+}
+
+function normalizeWorkbookSheetName(name: string): string {
+  return name.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function findAssetManagerSheet(workbook: ExcelJS.Workbook): ExcelJS.Worksheet | undefined {
+  const target = "asset manager";
+  return workbook.worksheets.find((ws) => normalizeWorkbookSheetName(ws.name) === target);
+}
+
+function parseCellNumber(cell: ExcelJS.Cell): number | null {
+  const raw = readCellText(cell).trim();
+  if (!raw) return null;
+  const cleaned = raw.replace(/,/g, "").replace(/%/g, "").trim();
+  const n = Number.parseFloat(cleaned);
+  if (!Number.isFinite(n)) return null;
+  return n;
+}
+
+function parseMcRatePercent(cell: ExcelJS.Cell): number | null {
+  const raw = readCellText(cell).trim();
+  if (!raw) return null;
+  const hasPercent = raw.includes("%");
+  const n = parseCellNumber(cell);
+  if (n === null) return null;
+  if (hasPercent) return n;
+  if (n > 0 && n <= 1) return n * 100;
+  return n;
+}
+
+function parseIntegerCell(cell: ExcelJS.Cell): number | null {
+  const n = parseCellNumber(cell);
+  if (n === null) return null;
+  return Math.round(n);
+}
+
+function extractAssetManagerKpis(workbook: ExcelJS.Workbook): AssetManagerKpis {
+  const empty: AssetManagerKpis = {
+    sheetFound: false,
+    mcRatePercent: null,
+    fleetTotal: null,
+    fmc: null,
+    nmc: null,
+    surplus: null,
+  };
+  const sheet = findAssetManagerSheet(workbook);
+  if (!sheet) return empty;
+
+  const row = sheet.getRow(2);
+  const mcRatePercent = parseMcRatePercent(row.getCell(6));
+  const fleetTotal = parseIntegerCell(row.getCell(7));
+  const fmc = parseIntegerCell(row.getCell(8));
+  const nmc = parseIntegerCell(row.getCell(9));
+  const surplus = parseIntegerCell(row.getCell(10));
+
+  const any =
+    mcRatePercent !== null ||
+    fleetTotal !== null ||
+    fmc !== null ||
+    nmc !== null ||
+    surplus !== null;
+
+  return {
+    sheetFound: any,
+    mcRatePercent,
+    fleetTotal,
+    fmc,
+    nmc,
+    surplus,
   };
 }
 
@@ -539,293 +1061,953 @@ function renderDashboardHtml(): string {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="color-scheme" content="dark light" />
+  <meta name="etic-ui" content="work-order-watch-v1" />
   <title>${escapedTitle}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&display=swap" rel="stylesheet" />
   <style>
     :root {
-      color-scheme: dark light;
-      --bg: #0b1220;
-      --panel: #111a2e;
-      --panel-alt: #16213d;
-      --border: #1f2a44;
-      --text: #e6ecf5;
-      --muted: #96a2b8;
+      color-scheme: dark;
+      --bg0: #070b14;
+      --bg1: #0d1526;
+      --surface: rgba(17, 26, 46, 0.72);
+      --surface-solid: #121c32;
+      --border: rgba(106, 169, 255, 0.14);
+      --border-strong: rgba(106, 169, 255, 0.28);
+      --text: #eef3fb;
+      --muted: #8b9ab5;
       --accent: #6aa9ff;
-      --up: #ff8c8c;
-      --down: #8cff9f;
-      --flat: #c7d0df;
+      --accent-dim: #4d87d9;
+      --glow: rgba(106, 169, 255, 0.12);
+      --radius: 16px;
+      --font: "DM Sans", ui-sans-serif, system-ui, -apple-system, sans-serif;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, sans-serif;
-      background: radial-gradient(1200px 800px at 10% -10%, #1a2748 0%, #0b1220 55%) fixed;
-      color: var(--text);
       min-height: 100vh;
+      font-family: var(--font);
+      color: var(--text);
+      background:
+        radial-gradient(ellipse 900px 500px at 15% -20%, var(--glow), transparent 55%),
+        radial-gradient(ellipse 700px 400px at 95% 10%, rgba(139, 92, 246, 0.08), transparent 50%),
+        linear-gradient(165deg, var(--bg1) 0%, var(--bg0) 45%, #050810 100%);
+      background-attachment: fixed;
     }
-    header {
-      padding: 24px 32px;
-      border-bottom: 1px solid var(--border);
+    .app {
+      max-width: 1040px;
+      margin: 0 auto;
+      padding: 28px 22px 56px;
+    }
+    .top {
       display: flex;
-      align-items: baseline;
-      gap: 14px;
       flex-wrap: wrap;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 20px;
+      margin-bottom: 28px;
     }
-    header h1 { margin: 0; font-size: 22px; letter-spacing: 0.02em; }
-    header .sub { color: var(--muted); font-size: 13px; }
-    main { padding: 24px 32px 80px; max-width: 1100px; margin: 0 auto; }
-    .cards {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 14px;
-      margin-bottom: 24px;
+    .brand h1 {
+      margin: 0 0 6px;
+      font-size: clamp(1.55rem, 3vw, 1.85rem);
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      line-height: 1.15;
     }
-    .card {
-      background: var(--panel);
-      border: 1px solid var(--border);
+    .brand p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.92rem;
+      max-width: 42ch;
+      line-height: 1.45;
+    }
+    .picker-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      min-width: min(100%, 280px);
+    }
+    .picker-wrap label {
+      font-size: 0.72rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.11em;
+      color: var(--muted);
+    }
+    select#etic-date {
+      appearance: none;
+      width: 100%;
+      padding: 14px 44px 14px 16px;
+      font-family: var(--font);
+      font-size: 1rem;
+      font-weight: 600;
+      color: var(--text);
+      background: var(--surface-solid) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20' viewBox='0 0 24 24' fill='none' stroke='%238b9ab5' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E") no-repeat right 14px center;
+      border: 1px solid var(--border-strong);
       border-radius: 12px;
-      padding: 16px 18px;
+      cursor: pointer;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.25);
     }
-    .card h3 { margin: 0 0 6px; font-size: 12px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; }
-    .card .v { font-size: 24px; font-weight: 600; }
-    .card .delta { margin-top: 6px; font-size: 12px; color: var(--muted); }
-    .up { color: var(--up); }
-    .down { color: var(--down); }
-    .flat { color: var(--flat); }
-    section { margin-bottom: 28px; }
-    h2 { font-size: 16px; margin: 0 0 10px; letter-spacing: 0.04em; }
-    table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
-    th, td { padding: 10px 12px; text-align: left; font-size: 13px; border-bottom: 1px solid var(--border); }
-    th { background: var(--panel-alt); color: var(--muted); font-weight: 600; }
-    tr:last-child td { border-bottom: 0; }
-    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #1c2a4a; color: #cdd9ef; font-size: 11px; border: 1px solid var(--border); }
-    .muted { color: var(--muted); }
-    footer { padding: 24px 32px; color: var(--muted); font-size: 12px; text-align: center; }
-    a { color: var(--accent); text-decoration: none; }
-    a:hover { text-decoration: underline; }
-    .empty { background: var(--panel); border: 1px dashed var(--border); border-radius: 12px; padding: 24px; color: var(--muted); text-align: center; }
-    code { background: #0e1729; padding: 2px 6px; border-radius: 6px; border: 1px solid var(--border); }
-    .btn {
-      background: linear-gradient(180deg, #2a4d8f, #1c3971);
-      color: #e7efff;
-      border: 1px solid #3a5da5;
-      padding: 8px 14px;
-      border-radius: 10px;
-      font-size: 13px;
+    select#etic-date:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--glow), 0 8px 32px rgba(0,0,0,0.25);
+    }
+    .hero {
+      position: relative;
+      border-radius: var(--radius);
+      padding: 28px 28px 26px;
+      margin-bottom: 22px;
+      background: var(--surface);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid var(--border);
+      box-shadow: 0 24px 48px rgba(0,0,0,0.35);
+      overflow: hidden;
+    }
+    .hero::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(125deg, rgba(106,169,255,0.07) 0%, transparent 45%);
+      pointer-events: none;
+    }
+    .hero-inner { position: relative; z-index: 1; }
+    .hero-date {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--accent);
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      margin-bottom: 10px;
+    }
+    .hero-date .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 12px var(--accent);
+    }
+    .hero h2 {
+      margin: 0 0 8px;
+      font-size: clamp(1.35rem, 2.5vw, 1.65rem);
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+    .hero-file {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+    .hero-file strong { color: #c5d4eb; font-weight: 500; }
+    .kpi-strip {
+      margin-bottom: 22px;
+      padding: 22px 20px 20px;
+      border-radius: var(--radius);
+      background: #000;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
+    }
+    .kpi-strip .kpi-head {
+      font-size: 0.65rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.14em;
+      color: rgba(255, 255, 255, 0.45);
+      margin-bottom: 14px;
+    }
+    .kpi-row {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 8px 12px;
+      align-items: end;
+    }
+    @media (max-width: 900px) {
+      .kpi-row { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    }
+    @media (max-width: 520px) {
+      .kpi-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    .kpi-cell { text-align: center; padding: 6px 4px; }
+    .kpi-cell .lbl {
+      font-size: 0.68rem;
+      font-weight: 600;
+      color: rgba(255, 255, 255, 0.88);
+      line-height: 1.25;
+      margin-bottom: 10px;
+      letter-spacing: 0.02em;
+    }
+    .kpi-cell .lbl small { display: block; font-size: 0.62rem; font-weight: 600; opacity: 0.9; }
+    .kpi-cell .val {
+      font-size: clamp(1.35rem, 3.5vw, 1.85rem);
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      line-height: 1.1;
+    }
+    .kpi-cell .val.em { font-size: clamp(1.55rem, 4vw, 2.1rem); }
+    .kpi-val-mc {
+      background: linear-gradient(180deg, #ffffff 0%, #7eb8ff 45%, #4a9fff 100%);
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+      filter: drop-shadow(0 0 20px rgba(106, 169, 255, 0.45));
+    }
+    .kpi-val-fleet { color: #7ec8ff; }
+    .kpi-val-fmc { color: #5ee397; }
+    .kpi-val-nmc { color: #ff8a8a; }
+    .kpi-val-surplus { color: #f5d547; }
+    .kpi-missing .val { color: rgba(255, 255, 255, 0.25); font-weight: 600; font-size: 1.1rem; }
+    .card {
+      border-radius: var(--radius);
+      background: var(--surface);
+      backdrop-filter: blur(12px);
+      border: 1px solid var(--border);
+      padding: 22px 22px 20px;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.22);
+    }
+    .card h3 {
+      margin: 0 0 14px;
+      font-size: 0.72rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--muted);
+    }
+    .detail-rows { display: flex; flex-direction: column; gap: 12px; }
+    .detail-row {
+      display: grid;
+      grid-template-columns: 120px 1fr;
+      gap: 12px;
+      font-size: 0.9rem;
+      align-items: start;
+    }
+    @media (max-width: 520px) { .detail-row { grid-template-columns: 1fr; gap: 4px; } }
+    .detail-row dt { color: var(--muted); font-weight: 500; margin: 0; }
+    .detail-row dd { margin: 0; color: #d2ddf0; line-height: 1.45; word-break: break-word; }
+    .ingest-card { margin-bottom: 22px; }
+    .yard-card { margin-bottom: 8px; }
+    .yard-card .yard-lead {
+      margin: 0 0 18px;
+      font-size: 0.92rem;
+      color: var(--muted);
+      line-height: 1.5;
+      max-width: 52ch;
+    }
+    .yard-export-btn {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      width: 100%;
+      margin: 0;
+      padding: 20px 22px;
+      border-radius: 14px;
+      border: 1px solid var(--border-strong);
+      background: linear-gradient(145deg, rgba(106, 169, 255, 0.12) 0%, rgba(7, 11, 20, 0.65) 55%);
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+      cursor: pointer;
+      font-family: var(--font);
+      text-align: left;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.12s ease;
+    }
+    .yard-export-btn:hover:not(:disabled) {
+      border-color: rgba(106, 169, 255, 0.45);
+      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.32), 0 0 0 1px rgba(106, 169, 255, 0.12);
+    }
+    .yard-export-btn:active:not(:disabled) { transform: scale(0.992); }
+    .yard-export-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .yard-export-btn .icon-wrap {
+      flex-shrink: 0;
+      width: 52px;
+      height: 52px;
+      border-radius: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(106, 169, 255, 0.18);
+      border: 1px solid rgba(106, 169, 255, 0.28);
+      color: var(--accent);
+    }
+    .yard-export-btn .icon-wrap svg { width: 26px; height: 26px; }
+    .yard-export-btn .copy { flex: 1; min-width: 0; }
+    .yard-export-btn .title {
+      display: block;
+      font-size: 1.08rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--text);
+      margin-bottom: 4px;
+    }
+    .yard-export-btn .sub {
+      display: block;
+      font-size: 0.82rem;
+      color: var(--muted);
+      font-weight: 500;
+    }
+    .yard-export-btn .chev {
+      flex-shrink: 0;
+      color: var(--accent);
+      opacity: 0.85;
+    }
+    .yard-export-btn .chev svg { width: 22px; height: 22px; display: block; }
+    .action-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-bottom: 10px;
+    }
+    @media (max-width: 560px) { .action-row { grid-template-columns: 1fr; } }
+    .btn-etic {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      width: 100%;
+      padding: 16px 18px;
+      border-radius: 14px;
+      border: 1px solid rgba(139, 154, 181, 0.35);
+      background: rgba(12, 18, 32, 0.85);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 0.95rem;
       font-weight: 600;
       cursor: pointer;
-      transition: transform 0.05s ease, filter 0.15s ease;
+      transition: border-color 0.15s ease, background 0.15s ease;
     }
-    .btn:hover { filter: brightness(1.1); }
-    .btn:active { transform: translateY(1px); }
-    .btn:disabled { opacity: 0.6; cursor: progress; }
+    .btn-etic:hover:not(:disabled) {
+      border-color: rgba(106, 169, 255, 0.45);
+      background: rgba(18, 28, 48, 0.95);
+    }
+    .btn-etic:disabled { opacity: 0.5; cursor: not-allowed; }
+    .compare-card { margin-bottom: 22px; }
+    .compare-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }
+    .compare-head .hint { font-size: 0.8rem; color: var(--muted); margin: 0; }
+    .table-wrap { overflow-x: auto; border-radius: 12px; border: 1px solid var(--border); }
+    .compare-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.82rem;
+      min-width: 720px;
+    }
+    .compare-table th, .compare-table td {
+      padding: 10px 12px;
+      text-align: right;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    .compare-table th:first-child, .compare-table td:first-child {
+      text-align: left;
+      position: sticky;
+      left: 0;
+      background: var(--surface-solid);
+      z-index: 1;
+    }
+    .compare-table thead th {
+      background: var(--surface-solid);
+      color: var(--muted);
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      font-size: 0.68rem;
+    }
+    .compare-table tbody tr:hover td { background: rgba(106, 169, 255, 0.06); }
+    .compare-table .mc { color: #9dc6ff; font-weight: 700; }
+    .compare-table .fmc { color: #5ee397; }
+    .compare-table .nmc { color: #ff8a8a; }
+    .compare-table .surp { color: #f5d547; }
+    .watch-card { margin-bottom: 22px; }
+    .watch-toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 12px; }
+    .watch-toolbar label { font-size: 0.8rem; color: var(--muted); display: flex; align-items: center; gap: 8px; cursor: pointer; }
+    .watch-toolbar button.linkish {
+      background: none; border: none; color: var(--accent); font-family: var(--font); font-size: 0.8rem;
+      cursor: pointer; text-decoration: underline; padding: 0;
+    }
+    .watch-table { font-size: 0.78rem; min-width: 920px; }
+    .watch-table th, .watch-table td { padding: 8px 10px; }
+    .watch-table .stale { background: rgba(255, 100, 100, 0.12); }
+    .watch-table .badge-tier { font-size: 0.62rem; font-weight: 700; text-transform: uppercase; padding: 2px 6px; border-radius: 4px; }
+    .tier-below { background: rgba(255, 138, 138, 0.2); color: #ff9a9a; }
+    .tier-at { background: rgba(255, 213, 71, 0.15); color: #f5d547; }
+    .tier-above { background: rgba(94, 227, 151, 0.15); color: #5ee397; }
+    .tier-unknown { background: rgba(139, 154, 181, 0.15); color: var(--muted); }
+    .modal-overlay {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.65); z-index: 1000;
+      display: flex; align-items: center; justify-content: center; padding: 20px;
+    }
+    .modal {
+      background: var(--surface-solid); border: 1px solid var(--border-strong); border-radius: 14px;
+      max-width: 640px; width: 100%; max-height: 85vh; overflow: hidden; display: flex; flex-direction: column;
+      box-shadow: 0 24px 64px rgba(0,0,0,0.5);
+    }
+    .modal header { padding: 16px 18px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+    .modal header h4 { margin: 0; font-size: 1rem; }
+    .modal .body { padding: 12px 18px; overflow-y: auto; font-size: 0.82rem; }
+    .modal .log-row { padding: 10px 0; border-bottom: 1px solid var(--border); }
+    .modal .log-row:last-child { border-bottom: 0; }
+    .modal .log-meta { color: var(--muted); font-size: 0.72rem; margin-bottom: 4px; }
+    .modal-close { background: none; border: none; color: var(--muted); font-size: 1.25rem; cursor: pointer; line-height: 1; }
+    .yard-status-wrap { margin-top: 14px; }
+    .status {
+      font-size: 0.88rem;
+      color: var(--muted);
+      min-height: 22px;
+      margin: 0;
+    }
+    .status.err { color: #ff9e9e; }
+    .status.ok { color: #8fd4a8; }
+    .empty-state {
+      text-align: center;
+      padding: 48px 24px;
+      color: var(--muted);
+      font-size: 0.95rem;
+      line-height: 1.55;
+    }
+    .empty-state strong { color: var(--text); }
+    .hidden { display: none !important; }
   </style>
 </head>
 <body>
-  <header>
-    <h1>${escapedTitle}</h1>
-    <span class="sub" id="updated">Loading…</span>
-    <span class="spacer" style="flex:1"></span>
-    <button id="download-yard-check" class="btn">Download Yard Check (.xlsx)</button>
-  </header>
-  <main>
-    <div id="yard-check-status" class="muted" style="margin-bottom:16px; min-height: 18px;"></div>
-    <div class="cards" id="summary-cards"></div>
-    <section>
-      <h2>Tools</h2>
-      <div class="card">
-        <div style="display:flex; justify-content:space-between; align-items:center; gap:16px; flex-wrap:wrap;">
-          <div>
-            <div style="font-size:15px; font-weight:600;">Yard Check Generator</div>
-            <div class="muted" style="font-size:12px; max-width:640px;">
-              Produces a landscape, print-ready Excel with every work order (Asset ID, Work Order ID, VIN/Serial, Make, Model, Previous Location) plus blank columns for new location and discrepancies. Use it to walk the compound and record current vehicle positions.
-            </div>
-          </div>
-          <button id="download-yard-check-2" class="btn">Download .xlsx</button>
+  <div class="app">
+    <header class="top">
+      <div class="brand">
+        <h1>${escapedTitle}</h1>
+        <p>Pick a report date, compare KPIs across days, download the raw ETIC or yard check.</p>
+      </div>
+      <div class="picker-wrap">
+        <label for="etic-date">ETIC report date</label>
+        <select id="etic-date" aria-label="Select ETIC report date"></select>
+      </div>
+    </header>
+
+    <div id="view-empty" class="empty-state hidden">
+      <p><strong>No ETIC files yet.</strong><br />Email the Vehicle ETIC workbook to your ingest address to get dates here.</p>
+    </div>
+
+    <div id="view-main" class="hidden">
+      <section class="hero">
+        <div class="hero-inner">
+          <div class="hero-date"><span class="dot" aria-hidden="true"></span> Selected snapshot</div>
+          <h2 id="hero-title">—</h2>
+          <p class="hero-file" id="hero-file"></p>
+        </div>
+      </section>
+
+      <div class="kpi-strip" id="kpi-strip" style="display:none" aria-label="Asset Manager summary">
+        <div class="kpi-head">Asset Manager</div>
+        <div class="kpi-row" id="kpi-row"></div>
+      </div>
+
+      <div class="card ingest-card">
+        <h3>This snapshot</h3>
+        <dl class="detail-rows" id="ingest-details"></dl>
+      </div>
+
+      <div class="card compare-card">
+        <div class="compare-head">
+          <h3 style="margin:0">Compare snapshots</h3>
+          <p class="hint" id="compare-hint">Asset Manager KPIs by report date (D1 index).</p>
+        </div>
+        <div class="table-wrap">
+          <table class="compare-table" id="compare-table" aria-label="Snapshot comparison">
+            <thead><tr><th>Report date</th><th>MC %</th><th>Fleet</th><th>FMC</th><th>NMC</th><th>Surplus</th></tr></thead>
+            <tbody id="compare-body"><tr><td colspan="6" style="text-align:center;color:var(--muted)">Loading…</td></tr></tbody>
+          </table>
         </div>
       </div>
-    </section>
-    <section>
-      <h2>History</h2>
-      <div id="history-wrap"><div class="empty">Loading history…</div></div>
-    </section>
-    <section>
-      <h2>Latest per-sheet summary</h2>
-      <div id="sheets-wrap"><div class="empty">Loading latest analysis…</div></div>
-    </section>
-  </main>
-  <footer>
-    Ingest flow: email <code>etic@2t3.app</code> → R2 <code>eticanalysis</code> → this dashboard.
-  </footer>
+
+      <div class="card watch-card">
+        <h3>Work order watch</h3>
+        <p class="yard-lead" style="margin-bottom:12px">
+          Remark update expectations by MEL: below = 3 days, at = 5 days, above = 10 days. ETIC “pushes” count when the parsed ETIC date moves later. Use changelog for full history per WO.
+        </p>
+        <div class="watch-toolbar">
+          <label><input type="checkbox" id="watch-stale-only" /> Stale remarks only</label>
+          <button type="button" class="linkish" id="watch-rebuild">Rebuild history from all ETICs (chronological)</button>
+        </div>
+        <p class="status" id="watch-status"></p>
+        <div class="table-wrap">
+          <table class="compare-table watch-table" id="watch-table">
+            <thead>
+              <tr>
+                <th>WO ID</th><th>Asset</th><th>MEL</th><th>Parts</th><th>ETIC</th><th>Remark Δ</th><th>Stale</th><th>Pushes</th><th>Slip days</th><th></th>
+              </tr>
+            </thead>
+            <tbody id="watch-body"><tr><td colspan="10" style="text-align:center;color:var(--muted)">Loading…</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div id="changelog-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="changelog-title">
+        <div class="modal">
+          <header>
+            <h4 id="changelog-title">Changelog</h4>
+            <button type="button" class="modal-close" id="changelog-close" aria-label="Close">×</button>
+          </header>
+          <div class="body" id="changelog-body"></div>
+        </div>
+      </div>
+
+      <div class="card yard-card">
+        <h3>Downloads</h3>
+        <p class="yard-lead">Get the raw Vehicle ETIC file for this date, or the yard check export for walkarounds.</p>
+        <div class="action-row">
+          <button type="button" class="btn-etic" id="btn-download-etic">Download Vehicle ETIC (.xlsx)</button>
+        </div>
+        <p class="status" id="etic-dl-status" role="status"></p>
+        <button type="button" class="yard-export-btn" id="btn-yard-check" aria-describedby="yard-status">
+          <span class="icon-wrap" aria-hidden="true">
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.75"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+          </span>
+          <span class="copy">
+            <span class="title">Export for compound walkaround</span>
+            <span class="sub">Excel workbook · landscape · ready to print</span>
+          </span>
+          <span class="chev" aria-hidden="true">
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+          </span>
+        </button>
+        <div class="yard-status-wrap">
+          <p class="status" id="yard-status" role="status"></p>
+        </div>
+      </div>
+    </div>
+  </div>
   <script>
-    const fmt = (n) => typeof n === "number" ? n.toLocaleString() : "—";
-    const deltaClass = (n) => n === null || n === undefined ? "flat" : n > 0 ? "up" : n < 0 ? "down" : "flat";
-    const deltaPrefix = (n) => n === null || n === undefined ? "" : n > 0 ? "+" : "";
-
-    async function loadAll() {
-      const [historyRes, latestRes] = await Promise.allSettled([
-        fetch("/api/history").then((r) => r.ok ? r.json() : null),
-        fetch("/api/latest").then((r) => r.ok ? r.json() : null),
-      ]);
-      const history = historyRes.status === "fulfilled" ? historyRes.value : null;
-      const latest = latestRes.status === "fulfilled" ? latestRes.value : null;
-      renderSummary(latest, history);
-      renderHistory(history);
-      renderSheets(latest);
+    function esc(s) {
+      if (s == null || s === undefined) return "";
+      return String(s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
     }
 
-    function renderSummary(latest, history) {
-      const updatedEl = document.getElementById("updated");
-      if (!latest) {
-        updatedEl.textContent = "No analysis yet — waiting for first inbound email.";
-      } else {
-        updatedEl.textContent = "Latest: " + new Date(latest.receivedAtIso).toLocaleString() + " · " + latest.workbookFileName;
-      }
-
-      const cards = document.getElementById("summary-cards");
-      const lastEntry = history && history.entries && history.entries.length
-        ? history.entries[history.entries.length - 1]
-        : null;
-
-      const items = latest ? [
-        { label: "Visible sheets", value: latest.totalVisibleSheets, delta: lastEntry?.diff?.deltaSheetsVisible ?? null },
-        { label: "Hidden sheets", value: latest.totalHiddenSheets, delta: null },
-        { label: "Rows (all sheets)", value: latest.totalRowsAcrossSheets, delta: lastEntry?.diff?.deltaTotalRows ?? null },
-        { label: "MEL mentions", value: latest.melMentionsTotal, delta: lastEntry?.diff?.deltaMelMentionsTotal ?? null },
-      ] : [];
-
-      cards.innerHTML = items.length === 0
-        ? '<div class="empty">No metrics yet.</div>'
-        : items.map((item) => {
-            const deltaHtml = item.delta === null || item.delta === undefined
-              ? '<span class="muted">no prior snapshot</span>'
-              : '<span class="' + deltaClass(item.delta) + '">Δ ' + deltaPrefix(item.delta) + fmt(item.delta) + ' vs prior day</span>';
-            return '<div class="card"><h3>' + item.label + '</h3><div class="v">' + fmt(item.value) + '</div><div class="delta">' + deltaHtml + '</div></div>';
-          }).join("");
+    function fmtKpi(n) {
+      if (n === null || n === undefined || typeof n !== "number") return "—";
+      return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
     }
 
-    function renderHistory(history) {
-      const wrap = document.getElementById("history-wrap");
-      if (!history || !history.entries || history.entries.length === 0) {
-        wrap.innerHTML = '<div class="empty">No history yet.</div>';
-        return;
-      }
-      const rows = [...history.entries].sort((a, b) => b.dateKey.localeCompare(a.dateKey)).map((e) => {
-        const d = e.diff || {};
-        const cls = (v) => deltaClass(v ?? null);
-        const pref = (v) => deltaPrefix(v ?? null);
-        const row = [
-          '<tr>',
-          '<td>' + e.dateKey + '</td>',
-          '<td>' + e.workbookFileName + '</td>',
-          '<td>' + fmt(e.totalVisibleSheets) + '</td>',
-          '<td>' + fmt(e.totalHiddenSheets) + '</td>',
-          '<td>' + fmt(e.totalRowsAcrossSheets) + ' <span class="' + cls(d.deltaTotalRows) + '">' + pref(d.deltaTotalRows) + fmt(d.deltaTotalRows) + '</span></td>',
-          '<td>' + fmt(e.melMentionsTotal) + ' <span class="' + cls(d.deltaMelMentionsTotal) + '">' + pref(d.deltaMelMentionsTotal) + fmt(d.deltaMelMentionsTotal) + '</span></td>',
-          '<td><span class="pill">' + (d.previousDateKey || "initial") + '</span></td>',
-          '</tr>'
-        ].join("");
-        return row;
-      }).join("");
-      wrap.innerHTML = [
-        '<table>',
-        '<thead><tr>',
-          '<th>Date</th>',
-          '<th>Workbook</th>',
-          '<th>Visible</th>',
-          '<th>Hidden</th>',
-          '<th>Rows (Δ)</th>',
-          '<th>MEL (Δ)</th>',
-          '<th>Compared to</th>',
-        '</tr></thead>',
-        '<tbody>', rows, '</tbody>',
-        '</table>'
-      ].join("");
+    function fmtMc(n) {
+      if (n === null || n === undefined || typeof n !== "number") return "—";
+      return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + "%";
     }
 
-    function renderSheets(latest) {
-      const wrap = document.getElementById("sheets-wrap");
-      if (!latest || !Array.isArray(latest.sheetSummaries) || latest.sheetSummaries.length === 0) {
-        wrap.innerHTML = '<div class="empty">No sheet data yet.</div>';
-        return;
-      }
-      const rows = latest.sheetSummaries.map((s) => [
-        '<tr>',
-        '<td>' + s.name + '</td>',
-        '<td>' + s.state + '</td>',
-        '<td>' + fmt(s.rowCount) + '</td>',
-        '<td>' + fmt(s.columnCountEstimate) + '</td>',
-        '<td>' + fmt(s.nonEmptyCellCountEstimate) + '</td>',
-        '<td>' + fmt(s.melMentions) + '</td>',
-        '<td class="muted">' + (s.sampleHeaders && s.sampleHeaders.length ? s.sampleHeaders.join(" | ") : "—") + '</td>',
-        '</tr>'
-      ].join("")).join("");
-      wrap.innerHTML = [
-        '<table>',
-        '<thead><tr>',
-          '<th>Sheet</th>',
-          '<th>State</th>',
-          '<th>Rows</th>',
-          '<th>Cols</th>',
-          '<th>Cells</th>',
-          '<th>MEL</th>',
-          '<th>Sample headers</th>',
-        '</tr></thead>',
-        '<tbody>', rows, '</tbody>',
-        '</table>'
-      ].join("");
+    function sortDesc(entries) {
+      return [...entries].sort((a, b) => b.dateKey.localeCompare(a.dateKey));
     }
 
-    async function downloadYardCheck(btn) {
-      const statusEl = document.getElementById("yard-check-status");
-      const prevLabel = btn.textContent;
-      btn.disabled = true;
-      btn.textContent = "Preparing…";
-      statusEl.textContent = "Generating yard check from latest workbook…";
+    function readHashDate() {
+      const h = (location.hash || "").replace(/^#/, "");
+      return /^\\d{4}-\\d{2}-\\d{2}$/.test(h) ? h : null;
+    }
+
+    let historyEntries = [];
+    let selectedDate = null;
+    let snapshotRows = [];
+
+    function setHash(dateKey) {
+      if (dateKey) location.hash = "#" + dateKey;
+      else location.hash = "";
+    }
+
+    async function loadHistory() {
+      const res = await fetch("/api/history");
+      if (!res.ok) throw new Error("Could not load history");
+      const data = await res.json();
+      return Array.isArray(data.entries) ? data.entries : [];
+    }
+
+    async function syncSnapshotsOnce() {
       try {
-        const res = await fetch("/api/yard-check.xlsx");
-        if (!res.ok) {
-          let message = "Failed to generate (" + res.status + ")";
-          try {
-            const body = await res.json();
-            if (body && body.error) message = body.error;
-          } catch (_) {}
-          statusEl.textContent = message;
+        if (sessionStorage.getItem("etic_d1_sync_v1")) return;
+        await fetch("/api/snapshots?sync=1", { method: "POST" });
+        sessionStorage.setItem("etic_d1_sync_v1", "1");
+      } catch (_) {}
+    }
+
+    async function loadSnapshots() {
+      const res = await fetch("/api/snapshots");
+      if (!res.ok) return [];
+      const data = await res.json();
+      return Array.isArray(data.snapshots) ? data.snapshots : [];
+    }
+
+    function renderCompareTable() {
+      const body = document.getElementById("compare-body");
+      const hint = document.getElementById("compare-hint");
+      if (!snapshotRows.length) {
+        body.innerHTML = "<tr><td colspan='6' style='text-align:center;color:var(--muted)'>No rows in index yet. Reload after a moment, or ingest a new ETIC.</td></tr>";
+        return;
+      }
+      hint.textContent = snapshotRows.length + " snapshots · newest first";
+      body.innerHTML = snapshotRows.map(function (r) {
+        const sel = r.dateKey === selectedDate ? " style='outline:1px solid rgba(106,169,255,0.5);'" : "";
+        const dash = "—";
+        const mc = r.mcRatePercent != null ? fmtMc(r.mcRatePercent) : dash;
+        const ft = r.fleetTotal != null ? fmtKpi(r.fleetTotal) : dash;
+        const fmc = r.fmc != null ? fmtKpi(r.fmc) : dash;
+        const nmc = r.nmc != null ? fmtKpi(r.nmc) : dash;
+        const sur = r.surplus != null ? fmtKpi(r.surplus) : dash;
+        return (
+          "<tr" + sel + ">" +
+          "<td><strong>" + esc(r.dateKey) + "</strong></td>" +
+          "<td class='mc'>" + esc(mc) + "</td>" +
+          "<td>" + esc(ft) + "</td>" +
+          "<td class='fmc'>" + esc(fmc) + "</td>" +
+          "<td class='nmc'>" + esc(nmc) + "</td>" +
+          "<td class='surp'>" + esc(sur) + "</td>" +
+          "</tr>"
+        );
+      }).join("");
+    }
+
+    function fillSelect(entries) {
+      const sel = document.getElementById("etic-date");
+      sel.innerHTML = "";
+      const sorted = sortDesc(entries);
+      for (const e of sorted) {
+        const opt = document.createElement("option");
+        opt.value = e.dateKey;
+        opt.textContent = e.dateKey;
+        sel.appendChild(opt);
+      }
+    }
+
+    async function loadAnalysis(dateKey) {
+      const res = await fetch("/api/analysis/" + encodeURIComponent(dateKey));
+      if (!res.ok) throw new Error("No analysis for " + dateKey);
+      return res.json();
+    }
+
+    function renderKpis(am) {
+      const row = document.getElementById("kpi-row");
+      const strip = document.getElementById("kpi-strip");
+      if (!am || !am.sheetFound) {
+        strip.style.display = "none";
+        row.innerHTML = "";
+        return;
+      }
+      strip.style.display = "block";
+      const cells = [
+        { lbl: "MC Rate", sub: "", val: fmtMc(am.mcRatePercent), cls: "kpi-val-mc em", miss: am.mcRatePercent == null },
+        { lbl: "Fleet Total", sub: "", val: fmtKpi(am.fleetTotal), cls: "kpi-val-fleet", miss: am.fleetTotal == null },
+        { lbl: "No. Vehs", sub: "FMC", val: fmtKpi(am.fmc), cls: "kpi-val-fmc", miss: am.fmc == null },
+        { lbl: "No. Vehs", sub: "NMC", val: fmtKpi(am.nmc), cls: "kpi-val-nmc", miss: am.nmc == null },
+        { lbl: "No. Vehs", sub: "Surplus", val: fmtKpi(am.surplus), cls: "kpi-val-surplus", miss: am.surplus == null },
+      ];
+      row.innerHTML = cells.map(function (c) {
+        const miss = c.miss ? " kpi-missing" : "";
+        const sub = c.sub ? "<small>" + esc(c.sub) + "</small>" : "";
+        return (
+          "<div class='kpi-cell" + miss + "'><div class='lbl'>" + esc(c.lbl) + sub + "</div>" +
+          "<div class='val " + c.cls + "'>" + esc(c.val) + "</div></div>"
+        );
+      }).join("");
+    }
+
+    async function loadWatch() {
+      if (!selectedDate) return;
+      const stale = document.getElementById("watch-stale-only").checked ? "&stale=1" : "";
+      const res = await fetch("/api/watch?date=" + encodeURIComponent(selectedDate) + stale);
+      if (!res.ok) return [];
+      const data = await res.json();
+      return data.rows || [];
+    }
+
+    function tierClass(t) {
+      if (t === "below") return "tier-below";
+      if (t === "at") return "tier-at";
+      if (t === "above") return "tier-above";
+      return "tier-unknown";
+    }
+
+    async function renderWatchTable() {
+      const body = document.getElementById("watch-body");
+      const st = document.getElementById("watch-status");
+      if (!selectedDate) return;
+      body.innerHTML = "<tr><td colspan='10' style='text-align:center;color:var(--muted)'>Loading…</td></tr>";
+      try {
+        const rows = await loadWatch();
+        if (!rows.length) {
+          body.innerHTML = "<tr><td colspan='10' style='text-align:center;color:var(--muted)'>No work orders in index yet. Ingest an ETIC or run Rebuild history.</td></tr>";
+          st.textContent = "";
           return;
         }
-        const disposition = res.headers.get("Content-Disposition") || "";
-        const nameMatch = /filename=\"?([^\";]+)\"?/i.exec(disposition);
-        const fileName = nameMatch ? nameMatch[1] : "yard-check.xlsx";
-        const blob = await res.blob();
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement("a");
-        link.href = url;
-        link.download = fileName;
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
-        URL.revokeObjectURL(url);
-        const assets = res.headers.get("X-Total-Assets") || "0";
-        const wo = res.headers.get("X-Total-Work-Orders") || "0";
-        statusEl.textContent = "Downloaded " + fileName + " (" + assets + " assets across " + wo + " work orders).";
-      } catch (err) {
-        statusEl.textContent = "Error: " + (err && err.message ? err.message : String(err));
-      } finally {
-        btn.disabled = false;
-        btn.textContent = prevLabel;
+        st.textContent = rows.length + " row(s) · toggle stale filter as needed";
+        body.innerHTML = rows.map(function (r) {
+          const staleRow = r.remarkStale ? " stale" : "";
+          const intv = r.requiredIntervalDays != null ? "/" + r.requiredIntervalDays + "d" : "";
+          return (
+            "<tr class='" + staleRow.trim() + "'>" +
+            "<td><strong>" + esc(r.workOrderId) + "</strong></td>" +
+            "<td>" + esc(r.assetId || "—") + "</td>" +
+            "<td><span class='badge-tier " + tierClass(r.melTier) + "'>" + esc(r.melTier) + "</span></td>" +
+            "<td style='max-width:140px;white-space:normal'>" + esc((r.partsStatus || "").slice(0, 80)) + "</td>" +
+            "<td>" + esc(r.eticRaw || r.eticDate || "—") + "</td>" +
+            "<td>" + esc(String(r.daysSinceRemarkChange)) + intv + "</td>" +
+            "<td>" + (r.remarkStale ? "<strong style='color:#ff9a9a'>Yes</strong>" : "—") + "</td>" +
+            "<td>" + esc(String(r.eticPushCount ?? 0)) + "</td>" +
+            "<td>" + esc(String(r.cumulativeEticSlipDays ?? 0)) + "</td>" +
+            "<td><button type='button' class='linkish watch-log-btn' data-wo='" + esc(r.workOrderId) + "'>Log</button></td>" +
+            "</tr>"
+          );
+        }).join("");
+      } catch (e) {
+        body.innerHTML = "<tr><td colspan='10' style='text-align:center;color:#ff9a9a'>" + esc(String(e.message || e)) + "</td></tr>";
       }
     }
 
-    document.addEventListener("click", (ev) => {
-      const target = ev.target;
-      if (target && target instanceof HTMLElement && (target.id === "download-yard-check" || target.id === "download-yard-check-2")) {
-        ev.preventDefault();
-        downloadYardCheck(target);
+    async function openChangelog(woId) {
+      const modal = document.getElementById("changelog-modal");
+      const title = document.getElementById("changelog-title");
+      const body = document.getElementById("changelog-body");
+      title.textContent = "Changelog — " + woId;
+      body.innerHTML = "Loading…";
+      modal.classList.remove("hidden");
+      try {
+        const res = await fetch("/api/work-order-changelog?workOrderId=" + encodeURIComponent(woId));
+        const data = await res.json();
+        const entries = data.entries || [];
+        if (!entries.length) {
+          body.innerHTML = "<p style='color:var(--muted)'>No changes recorded yet.</p>";
+          return;
+        }
+        body.innerHTML = entries.map(function (e) {
+          return (
+            "<div class='log-row'>" +
+            "<div class='log-meta'>" + esc(e.snapshot_date_key) + " · " + esc(e.field) + " · " + esc(e.changed_at_iso) + "</div>" +
+            "<div>" + esc(e.old_value || "—") + " → " + esc(e.new_value || "—") + "</div>" +
+            "</div>"
+          );
+        }).join("");
+      } catch (err) {
+        body.innerHTML = "<p style='color:#ff9a9a'>" + esc(String(err.message || err)) + "</p>";
       }
-    });
+    }
 
-    loadAll().catch((err) => {
-      document.getElementById("updated").textContent = "Failed to load: " + (err && err.message ? err.message : String(err));
-    });
+    function renderDetails(analysis) {
+      document.getElementById("hero-title").textContent = analysis.dateKey;
+      document.getElementById("hero-file").innerHTML =
+        "File <strong>" + esc(analysis.workbookFileName) + "</strong>";
+
+      renderKpis(analysis.assetManager);
+      renderCompareTable();
+      renderWatchTable();
+
+      const ing = document.getElementById("ingest-details");
+      const recv = analysis.receivedAtIso
+        ? new Date(analysis.receivedAtIso).toLocaleString(undefined, {
+            dateStyle: "medium",
+            timeStyle: "short",
+          })
+        : "—";
+      ing.innerHTML = [
+        "<div class='detail-row'><dt>Received</dt><dd>" + esc(recv) + "</dd></div>",
+        "<div class='detail-row'><dt>From</dt><dd>" + esc(analysis.from) + "</dd></div>",
+        "<div class='detail-row'><dt>To</dt><dd>" + esc(analysis.to) + "</dd></div>",
+        "<div class='detail-row'><dt>Workbook size</dt><dd>" +
+          (typeof analysis.workbookBytes === "number"
+            ? (analysis.workbookBytes / 1024 / 1024).toFixed(2) + " MB"
+            : "—") +
+          "</dd></div>",
+      ].join("");
+    }
+
+    async function selectDate(dateKey, pushHash) {
+      selectedDate = dateKey;
+      if (pushHash && dateKey) setHash(dateKey);
+      document.getElementById("yard-status").textContent = "";
+      document.getElementById("yard-status").className = "status";
+
+      if (!dateKey) return;
+
+      try {
+        const analysis = await loadAnalysis(dateKey);
+        renderDetails(analysis);
+      } catch (e) {
+        document.getElementById("ingest-details").innerHTML =
+          "<div class='detail-row'><dt>Error</dt><dd>" + esc(e.message || String(e)) + "</dd></div>";
+      }
+    }
+
+    async function downloadEticWorkbook() {
+      const btn = document.getElementById("btn-download-etic");
+      const st = document.getElementById("etic-dl-status");
+      if (!selectedDate) return;
+      btn.disabled = true;
+      st.className = "status";
+      st.textContent = "Downloading…";
+      try {
+        const url = "/api/workbook.xlsx?date=" + encodeURIComponent(selectedDate);
+        const res = await fetch(url);
+        if (!res.ok) {
+          let msg = "Could not download.";
+          try {
+            const j = await res.json();
+            if (j && j.error) msg = j.error;
+          } catch (_) {}
+          st.className = "status err";
+          st.textContent = msg;
+          return;
+        }
+        const disp = res.headers.get("Content-Disposition") || "";
+        const m = /filename="?([^";]+)"?/i.exec(disp);
+        const name = m ? m[1] : "etic.xlsx";
+        const blob = await res.blob();
+        const u = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = u;
+        a.download = name;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(u);
+        st.className = "status ok";
+        st.textContent = "Saved " + name;
+      } catch (e) {
+        st.className = "status err";
+        st.textContent = String(e && e.message ? e.message : e);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function downloadYardCheck() {
+      const btn = document.getElementById("btn-yard-check");
+      const st = document.getElementById("yard-status");
+      if (!selectedDate) return;
+      btn.disabled = true;
+      st.className = "status";
+      st.textContent = "Building your file…";
+      try {
+        const url = "/api/yard-check.xlsx?date=" + encodeURIComponent(selectedDate);
+        const res = await fetch(url);
+        if (!res.ok) {
+          let msg = "Could not generate file.";
+          try {
+            const j = await res.json();
+            if (j && j.error) msg = j.error;
+          } catch (_) {}
+          st.className = "status err";
+          st.textContent = msg;
+          return;
+        }
+        const disp = res.headers.get("Content-Disposition") || "";
+        const m = /filename="?([^";]+)"?/i.exec(disp);
+        const name = m ? m[1] : "yard-check.xlsx";
+        const blob = await res.blob();
+        const u = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = u;
+        a.download = name;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(u);
+        st.className = "status ok";
+        st.textContent = "Saved as " + name;
+      } catch (e) {
+        st.className = "status err";
+        st.textContent = String(e && e.message ? e.message : e);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function init() {
+      try {
+        historyEntries = await loadHistory();
+      } catch (e) {
+        document.getElementById("view-empty").classList.remove("hidden");
+        document.getElementById("view-empty").querySelector("p").innerHTML =
+          "<strong>Could not load data.</strong><br />" + esc(e.message || String(e));
+        return;
+      }
+
+      if (!historyEntries.length) {
+        document.getElementById("view-empty").classList.remove("hidden");
+        return;
+      }
+
+      document.getElementById("view-main").classList.remove("hidden");
+      fillSelect(historyEntries);
+
+      snapshotRows = await loadSnapshots();
+      renderCompareTable();
+      await syncSnapshotsOnce();
+      setTimeout(async function () {
+        snapshotRows = await loadSnapshots();
+        renderCompareTable();
+      }, 3000);
+
+      const sorted = sortDesc(historyEntries);
+      const hashDate = readHashDate();
+      const start =
+        hashDate && sorted.some((e) => e.dateKey === hashDate)
+          ? hashDate
+          : sorted[0].dateKey;
+      const sel = document.getElementById("etic-date");
+      sel.value = start;
+      await selectDate(start, true);
+
+      sel.addEventListener("change", async () => {
+        await selectDate(sel.value, true);
+      });
+
+      window.addEventListener("hashchange", async () => {
+        const d = readHashDate();
+        if (d && historyEntries.some((e) => e.dateKey === d) && d !== selectedDate) {
+          sel.value = d;
+          await selectDate(d, false);
+        }
+      });
+
+      document.getElementById("btn-yard-check").addEventListener("click", downloadYardCheck);
+      document.getElementById("btn-download-etic").addEventListener("click", downloadEticWorkbook);
+
+      document.getElementById("watch-stale-only").addEventListener("change", renderWatchTable);
+      document.getElementById("watch-rebuild").addEventListener("click", async function () {
+        const st = document.getElementById("watch-status");
+        if (!confirm("Rebuild clears work order changelog and replays every ETIC in date order. Continue?")) return;
+        st.textContent = "Starting rebuild…";
+        try {
+          const res = await fetch("/api/watch?rebuild=1", { method: "POST" });
+          const j = await res.json();
+          st.textContent = (j && j.message) ? j.message : "Rebuild started.";
+          setTimeout(renderWatchTable, 5000);
+        } catch (e) {
+          st.textContent = String(e && e.message ? e.message : e);
+        }
+      });
+      document.getElementById("watch-table").addEventListener("click", function (ev) {
+        const t = ev.target;
+        if (t && t.classList && t.classList.contains("watch-log-btn")) {
+          const wo = t.getAttribute("data-wo");
+          if (wo) openChangelog(wo);
+        }
+      });
+      document.getElementById("changelog-close").addEventListener("click", function () {
+        document.getElementById("changelog-modal").classList.add("hidden");
+      });
+      document.getElementById("changelog-modal").addEventListener("click", function (ev) {
+        if (ev.target.id === "changelog-modal") document.getElementById("changelog-modal").classList.add("hidden");
+      });
+    }
+
+    init();
   </script>
 </body>
 </html>`;
@@ -843,10 +2025,13 @@ function escapeHtml(input: string): string {
 export {
   analyzeWorkbook,
   countMelMentions,
+  extractAssetManagerKpis,
   isoDateKey,
   parseMaxAttachmentBytes,
+  parseReportDateKeyFromSubject,
   pickWorkbookAttachment,
   readCellText,
+  resolveAnalysisDateKey,
   sanitizeFileName,
   upsertHistoryEntry,
 };

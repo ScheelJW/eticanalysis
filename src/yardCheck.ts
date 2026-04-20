@@ -35,7 +35,10 @@ type WorkOrderField =
   | "shop"
   | "shop2"
   | "etiCLocation"
-  | "makeModel";
+  | "makeModel"
+  | "partsStatus"
+  | "eticDue"
+  | "currentMel";
 
 type FleetField = "assetId" | "vinSerial" | "makeModel" | "etiCLocation";
 
@@ -75,6 +78,29 @@ const WORK_ORDER_SYNONYMS: Record<WorkOrderField, string[]> = {
     "location",
   ],
   makeModel: ["make model", "make/model", "make / model"],
+  partsStatus: [
+    "parts status",
+    "part status",
+    "parts",
+    "parts availability",
+    "material status",
+  ],
+  eticDue: [
+    "etic",
+    "etic date",
+    "current etic",
+    "projected etic",
+    "etic due",
+    "estimated completion",
+  ],
+  currentMel: [
+    "mel",
+    "current mel",
+    "mel level",
+    "mission essential",
+    "mel status",
+    "m e l",
+  ],
 };
 
 const FLEET_SYNONYMS: Record<FleetField, string[]> = {
@@ -246,7 +272,7 @@ function findFleetSheet(workbook: ExcelJS.Workbook): ExcelJS.Worksheet | null {
   );
 }
 
-type RawWorkOrder = {
+export type RawWorkOrder = {
   assetId: string;
   workOrderId: string;
   remarks: string;
@@ -254,6 +280,9 @@ type RawWorkOrder = {
   shop2: string;
   etiCLocation: string;
   makeModel: string;
+  partsStatus: string;
+  eticDue: string;
+  currentMel: string;
 };
 
 type FleetRecord = {
@@ -283,6 +312,9 @@ function extractWorkOrders(sheet: ExcelJS.Worksheet): {
       shop2: "",
       etiCLocation: "",
       makeModel: "",
+      partsStatus: "",
+      eticDue: "",
+      currentMel: "",
     };
     let hasAny = false;
     scan.mapping.forEach((field, colNumber) => {
@@ -324,6 +356,15 @@ function extractFleet(sheet: ExcelJS.Worksheet): {
     }
   }
   return { byAsset, scan };
+}
+
+/** Raw WO rows from the workbook (one row per work order line). */
+export async function extractRawWorkOrdersFromBinary(binary: ArrayBuffer): Promise<RawWorkOrder[]> {
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(binary);
+  const woSheet = findWorkOrderSheet(workbook);
+  if (!woSheet) return [];
+  return extractWorkOrders(woSheet).rows;
 }
 
 export async function extractYardCheckSource(binary: ArrayBuffer): Promise<YardCheckSource | null> {

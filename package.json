@@ -9,7 +9,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "check": "npm run cf-typegen && npm run typecheck && npm run test",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy --env-file .env.cloudflare"
   },
   "repository": {
     "type": "git",
