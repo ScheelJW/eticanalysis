@@ -3750,7 +3750,6 @@ async function handleAbuseTrackerListApi(env: Env, request: Request): Promise<Re
     return Response.json({ error: "assetId or workOrderId required" }, { status: 400, headers: cacheHeaders() });
   }
   const createdBy = String(body.createdBy ?? "").trim();
-  if (!createdBy) return Response.json({ error: "createdBy (your name) required" }, { status: 400, headers: cacheHeaders() });
   try {
     const c = await createAbuseCase(env, {
       caseType: body.caseType,
@@ -13350,9 +13349,6 @@ function renderDashboardHtml(): string {
               </label>
               <label class="field" style="grid-column:1/-1"><span class="label">Work order ID</span>
                 <input type="text" id="abuse-new-wo" placeholder="Optional — fills asset from fleet data when known" />
-              </label>
-              <label class="field" style="grid-column:1/-1"><span class="label">Your name</span>
-                <input type="text" id="abuse-new-by" autocomplete="name" />
               </label>
             </div>
             <button type="button" class="primary" id="abuse-new-btn" style="margin-top:10px">Create case</button>
@@ -23112,10 +23108,9 @@ function renderDashboardHtml(): string {
       var msg = document.getElementById("abuse-new-msg");
       var asset = (document.getElementById("abuse-new-asset").value || "").trim();
       var wo = (document.getElementById("abuse-new-wo") && document.getElementById("abuse-new-wo").value || "").trim();
-      var by = (document.getElementById("abuse-new-by").value || "").trim();
       var typ = document.getElementById("abuse-new-type").value;
-      if ((!asset && !wo) || !by) {
-        msg.textContent = "Enter work order ID or asset id, and your name.";
+      if (!asset && !wo) {
+        msg.textContent = "Enter a work order ID or asset id.";
         return;
       }
       msg.textContent = "Creating…";
@@ -23123,7 +23118,7 @@ function renderDashboardHtml(): string {
         var r = await fetch("/api/abuse-tracker", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ caseType: typ, assetId: asset, workOrderId: wo, createdBy: by }),
+          body: JSON.stringify({ caseType: typ, assetId: asset, workOrderId: wo }),
         });
         var j = await r.json();
         if (!r.ok) throw new Error(j.error || "Create failed");
