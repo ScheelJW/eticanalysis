@@ -103,7 +103,6 @@ import {
   upsertMelSubdivision,
 } from "./melWatch";
 import {
-  addAbuseAttachment,
   addAbuseNote,
   createAbuseCase,
   findCaseByEmailToken,
@@ -118,7 +117,6 @@ import {
   updateAbuseCase,
   abuseDamEmailLocalPart,
   abuseIngestEmailAddresses,
-  type AbuseAttachmentKind,
   type AbuseCaseStage,
   type AbuseCaseType,
 } from "./abuseTracker";
@@ -593,12 +591,6 @@ export default {
       const aid = Number.parseInt(abuseAttMatch[1] ?? "", 10);
       if (!Number.isFinite(aid)) return new Response("Invalid attachment id", { status: 400 });
       return handleAbuseTrackerAttachmentApi(env, request, aid);
-    }
-    const abuseCaseUploadMatch = url.pathname.match(/^\/api\/abuse-tracker\/(\d+)\/attachments$/);
-    if (abuseCaseUploadMatch) {
-      const cid = Number.parseInt(abuseCaseUploadMatch[1] ?? "", 10);
-      if (!Number.isFinite(cid)) return new Response("Invalid case id", { status: 400 });
-      return handleAbuseTrackerAttachmentUploadApi(env, request, cid);
     }
     const abuseCaseMatch = url.pathname.match(/^\/api\/abuse-tracker\/(\d+)(?:\/(notes))?$/);
     if (abuseCaseMatch) {
@@ -3672,9 +3664,6 @@ function isAbuseCaseType(s: unknown): s is AbuseCaseType {
 function isAbuseCaseStage(s: unknown): s is AbuseCaseStage {
   return s === "intake" || s === "estimates" || s === "release_pending" || s === "approved_work" || s === "closed";
 }
-function isAbuseAttachmentKind(s: unknown): s is AbuseAttachmentKind {
-  return s === "damage_photo" || s === "release_letter" || s === "estimate" || s === "other";
-}
 
 async function handleFleetAssetsSearchApi(env: Env, request: Request): Promise<Response> {
   if (request.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
@@ -3898,57 +3887,6 @@ async function handleAbuseTrackerNoteApi(env: Env, request: Request, caseId: num
   const note = await addAbuseNote(env, caseId, text, author);
   if (!note) return new Response("Not Found", { status: 404 });
   return Response.json({ note }, { headers: cacheHeaders() });
-}
-
-async function handleAbuseTrackerAttachmentUploadApi(env: Env, request: Request, caseId: number): Promise<Response> {
-  if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
-  const ct = request.headers.get("content-type") || "";
-  if (!ct.startsWith("multipart/form-data")) {
-    return Response.json({ error: "expected multipart/form-data" }, { status: 415, headers: cacheHeaders() });
-  }
-  let form: FormData;
-  try {
-    form = await request.formData();
-  } catch (e) {
-    return Response.json(
-      { error: "could not parse form: " + (e instanceof Error ? e.message : String(e)) },
-      { status: 400, headers: cacheHeaders() },
-    );
-  }
-  const file = form.get("file");
-  if (!(file instanceof File) || file.size <= 0) {
-    return Response.json({ error: "file field required" }, { status: 400, headers: cacheHeaders() });
-  }
-  const MAX_BYTES = 25 * 1024 * 1024;
-  if (file.size > MAX_BYTES) {
-    return Response.json({ error: "file too large (max 25MB)" }, { status: 413, headers: cacheHeaders() });
-  }
-  const kindRaw = String(form.get("kind") ?? "other");
-  if (!isAbuseAttachmentKind(kindRaw)) {
-    return Response.json({ error: "invalid kind" }, { status: 400, headers: cacheHeaders() });
-  }
-  const uploadedBy = String(form.get("uploadedBy") ?? "").trim();
-  if (!uploadedBy) {
-    return Response.json({ error: "uploadedBy (your name) required" }, { status: 400, headers: cacheHeaders() });
-  }
-  const c = await getAbuseCaseDetail(env, caseId);
-  if (!c) return new Response("Not Found", { status: 404 });
-  const buf = await file.arrayBuffer();
-  try {
-    const att = await addAbuseAttachment(env, {
-      caseId,
-      kind: kindRaw,
-      body: buf,
-      filename: file.name || "upload",
-      contentType: file.type || "application/octet-stream",
-      uploadedBy,
-      source: "web",
-    });
-    return Response.json({ attachment: att }, { headers: cacheHeaders() });
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return Response.json({ error: msg }, { status: 400, headers: cacheHeaders() });
-  }
 }
 
 async function handleAbuseTrackerAttachmentApi(env: Env, request: Request, attachmentId: number): Promise<Response> {
@@ -9905,10 +9843,6 @@ function renderDashboardHtml(): string {
     @media (max-width: 640px) { .abuse-grid { grid-template-columns: 1fr; } }
     .abuse-check { display: flex; align-items: center; gap: 8px; padding-top: 22px; }
     .abuse-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 14px; }
-    .abuse-up-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-    @media (max-width: 640px) { .abuse-up-grid { grid-template-columns: 1fr; } }
-    #abuse-up-bar { display: none; }
-    #abuse-up-bar.show { display: block; }
     .abuse-notes-list {
       max-height: 220px; overflow-y: auto; border: 1px solid var(--border); border-radius: 10px;
       padding: 8px 10px; margin-bottom: 10px; background: var(--bg-elev); font-size: 0.85rem;
@@ -13300,7 +13234,7 @@ function renderDashboardHtml(): string {
             <div>
               <h2 style="margin:0">Accident / abuse tracker</h2>
               <p class="hint" style="margin:6px 0 0;max-width:52rem">
-                VFM/VMS cost recovery: open one accident and one abuse case per asset at a time. Each case has separate email addresses for damage photos, release letters, estimates, and other documents so attachments are labeled correctly (browser uploads may be blocked on some networks).
+                VFM/VMS cost recovery: open one accident and one abuse case per asset at a time. Files arrive by email only — each case has separate addresses for damage photos, release letters, estimates, and other documents so attachments are labeled correctly.
               </p>
             </div>
             <div class="abuse-head-actions">
@@ -13384,30 +13318,6 @@ function renderDashboardHtml(): string {
                   <button type="button" class="primary" id="abuse-save-case">Save case</button>
                   <button type="button" class="ghost" id="abuse-close-case">Close case</button>
                   <span class="status" id="abuse-case-status"></span>
-                </div>
-                <div class="abuse-upload">
-                  <h4 style="margin:18px 0 8px;font-size:0.9rem">Upload from browser</h4>
-                  <div class="abuse-up-grid">
-                    <label class="field"><span class="label">Kind</span>
-                      <select id="abuse-up-kind">
-                        <option value="damage_photo">Damage photo</option>
-                        <option value="release_letter">Release letter (PDF)</option>
-                        <option value="estimate">Estimate scan</option>
-                        <option value="other">Other</option>
-                      </select>
-                    </label>
-                    <label class="field"><span class="label">Your name</span>
-                      <input type="text" id="abuse-up-by" autocomplete="name" />
-                    </label>
-                    <label class="field" style="grid-column:1/-1"><span class="label">File</span>
-                      <input type="file" id="abuse-up-file" />
-                    </label>
-                  </div>
-                  <div id="abuse-up-bar" class="yard-upload-bar" style="margin-top:10px">
-                    <div class="yard-up-lbl" id="abuse-up-lbl">Uploading…</div>
-                    <div class="yard-up-track"><div class="yard-up-fill" id="abuse-up-fill"></div></div>
-                  </div>
-                  <button type="button" class="ghost" id="abuse-up-btn">Upload file</button>
                 </div>
                 <div class="abuse-notes">
                   <h4 style="margin:18px 0 8px;font-size:0.9rem">Notes</h4>
@@ -22936,46 +22846,6 @@ function renderDashboardHtml(): string {
       }
     }
 
-    function abusePostMultipart(url, fd, fillEl, lblEl, onOk, onErr) {
-      var xhr = new XMLHttpRequest();
-      xhr.open("POST", url);
-      xhr.upload.onprogress = function (ev) {
-        if (!fillEl || !lblEl) return;
-        fillEl.parentElement.classList.add("show");
-        if (!ev.lengthComputable) {
-          lblEl.textContent = "Uploading…";
-          fillEl.style.width = "8%";
-          return;
-        }
-        var pct = ev.total ? Math.round((ev.loaded / ev.total) * 100) : 0;
-        lblEl.textContent = "Uploading " + pct + "%";
-        fillEl.style.width = pct + "%";
-      };
-      xhr.onload = function () {
-        if (fillEl) fillEl.parentElement.classList.remove("show");
-        if (fillEl) fillEl.style.width = "0%";
-        if (xhr.status >= 200 && xhr.status < 300) {
-          try {
-            onOk(JSON.parse(xhr.responseText || "{}"));
-          } catch (e) {
-            onErr(new Error("Bad response"));
-          }
-        } else {
-          try {
-            var j = JSON.parse(xhr.responseText || "{}");
-            onErr(new Error(j.error || ("HTTP " + xhr.status)));
-          } catch (e2) {
-            onErr(new Error("Upload failed"));
-          }
-        }
-      };
-      xhr.onerror = function () {
-        if (fillEl) fillEl.parentElement.classList.remove("show");
-        onErr(new Error("Network error"));
-      };
-      xhr.send(fd);
-    }
-
     function abuseStageLabel(s) {
       if (s === "intake") return "Initial — awaiting documents";
       if (s === "estimates") return "Awaiting estimates";
@@ -23430,32 +23300,6 @@ function renderDashboardHtml(): string {
           var cur = abuseCollectEstimates();
           cur.push({ vendor: "", amount: null, note: "" });
           abuseRenderEstimates(cur);
-        });
-      }
-      var upBtn = document.getElementById("abuse-up-btn");
-      if (upBtn) {
-        upBtn.addEventListener("click", function () {
-          var id = abuseTrackerState.selectedId;
-          if (!id) return;
-          var f = document.getElementById("abuse-up-file").files && document.getElementById("abuse-up-file").files[0];
-          if (!f) return;
-          var by = (document.getElementById("abuse-up-by").value || "").trim();
-          if (!by) {
-            document.getElementById("abuse-case-status").textContent = "Enter your name for upload.";
-            return;
-          }
-          var fd = new FormData();
-          fd.append("file", f, f.name);
-          fd.append("kind", document.getElementById("abuse-up-kind").value);
-          fd.append("uploadedBy", by);
-          var fill = document.getElementById("abuse-up-fill");
-          var lbl = document.getElementById("abuse-up-lbl");
-          abusePostMultipart("/api/abuse-tracker/" + id + "/attachments", fd, fill, lbl, function () {
-            document.getElementById("abuse-up-file").value = "";
-            abuseSelectCase(id, false);
-          }, function (err) {
-            document.getElementById("abuse-case-status").textContent = err.message || "Upload failed";
-          });
         });
       }
     }
