@@ -113,9 +113,10 @@ import {
   ingestAbuseDamEmailFiles,
   listAbuseCases,
   searchFleetAssetsForPicker,
-  parseAbuseDamTokenFromEmailTo,
+  parseAbuseEmailIngestFromTo,
   updateAbuseCase,
   abuseDamEmailLocalPart,
+  abuseIngestEmailAddresses,
   type AbuseAttachmentKind,
   type AbuseCaseStage,
   type AbuseCaseType,
@@ -209,14 +210,14 @@ export default {
     }
 
     const parsed = await PostalMime.parse(message.raw, { attachmentEncoding: "arraybuffer" });
-    const damToken = parseAbuseDamTokenFromEmailTo(message.to || "");
-    if (damToken) {
-      const caseRow = await findCaseByEmailToken(env, damToken);
+    const abuseIngest = parseAbuseEmailIngestFromTo(message.to || "");
+    if (abuseIngest) {
+      const caseRow = await findCaseByEmailToken(env, abuseIngest.token);
       if (!caseRow) {
         console.warn(
           JSON.stringify({
             level: "warn",
-            message: "abuse-dam email: unknown token",
+            message: "abuse ingest email: unknown token",
             to: message.to,
             from: message.from,
           }),
@@ -228,7 +229,7 @@ export default {
         mimeType: a.mimeType,
         content: normalizeAttachmentBinary(a.content),
       }));
-      const n = await ingestAbuseDamEmailFiles(env, caseRow, atts, message.from);
+      const n = await ingestAbuseDamEmailFiles(env, caseRow, atts, message.from, abuseIngest.routeKind);
       if (n > 0) {
         await addAbuseNote(
           env,
@@ -3706,12 +3707,16 @@ async function handleAbuseTrackerListApi(env: Env, request: Request): Promise<Re
         "reimbursed_at_iso",
         "vehicle_location",
         "created_at_iso",
-        "closed_at_iso",
-        "email_ingest_address",
+        "email_ingest_damage_photo",
+        "email_ingest_release_letter",
+        "email_ingest_estimate",
+        "email_ingest_other",
+        "email_ingest_legacy_auto",
       ].join(",");
       const host = url.host || "your-domain";
-      const lines = rows.map((r) =>
-        [
+      const lines = rows.map((r) => {
+        const em = abuseIngestEmailAddresses(r.email_token);
+        return [
           escCsv(r.control_number),
           escCsv(r.case_type),
           escCsv(r.asset_id),
@@ -3727,9 +3732,13 @@ async function handleAbuseTrackerListApi(env: Env, request: Request): Promise<Re
           escCsv(r.vehicle_location),
           escCsv(r.created_at_iso),
           escCsv(r.closed_at_iso ?? ""),
-          escCsv(`${abuseDamEmailLocalPart(r.email_token)}@${host}`),
-        ].join(","),
-      );
+          escCsv(`${em.damage_photo}@${host}`),
+          escCsv(`${em.release_letter}@${host}`),
+          escCsv(`${em.estimate}@${host}`),
+          escCsv(`${em.other}@${host}`),
+          escCsv(`${em.auto}@${host}`),
+        ].join(",");
+      });
       const csv = [header, ...lines].join("\n");
       return new Response(csv, {
         headers: {
@@ -3775,8 +3784,13 @@ async function handleAbuseTrackerListApi(env: Env, request: Request): Promise<Re
     });
     const url = new URL(request.url);
     const host = url.host || "";
-    const ingestEmail = host ? `${abuseDamEmailLocalPart(c.email_token)}@${host}` : "";
-    return Response.json({ case: c, ingestEmail }, { headers: cacheHeaders() });
+    const ingestEmails = host
+      ? Object.fromEntries(
+          Object.entries(abuseIngestEmailAddresses(c.email_token)).map(([k, local]) => [k, `${local}@${host}`]),
+        )
+      : {};
+    const ingestEmail = (ingestEmails as { auto?: string }).auto ?? "";
+    return Response.json({ case: c, ingestEmail, ingestEmails }, { headers: cacheHeaders() });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return Response.json({ error: msg }, { status: 400, headers: cacheHeaders() });
@@ -3796,8 +3810,13 @@ async function handleAbuseTrackerCaseApi(env: Env, request: Request, caseId: num
     }
     const url = new URL(request.url);
     const host = url.host || "";
-    const ingestEmail = host ? `${abuseDamEmailLocalPart(d.case.email_token)}@${host}` : "";
-    return Response.json({ ...d, estimates, ingestEmail }, { headers: cacheHeaders() });
+    const ingestEmails = host
+      ? Object.fromEntries(
+          Object.entries(abuseIngestEmailAddresses(d.case.email_token)).map(([k, local]) => [k, `${local}@${host}`]),
+        )
+      : {};
+    const ingestEmail = (ingestEmails as { auto?: string }).auto ?? "";
+    return Response.json({ ...d, estimates, ingestEmail, ingestEmails }, { headers: cacheHeaders() });
   }
   if (request.method !== "PATCH") return new Response("Method Not Allowed", { status: 405 });
   const body = await readJsonBody<{
@@ -9868,6 +9887,11 @@ function renderDashboardHtml(): string {
     .abuse-new-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
     @media (max-width: 640px) { .abuse-new-grid { grid-template-columns: 1fr; } }
     .abuse-charts canvas { max-width: 100%; height: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-elev); }
+    .abuse-ingest-wrap { margin-top: 4px; }
+    .abuse-ingest-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; margin-top: 8px; }
+    .abuse-ingest-table th, .abuse-ingest-table td { border: 1px solid var(--border); padding: 6px 8px; text-align: left; vertical-align: top; }
+    .abuse-ingest-table th { background: rgba(0,0,0,0.04); font-weight: 600; width: 11rem; white-space: nowrap; }
+    .abuse-ingest-table code { word-break: break-all; font-size: 0.8em; display: block; }
 
     /* ---- Waivers tab ---- */
     #panel-waivers .hidden { display: none; }
@@ -13237,7 +13261,7 @@ function renderDashboardHtml(): string {
             <div>
               <h2 style="margin:0">Accident / abuse tracker</h2>
               <p class="hint" style="margin:6px 0 0;max-width:52rem">
-                VFM/VMS cost recovery: open one accident and one abuse case per asset at a time. Email photos or PDFs to the ingest address on each case (no upload button required for field units).
+                VFM/VMS cost recovery: open one accident and one abuse case per asset at a time. Each case has separate email addresses for damage photos, release letters, estimates, and other documents so attachments are labeled correctly (browser uploads may be blocked on some networks).
               </p>
             </div>
             <div class="abuse-head-actions">
@@ -13264,7 +13288,7 @@ function renderDashboardHtml(): string {
                   </div>
                   <span class="abuse-type-pill" id="abuse-d-type"></span>
                 </div>
-                <p class="hint" id="abuse-d-ingest"></p>
+                <div class="hint abuse-ingest-wrap" id="abuse-d-ingest"></div>
                 <div class="abuse-grid">
                   <label class="field"><span class="label">Stage</span>
                     <select id="abuse-d-stage">
@@ -22856,6 +22880,32 @@ function renderDashboardHtml(): string {
       return s || "";
     }
 
+    function abuseIngestTableHtml(em) {
+      if (!em || typeof em !== "object") return "";
+      var rows = [
+        ["Damage photos (images)", em.damage_photo],
+        ["Release letter (PDF)", em.release_letter],
+        ["Written estimates (PDF or scan)", em.estimate],
+        ["Other supporting docs", em.other],
+        ["Legacy auto-detect (any type)", em.auto],
+      ];
+      var body = rows
+        .filter(function (r) { return r[1]; })
+        .map(function (r) {
+          return (
+            "<tr><th>" + esc(r[0]) + "</th><td><code>" + esc(String(r[1])) + "</code></td></tr>"
+          );
+        })
+        .join("");
+      if (!body) return "";
+      return (
+        "<table class='abuse-ingest-table'><tbody>" +
+          body +
+        "</tbody></table>" +
+        "<p class='hint' style='margin:8px 0 0'>Use the address that matches the attachment type. Subject line is ignored.</p>"
+      );
+    }
+
     function abuseDrawStageChart() {
       var c = document.getElementById("abuse-chart-stage");
       if (!c || !c.getContext) return;
@@ -23013,9 +23063,12 @@ function renderDashboardHtml(): string {
         tp.className = "abuse-type-pill " + (c.case_type === "abuse" ? "abuse" : "accident");
         var ing = document.getElementById("abuse-d-ingest");
         if (ing) {
-          ing.innerHTML = j.ingestEmail
-            ? "<strong>Email ingest:</strong> <code style='font-size:0.85rem'>" + esc(j.ingestEmail) + "</code> — attach photos or PDFs; subject line is ignored."
-            : "";
+          var tbl = abuseIngestTableHtml(j.ingestEmails);
+          ing.innerHTML = tbl
+            ? "<strong>Email ingest</strong> (one address per file type)" + tbl
+            : j.ingestEmail
+              ? "<strong>Email ingest:</strong> <code style='font-size:0.85rem'>" + esc(j.ingestEmail) + "</code>"
+              : "";
         }
         document.getElementById("abuse-d-stage").value = c.stage || "intake";
         document.getElementById("abuse-d-loc").value = c.vehicle_location || "";
@@ -23137,8 +23190,10 @@ function renderDashboardHtml(): string {
         });
         var j = await r.json();
         if (!r.ok) throw new Error(j.error || "Create failed");
-        msg.innerHTML = "Created <strong>" + esc(j.case.control_number) + "</strong>." +
-          (j.ingestEmail ? " Ingest: <code>" + esc(j.ingestEmail) + "</code>" : "");
+        var createdTbl = abuseIngestTableHtml(j.ingestEmails);
+        msg.innerHTML =
+          "Created <strong>" + esc(j.case.control_number) + "</strong>." +
+          (createdTbl ? " Use these addresses to email files in:" + createdTbl : j.ingestEmail ? " Ingest: <code>" + esc(j.ingestEmail) + "</code>" : "");
         document.getElementById("abuse-new-asset").value = "";
         var nwo = document.getElementById("abuse-new-wo");
         if (nwo) nwo.value = "";

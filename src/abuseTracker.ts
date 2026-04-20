@@ -474,15 +474,64 @@ export async function searchFleetAssetsForPicker(
   return r.results ?? [];
 }
 
+/** Legacy local-part: filename extension chooses damage vs release vs other. */
 export function abuseDamEmailLocalPart(token: string): string {
   return `abuse-dam-${token.trim().toLowerCase()}`;
 }
 
-/** Parse To header for abuse-dam-<token>@host */
+const ABUSE_INGEST_PREFIX_TO_KIND: Record<string, "auto" | AbuseAttachmentKind> = {
+  dam: "auto",
+  photo: "damage_photo",
+  rel: "release_letter",
+  est: "estimate",
+  doc: "other",
+};
+
+/** Typed ingest addresses (one per attachment kind). Corporate browsers often block uploads. */
+export function abuseIngestEmailLocalPart(kind: AbuseAttachmentKind, token: string): string {
+  const t = token.trim().toLowerCase();
+  if (kind === "damage_photo") return `abuse-photo-${t}`;
+  if (kind === "release_letter") return `abuse-rel-${t}`;
+  if (kind === "estimate") return `abuse-est-${t}`;
+  return `abuse-doc-${t}`;
+}
+
+export function abuseIngestEmailAddresses(token: string): {
+  auto: string;
+  damage_photo: string;
+  release_letter: string;
+  estimate: string;
+  other: string;
+} {
+  const t = token.trim().toLowerCase();
+  return {
+    auto: abuseDamEmailLocalPart(t),
+    damage_photo: abuseIngestEmailLocalPart("damage_photo", t),
+    release_letter: abuseIngestEmailLocalPart("release_letter", t),
+    estimate: abuseIngestEmailLocalPart("estimate", t),
+    other: abuseIngestEmailLocalPart("other", t),
+  };
+}
+
+/** Parse To (or Delivered-To style) for abuse-{dam|photo|rel|est|doc}-<token>@host */
+export function parseAbuseEmailIngestFromTo(toHeader: string): { token: string; routeKind: "auto" | AbuseAttachmentKind } | null {
+  const raw = toHeader.replace(/[<>]/g, " ").trim().toLowerCase();
+  const re = /\babuse-(dam|photo|rel|est|doc)-([a-f0-9]{16})@/g;
+  let m: RegExpExecArray | null;
+  let last: { token: string; routeKind: "auto" | AbuseAttachmentKind } | null = null;
+  while ((m = re.exec(raw)) !== null) {
+    const short = m[1]!;
+    const token = m[2]!;
+    const rk = ABUSE_INGEST_PREFIX_TO_KIND[short];
+    if (rk) last = { token, routeKind: rk };
+  }
+  return last;
+}
+
+/** @deprecated use parseAbuseEmailIngestFromTo */
 export function parseAbuseDamTokenFromEmailTo(toHeader: string): string | null {
-  const raw = toHeader.replace(/[<>]/g, "").trim().toLowerCase();
-  const m = raw.match(/abuse-dam-([a-f0-9]{16})@/);
-  return m ? m[1]! : null;
+  const p = parseAbuseEmailIngestFromTo(toHeader);
+  return p && p.routeKind === "auto" ? p.token : null;
 }
 
 export type ParsedEmailAttachment = {
@@ -497,6 +546,7 @@ export async function ingestAbuseDamEmailFiles(
   caseRow: AbuseCaseRow,
   attachments: ParsedEmailAttachment[],
   from: string,
+  routeKind: "auto" | AbuseAttachmentKind = "auto",
 ): Promise<number> {
   let n = 0;
   const fromTrim = (from ?? "").trim();
@@ -506,14 +556,34 @@ export async function ingestAbuseDamEmailFiles(
     const bytes = att.content.byteLength;
     if (bytes <= 0 || bytes > 25 * 1024 * 1024) continue;
     const lower = fn;
-    let kind: AbuseAttachmentKind = "other";
-    if (lower.endsWith(".pdf")) kind = "release_letter";
-    else if (/\.(jpe?g|png|gif|webp|heic|heif)$/i.test(lower)) kind = "damage_photo";
+    let kind: AbuseAttachmentKind;
+    if (routeKind !== "auto") {
+      kind = routeKind;
+    } else {
+      kind = "other";
+      if (lower.endsWith(".pdf")) kind = "release_letter";
+      else if (/\.(jpe?g|png|gif|webp|heic|heif)$/i.test(lower)) kind = "damage_photo";
+    }
+    const base = (att.filename || "attachment").replace(/^.*[/\\]/, "") || "attachment";
+    let outName = base;
+    if (routeKind !== "auto") {
+      const ext = fn.match(/(\.[^.]+)$/)?.[1] ?? "";
+      const stem = base.replace(/\.[^.]+$/, "");
+      const routeLabel =
+        routeKind === "damage_photo"
+          ? "email-damage"
+          : routeKind === "release_letter"
+            ? "email-release"
+            : routeKind === "estimate"
+              ? "email-estimate"
+              : "email-doc";
+      outName = stem + "__" + routeLabel + ext;
+    }
     await addAbuseAttachment(env, {
       caseId: caseRow.id,
       kind,
       body: att.content,
-      filename: att.filename || "attachment",
+      filename: outName.slice(0, 240),
       contentType: att.mimeType || "application/octet-stream",
       uploadedBy: fromTrim || "email",
       source: "email",
