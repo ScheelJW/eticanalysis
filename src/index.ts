@@ -14364,6 +14364,7 @@ function renderDashboardHtml(): string {
     let historyEntries = [];
     let mcChartLastPoints = null;
     let mcChartLastSeriesPoints = null;
+    let mcChartLayoutDeferrals = 0;
     let mcChartLastApiResponse = null;
     let mcChartDimensions = null;
     let selectedDate = null;
@@ -15228,10 +15229,26 @@ function renderDashboardHtml(): string {
       if (!canvas) return;
       const wrap = canvas.parentElement;
       if (!wrap) return;
+      const panel = wrap.closest("#panel-snapshot");
+      if (panel && panel.classList.contains("hidden")) {
+        return;
+      }
       const rect = wrap.getBoundingClientRect();
+      const rw = Math.max(rect.width, wrap.clientWidth || 0, wrap.offsetWidth || 0);
+      const rh = Math.max(rect.height, wrap.clientHeight || 0, wrap.offsetHeight || 0);
+      if (rw < 64 || rh < 64) {
+        if (mcChartLayoutDeferrals < 16) {
+          mcChartLayoutDeferrals += 1;
+          requestAnimationFrame(function () {
+            drawMcChartSeries(points);
+          });
+          return;
+        }
+      }
+      mcChartLayoutDeferrals = 0;
       const dpr = window.devicePixelRatio || 1;
-      const W = Math.max(280, Math.floor(rect.width));
-      const H = Math.max(200, Math.floor(rect.height));
+      const W = Math.max(280, Math.floor(rw));
+      const H = Math.max(200, Math.floor(rh));
       canvas.width = W * dpr;
       canvas.height = H * dpr;
       canvas.style.width = W + "px";
@@ -15589,6 +15606,26 @@ function renderDashboardHtml(): string {
           });
         });
       }
+      const chartWrap = document.querySelector(".mc-chart-wrap");
+      if (chartWrap && typeof ResizeObserver !== "undefined" && !chartWrap._mcResizeObs) {
+        chartWrap._mcResizeObs = true;
+        var mcResizeTimer = null;
+        new ResizeObserver(function () {
+          if (mcResizeTimer) clearTimeout(mcResizeTimer);
+          mcResizeTimer = setTimeout(function () {
+            if (mcChartLastSeriesPoints) drawMcChartSeries(mcChartLastSeriesPoints);
+          }, 60);
+        }).observe(chartWrap);
+      }
+      const mcCard = document.getElementById("mc-chart-card");
+      if (mcCard && !mcCard._mcToggleEv) {
+        mcCard._mcToggleEv = true;
+        mcCard.addEventListener("toggle", function () {
+          requestAnimationFrame(function () {
+            if (mcChartLastSeriesPoints) drawMcChartSeries(mcChartLastSeriesPoints);
+          });
+        });
+      }
     }
 
     /**
@@ -15799,6 +15836,15 @@ function renderDashboardHtml(): string {
         setTimeout(function () { const t = document.getElementById("ask-input-tab"); if (t) t.focus(); }, 30);
       } else if (isSet) {
         onEnterSettingsTab();
+      }
+      if (isSnap) {
+        mcChartLayoutDeferrals = 0;
+        requestAnimationFrame(function () {
+          requestAnimationFrame(function () {
+            if (mcChartLastSeriesPoints) drawMcChartSeries(mcChartLastSeriesPoints);
+            else void refreshMcChart();
+          });
+        });
       }
     }
 
@@ -17650,6 +17696,11 @@ function renderDashboardHtml(): string {
       refreshMcChartPresetChips();
       await loadMcChartDimensions();
       refreshMcChart();
+      requestAnimationFrame(function () {
+        requestAnimationFrame(function () {
+          if (mcChartLastSeriesPoints) drawMcChartSeries(mcChartLastSeriesPoints);
+        });
+      });
 
       // Date picker controls.
       document.getElementById("date-select").addEventListener("change", function (ev) {
