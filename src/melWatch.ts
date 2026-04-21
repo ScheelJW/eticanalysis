@@ -100,6 +100,37 @@ function toInt(s: string): number {
   return Number.isFinite(n) ? n : 0;
 }
 
+/** Lowercase + collapse whitespace for header cell matching. */
+function normHeaderText(s: string): string {
+  return s.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+/** True when early rows look like the MEL Calculator grid (not just sheet name). */
+function sheetLooksLikeMelCalculatorGrid(sheet: ExcelJS.Worksheet): boolean {
+  const maxR = Math.min(40, sheet.actualRowCount || sheet.rowCount || 0);
+  for (let r = 1; r <= maxR; r++) {
+    const row = sheet.getRow(r);
+    const parts: string[] = [];
+    row.eachCell({ includeEmpty: false }, (cell) => {
+      parts.push(normHeaderText(readCellText(cell)));
+    });
+    const joined = parts.join(" ");
+    if (joined.includes("mel key") && joined.includes("nmc") && joined.includes("fmc")) return true;
+    if (joined.includes("mel key") && joined.includes("mel assigned")) return true;
+  }
+  return false;
+}
+
+function findMelCalculatorSheet(wb: ExcelJS.Workbook): ExcelJS.Worksheet | null {
+  for (const ws of wb.worksheets) {
+    if (/mel\s*calc/i.test(ws.name)) return ws;
+  }
+  for (const ws of wb.worksheets) {
+    if (sheetLooksLikeMelCalculatorGrid(ws)) return ws;
+  }
+  return null;
+}
+
 function classifyStatus(raw: string): MelStatus {
   const s = raw.replace(/\s+/g, " ").trim().toLowerCase();
   if (!s) return "unknown";
@@ -113,20 +144,41 @@ function classifyStatus(raw: string): MelStatus {
 export async function extractMelRowsFromBinary(bytes: ArrayBuffer): Promise<MelRow[]> {
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(bytes);
-  const sheet = wb.worksheets.find((ws) => /mel\s*calc/i.test(ws.name));
+  const sheet = findMelCalculatorSheet(wb);
   if (!sheet) return [];
 
-  // Find the header row (first row with >= 4 non-empty cells).
+  // Find the header row: prefer a row that mentions MEL key + NMC/FMC; else
+  // first row in the top band with enough populated cells.
+  const norm = normHeaderText;
   let headerRow = -1;
-  for (let r = 1; r <= 12; r++) {
+  for (let r = 1; r <= 25; r++) {
+    const row = sheet.getRow(r);
+    const texts: string[] = [];
     let count = 0;
-    sheet.getRow(r).eachCell({ includeEmpty: false }, () => { count += 1; });
-    if (count >= 4) { headerRow = r; break; }
+    row.eachCell({ includeEmpty: false }, (cell) => {
+      count += 1;
+      texts.push(norm(readCellText(cell)));
+    });
+    if (count < 4) continue;
+    const joined = texts.join(" ");
+    if (joined.includes("mel key") && (joined.includes("nmc") || joined.includes("fmc"))) {
+      headerRow = r;
+      break;
+    }
+  }
+  if (headerRow < 1) {
+    for (let r = 1; r <= 12; r++) {
+      let count = 0;
+      sheet.getRow(r).eachCell({ includeEmpty: false }, () => { count += 1; });
+      if (count >= 4) {
+        headerRow = r;
+        break;
+      }
+    }
   }
   if (headerRow < 1) return [];
 
   // Map header text → column index (case-insensitive, whitespace-collapsed).
-  const norm = (s: string) => s.replace(/\s+/g, " ").trim().toLowerCase();
   const colByHeader = new Map<string, number>();
   sheet.getRow(headerRow).eachCell({ includeEmpty: false }, (cell, col) => {
     colByHeader.set(norm(readCellText(cell)), col);
@@ -145,17 +197,30 @@ export async function extractMelRowsFromBinary(bytes: ArrayBuffer): Promise<MelR
     return -1;
   };
 
-  const cMelKey = colOf("mel key");
-  const cAssigned = colOf("mel assigned total", "assigned total");
-  const cNmc = colOf("nmc count");
-  const cFmc = colOf("fmc count");
+  const cMelKey = colOf("mel key", "melkey", "priority key", "mel lin");
+  const cAssigned = colOf(
+    "mel assigned total",
+    "assigned total",
+    "mel assigned",
+    "total assigned",
+    "assigned",
+  );
+  const cNmc = colOf("nmc count", "nmc", "total nmc", "# nmc");
+  const cFmc = colOf("fmc count", "fmc", "total fmc", "# fmc");
   const cAcc = colOf("acc/abus", "acc abus");
   const cMel = colOf("mel");
   const cTier = colOf("prioritytier", "priority tier");
   const cUserUnit = colOf("user/unit", "user unit");
   const cUnit = colOf("unit");
   const cDoc = colOf("detail doc number");
-  const cMgmt = colOf("afa4_mgmtcodename__c.1", "mgmt code name", "mgmtcodename");
+  const cMgmt = colOf(
+    "afa4_mgmtcodename__c.1",
+    "mgmt code name",
+    "mgmtcodename",
+    "mgmt code",
+    "mgmt name",
+    "nomenclature",
+  );
   const cRecall = colOf("recall +/-", "recall");
   const cMelDelta = colOf("mel +/-");
   const cStatus = colOf("mel status", "status");
@@ -191,6 +256,90 @@ export async function extractMelRowsFromBinary(bytes: ArrayBuffer): Promise<MelR
     });
   }
   return rows;
+}
+
+/** Debug payload when MEL rows are empty — written to R2 on ingest. */
+export async function diagnoseMelExtractFromBinary(bytes: ArrayBuffer): Promise<Record<string, unknown>> {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(bytes);
+  const sheetNames = wb.worksheets.map((w) => w.name);
+  const sheet = findMelCalculatorSheet(wb);
+  if (!sheet) {
+    return { ok: false, reason: "no_mel_sheet", sheetNames };
+  }
+  const norm = normHeaderText;
+  let headerRow = -1;
+  let headerJoined = "";
+  for (let r = 1; r <= 25; r++) {
+    const row = sheet.getRow(r);
+    const texts: string[] = [];
+    let count = 0;
+    row.eachCell({ includeEmpty: false }, (cell) => {
+      count += 1;
+      texts.push(norm(readCellText(cell)));
+    });
+    if (count < 4) continue;
+    const joined = texts.join(" ");
+    if (joined.includes("mel key") && (joined.includes("nmc") || joined.includes("fmc"))) {
+      headerRow = r;
+      headerJoined = joined;
+      break;
+    }
+  }
+  if (headerRow < 1) {
+    for (let r = 1; r <= 12; r++) {
+      let count = 0;
+      sheet.getRow(r).eachCell({ includeEmpty: false }, () => { count += 1; });
+      if (count >= 4) {
+        headerRow = r;
+        const parts: string[] = [];
+        sheet.getRow(r).eachCell({ includeEmpty: false }, (cell) => {
+          parts.push(norm(readCellText(cell)));
+        });
+        headerJoined = parts.join(" ");
+        break;
+      }
+    }
+  }
+  if (headerRow < 1) {
+    return { ok: false, reason: "no_header_row", sheet: sheet.name, sheetNames };
+  }
+  const colByHeader = new Map<string, number>();
+  sheet.getRow(headerRow).eachCell({ includeEmpty: false }, (cell, col) => {
+    colByHeader.set(norm(readCellText(cell)), col);
+  });
+  const headers = [...colByHeader.keys()].sort();
+  const colOf = (...candidates: string[]): number => {
+    for (const c of candidates) {
+      const k = norm(c);
+      if (colByHeader.has(k)) return colByHeader.get(k) as number;
+    }
+    for (const [hdr, col] of colByHeader) {
+      for (const c of candidates) {
+        if (hdr.includes(norm(c))) return col;
+      }
+    }
+    return -1;
+  };
+  const cMelKey = colOf("mel key", "melkey", "priority key", "mel lin");
+  const cAssigned = colOf(
+    "mel assigned total",
+    "assigned total",
+    "mel assigned",
+    "total assigned",
+    "assigned",
+  );
+  const cNmc = colOf("nmc count", "nmc", "total nmc", "# nmc");
+  const cFmc = colOf("fmc count", "fmc", "total fmc", "# fmc");
+  return {
+    ok: cMelKey >= 1 && cAssigned >= 1 && cNmc >= 1 && cFmc >= 1,
+    sheet: sheet.name,
+    headerRow,
+    headerSample: headerJoined.slice(0, 500),
+    headers,
+    columns: { melKey: cMelKey, assigned: cAssigned, nmc: cNmc, fmc: cFmc },
+    sheetNames,
+  };
 }
 
 /** Insert one MEL snapshot for a date, replace existing snapshot for that
