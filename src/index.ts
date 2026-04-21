@@ -113,6 +113,7 @@ import {
   listAbuseCases,
   listOpenAbuseCasesForWorkOrder,
   listFleetOwningUnits,
+  listFleetAssetIdsForPicker,
   searchFleetAssetsForPicker,
   parseAbuseEmailIngestFromTo,
   normalizeAbuseCaseStage,
@@ -602,6 +603,9 @@ export default {
 
     if (url.pathname === "/api/fleet/assets") {
       return handleFleetAssetsSearchApi(env, request);
+    }
+    if (url.pathname === "/api/fleet/asset-ids") {
+      return handleFleetAssetIdsListApi(env, request);
     }
     if (url.pathname === "/api/fleet/units") {
       return handleFleetOwningUnitsApi(env, request);
@@ -2373,6 +2377,27 @@ function renderWaiverAppHtml(): string {
       width: 76px; height: 76px; object-fit: cover; border-radius: 8px;
       border: 1px solid var(--border); background: #0a1a3a;
     }
+    .sub-preview-grid video.sub-thumb {
+      object-fit: contain;
+    }
+    .fleet-list-wrap { margin-top: 8px; }
+    .fleet-list-wrap .fleet-filter {
+      width: 100%; background: var(--bg1); border: 1px solid var(--border); color: var(--text);
+      border-radius: 12px; padding: 12px 14px; font-size: 1rem; font-variant-numeric: tabular-nums;
+      margin-bottom: 10px; box-sizing: border-box;
+    }
+    .fleet-chip-wrap {
+      max-height: min(52vh, 420px); overflow-y: auto; -webkit-overflow-scrolling: touch;
+      border: 1px solid var(--border); border-radius: 12px; background: var(--bg1); padding: 8px;
+    }
+    .fleet-chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: flex-start; }
+    .fleet-chip {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.86rem; font-weight: 600;
+      padding: 8px 11px; border-radius: 8px; border: 1px solid var(--border);
+      background: var(--bg2); color: var(--text); cursor: pointer; max-width: 100%;
+    }
+    .fleet-chip:active { background: var(--bg3); }
+    .fleet-chip.active { border-color: var(--accent); background: rgba(0,58,140,0.08); }
     .wcard-actions {
       display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 12px;
       background: var(--bg2); border-top: 1px solid var(--border);
@@ -2445,19 +2470,12 @@ function renderWaiverAppHtml(): string {
 
   <main>
     <div id="view-lookup">
-      <div class="lookup">
-        <div class="asset-ac">
-          <input id="asset-input" type="text" inputmode="text" autocapitalize="characters" autocorrect="off"
-                 spellcheck="false" placeholder="Type part of an asset id…"
-                 autocomplete="off" role="combobox" aria-autocomplete="list" aria-controls="asset-suggest" aria-expanded="false" />
-          <ul id="asset-suggest" class="asset-suggest" hidden role="listbox" aria-label="Matching asset ids"></ul>
-          <p class="asset-ac-hint">Matches load automatically — tap a row or keep typing until only one match, then Open.</p>
+      <div class="fleet-list-wrap">
+        <p class="asset-ac-hint" style="margin-top:0">Fleet roster from the daily workbook. Filter and tap an asset id, or pick from Recent below.</p>
+        <input id="fleet-filter" type="search" class="fleet-filter" placeholder="Filter by asset id…" autocomplete="off" spellcheck="false" />
+        <div id="fleet-chip-wrap" class="fleet-chip-wrap">
+          <p class="hint" style="margin:8px;color:var(--muted)">Loading fleet list…</p>
         </div>
-        <button type="button" class="btn" id="lookup-btn">Open</button>
-      </div>
-      <div class="name-prompt">
-        <label for="name-input">Your name (used on every action you take)</label>
-        <input id="name-input" type="text" autocomplete="name" placeholder="First Last" />
       </div>
       <div class="recent" id="recent-wrap" hidden>
         <div class="lbl">Recent</div>
@@ -2483,10 +2501,12 @@ function renderWaiverAppHtml(): string {
       <input id="sub-title" type="text" maxlength="120" placeholder="e.g. Driver-side mirror crack < 2&quot;" />
       <label for="sub-desc">Details (where it is, why it doesn't affect safety, etc.)</label>
       <textarea id="sub-desc" maxlength="2000"></textarea>
-      <label>Photos of the defect (one or more)</label>
+      <label for="sub-submit-by">Your name (required)</label>
+      <input id="sub-submit-by" type="text" autocomplete="name" placeholder="First Last" maxlength="120" />
+      <label>Photos or video (optional — add if you have them)</label>
       <div class="file-row">
-        <label class="file-btn" for="sub-photo">📷 Take / choose photos</label>
-        <input id="sub-photo" type="file" accept="image/*" capture="environment" multiple />
+        <label class="file-btn" for="sub-photo">📷 🎬 Add photos or video</label>
+        <input id="sub-photo" type="file" accept="image/*,video/mp4,video/quicktime,video/webm,video/3gpp,video/*" multiple />
         <span id="sub-photo-name" style="font-size:0.85rem;color:var(--muted);"></span>
       </div>
       <div id="sub-preview-grid" class="sub-preview-grid" hidden></div>
@@ -2509,11 +2529,12 @@ function renderWaiverAppHtml(): string {
       <textarea id="verify-note" maxlength="500" placeholder="e.g. Re-checked during PMI, still applies"></textarea>
       <label>Photo at verification (optional)</label>
       <div class="file-row">
-        <label class="file-btn" for="verify-photo">📷 Take / choose photo</label>
-        <input id="verify-photo" type="file" accept="image/*" capture="environment" />
+        <label class="file-btn" for="verify-photo">📷 🎬 Add photo or video</label>
+        <input id="verify-photo" type="file" accept="image/*,video/mp4,video/quicktime,video/webm,video/3gpp,video/*" />
         <span id="verify-photo-name" style="font-size:0.85rem;color:var(--muted);"></span>
       </div>
       <img id="verify-preview" class="preview" hidden alt="" />
+      <video id="verify-preview-v" class="preview" hidden playsinline controls muted style="width:100%"></video>
       <div id="verify-err" class="err" hidden></div>
       <div class="btn-row">
         <button type="button" class="btn secondary" id="verify-cancel">Cancel</button>
@@ -2533,9 +2554,10 @@ function renderWaiverAppHtml(): string {
     waivers: [],
     pendingActionId: null,
   };
-  /** Asset ids that have at least one approved or pending waiver (from /api/waivers/counts). */
-  var waiverIndex = { keys: [], loaded: false, loadPromise: null };
-  var suggestTimer = null;
+  var fleetAssetIds = [];
+  var fleetLoaded = false;
+  var fleetLoadPromise = null;
+  var fleetFilterTimer = null;
 
   function $(id) { return document.getElementById(id); }
   function esc(s) {
@@ -2566,7 +2588,7 @@ function renderWaiverAppHtml(): string {
     t.classList.add("show");
     setTimeout(function () { t.classList.remove("show"); }, 2400);
   }
-  function readName() { return ($("name-input").value || localStorage.getItem(NAME_KEY) || "").trim(); }
+  function readName() { return (localStorage.getItem(NAME_KEY) || "").trim(); }
   function rememberName(n) {
     if (n) localStorage.setItem(NAME_KEY, n);
   }
@@ -2595,127 +2617,103 @@ function renderWaiverAppHtml(): string {
     }).join("");
     chips.querySelectorAll(".chip").forEach(function (b) {
       b.addEventListener("click", function () {
-        $("asset-input").value = b.getAttribute("data-asset");
-        openAsset();
+        openAsset(b.getAttribute("data-asset") || "");
       });
     });
   }
 
-  function hideSuggest() {
-    var ul = $("asset-suggest");
-    var inp = $("asset-input");
-    if (ul) {
-      ul.hidden = true;
-      ul.innerHTML = "";
-    }
-    if (inp) inp.setAttribute("aria-expanded", "false");
-  }
-  function showSuggest() {
-    var ul = $("asset-suggest");
-    var inp = $("asset-input");
-    if (ul && ul.children.length) ul.hidden = false;
-    if (inp) inp.setAttribute("aria-expanded", ul && !ul.hidden ? "true" : "false");
-  }
-  function filterMatches(q) {
-    var ql = (q || "").trim().toLowerCase();
-    if (!ql || !waiverIndex.keys.length) return [];
-    var starts = [];
-    var subs = [];
-    for (var i = 0; i < waiverIndex.keys.length; i++) {
-      var k = waiverIndex.keys[i];
-      var kl = k.toLowerCase();
-      var ix = kl.indexOf(ql);
-      if (ix < 0) continue;
-      if (ix === 0) starts.push(k);
-      else subs.push(k);
-    }
-    starts.sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); });
-    subs.sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); });
-    return starts.concat(subs);
-  }
-  function renderSuggest(matches) {
-    var ul = $("asset-suggest");
-    if (!ul) return;
-    ul.innerHTML = matches.map(function (id) {
-      return "<li role='presentation'><button type='button' role='option' data-asset='" + esc(id) + "'>" + esc(id) + "</button></li>";
-    }).join("");
-    ul.querySelectorAll("button[data-asset]").forEach(function (b) {
-      b.addEventListener("click", function () {
-        pickSuggest(b.getAttribute("data-asset") || "");
-      });
-    });
-    showSuggest();
-  }
-  function updateSuggestFromInput() {
-    var q = ($("asset-input").value || "").trim();
-    if (!q || !waiverIndex.loaded) { hideSuggest(); return; }
-    var m = filterMatches(q);
-    if (!m.length) { hideSuggest(); return; }
-    if (m.length > 50) m = m.slice(0, 50);
-    renderSuggest(m);
-  }
-  function pickSuggest(id) {
-    if (!id) return;
-    $("asset-input").value = id;
-    hideSuggest();
-    openAsset(id);
-  }
-  async function ensureWaiverIndex() {
-    if (waiverIndex.loaded) return;
-    if (waiverIndex.loadPromise) return waiverIndex.loadPromise;
-    waiverIndex.loadPromise = (async function () {
-      try {
-        var r = await fetch("/api/waivers/counts", { cache: "no-store" });
-        var j = await r.json();
-        var c = (j && j.counts) || {};
-        var keys = [];
-        for (var id in c) {
-          if (!Object.prototype.hasOwnProperty.call(c, id)) continue;
-          var n = c[id];
-          var tot = ((n && n.approved) || 0) + ((n && n.pending) || 0);
-          if (tot > 0) keys.push(id);
-        }
-        keys.sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); });
-        waiverIndex.keys = keys;
-      } catch (e) {
-        waiverIndex.keys = [];
-      }
-      waiverIndex.loaded = true;
-      waiverIndex.loadPromise = null;
-    })();
-    return waiverIndex.loadPromise;
-  }
-  /**
-   * Resolve typed text to a single canonical asset id, or null if the user
-   * must pick from multiple matches (dropdown already shown).
-   */
-  function resolveCanonicalAssetId(inputVal) {
-    var q = (inputVal || "").trim();
-    if (!q) {
-      showToast("Enter an asset id", true);
-      return null;
-    }
-    var keys = waiverIndex.keys;
+  function normalizeFleetAssetId(raw) {
+    var q = (raw || "").trim();
+    if (!q) return "";
     var qu = q.toUpperCase();
     var i;
-    for (i = 0; i < keys.length; i++) {
-      if (keys[i].toUpperCase() === qu) return keys[i];
+    for (i = 0; i < fleetAssetIds.length; i++) {
+      if (fleetAssetIds[i].toUpperCase() === qu) return fleetAssetIds[i];
     }
-    var m = filterMatches(q);
-    if (m.length === 1) return m[0];
-    if (!m.length) return q;
-    showToast("Several matches — pick one below", true);
-    renderSuggest(m);
-    return null;
+    return q;
   }
+
+  async function ensureFleetList() {
+    if (fleetLoaded) return;
+    if (fleetLoadPromise) return fleetLoadPromise;
+    fleetLoadPromise = (async function () {
+      var wrap = $("fleet-chip-wrap");
+      try {
+        var r = await fetch("/api/fleet/asset-ids?limit=8000", { cache: "no-store" });
+        var j = await r.json();
+        fleetAssetIds = Array.isArray(j && j.assetIds) ? j.assetIds : [];
+        fleetAssetIds.sort(function (a, b) {
+          return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
+        });
+        if (!fleetAssetIds.length && wrap) {
+          wrap.innerHTML = "<p class='hint' style='margin:8px;color:var(--muted)'>No fleet ids in database yet. After the next workbook ingest, the list fills in.</p>";
+        }
+      } catch (e) {
+        fleetAssetIds = [];
+        if (wrap) {
+          wrap.innerHTML = "<p class='hint' style='margin:8px;color:var(--danger)'>Could not load fleet list.</p>";
+        }
+      }
+      fleetLoaded = true;
+      fleetLoadPromise = null;
+      renderFleetChips();
+    })();
+    return fleetLoadPromise;
+  }
+
+  function renderFleetChips() {
+    var wrap = $("fleet-chip-wrap");
+    if (!wrap || !fleetLoaded) return;
+    var q = ($("fleet-filter") && $("fleet-filter").value || "").trim().toLowerCase();
+    var keys = fleetAssetIds.filter(function (id) {
+      return !q || String(id).toLowerCase().indexOf(q) !== -1;
+    });
+    if (!fleetAssetIds.length) return;
+    if (!keys.length) {
+      wrap.innerHTML = "<p class='hint' style='margin:8px;color:var(--muted)'>No asset ids match this filter.</p>";
+      return;
+    }
+    var maxShow = 500;
+    var slice = keys.length > maxShow ? keys.slice(0, maxShow) : keys;
+    var more = keys.length > maxShow;
+    wrap.innerHTML =
+      "<div class='fleet-chips'>" +
+      slice.map(function (id) {
+        return "<button type='button' class='fleet-chip' data-asset='" + esc(id) + "'>" + esc(id) + "</button>";
+      }).join("") +
+      "</div>" +
+      (more
+        ? "<p class='hint' style='margin:8px 4px 0;color:var(--muted)'>Showing first " +
+          maxShow +
+          " of " +
+          keys.length +
+          " matches — narrow the filter.</p>"
+        : "");
+    wrap.querySelectorAll(".fleet-chip").forEach(function (b) {
+      b.addEventListener("click", function () {
+        openAsset(b.getAttribute("data-asset") || "");
+      });
+    });
+    highlightFleetChip(state.assetId);
+  }
+
+  function highlightFleetChip(assetId) {
+    var wrap = $("fleet-chip-wrap");
+    if (!wrap) return;
+    var cur = (assetId || "").trim();
+    wrap.querySelectorAll(".fleet-chip").forEach(function (x) {
+      x.classList.toggle("active", x.getAttribute("data-asset") === cur);
+    });
+  }
+
   function showLookup() {
     document.body.classList.remove("detail");
     $("view-lookup").hidden = false;
     $("view-detail").hidden = true;
     $("h-title").textContent = ${JSON.stringify(SITE_TITLE)};
-    $("h-sub").textContent = "Pull up an asset to view or request waivers.";
+    $("h-sub").textContent = "Pick an asset from the fleet list.";
     state.assetId = "";
-    hideSuggest();
+    renderFleetChips();
   }
   function showDetail() {
     document.body.classList.add("detail");
@@ -2724,25 +2722,14 @@ function renderWaiverAppHtml(): string {
   }
 
   async function openAsset(forcedId) {
-    await ensureWaiverIndex();
-    var raw;
-    if (typeof forcedId === "string" && forcedId.trim()) {
-      raw = forcedId.trim();
-      var up = raw.toUpperCase();
-      for (var j = 0; j < waiverIndex.keys.length; j++) {
-        if (waiverIndex.keys[j].toUpperCase() === up) {
-          raw = waiverIndex.keys[j];
-          break;
-        }
-      }
-      $("asset-input").value = raw;
-    } else {
-      var resolved = resolveCanonicalAssetId($("asset-input").value);
-      if (resolved == null) return;
-      raw = resolved;
-    }
-    hideSuggest();
-    if (!raw) { showToast("Enter an asset id", true); return; }
+    await ensureFleetList();
+    var raw =
+      typeof forcedId === "string" && forcedId.trim()
+        ? forcedId.trim()
+        : (state.assetId || "").trim();
+    if (!raw) { showToast("Pick an asset from the list", true); return; }
+    raw = normalizeFleetAssetId(raw);
+    if (!raw) { showToast("Pick an asset from the list", true); return; }
     state.assetId = raw;
     pushRecent(raw);
     $("h-title").textContent = "Asset " + raw;
@@ -2753,6 +2740,7 @@ function renderWaiverAppHtml(): string {
       var j = await r.json();
       state.waivers = (j && j.waivers) || [];
       renderDetail();
+      highlightFleetChip(raw);
     } catch (e) {
       $("h-sub").textContent = "Could not load waivers.";
     }
@@ -2788,11 +2776,10 @@ function renderWaiverAppHtml(): string {
   }
 
   async function removeWaiverFromCard(id) {
-    var name = readName();
-    if (!name) {
-      showToast("Enter your name in the field above first.", true);
-      return;
-    }
+    var name = window.prompt("Your name (required for audit):", readName());
+    if (!name || !name.trim()) return;
+    rememberName(name.trim());
+    name = name.trim();
     if (!confirm("Remove this waiver? Your name is stored for the audit trail.")) return;
     try {
       var r = await fetch("/api/waivers/" + id, {
@@ -2824,11 +2811,16 @@ function renderWaiverAppHtml(): string {
             ? (' · Last verified ' + fmtDate(w.lastVerifiedAtIso) + ' by ' + esc(w.lastVerifiedBy || "—"))
             : ''))
       : ('Submitted by ' + esc(w.submittedBy) + ' · ' + fmtAge(w.submittedAtIso));
-    var plist = (w.photos && w.photos.length) ? w.photos : (w.hasPhoto && w.photoUrl ? [{ url: w.photoUrl }] : []);
+    var plist = (w.photos && w.photos.length) ? w.photos : (w.hasPhoto && w.photoUrl ? [{ url: w.photoUrl, contentType: "" }] : []);
+    function mediaTag(p) {
+      var ct = (p.contentType || "").toLowerCase();
+      if (ct.indexOf("video/") === 0) {
+        return '<video class="wcard-photo" src="' + esc(p.url) + '" controls playsinline muted preload="metadata"></video>';
+      }
+      return '<img class="wcard-photo" src="' + esc(p.url) + '" alt="" loading="lazy" />';
+    }
     var photo = plist.length
-      ? ('<div class="wcard-photos">' + plist.map(function (p) {
-          return '<img class="wcard-photo" src="' + esc(p.url) + '" alt="" loading="lazy" />';
-        }).join("") + "</div>")
+      ? ('<div class="wcard-photos">' + plist.map(function (p) { return mediaTag(p); }).join("") + "</div>")
       : "";
     var actions = "";
     if (status === "approved") {
@@ -2861,6 +2853,7 @@ function renderWaiverAppHtml(): string {
     $("submit-asset-line").textContent = "For asset " + state.assetId;
     $("sub-title").value = "";
     $("sub-desc").value = "";
+    $("sub-submit-by").value = readName();
     $("sub-photo").value = "";
     $("sub-photo-name").textContent = "";
     var g = $("sub-preview-grid");
@@ -2878,25 +2871,34 @@ function renderWaiverAppHtml(): string {
     grid.innerHTML = "";
     var files = inp.files ? Array.from(inp.files) : [];
     if (!files.length) { grid.hidden = true; $("sub-photo-name").textContent = ""; return; }
-    $("sub-photo-name").textContent = files.length + " photo" + (files.length === 1 ? "" : "s") + " selected";
+    $("sub-photo-name").textContent = files.length + " file" + (files.length === 1 ? "" : "s") + " selected";
     grid.hidden = false;
     files.forEach(function (f) {
       var url = URL.createObjectURL(f);
-      var im = document.createElement("img");
-      im.className = "sub-thumb";
-      im.src = url;
-      im.alt = "";
-      grid.appendChild(im);
+      if (f.type && f.type.indexOf("video/") === 0) {
+        var v = document.createElement("video");
+        v.className = "sub-thumb";
+        v.src = url;
+        v.muted = true;
+        v.playsInline = true;
+        v.controls = true;
+        grid.appendChild(v);
+      } else {
+        var im = document.createElement("img");
+        im.className = "sub-thumb";
+        im.src = url;
+        im.alt = "";
+        grid.appendChild(im);
+      }
     });
   });
   $("sub-submit").addEventListener("click", async function () {
-    var name = readName();
-    if (!name) { $("sub-err").textContent = "Enter your name on the lookup screen first."; $("sub-err").hidden = false; return; }
+    var name = ($("sub-submit-by").value || "").trim();
+    if (!name) { $("sub-err").textContent = "Enter your name before submitting."; $("sub-err").hidden = false; return; }
     rememberName(name);
     var title = $("sub-title").value.trim();
     if (!title) { $("sub-err").textContent = "Title is required."; $("sub-err").hidden = false; return; }
     var files = $("sub-photo").files ? Array.from($("sub-photo").files) : [];
-    if (!files.length) { $("sub-err").textContent = "At least one photo is required for a waiver request."; $("sub-err").hidden = false; return; }
     var fd = new FormData();
     fd.append("assetId", state.assetId);
     fd.append("title", title);
@@ -2929,6 +2931,8 @@ function renderWaiverAppHtml(): string {
     $("verify-photo").value = "";
     $("verify-photo-name").textContent = "";
     $("verify-preview").hidden = true;
+    var pv = $("verify-preview-v");
+    if (pv) { pv.hidden = true; pv.removeAttribute("src"); }
     $("verify-err").hidden = true;
     $("verify-modal").classList.add("open");
   }
@@ -2938,15 +2942,30 @@ function renderWaiverAppHtml(): string {
     $("verify-photo").value = "";
     $("verify-photo-name").textContent = "";
     $("verify-preview").hidden = true;
+    var pv = $("verify-preview-v");
+    if (pv) { pv.hidden = true; pv.removeAttribute("src"); }
   }
   $("verify-cancel").addEventListener("click", closeVerifyModal);
   $("verify-photo").addEventListener("change", function () {
     var f = $("verify-photo").files && $("verify-photo").files[0];
-    if (!f) { $("verify-preview").hidden = true; $("verify-photo-name").textContent = ""; return; }
+    var pv = $("verify-preview-v");
+    if (!f) {
+      $("verify-preview").hidden = true;
+      if (pv) { pv.hidden = true; pv.removeAttribute("src"); }
+      $("verify-photo-name").textContent = "";
+      return;
+    }
     $("verify-photo-name").textContent = f.name + " (" + Math.round(f.size / 1024) + " KB)";
     var url = URL.createObjectURL(f);
-    $("verify-preview").src = url;
-    $("verify-preview").hidden = false;
+    if (f.type && f.type.indexOf("video/") === 0 && pv) {
+      $("verify-preview").hidden = true;
+      pv.src = url;
+      pv.hidden = false;
+    } else {
+      if (pv) { pv.hidden = true; pv.removeAttribute("src"); }
+      $("verify-preview").src = url;
+      $("verify-preview").hidden = false;
+    }
   });
   $("verify-confirm").addEventListener("click", async function () {
     var name = $("verify-name").value.trim();
@@ -2979,37 +2998,21 @@ function renderWaiverAppHtml(): string {
   // ---- Header back ----
   $("back-btn").addEventListener("click", function () { showLookup(); });
 
-  // ---- Lookup binding ----
-  $("lookup-btn").addEventListener("click", function () { openAsset(); });
-  $("asset-input").addEventListener("keydown", function (e) {
-    if (e.key === "Enter") { e.preventDefault(); openAsset(); }
-  });
-  $("asset-input").addEventListener("input", function () {
-    clearTimeout(suggestTimer);
-    suggestTimer = setTimeout(updateSuggestFromInput, 90);
-  });
-  $("asset-input").addEventListener("focus", function () {
-    ensureWaiverIndex().then(function () { updateSuggestFromInput(); });
-  });
-  var sug = $("asset-suggest");
-  if (sug) {
-    sug.addEventListener("mousedown", function (e) {
-      if (e.target.closest("button[data-asset]")) e.preventDefault();
+  var ff = $("fleet-filter");
+  if (ff) {
+    ff.addEventListener("input", function () {
+      clearTimeout(fleetFilterTimer);
+      fleetFilterTimer = setTimeout(renderFleetChips, 120);
     });
   }
-  document.addEventListener("click", function (e) {
-    if (!e.target.closest(".asset-ac")) hideSuggest();
-  });
-  $("name-input").addEventListener("change", function () { rememberName($("name-input").value.trim()); });
 
   // ---- Init ----
-  $("name-input").value = localStorage.getItem(NAME_KEY) || "";
   renderRecent();
-  ensureWaiverIndex();
+  ensureFleetList();
   // Allow ?asset=M-1234 deep link from desktop "Open in mobile" buttons.
   var hashParams = new URLSearchParams(location.search);
   var deep = hashParams.get("asset");
-  if (deep) { $("asset-input").value = deep; openAsset(deep); }
+  if (deep) openAsset(deep);
 
   var appsL = document.querySelector("a.h-switch");
   if (appsL) {
@@ -3348,6 +3351,26 @@ function renderWaiverPrintCardHtml(assetId: string, waivers: Waiver[]): string {
     if (d.toLowerCase() === String(w.title ?? "").trim().toLowerCase()) return "";
     return d;
   };
+  const fmtCardDate = (iso: string): string => {
+    const t = Date.parse(iso);
+    if (!Number.isFinite(t)) return (iso ?? "").trim().slice(0, 10) || "—";
+    return new Date(t).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" });
+  };
+  const lastVerifiedLineHtml = (w: Waiver): string => {
+    const at = (w.lastVerifiedAtIso ?? "").trim();
+    const by = (w.lastVerifiedBy ?? "").trim();
+    if (at) {
+      const who = by ? ` · ${escHtml(by)}` : "";
+      return `Last verified: ${escHtml(fmtCardDate(at))}${who}`;
+    }
+    const rap = (w.reviewedAtIso ?? "").trim();
+    const rb = (w.reviewedBy ?? "").trim();
+    if (rap) {
+      const who = rb ? ` · ${escHtml(rb)}` : "";
+      return `On card since: ${escHtml(fmtCardDate(rap))}${who}`;
+    }
+    return "Last verified: —";
+  };
   const n = printRows.length;
   const densityClass =
     n >= 16 ? "wv-print--vheavy" : n >= 10 ? "wv-print--heavy" : n >= 6 ? "wv-print--medium" : "";
@@ -3363,7 +3386,7 @@ function renderWaiverPrintCardHtml(assetId: string, waivers: Waiver[]): string {
           <div class="body">
             <div class="title">${escHtml(w.title)}</div>
             ${descPrint ? `<div class="desc">${escHtml(descPrint)}</div>` : ""}
-            <div class="last-verified">Last verified: legacy</div>
+            <div class="last-verified">${lastVerifiedLineHtml(w)}</div>
           </div>
         </article>`;
     })
@@ -3524,10 +3547,28 @@ async function handleWaiverCountsApi(env: Env): Promise<Response> {
   );
 }
 
+function isAllowedWaiverDefectMediaType(ct: string): boolean {
+  const c = (ct || "").toLowerCase().trim();
+  if (!c) return true;
+  if (c.startsWith("image/")) return true;
+  if (c.startsWith("video/")) {
+    return (
+      c === "video/mp4" ||
+      c === "video/quicktime" ||
+      c === "video/webm" ||
+      c.startsWith("video/3gpp") ||
+      c === "video/x-msvideo" ||
+      c === "video/mpeg"
+    );
+  }
+  return false;
+}
+
 /**
  * POST /api/waivers — submit a new waiver request.
- * multipart/form-data: assetId, title, description?, submittedBy, and one or
- * more `photo` file fields (same name repeated). Up to 8 files, 10MB each.
+ * multipart/form-data: assetId, title, description?, submittedBy, and zero or
+ * more `photo` file fields (same name repeated). Up to 8 files, 50MB each;
+ * images and short video clips (mp4, mov, webm, etc.).
  */
 async function handleWaiverSubmitApi(env: Env, request: Request): Promise<Response> {
   if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
@@ -3554,16 +3595,26 @@ async function handleWaiverSubmitApi(env: Env, request: Request): Promise<Respon
       { status: 400, headers: cacheHeaders() },
     );
   }
-  const MAX_BYTES = 10 * 1024 * 1024;
+  const MAX_BYTES = 50 * 1024 * 1024;
   const MAX_FILES = 8;
   const rawFiles = form.getAll("photo");
   const photos: Array<{ body: ArrayBuffer; contentType: string }> = [];
   for (const entry of rawFiles) {
     if (!(entry instanceof File) || entry.size <= 0) continue;
     if (entry.size > MAX_BYTES) {
-      return Response.json({ error: "each photo must be 10MB or less" }, { status: 413, headers: cacheHeaders() });
+      return Response.json({ error: "each attachment must be 50MB or less" }, { status: 413, headers: cacheHeaders() });
     }
-    photos.push({ body: await entry.arrayBuffer(), contentType: entry.type || "image/jpeg" });
+    const fileCt = entry.type || "";
+    if (!isAllowedWaiverDefectMediaType(fileCt)) {
+      return Response.json(
+        { error: "unsupported file type — use images or common video formats (mp4, mov, webm)" },
+        { status: 415, headers: cacheHeaders() },
+      );
+    }
+    photos.push({
+      body: await entry.arrayBuffer(),
+      contentType: fileCt || "application/octet-stream",
+    });
     if (photos.length >= MAX_FILES) break;
   }
   try {
@@ -3636,11 +3687,18 @@ async function handleWaiverActionApi(
         if (k === "adhoc") kind = "adhoc";
         const file = form.get("photo");
         if (file instanceof File && file.size > 0) {
-          const MAX_BYTES = 10 * 1024 * 1024;
+          const MAX_BYTES = 50 * 1024 * 1024;
           if (file.size > MAX_BYTES) {
-            return Response.json({ error: "photo too large (max 10MB)" }, { status: 413, headers: cacheHeaders() });
+            return Response.json({ error: "attachment too large (max 50MB)" }, { status: 413, headers: cacheHeaders() });
           }
-          photo = { body: await file.arrayBuffer(), contentType: file.type || "image/jpeg" };
+          const fileCt = file.type || "";
+          if (!isAllowedWaiverDefectMediaType(fileCt)) {
+            return Response.json(
+              { error: "unsupported file type — use images or common video formats (mp4, mov, webm)" },
+              { status: 415, headers: cacheHeaders() },
+            );
+          }
+          photo = { body: await file.arrayBuffer(), contentType: fileCt || "application/octet-stream" };
         }
       } else {
         const body = (await readJsonBody<{ by?: string; note?: string; kind?: "annual" | "adhoc" }>(request)) ?? {};
@@ -3723,6 +3781,14 @@ async function handleFleetAssetsSearchApi(env: Env, request: Request): Promise<R
   const limit = Number.parseInt(url.searchParams.get("limit") ?? "60", 10) || 60;
   const rows = await searchFleetAssetsForPicker(env, q, limit);
   return Response.json({ assets: rows }, { headers: cacheHeaders() });
+}
+
+async function handleFleetAssetIdsListApi(env: Env, request: Request): Promise<Response> {
+  if (request.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
+  const url = new URL(request.url);
+  const limit = Number.parseInt(url.searchParams.get("limit") ?? "6000", 10) || 6000;
+  const ids = await listFleetAssetIdsForPicker(env, limit);
+  return Response.json({ assetIds: ids }, { headers: cacheHeaders() });
 }
 
 async function handleFleetOwningUnitsApi(env: Env, request: Request): Promise<Response> {
@@ -6546,8 +6612,8 @@ function renderYardAppHtml(): string {
       }
       photoHtml += '<label class="photo-add" id="photo-add">' +
         '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg>' +
-        '<span>Take photo</span>' +
-        '<input type="file" id="photo-input" accept="image/*" capture="environment" />' +
+        '<span>Add photo</span>' +
+        '<input type="file" id="photo-input" accept="image/*" />' +
       '</label>';
 
       var checks = d.checks || [];
@@ -10286,10 +10352,12 @@ function renderDashboardHtml(): string {
       display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 0 0;
       border-top: 1px solid var(--border);
     }
-    .wv-photo-grid img.photo {
+    .wv-photo-grid img.photo,
+    .wv-photo-grid video.photo {
       display: block; width: auto; max-width: min(48%, 280px); max-height: 220px;
       object-fit: cover; border-radius: 8px; border: 1px solid var(--border); background: #0a1a3a;
     }
+    .wv-photo-grid video.photo { object-fit: contain; max-height: 260px; }
     .wv-pcard .actions { display: flex; gap: 8px; padding: 10px 12px; background: rgba(15,30,60,0.03); }
     .wv-pcard .actions button { flex: 1; }
     .wv-pcard textarea {
@@ -10384,8 +10452,8 @@ function renderDashboardHtml(): string {
     }
     .wv-bv-result .vehicle-head .stat { color: var(--muted); font-size: 0.9rem; }
     .wv-bv-result .vehicle-head .stat strong { color: var(--text); }
-    .wv-bv-result .vehicle-head .print-btn {
-      margin-left: auto;
+    .wv-bv-result .vehicle-head .wv-bv-head-actions {
+      margin-left: auto; display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
     }
     .wv-bv-list { display: flex; flex-direction: column; gap: 12px; }
     .wv-bv-card {
@@ -13516,7 +13584,7 @@ function renderDashboardHtml(): string {
         <div class="waivers-wrap">
           <div class="waivers-strap">
             <h2 class="waivers-strap-title">Waiver desk</h2>
-            <p class="waivers-strap-desc">Pending review is the approval queue. By vehicle is for lookup, history, and printing the in-cab waiver card.</p>
+            <p class="waivers-strap-desc">Pending review is the approval queue. By vehicle lists the full fleet roster, waiver history, print card, and submitting a new waiver request for desk staff.</p>
           </div>
           <header class="waivers-head">
             <nav class="waivers-subnav" id="waivers-subnav" aria-label="Waiver views">
@@ -13541,15 +13609,6 @@ function renderDashboardHtml(): string {
           <section id="wv-view-byvehicle" class="wv-view" hidden>
             <div class="wv-byvehicle-layout">
               <div class="wv-byvehicle-side">
-                <div class="wv-hero-card">
-                  <h3 class="wv-hero-title">Look up a vehicle</h3>
-                  <p class="wv-hero-lead">Enter an asset id to load waivers, verification history, and print the driver card.</p>
-                  <div class="wv-hero-form">
-                    <input type="text" id="wv-bv-input" placeholder="e.g. AF00C00488"
-                           autocomplete="off" autocapitalize="characters" spellcheck="false" />
-                    <button type="button" class="primary" id="wv-bv-go">Look up</button>
-                  </div>
-                </div>
                 <div class="wv-asset-browser" id="wv-asset-browser">
                   <div class="wv-asset-browser-head">
                     <div class="wv-ab-titles">
@@ -13560,7 +13619,7 @@ function renderDashboardHtml(): string {
                            placeholder="Filter by asset id…" autocomplete="off" spellcheck="false" />
                   </div>
                   <div class="wv-asset-chip-wrap" id="wv-asset-chip-wrap">
-                    <p class="wv-chip-hint hint">Open this tab and hit Refresh to load every asset that has a waiver. Tap an id to load it.</p>
+                    <p class="wv-chip-hint hint">Open this tab and hit Refresh to load asset ids from the fleet roster. Tap an id to load waivers and print the card.</p>
                   </div>
                 </div>
               </div>
@@ -13569,12 +13628,44 @@ function renderDashboardHtml(): string {
                   <div class="wv-bv-placeholder">
                     <span class="wv-bv-placeholder-icon" aria-hidden="true">📋</span>
                     <strong>No vehicle selected</strong>
-                    <span>Type an asset id and choose Look up, or tap a fleet id on the left.</span>
+                    <span>Tap a fleet id on the left to load waivers, verification history, and print the driver card.</span>
                   </div>
                 </div>
               </div>
             </div>
           </section>
+        </div>
+        <div id="wv-submit-overlay" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="wv-submit-title" aria-hidden="true">
+          <div class="modal-card" style="max-width:520px;">
+            <header style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;">
+              <h3 style="margin:0;" id="wv-submit-title">Submit waiver request</h3>
+              <button type="button" class="ghost" id="wv-submit-close" aria-label="Close" style="font-size:20px;line-height:1;padding:4px 10px;">\u00D7</button>
+            </header>
+            <p class="hint" id="wv-submit-asset-line" style="margin:0 0 12px;"></p>
+            <div class="settings-grid">
+              <label class="field">
+                <span class="label">Short title</span>
+                <input type="text" id="wv-submit-title-in" maxlength="120" placeholder="What is the defect?" autocomplete="off" />
+              </label>
+              <label class="field" style="grid-column:1/-1">
+                <span class="label">Details</span>
+                <textarea id="wv-submit-desc" rows="3" maxlength="2000" placeholder="Where it is, why it does not affect safety, etc."></textarea>
+              </label>
+              <label class="field" style="grid-column:1/-1">
+                <span class="label">Your name</span>
+                <input type="text" id="wv-submit-by" autocomplete="name" placeholder="First Last" />
+              </label>
+              <label class="field" style="grid-column:1/-1">
+                <span class="label">Photos or video (optional)</span>
+                <input type="file" id="wv-submit-files" multiple accept="image/*,video/mp4,video/quicktime,video/webm,video/3gpp,video/*" />
+              </label>
+            </div>
+            <p class="hint" id="wv-submit-err" style="margin:10px 0 0;color:var(--danger)" hidden></p>
+            <div class="settings-actions" style="margin-top:14px;">
+              <button type="button" class="primary" id="wv-submit-send">Submit for review</button>
+              <button type="button" class="ghost" id="wv-submit-cancel">Cancel</button>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -20140,7 +20231,7 @@ function renderDashboardHtml(): string {
       subTab: "pending",          // "pending" | "byvehicle"
       pending: [],
       bv: { assetId: "", waivers: [], removed: [], verifications: {} },
-      /** Sorted asset ids from last /api/waivers/counts (By vehicle list). */
+      /** Sorted asset ids from /api/fleet/asset-ids (full fleet roster). */
       bvAssetKeys: [],
     };
 
@@ -20177,21 +20268,20 @@ function renderDashboardHtml(): string {
         // Counts feed the badges everywhere — keep them fresh.
         loadWaiverCounts(true);
       });
-      const bvInput = document.getElementById("wv-bv-input");
-      const bvGo = document.getElementById("wv-bv-go");
-      if (bvGo) bvGo.addEventListener("click", function () {
-        const v = (bvInput.value || "").trim().toUpperCase();
-        if (v) loadWaiverByVehicle(v);
-      });
-      if (bvInput) bvInput.addEventListener("keydown", function (ev) {
-        if (ev.key === "Enter") {
-          ev.preventDefault();
-          const v = (bvInput.value || "").trim().toUpperCase();
-          if (v) loadWaiverByVehicle(v);
-        }
-      });
       const wvAf = document.getElementById("wv-asset-filter");
       if (wvAf) wvAf.addEventListener("input", function () { renderWaiverAssetChipList(); });
+      const ovClose = document.getElementById("wv-submit-close");
+      const ovCancel = document.getElementById("wv-submit-cancel");
+      const ovSend = document.getElementById("wv-submit-send");
+      if (ovClose) ovClose.addEventListener("click", closeWaiverDeskSubmitOverlay);
+      if (ovCancel) ovCancel.addEventListener("click", closeWaiverDeskSubmitOverlay);
+      if (ovSend) ovSend.addEventListener("click", submitWaiverFromDesk);
+      const ov = document.getElementById("wv-submit-overlay");
+      if (ov) {
+        ov.addEventListener("click", function (e) {
+          if (e.target === ov) closeWaiverDeskSubmitOverlay();
+        });
+      }
     }
 
     async function loadWaiverAssetBrowser() {
@@ -20200,20 +20290,18 @@ function renderDashboardHtml(): string {
       if (!wrap) return;
       wrap.innerHTML = "<div class='hint' style='color:var(--muted);padding:6px 0'>Loading asset list…</div>";
       try {
-        const m = await loadWaiverCounts(true);
-        const keys = [];
-        m.forEach(function (c, assetId) {
-          var tot = (c.approved || 0) + (c.pending || 0);
-          if (tot > 0) keys.push(assetId);
-        });
+        const r = await fetch("/api/fleet/asset-ids?limit=8000", { cache: "no-store" });
+        await loadWaiverCounts(true);
+        const j = await r.json();
+        const keys = Array.isArray(j && j.assetIds) ? j.assetIds : [];
         keys.sort(function (a, b) {
           return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
         });
         waiversState.bvAssetKeys = keys;
         if (meta) {
           meta.textContent = keys.length
-            ? keys.length + " vehicle" + (keys.length === 1 ? "" : "s") + " with waivers"
-            : "No vehicles in list yet";
+            ? keys.length + " asset" + (keys.length === 1 ? "" : "s") + " in roster"
+            : "No fleet ids in database yet";
         }
         renderWaiverAssetChipList();
       } catch (e) {
@@ -20235,13 +20323,16 @@ function renderDashboardHtml(): string {
           "<p class='hint' style='margin:8px 0;color:var(--muted)'>" +
           ((waiversState.bvAssetKeys && waiversState.bvAssetKeys.length)
             ? "No asset ids match this filter."
-            : "No waivers on file yet — nothing to list.") +
+            : "No fleet ids loaded yet — choose Refresh, or wait for the next workbook ingest.") +
           "</p>";
         return;
       }
+      var maxShow = 500;
+      var slice = keys.length > maxShow ? keys.slice(0, maxShow) : keys;
+      var more = keys.length > maxShow;
       wrap.innerHTML =
         "<div class='wv-asset-chips'>" +
-        keys.map(function (id) {
+        slice.map(function (id) {
           var c = waiverCountState.map.get(id) || { approved: 0, pending: 0, overdueVerify: 0 };
           var tip = (c.approved || 0) + " on card · " + (c.pending || 0) + " pending";
           if (c.overdueVerify) tip += " · " + c.overdueVerify + " overdue verify";
@@ -20251,12 +20342,17 @@ function renderDashboardHtml(): string {
             "</button>"
           );
         }).join("") +
-        "</div>";
+        "</div>" +
+        (more
+          ? "<p class='hint' style='margin:8px 4px 0;color:var(--muted)'>Showing first " +
+            maxShow +
+            " of " +
+            keys.length +
+            " matches — narrow the filter.</p>"
+          : "");
       wrap.querySelectorAll(".wv-asset-chip").forEach(function (b) {
         b.addEventListener("click", function () {
           var aid = b.getAttribute("data-asset");
-          var inp = document.getElementById("wv-bv-input");
-          if (inp) inp.value = aid;
           loadWaiverByVehicle(aid);
         });
       });
@@ -20270,6 +20366,84 @@ function renderDashboardHtml(): string {
       wrap.querySelectorAll(".wv-asset-chip").forEach(function (x) {
         x.classList.toggle("active", x.getAttribute("data-asset") === cur);
       });
+    }
+
+    function openWaiverDeskSubmitOverlay() {
+      const aid = (waiversState.bv.assetId || "").trim();
+      if (!aid) return;
+      const ov = document.getElementById("wv-submit-overlay");
+      const line = document.getElementById("wv-submit-asset-line");
+      const titleIn = document.getElementById("wv-submit-title-in");
+      const desc = document.getElementById("wv-submit-desc");
+      const by = document.getElementById("wv-submit-by");
+      const files = document.getElementById("wv-submit-files");
+      const err = document.getElementById("wv-submit-err");
+      if (!ov || !line || !titleIn || !desc || !by || !files) return;
+      line.textContent = "For asset " + aid;
+      titleIn.value = "";
+      desc.value = "";
+      by.value = localStorage.getItem("waiver.reviewerName") || "";
+      files.value = "";
+      if (err) { err.hidden = true; err.textContent = ""; }
+      ov.classList.remove("hidden");
+      ov.setAttribute("aria-hidden", "false");
+      titleIn.focus();
+    }
+
+    function closeWaiverDeskSubmitOverlay() {
+      const ov = document.getElementById("wv-submit-overlay");
+      if (!ov) return;
+      ov.classList.add("hidden");
+      ov.setAttribute("aria-hidden", "true");
+    }
+
+    async function submitWaiverFromDesk() {
+      const aid = (waiversState.bv.assetId || "").trim();
+      const titleIn = document.getElementById("wv-submit-title-in");
+      const desc = document.getElementById("wv-submit-desc");
+      const by = document.getElementById("wv-submit-by");
+      const files = document.getElementById("wv-submit-files");
+      const err = document.getElementById("wv-submit-err");
+      const send = document.getElementById("wv-submit-send");
+      if (!aid || !titleIn || !desc || !by || !files || !err) return;
+      const title = (titleIn.value || "").trim();
+      const submittedBy = (by.value || "").trim();
+      const fileList = files.files ? Array.from(files.files) : [];
+      if (!title) {
+        err.textContent = "Title is required.";
+        err.hidden = false;
+        return;
+      }
+      if (!submittedBy) {
+        err.textContent = "Your name is required.";
+        err.hidden = false;
+        return;
+      }
+      localStorage.setItem("waiver.reviewerName", submittedBy);
+      const fd = new FormData();
+      fd.append("assetId", aid);
+      fd.append("title", title);
+      fd.append("description", (desc.value || "").trim());
+      fd.append("submittedBy", submittedBy);
+      fileList.forEach(function (f) {
+        fd.append("photo", f);
+      });
+      if (send) send.disabled = true;
+      err.hidden = true;
+      try {
+        const r = await fetch("/api/waivers", { method: "POST", body: fd });
+        const j = await r.json();
+        if (!r.ok) throw new Error((j && j.error) || ("HTTP " + r.status));
+        closeWaiverDeskSubmitOverlay();
+        await loadWaiverByVehicle(aid);
+        await loadWaiverPending();
+        loadWaiverCounts(true);
+      } catch (e) {
+        err.textContent = "Submit failed: " + (e.message || e);
+        err.hidden = false;
+      } finally {
+        if (send) send.disabled = false;
+      }
     }
 
     function onEnterWaiversTab() {
@@ -20312,12 +20486,18 @@ function renderDashboardHtml(): string {
 
     function waiverDefectPhotosHtml(w) {
       const list =
-        w.photos && w.photos.length ? w.photos : w.hasPhoto && w.photoUrl ? [{ url: w.photoUrl }] : [];
+        w.photos && w.photos.length ? w.photos : w.hasPhoto && w.photoUrl ? [{ url: w.photoUrl, contentType: "" }] : [];
       if (!list.length) return "";
       return (
         "<div class='wv-photo-grid'>" +
         list
           .map(function (p) {
+            var ct = String(p.contentType || "").toLowerCase();
+            if (ct.indexOf("video/") === 0) {
+              return (
+                "<video class='photo' src='" + esc(p.url) + "' controls playsinline muted preload='metadata'></video>"
+              );
+            }
             return "<img class='photo' src='" + esc(p.url) + "' alt='' loading='lazy' />";
           })
           .join("") +
@@ -20443,9 +20623,12 @@ function renderDashboardHtml(): string {
             "<strong>" + pending.length + "</strong> pending" +
             (overdue ? " · <strong style='color:var(--danger)'>" + overdue + "</strong> overdue verify" : "") +
           "</div>" +
-          "<button type='button' class='ghost print-btn' data-print='" + esc(printUrl) + "' " +
+          "<div class='wv-bv-head-actions'>" +
+            "<button type='button' class='primary wv-add-waiver-btn' id='wv-open-submit'>+ Add waiver</button>" +
+            "<button type='button' class='ghost print-btn' data-print='" + esc(printUrl) + "' " +
             (approved.length ? "" : "disabled title='No approved waivers to print'") +
             ">🖨 Print waiver card</button>" +
+          "</div>" +
         "</div>";
       const list = ws.length
         ? "<div class='wv-bv-list'>" + ws.map(renderBvCard).join("") + "</div>"
@@ -20462,6 +20645,8 @@ function renderDashboardHtml(): string {
       if (pb) pb.addEventListener("click", function () {
         window.open(pb.getAttribute("data-print"), "_blank", "noopener");
       });
+      const addBtn = document.getElementById("wv-open-submit");
+      if (addBtn) addBtn.addEventListener("click", openWaiverDeskSubmitOverlay);
       wrap.querySelectorAll("[data-verify]").forEach(function (b) {
         b.addEventListener("click", function () { promptVerify(Number(b.getAttribute("data-verify"))); });
       });

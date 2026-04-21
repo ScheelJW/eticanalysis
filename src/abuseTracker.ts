@@ -451,6 +451,24 @@ export async function listFleetOwningUnits(env: Env, limit: number): Promise<str
   return out;
 }
 
+/** All asset ids from fleet roster (Fleet P&A ingest) for pickers that need the full fleet. */
+export async function listFleetAssetIdsForPicker(env: Env, limit: number): Promise<string[]> {
+  const lim = Math.min(8000, Math.max(1, limit || 4000));
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT asset_id FROM fleet_asset_current
+     WHERE trim(asset_id) != ''
+     ORDER BY asset_id ASC LIMIT ?`,
+  )
+    .bind(lim)
+    .all<{ asset_id: string }>();
+  const out: string[] = [];
+  for (const row of r.results ?? []) {
+    const id = (row.asset_id ?? "").trim();
+    if (id && !out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
 export async function updateAbuseCase(
   env: Env,
   caseId: number,
