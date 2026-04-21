@@ -2723,7 +2723,10 @@ function renderWaiverAppHtml(): string {
 
   async function openAsset(forcedId) {
     await ensureFleetList();
-    var raw = typeof forcedId === "string" && forcedId.trim() ? forcedId.trim() : "";
+    var raw =
+      typeof forcedId === "string" && forcedId.trim()
+        ? forcedId.trim()
+        : (state.assetId || "").trim();
     if (!raw) { showToast("Pick an asset from the list", true); return; }
     raw = normalizeFleetAssetId(raw);
     if (!raw) { showToast("Pick an asset from the list", true); return; }
