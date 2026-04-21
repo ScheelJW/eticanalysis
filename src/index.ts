@@ -18438,7 +18438,26 @@ function renderDashboardHtml(): string {
       }
       melState.rows = data.rows || [];
       melState.availableDates = data.availableDates || [];
-      if (!melState.asOfDate) melState.asOfDate = data.asOfDate || data.latestDate || "";
+      const latest = (data.latestDate || "").trim();
+      if (!melState.asOfDate) {
+        melState.asOfDate = (data.asOfDate || latest || "").trim();
+      } else if (latest && melState.asOfDate !== latest) {
+        // Sticky asOfDate is useful while browsing history, but after a new
+        // workbook ingest the newest snapshot date moves forward — if we keep
+        // the old date the tab looks "stuck" on e.g. 17 Apr forever.
+        const hasNewer = melState.availableDates.some(function (d) { return d > melState.asOfDate; });
+        if (hasNewer) {
+          melState.asOfDate = latest;
+          try {
+            const r2 = await fetch("/api/mel?date=" + encodeURIComponent(melState.asOfDate));
+            data = await r2.json();
+            melState.rows = data.rows || [];
+            melState.availableDates = data.availableDates || [];
+          } catch (_e2) {
+            /* keep first payload */
+          }
+        }
+      }
       loadYardPhotoLatest(false);
 
       // Populate date select
