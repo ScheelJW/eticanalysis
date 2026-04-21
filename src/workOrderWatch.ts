@@ -181,6 +181,93 @@ function fleetRowFromFleetRecord(
   };
 }
 
+type FleetOverlayRow = {
+  assetId: string;
+  owningUnit: string;
+  shop: string;
+  makeModel: string;
+  vehNomen: string;
+  mgmtCd: string;
+  melKey: string;
+};
+
+/** Merge Fleet (P&A) sheet + WO rows into fleet_asset_current (runs even when WO list is empty). */
+async function upsertFleetAssetCurrentFromWorkbook(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  dateKey: string,
+  updatedAtIso: string,
+  workbookBinary: ArrayBuffer | undefined,
+  overlayRows: FleetOverlayRow[],
+): Promise<void> {
+  const fleetByAsset = new Map<
+    string,
+    { owning_unit: string; shop: string; make_model: string; veh_nomen: string; mgmt_cd: string; mel_key: string }
+  >();
+  if (workbookBinary && workbookBinary.byteLength > 0) {
+    try {
+      const fleetMaps = await extractFleetMapsFromBinary(workbookBinary);
+      if (fleetMaps) {
+        for (const [aid, rec] of fleetMaps.byAsset) {
+          const id = (aid ?? "").trim();
+          if (!id) continue;
+          const raw = fleetMaps.rawByAsset.get(aid);
+          fleetByAsset.set(id, fleetRowFromFleetRecord(rec, raw));
+        }
+      }
+    } catch {
+      /* fleet parse optional */
+    }
+  }
+  for (const c of overlayRows) {
+    const aid = (c.assetId ?? "").trim();
+    if (!aid) continue;
+    fleetByAsset.set(aid, {
+      owning_unit: c.owningUnit,
+      shop: c.shop,
+      make_model: c.makeModel,
+      veh_nomen: c.vehNomen,
+      mgmt_cd: c.mgmtCd,
+      mel_key: c.melKey,
+    });
+  }
+  if (fleetByAsset.size === 0) return;
+
+  const fleetUpsert = env.ETIC_SNAPSHOTS.prepare(
+    `INSERT INTO fleet_asset_current (
+       asset_id, owning_unit, shop, make_model, veh_nomen, mgmt_cd, mel_key, last_seen_snapshot_date, updated_at_iso
+     ) VALUES (?,?,?,?,?,?,?,?,?)
+     ON CONFLICT(asset_id) DO UPDATE SET
+       owning_unit = excluded.owning_unit,
+       shop = excluded.shop,
+       make_model = excluded.make_model,
+       veh_nomen = excluded.veh_nomen,
+       mgmt_cd = excluded.mgmt_cd,
+       mel_key = excluded.mel_key,
+       last_seen_snapshot_date = excluded.last_seen_snapshot_date,
+       updated_at_iso = excluded.updated_at_iso`,
+  );
+  const BATCH = 50;
+  const fleetStmts: D1PreparedStatement[] = [];
+  for (const [aid, f] of fleetByAsset) {
+    fleetStmts.push(
+      fleetUpsert.bind(
+        aid,
+        f.owning_unit,
+        f.shop,
+        f.make_model,
+        f.veh_nomen,
+        f.mgmt_cd,
+        f.mel_key,
+        dateKey,
+        updatedAtIso,
+      ),
+    );
+  }
+  for (let i = 0; i < fleetStmts.length; i += BATCH) {
+    await env.ETIC_SNAPSHOTS.batch(fleetStmts.slice(i, i + BATCH));
+  }
+}
+
 export async function ingestWorkOrderSnapshot(
   env: { ETIC_SNAPSHOTS: D1Database },
   dateKey: string,
@@ -207,39 +294,39 @@ export async function ingestWorkOrderSnapshot(
       rawRowJson: JSON.stringify(wo.rawColumns ?? {}),
     }))
     .filter((w) => w.wid.length > 0);
-  if (cleaned.length === 0) return;
 
   const dedup = new Map<string, (typeof cleaned)[number]>();
   for (const c of cleaned) dedup.set(c.wid, c);
   const workOrders = [...dedup.values()];
 
-  const priorByWid = new Map<string, WoStateRow>();
-  const selectBatchSize = 90;
-  for (let i = 0; i < workOrders.length; i += selectBatchSize) {
-    const chunk = workOrders.slice(i, i + selectBatchSize);
-    const placeholders = chunk.map(() => "?").join(",");
-    const stmt = env.ETIC_SNAPSHOTS.prepare(
-      `SELECT work_order_id, asset_id, remarks, parts_status, etic_raw, etic_date, mel_tier,
+  if (workOrders.length > 0) {
+    const priorByWid = new Map<string, WoStateRow>();
+    const selectBatchSize = 90;
+    for (let i = 0; i < workOrders.length; i += selectBatchSize) {
+      const chunk = workOrders.slice(i, i + selectBatchSize);
+      const placeholders = chunk.map(() => "?").join(",");
+      const stmt = env.ETIC_SNAPSHOTS.prepare(
+        `SELECT work_order_id, asset_id, remarks, parts_status, etic_raw, etic_date, mel_tier,
               last_remark_change_date, etic_push_count, first_etic_date, last_etic_date, cumulative_etic_slip_days,
               owning_unit, mel_key, shop, mgmt_cd, make_model, veh_nomen
        FROM work_order_state WHERE work_order_id IN (${placeholders})`,
-    ).bind(...chunk.map((c) => c.wid));
-    const r = await stmt.all<WoStateRow>();
-    for (const row of r.results ?? []) {
-      priorByWid.set(row.work_order_id, row);
+      ).bind(...chunk.map((c) => c.wid));
+      const r = await stmt.all<WoStateRow>();
+      for (const row of r.results ?? []) {
+        priorByWid.set(row.work_order_id, row);
+      }
     }
-  }
 
-  // INSERT OR IGNORE pairs with the UNIQUE(work_order_id, snapshot_date_key, field)
-  // index added in migration 0017. Re-ingesting the same snapshot (rebuild history,
-  // replay, or a re-emailed workbook for the same day) is now a no-op for the
-  // changelog instead of doubling every change row, which was the root cause of the
-  // duplicated MEL TIER / PARTS entries showing up on the WO change timeline.
-  const insertLog = env.ETIC_SNAPSHOTS.prepare(
-    `INSERT OR IGNORE INTO work_order_changelog (work_order_id, snapshot_date_key, changed_at_iso, field, old_value, new_value)
+    // INSERT OR IGNORE pairs with the UNIQUE(work_order_id, snapshot_date_key, field)
+    // index added in migration 0017. Re-ingesting the same snapshot (rebuild history,
+    // replay, or a re-emailed workbook for the same day) is now a no-op for the
+    // changelog instead of doubling every change row, which was the root cause of the
+    // duplicated MEL TIER / PARTS entries showing up on the WO change timeline.
+    const insertLog = env.ETIC_SNAPSHOTS.prepare(
+      `INSERT OR IGNORE INTO work_order_changelog (work_order_id, snapshot_date_key, changed_at_iso, field, old_value, new_value)
      VALUES (?, ?, ?, ?, ?, ?)`,
-  );
-  const upsert = env.ETIC_SNAPSHOTS.prepare(
+    );
+    const upsert = env.ETIC_SNAPSHOTS.prepare(
     `INSERT INTO work_order_state (
       work_order_id, asset_id, last_snapshot_date, remarks, parts_status, etic_raw, etic_date, mel_tier,
       last_remark_change_date, etic_push_count, first_etic_date, last_etic_date, cumulative_etic_slip_days,
@@ -401,73 +488,6 @@ export async function ingestWorkOrderSnapshot(
     await env.ETIC_SNAPSHOTS.batch(statements.slice(i, i + BATCH));
   }
 
-  // Rolling fleet roster: merge **entire** Fleet (P&A) sheet (all asset rows) with
-  // WO-derived rows so FMC-only assets still appear in pickers (abuse tracker, etc.).
-  const fleetByAsset = new Map<
-    string,
-    { owning_unit: string; shop: string; make_model: string; veh_nomen: string; mgmt_cd: string; mel_key: string }
-  >();
-  if (workbookBinary && workbookBinary.byteLength > 0) {
-    try {
-      const fleetMaps = await extractFleetMapsFromBinary(workbookBinary);
-      if (fleetMaps) {
-        for (const [aid, rec] of fleetMaps.byAsset) {
-          const id = (aid ?? "").trim();
-          if (!id) continue;
-          const raw = fleetMaps.rawByAsset.get(aid);
-          fleetByAsset.set(id, fleetRowFromFleetRecord(rec, raw));
-        }
-      }
-    } catch {
-      /* fleet parse optional — WO list still updates */
-    }
-  }
-  for (const c of workOrders) {
-    const aid = (c.assetId ?? "").trim();
-    if (!aid) continue;
-    fleetByAsset.set(aid, {
-      owning_unit: c.owningUnit,
-      shop: c.shop,
-      make_model: c.makeModel,
-      veh_nomen: c.vehNomen,
-      mgmt_cd: c.mgmtCd,
-      mel_key: c.melKey,
-    });
-  }
-  const fleetUpsert = env.ETIC_SNAPSHOTS.prepare(
-    `INSERT INTO fleet_asset_current (
-       asset_id, owning_unit, shop, make_model, veh_nomen, mgmt_cd, mel_key, last_seen_snapshot_date, updated_at_iso
-     ) VALUES (?,?,?,?,?,?,?,?,?)
-     ON CONFLICT(asset_id) DO UPDATE SET
-       owning_unit = excluded.owning_unit,
-       shop = excluded.shop,
-       make_model = excluded.make_model,
-       veh_nomen = excluded.veh_nomen,
-       mgmt_cd = excluded.mgmt_cd,
-       mel_key = excluded.mel_key,
-       last_seen_snapshot_date = excluded.last_seen_snapshot_date,
-       updated_at_iso = excluded.updated_at_iso`,
-  );
-  const fleetStmts: D1PreparedStatement[] = [];
-  for (const [aid, f] of fleetByAsset) {
-    fleetStmts.push(
-      fleetUpsert.bind(
-        aid,
-        f.owning_unit,
-        f.shop,
-        f.make_model,
-        f.veh_nomen,
-        f.mgmt_cd,
-        f.mel_key,
-        dateKey,
-        updatedAtIso,
-      ),
-    );
-  }
-  for (let i = 0; i < fleetStmts.length; i += BATCH) {
-    await env.ETIC_SNAPSHOTS.batch(fleetStmts.slice(i, i + BATCH));
-  }
-
   // Verify any pending FM&A actions against the changes we just wrote.
   // Soft-fails so a verifier bug never blocks an ingest.
   try {
@@ -475,6 +495,9 @@ export async function ingestWorkOrderSnapshot(
   } catch (err) {
     console.error("verifyWorkOrderActionsForSnapshot failed", err);
   }
+  }
+
+  await upsertFleetAssetCurrentFromWorkbook(env, dateKey, updatedAtIso, workbookBinary, workOrders);
 }
 
 /** Schedule maintenance (Fleet P&A Schedule Mx / due columns). */
