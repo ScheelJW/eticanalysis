@@ -9920,6 +9920,23 @@ function renderDashboardHtml(): string {
     .abuse-new-card { margin-top: 16px; }
     .abuse-new-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
     @media (max-width: 640px) { .abuse-new-grid { grid-template-columns: 1fr; } }
+    .abuse-asset-combo { position: relative; }
+    .abuse-asset-dd {
+      position: absolute; left: 0; right: 0; top: calc(100% + 4px); z-index: 30;
+      max-height: min(260px, 42vh); overflow-y: auto;
+      background: var(--surface); border: 1px solid var(--border-strong); border-radius: 10px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.12);
+    }
+    .abuse-asset-dd.hidden { display: none; }
+    .abuse-asset-opt {
+      display: block; width: 100%; text-align: left; padding: 9px 12px; margin: 0; border: 0; border-bottom: 1px solid var(--border);
+      background: transparent; font: inherit; cursor: pointer; color: var(--text);
+    }
+    .abuse-asset-opt:last-child { border-bottom: 0; }
+    .abuse-asset-opt:hover, .abuse-asset-opt:focus { background: rgba(0,58,140,0.07); outline: none; }
+    .abuse-asset-opt .opt-id { font-weight: 700; font-family: var(--font-mono); font-size: 0.86rem; letter-spacing: 0.02em; }
+    .abuse-asset-opt .opt-sub { font-size: 0.74rem; color: var(--muted); margin-top: 3px; line-height: 1.35; }
+    .abuse-asset-dd .abuse-asset-empty { padding: 10px 12px; font-size: 0.82rem; color: var(--muted); }
     .abuse-charts canvas { max-width: 100%; height: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-elev); }
     .abuse-ingest-wrap { margin-top: 4px; }
     .abuse-ingest-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; margin-top: 8px; }
@@ -13432,8 +13449,10 @@ function renderDashboardHtml(): string {
                 </select>
               </label>
               <label class="field"><span class="label">Asset ID</span>
-                <input type="text" id="abuse-new-asset" list="abuse-asset-datalist" placeholder="Type to search fleet roster…" autocapitalize="characters" autocomplete="off" />
-                <datalist id="abuse-asset-datalist"></datalist>
+                <div class="abuse-asset-combo">
+                  <input type="text" id="abuse-new-asset" placeholder="Type to search, then pick from the list…" autocapitalize="characters" autocomplete="off" aria-autocomplete="list" aria-controls="abuse-asset-dd" aria-expanded="false" />
+                  <div id="abuse-asset-dd" class="abuse-asset-dd hidden" role="listbox" hidden></div>
+                </div>
               </label>
               <p class="hint" style="grid-column:1/-1;margin:0">Unit / shop / make-model are copied from the latest Fleet roster <strong>once</strong> when you create the case and do not change if the vehicle moves later.</p>
               <label class="field" style="grid-column:1/-1"><span class="label">Work order ID</span>
@@ -23423,29 +23442,79 @@ function renderDashboardHtml(): string {
       abuseRefreshFleetUnits();
       var abuseAssetPickTimer = null;
       var abuseAssetInp = document.getElementById("abuse-new-asset");
-      var abuseAssetDl = document.getElementById("abuse-asset-datalist");
-      function refreshAbuseAssetDatalist() {
-        if (!abuseAssetInp || !abuseAssetDl) return;
+      var abuseAssetDd = document.getElementById("abuse-asset-dd");
+      var abuseAssetCombo = abuseAssetInp ? abuseAssetInp.closest(".abuse-asset-combo") : null;
+      function abuseAssetDdSetOpen(open) {
+        if (!abuseAssetDd || !abuseAssetInp) return;
+        abuseAssetDd.classList.toggle("hidden", !open);
+        abuseAssetDd.toggleAttribute("hidden", !open);
+        abuseAssetInp.setAttribute("aria-expanded", open ? "true" : "false");
+      }
+      function abuseAssetDdHide() {
+        abuseAssetDdSetOpen(false);
+      }
+      function abuseAssetDdRender(rows) {
+        if (!abuseAssetDd) return;
+        if (!rows.length) {
+          abuseAssetDd.innerHTML = "<div class='abuse-asset-empty'>No matches. Try another id or unit fragment.</div>";
+          abuseAssetDdSetOpen(true);
+          return;
+        }
+        abuseAssetDd.innerHTML = rows.map(function (a) {
+          var sub = [a.make_model || "", a.shop || "", a.owning_unit || ""].filter(Boolean).join(" · ");
+          return (
+            "<button type='button' class='abuse-asset-opt' role='option' data-asset-id='" + esc(a.asset_id) + "'>" +
+              "<div class='opt-id'>" + esc(a.asset_id) + "</div>" +
+              "<div class='opt-sub'>" + esc(sub || "—") + "</div>" +
+            "</button>"
+          );
+        }).join("");
+        abuseAssetDd.querySelectorAll(".abuse-asset-opt").forEach(function (btn) {
+          btn.addEventListener("mousedown", function (ev) {
+            ev.preventDefault();
+            var id = (btn.getAttribute("data-asset-id") || "").trim();
+            if (abuseAssetInp && id) abuseAssetInp.value = id;
+            abuseAssetDdHide();
+            if (abuseAssetInp) abuseAssetInp.focus();
+          });
+        });
+        abuseAssetDdSetOpen(true);
+      }
+      function refreshAbuseAssetDropdown() {
+        if (!abuseAssetInp || !abuseAssetDd) return;
         var q = (abuseAssetInp.value || "").trim();
         if (q.length < 2) {
-          abuseAssetDl.innerHTML = "";
+          abuseAssetDd.innerHTML = "";
+          abuseAssetDdHide();
           return;
         }
         fetch("/api/fleet/assets?q=" + encodeURIComponent(q) + "&limit=25", { cache: "no-store" })
           .then(function (r) { return r.ok ? r.json() : { assets: [] }; })
           .then(function (j) {
-            var rows = (j && j.assets) || [];
-            abuseAssetDl.innerHTML = rows.map(function (a) {
-              var lab = a.asset_id + " — " + (a.make_model || "") + " · " + (a.shop || "") + " · " + (a.owning_unit || "");
-              return "<option value='" + esc(a.asset_id) + "' label='" + esc(lab) + "'></option>";
-            }).join("");
+            abuseAssetDdRender((j && j.assets) || []);
           })
-          .catch(function () { abuseAssetDl.innerHTML = ""; });
+          .catch(function () {
+            abuseAssetDd.innerHTML = "";
+            abuseAssetDdHide();
+          });
       }
-      if (abuseAssetInp && abuseAssetDl) {
+      if (abuseAssetInp && abuseAssetDd) {
         abuseAssetInp.addEventListener("input", function () {
           if (abuseAssetPickTimer) clearTimeout(abuseAssetPickTimer);
-          abuseAssetPickTimer = setTimeout(refreshAbuseAssetDatalist, 200);
+          abuseAssetPickTimer = setTimeout(refreshAbuseAssetDropdown, 200);
+        });
+        abuseAssetInp.addEventListener("focus", function () {
+          var q = (abuseAssetInp.value || "").trim();
+          if (q.length >= 2) refreshAbuseAssetDropdown();
+        });
+        abuseAssetInp.addEventListener("keydown", function (ev) {
+          if (ev.key === "Escape") abuseAssetDdHide();
+        });
+        document.addEventListener("click", function (ev) {
+          if (!abuseAssetDd) return;
+          var t = ev.target;
+          if (abuseAssetCombo && abuseAssetCombo.contains(t)) return;
+          abuseAssetDdHide();
         });
       }
       var rf = document.getElementById("abuse-refresh");
