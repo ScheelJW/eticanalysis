@@ -131,6 +131,28 @@ async function getLatestSnapshotDateKey(env: Env): Promise<string> {
 }
 
 /**
+ * Yard roster + open-WO panels read `work_order_snapshot`. The newest row in
+ * `etic_snapshots` can drift from the newest WO snapshot day (relabel, partial
+ * ingest, manual D1 edits). When the preferred day has no WO rows, fall back to
+ * the latest day that does so walkers still see the fleet.
+ */
+async function resolveWorkOrderSnapshotDateKeyForRoster(env: Env, preferredDateKey: string): Promise<string> {
+  const preferred = (preferredDateKey ?? "").trim();
+  if (preferred) {
+    const probe = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT 1 AS x FROM work_order_snapshot WHERE snapshot_date_key = ? AND TRIM(COALESCE(asset_id, '')) != '' LIMIT 1`,
+    )
+      .bind(preferred)
+      .first<{ x: number }>();
+    if (probe) return preferred;
+  }
+  const row = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT MAX(snapshot_date_key) AS d FROM work_order_snapshot WHERE TRIM(COALESCE(asset_id, '')) != ''`,
+  ).first<{ d: string | null }>();
+  return (row?.d ?? "").trim();
+}
+
+/**
  * Pull a VIN/serial from a raw work-order JSON blob. The workbook may store it
  * under "vin", "serial", "serial nbr", "fleet.vin", etc. (see FLEET_SYNONYMS).
  */
@@ -386,7 +408,8 @@ export async function getSessionDetail(
 ): Promise<YardSessionDetail | null> {
   const session = await getSession(env, sessionId);
   if (!session) return null;
-  const dateKey = session.sourceDateKey || (await getLatestSnapshotDateKey(env));
+  const preferred = (session.sourceDateKey ?? "").trim() || (await getLatestSnapshotDateKey(env));
+  const dateKey = await resolveWorkOrderSnapshotDateKeyForRoster(env, preferred);
   const [entries, roster] = await Promise.all([
     getEntries(env, sessionId),
     getYardRosterForDate(env, dateKey),
@@ -688,7 +711,8 @@ function bucketState(daysSince: number | null, intervalDays: number): RollingAss
  */
 export async function getRollingRoster(env: Env): Promise<RollingRoster> {
   const intervalDays = await getYardCheckIntervalDays(env);
-  const dateKey = await getLatestSnapshotDateKey(env);
+  const preferredKey = await getLatestSnapshotDateKey(env);
+  const dateKey = await resolveWorkOrderSnapshotDateKeyForRoster(env, preferredKey);
   if (!dateKey) {
     return {
       dateKey: "",
