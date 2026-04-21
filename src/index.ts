@@ -14444,6 +14444,8 @@ function renderDashboardHtml(): string {
     let selectedDate = null;
     let snapshotRows = [];
     const watchCacheByDate = new Map();
+    /** Last /api/watch list response asOfDateKey (may differ from requested date when server falls back). */
+    let woWatchResolvedAsOf = "";
     const changelogCache = new Map();
     let selectedWoId = null;
     let woFilter = "all";
@@ -14532,7 +14534,10 @@ function renderDashboardHtml(): string {
       if (!res.ok) { watchCacheByDate.set(dateKey, []); return []; }
       const data = await res.json();
       const rows = Array.isArray(data.rows) ? data.rows : [];
+      const resolved = String(data.asOfDateKey || dateKey || "").trim();
+      if (resolved) woWatchResolvedAsOf = resolved;
       watchCacheByDate.set(dateKey, rows);
+      if (resolved && resolved !== dateKey) watchCacheByDate.set(resolved, rows);
       return rows;
     }
 
@@ -15800,9 +15805,23 @@ function renderDashboardHtml(): string {
      * /api/history alone, which can list a date before WO rows exist for it.
      */
     function woAsOfDate() {
+      if (woWatchResolvedAsOf) return woWatchResolvedAsOf;
       const snaps = (snapshotRows || []).slice().sort(function (a, b) { return b.dateKey.localeCompare(a.dateKey); });
       if (snaps.length) return snaps[0].dateKey;
       return latestSnapshotDate() || selectedDate || "";
+    }
+
+    async function refreshWoTabIndexFromServer() {
+      try {
+        const pair = await Promise.all([loadHistory(), loadSnapshots()]);
+        historyEntries = pair[0];
+        snapshotRows = pair[1];
+        renderDatePicker();
+        populateCompareDateSelects();
+        populateBreakdownCompareSelect();
+      } catch (_e) {
+        /* non-fatal — woAsOfDate still falls back */
+      }
     }
 
     function setMainTab(which) {
@@ -15892,8 +15911,11 @@ function renderDashboardHtml(): string {
         : "Fleet readiness at a glance.";
       if (isWo) {
         watchCacheByDate.clear();
-        const asOf = woAsOfDate();
-        if (asOf) loadAndRenderWoList(asOf, { force: true });
+        woWatchResolvedAsOf = "";
+        void refreshWoTabIndexFromServer().then(function () {
+          const asOf = woAsOfDate();
+          if (asOf) loadAndRenderWoList(asOf, { force: true });
+        });
       } else if (isSmx) {
         loadScheduleMxTab();
       } else if (isAuthz) {
@@ -16445,6 +16467,7 @@ function renderDashboardHtml(): string {
 
     async function loadAndRenderWoList(dateKey, opts) {
       const meta = document.getElementById("wo-list-meta");
+      const pill = document.getElementById("wo-asof-pill");
       meta.textContent = "Loading…";
       try {
         // Pull WO rows + last-yard-sighting map + waiver counts in parallel
@@ -16457,6 +16480,12 @@ function renderDashboardHtml(): string {
           loadYardPhotoLatest(!!(opts && opts.force)),
         ]);
         renderWoList(rows);
+        const asOf = woAsOfDate();
+        if (pill) {
+          pill.textContent = asOf ? fmtKeyLong(asOf) : "Latest";
+          pill.title = "Work order list is keyed to snapshot " + (asOf || "—") +
+            ". Refreshes when you open this tab after a new ingest.";
+        }
       } catch (e) {
         meta.textContent = "Could not load work orders.";
       }
