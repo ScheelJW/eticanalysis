@@ -2505,8 +2505,8 @@ function renderWaiverAppHtml(): string {
       <input id="sub-submit-by" type="text" autocomplete="name" placeholder="First Last" maxlength="120" />
       <label>Photos or video of the defect (one or more files)</label>
       <div class="file-row">
-        <label class="file-btn" for="sub-photo">📷 🎬 Take / choose files</label>
-        <input id="sub-photo" type="file" accept="image/*,video/mp4,video/quicktime,video/webm,video/3gpp,video/*" capture="environment" multiple />
+        <label class="file-btn" for="sub-photo">📷 🎬 Add photos or video</label>
+        <input id="sub-photo" type="file" accept="image/*,video/mp4,video/quicktime,video/webm,video/3gpp,video/*" multiple />
         <span id="sub-photo-name" style="font-size:0.85rem;color:var(--muted);"></span>
       </div>
       <div id="sub-preview-grid" class="sub-preview-grid" hidden></div>
@@ -2529,8 +2529,8 @@ function renderWaiverAppHtml(): string {
       <textarea id="verify-note" maxlength="500" placeholder="e.g. Re-checked during PMI, still applies"></textarea>
       <label>Photo at verification (optional)</label>
       <div class="file-row">
-        <label class="file-btn" for="verify-photo">📷 🎬 Take / choose file</label>
-        <input id="verify-photo" type="file" accept="image/*,video/mp4,video/quicktime,video/webm,video/3gpp,video/*" capture="environment" />
+        <label class="file-btn" for="verify-photo">📷 🎬 Add photo or video</label>
+        <input id="verify-photo" type="file" accept="image/*,video/mp4,video/quicktime,video/webm,video/3gpp,video/*" />
         <span id="verify-photo-name" style="font-size:0.85rem;color:var(--muted);"></span>
       </div>
       <img id="verify-preview" class="preview" hidden alt="" />
@@ -6590,8 +6590,8 @@ function renderYardAppHtml(): string {
       }
       photoHtml += '<label class="photo-add" id="photo-add">' +
         '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg>' +
-        '<span>Take photo</span>' +
-        '<input type="file" id="photo-input" accept="image/*" capture="environment" />' +
+        '<span>Add photo</span>' +
+        '<input type="file" id="photo-input" accept="image/*" />' +
       '</label>';
 
       var checks = d.checks || [];
