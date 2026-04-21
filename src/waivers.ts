@@ -39,6 +39,8 @@ export type WaiverPhotoRef = {
   id: number;
   /** GET path — `/api/waivers/photo/:id` for real rows; legacy single-photo uses `/api/waivers/:waiverId/photo`. */
   url: string;
+  /** Stored MIME type when known (helps the UI choose img vs video). */
+  contentType?: string;
 };
 
 export type Waiver = {
@@ -201,7 +203,13 @@ function rowToWaiver(r: WaiverRow, waiverPhotos: WaiverPhotoRef[] = []): Waiver 
     waiverPhotos.length > 0
       ? waiverPhotos
       : r.photo_r2_key
-        ? [{ id: 0, url: `/api/waivers/${r.id}/photo` }]
+        ? [
+            {
+              id: 0,
+              url: `/api/waivers/${r.id}/photo`,
+              ...(r.photo_content_type ? { contentType: r.photo_content_type } : {}),
+            },
+          ]
         : [];
   const isRemoved =
     r.deleted_at_iso != null && String(r.deleted_at_iso).trim().length > 0;
@@ -257,6 +265,11 @@ function extensionForContentType(ct: string): string {
   if (c.includes("webp")) return "webp";
   if (c.includes("heic") || c.includes("heif")) return "heic";
   if (c.includes("gif")) return "gif";
+  if (c.includes("webm")) return "webm";
+  if (c.includes("quicktime") || c.includes("/mov")) return "mov";
+  if (c.includes("mp4")) return "mp4";
+  if (c === "video/mpeg" || c === "audio/mpeg") return "mpeg";
+  if (c.includes("3gpp")) return "3gp";
   return "jpg";
 }
 
@@ -269,16 +282,21 @@ async function listWaiverPhotosForWaiverIds(
   if (!uniq.length) return out;
   const ph = uniq.map(() => "?").join(",");
   const r = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT id, waiver_id, sort_index
+    `SELECT id, waiver_id, sort_index, content_type
        FROM waiver_photo
       WHERE waiver_id IN (${ph})
       ORDER BY waiver_id, sort_index ASC, id ASC`,
   )
     .bind(...uniq)
-    .all<{ id: number; waiver_id: number; sort_index: number }>();
+    .all<{ id: number; waiver_id: number; sort_index: number; content_type: string | null }>();
   for (const row of r.results ?? []) {
     const list = out.get(row.waiver_id) ?? [];
-    list.push({ id: row.id, url: `/api/waivers/photo/${row.id}` });
+    const ct = (row.content_type ?? "").trim();
+    list.push({
+      id: row.id,
+      url: `/api/waivers/photo/${row.id}`,
+      ...(ct ? { contentType: ct } : {}),
+    });
     out.set(row.waiver_id, list);
   }
   return out;
