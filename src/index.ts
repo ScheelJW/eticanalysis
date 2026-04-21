@@ -311,7 +311,7 @@ export default {
       await upsertSnapshotRow(env, analysis, workbookKey);
 
       const rawWos = await extractRawWorkOrdersFromBinary(workbookBytes);
-      await ingestWorkOrderSnapshot(env, dateKey, rawWos, now.toISOString());
+      await ingestWorkOrderSnapshot(env, dateKey, rawWos, now.toISOString(), workbookBytes);
 
       const melRows = await extractMelRowsFromBinary(workbookBytes);
       await ingestMelSnapshot(env, dateKey, melRows, now.toISOString());
@@ -1490,7 +1490,7 @@ async function replayWorkOrderWatchForDate(env: Env, dateKey: string): Promise<n
   if (!obj) return 0;
   const bytes = await obj.arrayBuffer();
   const raw = await extractRawWorkOrdersFromBinary(bytes);
-  await ingestWorkOrderSnapshot(env, dateKey, raw, new Date().toISOString());
+  await ingestWorkOrderSnapshot(env, dateKey, raw, new Date().toISOString(), bytes);
   const melRows = await extractMelRowsFromBinary(bytes);
   await ingestMelSnapshot(env, dateKey, melRows, new Date().toISOString());
   return raw.length;
@@ -1512,7 +1512,7 @@ async function rebuildWorkOrderWatchFromHistory(env: Env): Promise<void> {
     if (!obj) continue;
     const bytes = await obj.arrayBuffer();
     const raw = await extractRawWorkOrdersFromBinary(bytes);
-    await ingestWorkOrderSnapshot(env, entry.dateKey, raw, nowIso);
+    await ingestWorkOrderSnapshot(env, entry.dateKey, raw, nowIso, bytes);
     const melRows = await extractMelRowsFromBinary(bytes);
     await ingestMelSnapshot(env, entry.dateKey, melRows, nowIso);
   }
@@ -3675,7 +3675,7 @@ async function handleFleetAssetsSearchApi(env: Env, request: Request): Promise<R
   if (request.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
   const url = new URL(request.url);
   const q = url.searchParams.get("q") ?? "";
-  const limit = Number.parseInt(url.searchParams.get("limit") ?? "20", 10) || 20;
+  const limit = Number.parseInt(url.searchParams.get("limit") ?? "60", 10) || 60;
   const rows = await searchFleetAssetsForPicker(env, q, limit);
   return Response.json({ assets: rows }, { headers: cacheHeaders() });
 }
@@ -23713,7 +23713,7 @@ function renderDashboardHtml(): string {
           abuseAssetDdHide();
           return;
         }
-        fetch("/api/fleet/assets?q=" + encodeURIComponent(q) + "&limit=25", { cache: "no-store" })
+        fetch("/api/fleet/assets?q=" + encodeURIComponent(q) + "&limit=80", { cache: "no-store" })
           .then(function (r) { return r.ok ? r.json() : { assets: [] }; })
           .then(function (j) {
             abuseAssetDdRender((j && j.assets) || []);

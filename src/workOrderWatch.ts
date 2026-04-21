@@ -132,11 +132,61 @@ type WoStateRow = {
   updated_at_iso: string;
 };
 
+function guessOwningUnitFromFleetRaw(raw: Record<string, string> | undefined): string {
+  if (!raw) return "";
+  for (const [k, v] of Object.entries(raw)) {
+    const kk = k.toLowerCase();
+    const t = (v ?? "").trim();
+    if (!t) continue;
+    if (/\bunit\b|owning|organization|org\b|squadron|flight|assigned/.test(kk)) return t;
+  }
+  return "";
+}
+
+function guessShopFromFleetRaw(raw: Record<string, string> | undefined, eticLocation: string): string {
+  const loc = (eticLocation ?? "").trim();
+  if (loc) return loc;
+  if (!raw) return "";
+  for (const [k, v] of Object.entries(raw)) {
+    const kk = k.toLowerCase();
+    const t = (v ?? "").trim();
+    if (!t) continue;
+    if (/shop|location|bay|hangar|eti\s*c|et\s*i\s*c/.test(kk)) return t;
+  }
+  return "";
+}
+
+function guessMelKeyFromFleetRaw(raw: Record<string, string> | undefined): string {
+  if (!raw) return "";
+  for (const [k, v] of Object.entries(raw)) {
+    const t = (v ?? "").trim();
+    if (!t) continue;
+    const kk = k.toLowerCase();
+    if (/mel\s*key|^mel\b/.test(kk)) return t;
+  }
+  return "";
+}
+
+function fleetRowFromFleetRecord(
+  rec: FleetRecord,
+  raw: Record<string, string> | undefined,
+): { owning_unit: string; shop: string; make_model: string; veh_nomen: string; mgmt_cd: string; mel_key: string } {
+  return {
+    owning_unit: guessOwningUnitFromFleetRaw(raw),
+    shop: guessShopFromFleetRaw(raw, rec.etiCLocation ?? ""),
+    make_model: (rec.makeModel ?? "").trim(),
+    veh_nomen: (rec.vehNomen ?? "").trim(),
+    mgmt_cd: (rec.mgmtCd ?? "").trim(),
+    mel_key: guessMelKeyFromFleetRaw(raw),
+  };
+}
+
 export async function ingestWorkOrderSnapshot(
   env: { ETIC_SNAPSHOTS: D1Database },
   dateKey: string,
   rows: RawWorkOrder[],
   updatedAtIso: string,
+  workbookBinary?: ArrayBuffer,
 ): Promise<void> {
   const cleaned = rows
     .map((wo) => ({
@@ -351,12 +401,27 @@ export async function ingestWorkOrderSnapshot(
     await env.ETIC_SNAPSHOTS.batch(statements.slice(i, i + BATCH));
   }
 
-  // Rolling fleet roster (one row per asset) for apps that need an asset list
-  // without an open WO — e.g. abuse tracker snapshots org fields at case create.
+  // Rolling fleet roster: merge **entire** Fleet (P&A) sheet (all asset rows) with
+  // WO-derived rows so FMC-only assets still appear in pickers (abuse tracker, etc.).
   const fleetByAsset = new Map<
     string,
     { owning_unit: string; shop: string; make_model: string; veh_nomen: string; mgmt_cd: string; mel_key: string }
   >();
+  if (workbookBinary && workbookBinary.byteLength > 0) {
+    try {
+      const fleetMaps = await extractFleetMapsFromBinary(workbookBinary);
+      if (fleetMaps) {
+        for (const [aid, rec] of fleetMaps.byAsset) {
+          const id = (aid ?? "").trim();
+          if (!id) continue;
+          const raw = fleetMaps.rawByAsset.get(aid);
+          fleetByAsset.set(id, fleetRowFromFleetRecord(rec, raw));
+        }
+      }
+    } catch {
+      /* fleet parse optional — WO list still updates */
+    }
+  }
   for (const c of workOrders) {
     const aid = (c.assetId ?? "").trim();
     if (!aid) continue;

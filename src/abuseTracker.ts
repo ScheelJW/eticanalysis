@@ -849,7 +849,7 @@ export async function searchFleetAssetsForPicker(
   if (!raw) return [];
   const safe = raw.replace(/[%_]/g, "").slice(0, 48);
   if (!safe) return [];
-  const lim = Math.min(50, Math.max(1, limit || 20));
+  const lim = Math.min(120, Math.max(1, limit || 40));
   const like = `%${safe}%`;
   const r = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT asset_id, owning_unit, shop, make_model FROM fleet_asset_current
