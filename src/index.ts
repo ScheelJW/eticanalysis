@@ -103,7 +103,6 @@ import {
   upsertMelSubdivision,
 } from "./melWatch";
 import {
-  addAbuseAttachment,
   addAbuseNote,
   createAbuseCase,
   findCaseByEmailToken,
@@ -112,11 +111,15 @@ import {
   getAbuseTrackerStats,
   ingestAbuseDamEmailFiles,
   listAbuseCases,
+  listOpenAbuseCasesForWorkOrder,
+  listFleetOwningUnits,
   searchFleetAssetsForPicker,
-  parseAbuseDamTokenFromEmailTo,
+  parseAbuseEmailIngestFromTo,
+  normalizeAbuseCaseStage,
+  isValidAbuseStageInput,
   updateAbuseCase,
   abuseDamEmailLocalPart,
-  type AbuseAttachmentKind,
+  abuseIngestEmailAddresses,
   type AbuseCaseStage,
   type AbuseCaseType,
 } from "./abuseTracker";
@@ -209,14 +212,14 @@ export default {
     }
 
     const parsed = await PostalMime.parse(message.raw, { attachmentEncoding: "arraybuffer" });
-    const damToken = parseAbuseDamTokenFromEmailTo(message.to || "");
-    if (damToken) {
-      const caseRow = await findCaseByEmailToken(env, damToken);
+    const abuseIngest = parseAbuseEmailIngestFromTo(message.to || "");
+    if (abuseIngest) {
+      const caseRow = await findCaseByEmailToken(env, abuseIngest.token);
       if (!caseRow) {
         console.warn(
           JSON.stringify({
             level: "warn",
-            message: "abuse-dam email: unknown token",
+            message: "abuse ingest email: unknown token",
             to: message.to,
             from: message.from,
           }),
@@ -228,7 +231,7 @@ export default {
         mimeType: a.mimeType,
         content: normalizeAttachmentBinary(a.content),
       }));
-      const n = await ingestAbuseDamEmailFiles(env, caseRow, atts, message.from);
+      const n = await ingestAbuseDamEmailFiles(env, caseRow, atts, message.from, abuseIngest.routeKind);
       if (n > 0) {
         await addAbuseNote(
           env,
@@ -308,7 +311,7 @@ export default {
       await upsertSnapshotRow(env, analysis, workbookKey);
 
       const rawWos = await extractRawWorkOrdersFromBinary(workbookBytes);
-      await ingestWorkOrderSnapshot(env, dateKey, rawWos, now.toISOString());
+      await ingestWorkOrderSnapshot(env, dateKey, rawWos, now.toISOString(), workbookBytes);
 
       const melRows = await extractMelRowsFromBinary(workbookBytes);
       await ingestMelSnapshot(env, dateKey, melRows, now.toISOString());
@@ -600,23 +603,24 @@ export default {
     if (url.pathname === "/api/fleet/assets") {
       return handleFleetAssetsSearchApi(env, request);
     }
+    if (url.pathname === "/api/fleet/units") {
+      return handleFleetOwningUnitsApi(env, request);
+    }
     if (url.pathname === "/api/abuse-tracker/stats") {
       return handleAbuseTrackerStatsApi(env, request);
     }
     if (url.pathname === "/api/abuse-tracker") {
       return handleAbuseTrackerListApi(env, request);
     }
+    const abuseByWoMatch = url.pathname.match(/^\/api\/abuse-tracker\/by-work-order\/(.+)$/);
+    if (abuseByWoMatch) {
+      return handleAbuseTrackerByWorkOrderApi(env, request, abuseByWoMatch[1] ?? "");
+    }
     const abuseAttMatch = url.pathname.match(/^\/api\/abuse-tracker\/attachments\/(\d+)$/);
     if (abuseAttMatch) {
       const aid = Number.parseInt(abuseAttMatch[1] ?? "", 10);
       if (!Number.isFinite(aid)) return new Response("Invalid attachment id", { status: 400 });
       return handleAbuseTrackerAttachmentApi(env, request, aid);
-    }
-    const abuseCaseUploadMatch = url.pathname.match(/^\/api\/abuse-tracker\/(\d+)\/attachments$/);
-    if (abuseCaseUploadMatch) {
-      const cid = Number.parseInt(abuseCaseUploadMatch[1] ?? "", 10);
-      if (!Number.isFinite(cid)) return new Response("Invalid case id", { status: 400 });
-      return handleAbuseTrackerAttachmentUploadApi(env, request, cid);
     }
     const abuseCaseMatch = url.pathname.match(/^\/api\/abuse-tracker\/(\d+)(?:\/(notes))?$/);
     if (abuseCaseMatch) {
@@ -1517,7 +1521,7 @@ async function replayWorkOrderWatchForDate(env: Env, dateKey: string): Promise<n
   if (!obj) return 0;
   const bytes = await obj.arrayBuffer();
   const raw = await extractRawWorkOrdersFromBinary(bytes);
-  await ingestWorkOrderSnapshot(env, dateKey, raw, new Date().toISOString());
+  await ingestWorkOrderSnapshot(env, dateKey, raw, new Date().toISOString(), bytes);
   const melRows = await extractMelRowsFromBinary(bytes);
   await ingestMelSnapshot(env, dateKey, melRows, new Date().toISOString());
   return raw.length;
@@ -1539,7 +1543,7 @@ async function rebuildWorkOrderWatchFromHistory(env: Env): Promise<void> {
     if (!obj) continue;
     const bytes = await obj.arrayBuffer();
     const raw = await extractRawWorkOrdersFromBinary(bytes);
-    await ingestWorkOrderSnapshot(env, entry.dateKey, raw, nowIso);
+    await ingestWorkOrderSnapshot(env, entry.dateKey, raw, nowIso, bytes);
     const melRows = await extractMelRowsFromBinary(bytes);
     await ingestMelSnapshot(env, entry.dateKey, melRows, nowIso);
   }
@@ -3695,25 +3699,38 @@ function isAbuseCaseType(s: unknown): s is AbuseCaseType {
   return s === "accident" || s === "abuse";
 }
 function isAbuseCaseStage(s: unknown): s is AbuseCaseStage {
-  return s === "intake" || s === "estimates" || s === "release_pending" || s === "approved_work" || s === "closed";
-}
-function isAbuseAttachmentKind(s: unknown): s is AbuseAttachmentKind {
-  return s === "damage_photo" || s === "release_letter" || s === "estimate" || s === "other";
+  return typeof s === "string" && isValidAbuseStageInput(s);
 }
 
 async function handleFleetAssetsSearchApi(env: Env, request: Request): Promise<Response> {
   if (request.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
   const url = new URL(request.url);
   const q = url.searchParams.get("q") ?? "";
-  const limit = Number.parseInt(url.searchParams.get("limit") ?? "20", 10) || 20;
+  const limit = Number.parseInt(url.searchParams.get("limit") ?? "60", 10) || 60;
   const rows = await searchFleetAssetsForPicker(env, q, limit);
   return Response.json({ assets: rows }, { headers: cacheHeaders() });
+}
+
+async function handleFleetOwningUnitsApi(env: Env, request: Request): Promise<Response> {
+  if (request.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
+  const url = new URL(request.url);
+  const limit = Number.parseInt(url.searchParams.get("limit") ?? "800", 10) || 800;
+  const units = await listFleetOwningUnits(env, limit);
+  return Response.json({ units }, { headers: cacheHeaders() });
 }
 
 async function handleAbuseTrackerStatsApi(env: Env, request: Request): Promise<Response> {
   if (request.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
   const s = await getAbuseTrackerStats(env);
   return Response.json(s, { headers: cacheHeaders() });
+}
+
+async function handleAbuseTrackerByWorkOrderApi(env: Env, request: Request, workOrderId: string): Promise<Response> {
+  if (request.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
+  const wid = decodeURIComponent(workOrderId || "").trim();
+  if (!wid) return Response.json({ cases: [] }, { headers: cacheHeaders() });
+  const cases = await listOpenAbuseCasesForWorkOrder(env, wid);
+  return Response.json({ cases }, { headers: cacheHeaders() });
 }
 
 async function handleAbuseTrackerListApi(env: Env, request: Request): Promise<Response> {
@@ -3736,13 +3753,22 @@ async function handleAbuseTrackerListApi(env: Env, request: Request): Promise<Re
         "reimbursed_to_vm",
         "reimbursed_at_iso",
         "vehicle_location",
+        "package_checklist_json",
+        "estimates_runner",
+        "estimates_downtown_planned_date",
         "created_at_iso",
         "closed_at_iso",
-        "email_ingest_address",
+        "tracking_active",
+        "email_ingest_damage_photo",
+        "email_ingest_release_letter",
+        "email_ingest_estimate",
+        "email_ingest_other",
+        "email_ingest_legacy_auto",
       ].join(",");
       const host = url.host || "your-domain";
-      const lines = rows.map((r) =>
-        [
+      const lines = rows.map((r) => {
+        const em = abuseIngestEmailAddresses(r.email_token);
+        return [
           escCsv(r.control_number),
           escCsv(r.case_type),
           escCsv(r.asset_id),
@@ -3756,11 +3782,19 @@ async function handleAbuseTrackerListApi(env: Env, request: Request): Promise<Re
           r.reimbursed_to_vm ? "1" : "0",
           escCsv(r.reimbursed_at_iso ?? ""),
           escCsv(r.vehicle_location),
+          escCsv(r.package_checklist_json ?? "{}"),
+          escCsv(r.estimates_runner ?? ""),
+          escCsv(r.estimates_downtown_planned_date ?? ""),
           escCsv(r.created_at_iso),
           escCsv(r.closed_at_iso ?? ""),
-          escCsv(`${abuseDamEmailLocalPart(r.email_token)}@${host}`),
-        ].join(","),
-      );
+          r.tracking_active ? "1" : "0",
+          escCsv(`${em.damage_photo}@${host}`),
+          escCsv(`${em.release_letter}@${host}`),
+          escCsv(`${em.estimate}@${host}`),
+          escCsv(`${em.other}@${host}`),
+          escCsv(`${em.auto}@${host}`),
+        ].join(",");
+      });
       const csv = [header, ...lines].join("\n");
       return new Response(csv, {
         headers: {
@@ -3771,7 +3805,7 @@ async function handleAbuseTrackerListApi(env: Env, request: Request): Promise<Re
       });
     }
     const openOnly = url.searchParams.get("open") === "1" || url.searchParams.get("open") === "true";
-    const limit = Number.parseInt(url.searchParams.get("limit") ?? "200", 10) || 200;
+    const limit = Number.parseInt(url.searchParams.get("limit") ?? "2500", 10) || 2500;
     const rows = await listAbuseCases(env, { openOnly, limit });
     return Response.json({ cases: rows }, { headers: cacheHeaders() });
   }
@@ -3806,8 +3840,13 @@ async function handleAbuseTrackerListApi(env: Env, request: Request): Promise<Re
     });
     const url = new URL(request.url);
     const host = url.host || "";
-    const ingestEmail = host ? `${abuseDamEmailLocalPart(c.email_token)}@${host}` : "";
-    return Response.json({ case: c, ingestEmail }, { headers: cacheHeaders() });
+    const ingestEmails = host
+      ? Object.fromEntries(
+          Object.entries(abuseIngestEmailAddresses(c.email_token)).map(([k, local]) => [k, `${local}@${host}`]),
+        )
+      : {};
+    const ingestEmail = (ingestEmails as { auto?: string }).auto ?? "";
+    return Response.json({ case: c, ingestEmail, ingestEmails }, { headers: cacheHeaders() });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return Response.json({ error: msg }, { status: 400, headers: cacheHeaders() });
@@ -3827,8 +3866,13 @@ async function handleAbuseTrackerCaseApi(env: Env, request: Request, caseId: num
     }
     const url = new URL(request.url);
     const host = url.host || "";
-    const ingestEmail = host ? `${abuseDamEmailLocalPart(d.case.email_token)}@${host}` : "";
-    return Response.json({ ...d, estimates, ingestEmail }, { headers: cacheHeaders() });
+    const ingestEmails = host
+      ? Object.fromEntries(
+          Object.entries(abuseIngestEmailAddresses(d.case.email_token)).map(([k, local]) => [k, `${local}@${host}`]),
+        )
+      : {};
+    const ingestEmail = (ingestEmails as { auto?: string }).auto ?? "";
+    return Response.json({ ...d, estimates, ingestEmail, ingestEmails }, { headers: cacheHeaders() });
   }
   if (request.method !== "PATCH") return new Response("Method Not Allowed", { status: 405 });
   const body = await readJsonBody<{
@@ -3842,6 +3886,11 @@ async function handleAbuseTrackerCaseApi(env: Env, request: Request, caseId: num
     vehicleLocation?: unknown;
     estimates?: unknown;
     closed?: unknown;
+    trackingActive?: unknown;
+    timelineAuthor?: unknown;
+    packageChecklist?: unknown;
+    estimatesRunner?: unknown;
+    estimatesDowntownPlannedDate?: unknown;
   }>(request);
   if (!body) return Response.json({ error: "JSON body required" }, { status: 400, headers: cacheHeaders() });
   const patch: Parameters<typeof updateAbuseCase>[2] = {};
@@ -3858,8 +3907,10 @@ async function handleAbuseTrackerCaseApi(env: Env, request: Request, caseId: num
     if (!isAbuseCaseStage(body.stage)) {
       return Response.json({ error: "invalid stage" }, { status: 400, headers: cacheHeaders() });
     }
-    patch.stage = body.stage;
+    patch.stage = normalizeAbuseCaseStage(String(body.stage));
   }
+  if (body.trackingActive !== undefined) patch.trackingActive = !!body.trackingActive;
+  if (body.timelineAuthor !== undefined) patch.timelineAuthor = String(body.timelineAuthor ?? "");
   if (body.vehicleLocation !== undefined) patch.vehicleLocation = String(body.vehicleLocation);
   if (body.estimates !== undefined) {
     if (!Array.isArray(body.estimates)) {
@@ -3882,6 +3933,18 @@ async function handleAbuseTrackerCaseApi(env: Env, request: Request, caseId: num
     });
   }
   if (body.closed !== undefined) patch.closed = !!body.closed;
+  if (body.packageChecklist !== undefined && body.packageChecklist && typeof body.packageChecklist === "object") {
+    const pc = body.packageChecklist as Record<string, unknown>;
+    patch.packageChecklist = {
+      sf91: !!pc.sf91,
+      photos: !!pc.photos,
+      vehicleAtVmCompound: !!pc.vehicleAtVmCompound,
+    };
+  }
+  if (body.estimatesRunner !== undefined) patch.estimatesRunner = String(body.estimatesRunner ?? "");
+  if (body.estimatesDowntownPlannedDate !== undefined) {
+    patch.estimatesDowntownPlannedDate = String(body.estimatesDowntownPlannedDate ?? "");
+  }
   const updated = await updateAbuseCase(env, caseId, patch);
   if (!updated) return new Response("Not Found", { status: 404 });
   return Response.json({ case: updated }, { headers: cacheHeaders() });
@@ -3897,57 +3960,6 @@ async function handleAbuseTrackerNoteApi(env: Env, request: Request, caseId: num
   const note = await addAbuseNote(env, caseId, text, author);
   if (!note) return new Response("Not Found", { status: 404 });
   return Response.json({ note }, { headers: cacheHeaders() });
-}
-
-async function handleAbuseTrackerAttachmentUploadApi(env: Env, request: Request, caseId: number): Promise<Response> {
-  if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
-  const ct = request.headers.get("content-type") || "";
-  if (!ct.startsWith("multipart/form-data")) {
-    return Response.json({ error: "expected multipart/form-data" }, { status: 415, headers: cacheHeaders() });
-  }
-  let form: FormData;
-  try {
-    form = await request.formData();
-  } catch (e) {
-    return Response.json(
-      { error: "could not parse form: " + (e instanceof Error ? e.message : String(e)) },
-      { status: 400, headers: cacheHeaders() },
-    );
-  }
-  const file = form.get("file");
-  if (!(file instanceof File) || file.size <= 0) {
-    return Response.json({ error: "file field required" }, { status: 400, headers: cacheHeaders() });
-  }
-  const MAX_BYTES = 25 * 1024 * 1024;
-  if (file.size > MAX_BYTES) {
-    return Response.json({ error: "file too large (max 25MB)" }, { status: 413, headers: cacheHeaders() });
-  }
-  const kindRaw = String(form.get("kind") ?? "other");
-  if (!isAbuseAttachmentKind(kindRaw)) {
-    return Response.json({ error: "invalid kind" }, { status: 400, headers: cacheHeaders() });
-  }
-  const uploadedBy = String(form.get("uploadedBy") ?? "").trim();
-  if (!uploadedBy) {
-    return Response.json({ error: "uploadedBy (your name) required" }, { status: 400, headers: cacheHeaders() });
-  }
-  const c = await getAbuseCaseDetail(env, caseId);
-  if (!c) return new Response("Not Found", { status: 404 });
-  const buf = await file.arrayBuffer();
-  try {
-    const att = await addAbuseAttachment(env, {
-      caseId,
-      kind: kindRaw,
-      body: buf,
-      filename: file.name || "upload",
-      contentType: file.type || "application/octet-stream",
-      uploadedBy,
-      source: "web",
-    });
-    return Response.json({ attachment: att }, { headers: cacheHeaders() });
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return Response.json({ error: msg }, { status: 400, headers: cacheHeaders() });
-  }
 }
 
 async function handleAbuseTrackerAttachmentApi(env: Env, request: Request, attachmentId: number): Promise<Response> {
@@ -7264,21 +7276,28 @@ function renderDashboardHtml(): string {
        .app column. Sits flush under the 4px accent strap. */
     .top {
       display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      justify-content: space-between;
-      gap: 20px;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 0;
       margin-left: calc(50% - 50vw);
       margin-right: calc(50% - 50vw);
       margin-top: 0;
-      margin-bottom: 24px;
-      padding: 14px max(32px, calc(50vw - 528px));
+      margin-bottom: 20px;
+      padding: 0;
       background: var(--accent);
       color: #ffffff;
       border-bottom: 3px solid var(--accent-strong);
     }
+    .top-shell {
+      padding: 14px max(32px, calc(50vw - 528px)) 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      box-sizing: border-box;
+    }
     @media (max-width: 640px) {
-      .top { padding: 12px 20px; margin-bottom: 18px; }
+      .top { margin-bottom: 16px; }
+      .top-shell { padding: 12px 20px 14px; }
     }
     .brand { display: flex; align-items: center; gap: 14px; min-width: 0; }
     .brand-mark {
@@ -7348,37 +7367,63 @@ function renderDashboardHtml(): string {
       color: var(--text);
     }
 
-    /* --- Segmented nav ---------------------------------------------------- */
+    /* --- Main nav (sits on blue header; horizontal scroll on narrow viewports) */
     .main-nav {
-      display: inline-flex;
-      gap: 2px;
-      padding: 4px;
-      margin-bottom: 24px;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      box-shadow: var(--shadow-sm);
+      display: flex;
+      flex-wrap: nowrap;
+      align-items: stretch;
+      gap: 4px;
+      padding: 6px;
+      margin: 0;
+      width: 100%;
+      max-width: 100%;
+      box-sizing: border-box;
+      overflow-x: auto;
+      overflow-y: hidden;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(255,255,255,0.45) transparent;
+      background: rgba(255, 255, 255, 0.12);
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      border-radius: 10px;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+    }
+    .main-nav::-webkit-scrollbar { height: 6px; }
+    .main-nav::-webkit-scrollbar-thumb {
+      background: rgba(255, 255, 255, 0.35);
+      border-radius: 999px;
     }
     .main-nav button {
       font-family: var(--font);
-      font-size: 0.88rem;
-      font-weight: 500;
-      padding: 9px 18px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      line-height: 1.2;
+      padding: 9px 14px;
+      min-height: 38px;
       border-radius: 8px;
       border: 1px solid transparent;
       background: transparent;
-      color: var(--muted);
+      color: rgba(255, 255, 255, 0.88);
       cursor: pointer;
-      transition: color 0.15s ease, background 0.15s ease;
+      white-space: nowrap;
+      flex: 0 0 auto;
+      transition: color 0.12s ease, background 0.12s ease, border-color 0.12s ease;
     }
-    .main-nav button:hover { color: var(--text); }
-    .main-nav button.active {
-      background: var(--accent);
+    .main-nav button:hover {
       color: #ffffff;
-      border-color: var(--accent);
-      box-shadow: 0 1px 2px rgba(0,0,0,0.08);
+      background: rgba(255, 255, 255, 0.12);
+      border-color: rgba(255, 255, 255, 0.2);
     }
-    .main-nav button.active:hover { color: #ffffff; }
+    .main-nav button.active {
+      background: #ffffff;
+      color: var(--accent);
+      border-color: rgba(255, 255, 255, 0.95);
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+    }
+    .main-nav button.active:hover {
+      color: var(--accent);
+      background: #ffffff;
+    }
 
     .construction-banner {
       display: flex;
@@ -9015,6 +9060,20 @@ function renderDashboardHtml(): string {
       padding: 2px 0 0;
       border-bottom: none;
     }
+    .wo-abuse-strip {
+      display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+      margin: 10px 0 4px; padding: 10px 12px; border-radius: 10px;
+      border: 1px solid var(--border); background: rgba(0,58,140,0.05); font-size: 0.82rem;
+    }
+    .wo-abuse-strip.hidden { display: none; }
+    .wo-abuse-strip .lbl { font-weight: 700; color: var(--text); margin-right: 4px; }
+    .wo-abuse-strip .wo-abuse-btn {
+      font: inherit; font-size: 0.78rem; font-weight: 600; cursor: pointer;
+      padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border);
+      background: var(--surface); color: var(--accent);
+    }
+    .wo-abuse-strip .wo-abuse-btn:hover { border-color: var(--accent); }
+    .wo-abuse-strip .wo-abuse-btn.abuse { color: var(--danger); }
     .wo-hero-row {
       display: flex;
       align-items: center;
@@ -9947,40 +10006,95 @@ function renderDashboardHtml(): string {
 
     /* ---- Accident / abuse tracker tab ---- */
     #panel-abuse-tracker .hidden { display: none; }
-    .abuse-wrap { max-width: 1280px; margin: 0 auto; padding: 0 0 48px; }
+    #panel-abuse-tracker {
+      --abuse-accent: #003a8c;
+      --abuse-accent-soft: rgba(0, 58, 140, 0.12);
+      --abuse-warn: #b45309;
+      --abuse-warn-bg: rgba(245, 158, 11, 0.14);
+      --abuse-ok: #0d6b3a;
+      --abuse-ok-bg: rgba(13, 107, 58, 0.1);
+      --abuse-muted-bg: rgba(91, 102, 117, 0.1);
+    }
+    .abuse-wrap { max-width: 1400px; margin: 0 auto; padding: 0 0 48px; }
     .abuse-head {
       display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between;
-      gap: 14px; margin-bottom: 16px; padding-bottom: 14px; border-bottom: 1px solid var(--border);
+      gap: 14px; margin-bottom: 18px; padding: 18px 20px; border-radius: 14px;
+      border: 1px solid var(--border); background: linear-gradient(135deg, rgba(0,58,140,0.07) 0%, var(--surface) 55%);
+      box-shadow: var(--shadow-sm);
     }
-    .abuse-head-actions { display: flex; gap: 8px; flex-wrap: wrap; }
-    .abuse-stats {
-      display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px;
+    .abuse-head h2 { letter-spacing: -0.02em; }
+    .abuse-head-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .abuse-view-toggle { display: inline-flex; border: 1px solid var(--border-strong); border-radius: 10px; overflow: hidden; background: var(--bg-elev); }
+    .abuse-view-toggle button {
+      font: inherit; font-size: 0.82rem; font-weight: 600; padding: 9px 16px; border: 0; cursor: pointer;
+      background: transparent; color: var(--muted);
+    }
+    .abuse-view-toggle button:hover { color: var(--text); background: rgba(0,0,0,0.03); }
+    .abuse-view-toggle button.active { background: var(--accent); color: #fff; box-shadow: none; }
+    .abuse-stats-full {
+      display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px;
     }
     .abuse-stat-pill {
-      padding: 8px 14px; border-radius: 10px; background: var(--surface); border: 1px solid var(--border);
-      font-size: 0.85rem;
+      padding: 8px 14px; border-radius: 999px; border: 1px solid var(--border);
+      font-size: 0.8rem; font-weight: 500; background: var(--surface);
     }
-    .abuse-stat-pill b { color: var(--accent); }
-    .abuse-split {
-      display: grid; grid-template-columns: minmax(260px, 340px) 1fr; gap: 16px; align-items: start;
+    .abuse-stat-pill b { color: var(--accent); font-weight: 800; }
+    .abuse-stat-pill.stat-open { background: var(--abuse-accent-soft); border-color: rgba(0,58,140,0.25); }
+    .abuse-stat-pill.stat-warn { background: var(--abuse-warn-bg); border-color: rgba(180,83,9,0.35); color: var(--abuse-warn); }
+    .abuse-stat-pill.stat-ok { background: var(--abuse-ok-bg); border-color: rgba(13,107,58,0.3); color: var(--abuse-ok); }
+    .abuse-stat-pill.stat-neutral { background: var(--abuse-muted-bg); }
+    .abuse-top-new { margin-bottom: 16px; }
+    .abuse-cases-layout {
+      display: grid; grid-template-columns: 1fr minmax(300px, 400px); gap: 16px; align-items: start;
     }
-    @media (max-width: 960px) { .abuse-split { grid-template-columns: 1fr; } }
-    .abuse-list-card, .abuse-detail-card, .abuse-new-card {
-      background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 14px 16px;
+    @media (max-width: 1100px) { .abuse-cases-layout { grid-template-columns: 1fr; } }
+    .abuse-sub-panel {
+      grid-column: 1 / -1; margin-top: 12px; padding: 14px 16px; border-radius: 12px;
+      border: 1px solid var(--border); background: rgba(0,58,140,0.04);
     }
-    .abuse-list-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; gap: 8px; }
+    .abuse-sub-panel .sub-h {
+      font-size: 0.72rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.08em; color: var(--accent); margin: 0 0 10px;
+    }
+    .abuse-pkg-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: center; }
+    .abuse-est-sub-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 16px; max-width: 36rem; }
+    @media (max-width: 640px) { .abuse-est-sub-grid { grid-template-columns: 1fr; } }
+    .abuse-table-card, .abuse-detail-card, .abuse-new-card {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 16px 18px;
+      box-shadow: 0 1px 0 rgba(255,255,255,0.6) inset, var(--shadow-sm);
+    }
+    .abuse-detail-card {
+      border-left: 4px solid var(--accent);
+    }
+    .abuse-table-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; gap: 10px; flex-wrap: wrap; }
+    .abuse-type-filters { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .abuse-type-filters .lbl { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-right: 4px; }
+    .abuse-type-chip {
+      font: inherit; font-size: 0.78rem; font-weight: 600; padding: 6px 12px; border-radius: 999px; cursor: pointer;
+      border: 1px solid var(--border); background: var(--bg-elev); color: var(--muted);
+    }
+    .abuse-type-chip:hover { border-color: var(--accent); color: var(--text); }
+    .abuse-type-chip.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+    .abuse-type-chip.acc.active { background: #0b4a9e; border-color: #0b4a9e; }
+    .abuse-type-chip.abu.active { background: #9b1c2e; border-color: #9b1c2e; }
     .abuse-filter { font-size: 0.82rem; color: var(--muted); display: flex; align-items: center; gap: 6px; cursor: pointer; }
-    .abuse-list { display: flex; flex-direction: column; gap: 6px; max-height: 62vh; overflow-y: auto; }
-    .abuse-row {
-      text-align: left; width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border);
-      background: var(--bg-elev); cursor: pointer; font: inherit;
+    .abuse-table-scroll { overflow: auto; max-height: min(70vh, 720px); border: 1px solid var(--border-strong); border-radius: 12px; background: var(--bg-elev); }
+    .abuse-case-table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+    .abuse-case-table thead th {
+      position: sticky; top: 0; z-index: 1;
+      background: linear-gradient(180deg, rgba(0,58,140,0.12) 0%, rgba(0,58,140,0.06) 100%);
+      border-bottom: 2px solid rgba(0,58,140,0.2);
+      text-align: left; padding: 10px 12px; font-weight: 800; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--accent);
     }
-    .abuse-row:hover { border-color: var(--accent); }
-    .abuse-row.active { border-color: var(--accent); background: rgba(0,58,140,0.06); }
-    .abuse-row .r1 { font-weight: 700; font-size: 0.88rem; }
-    .abuse-row .r2 { font-size: 0.78rem; color: var(--muted); margin-top: 2px; }
-    .abuse-cn { font-size: 1.05rem; font-weight: 800; letter-spacing: 0.02em; }
-    .abuse-detail-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+    .abuse-case-table tbody td { border-bottom: 1px solid var(--border); padding: 9px 12px; vertical-align: top; }
+    .abuse-case-table tbody tr { cursor: pointer; }
+    .abuse-case-table tbody tr:hover { background: rgba(0,58,140,0.06); }
+    .abuse-case-table tbody tr.active { background: rgba(0,58,140,0.11); box-shadow: inset 3px 0 0 var(--accent); }
+    .abuse-case-table .cn { font-weight: 800; white-space: nowrap; font-family: var(--font-mono); font-size: 0.82rem; }
+    .abuse-case-table .muted-cell { color: var(--muted); font-size: 0.76rem; max-width: 14rem; }
+    .abuse-case-table .type-acc { color: #0b4a9e; font-weight: 700; }
+    .abuse-case-table .type-abu { color: #9b1c2e; font-weight: 700; }
+    .abuse-cn { font-size: 1.08rem; font-weight: 800; letter-spacing: 0.02em; font-family: var(--font-mono); }
+    .abuse-detail-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
     .abuse-type-pill {
       font-size: 0.68rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.08em;
       padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border);
@@ -9990,11 +10104,39 @@ function renderDashboardHtml(): string {
     .abuse-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; margin-top: 8px; }
     @media (max-width: 640px) { .abuse-grid { grid-template-columns: 1fr; } }
     .abuse-check { display: flex; align-items: center; gap: 8px; padding-top: 22px; }
-    .abuse-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 14px; }
-    .abuse-up-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-    @media (max-width: 640px) { .abuse-up-grid { grid-template-columns: 1fr; } }
-    #abuse-up-bar { display: none; }
-    #abuse-up-bar.show { display: block; }
+    .abuse-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 16px; }
+    .abuse-actions .primary { padding: 10px 20px; font-weight: 700; box-shadow: 0 2px 8px rgba(0,58,140,0.25); }
+    .abuse-actions .ghost { padding: 10px 16px; font-weight: 600; border-width: 2px; }
+    .abuse-section-title {
+      margin: 18px 0 10px; font-size: 0.72rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.1em;
+      color: var(--accent); padding-left: 10px; border-left: 3px solid var(--accent);
+    }
+    .abuse-stage-panel { grid-column: 1 / -1; margin-top: 4px; }
+    .abuse-stage-select-native {
+      position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
+    }
+    .abuse-stage-strip {
+      display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px;
+    }
+    .abuse-stage-btn {
+      font: inherit; font-size: 0.76rem; font-weight: 700; padding: 8px 12px; border-radius: 10px; cursor: pointer;
+      border: 2px solid var(--border); background: var(--bg-elev); color: var(--text); line-height: 1.25; text-align: left;
+      transition: transform 0.08s ease, border-color 0.12s ease, box-shadow 0.12s ease;
+    }
+    .abuse-stage-btn:hover { border-color: var(--accent); transform: translateY(-1px); }
+    .abuse-stage-btn.active {
+      border-color: var(--accent); background: rgba(0,58,140,0.12); box-shadow: 0 0 0 1px rgba(0,58,140,0.15);
+    }
+    .abuse-stage-btn.cat-docs.active { border-color: #5b6675; background: rgba(91,102,117,0.12); }
+    .abuse-stage-btn.cat-legal.active { border-color: #b45309; background: var(--abuse-warn-bg); }
+    .abuse-stage-btn.cat-mx.active { border-color: #0b4a9e; background: rgba(11,74,158,0.12); }
+    .abuse-stage-btn.cat-done.active { border-color: #0d6b3a; background: var(--abuse-ok-bg); }
+    .abuse-stage-hint { margin: 10px 0 0; font-size: 0.76rem; color: var(--muted); line-height: 1.45; }
+    .abuse-estimates-wrap {
+      margin-top: 8px; padding: 14px; border-radius: 12px; border: 1px solid var(--border);
+      background: linear-gradient(180deg, rgba(0,58,140,0.04) 0%, var(--bg-elev) 100%);
+    }
+    .abuse-estimates-wrap .abuse-est-del { min-width: 40px; border-radius: 8px; font-weight: 700; color: var(--danger); border-color: rgba(176,0,32,0.35); }
     .abuse-notes-list {
       max-height: 220px; overflow-y: auto; border: 1px solid var(--border); border-radius: 10px;
       padding: 8px 10px; margin-bottom: 10px; background: var(--bg-elev); font-size: 0.85rem;
@@ -10005,12 +10147,42 @@ function renderDashboardHtml(): string {
     .abuse-atts-list { display: flex; flex-direction: column; gap: 6px; }
     .abuse-att-row { font-size: 0.84rem; }
     .abuse-att-row a { color: var(--accent); font-weight: 600; }
+    .abuse-timeline {
+      margin-top: 14px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px;
+      background: var(--bg-elev); max-height: 280px; overflow-y: auto; font-size: 0.8rem;
+    }
+    .abuse-tl-row { padding: 8px 0; border-bottom: 1px dashed var(--border); }
+    .abuse-tl-row:last-child { border-bottom: none; }
+    .abuse-tl-when { font-size: 0.72rem; color: var(--muted); margin-bottom: 2px; }
+    .abuse-tl-kind { font-weight: 700; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--accent); }
     .abuse-est-row { display: grid; grid-template-columns: 1fr 100px 1fr auto; gap: 8px; margin-bottom: 8px; align-items: end; }
     @media (max-width: 720px) { .abuse-est-row { grid-template-columns: 1fr; } }
     .abuse-new-card { margin-top: 16px; }
     .abuse-new-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
     @media (max-width: 640px) { .abuse-new-grid { grid-template-columns: 1fr; } }
+    .abuse-asset-combo { position: relative; }
+    .abuse-asset-dd {
+      position: absolute; left: 0; right: 0; top: calc(100% + 4px); z-index: 30;
+      max-height: min(260px, 42vh); overflow-y: auto;
+      background: var(--surface); border: 1px solid var(--border-strong); border-radius: 10px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.12);
+    }
+    .abuse-asset-dd.hidden { display: none; }
+    .abuse-asset-opt {
+      display: block; width: 100%; text-align: left; padding: 9px 12px; margin: 0; border: 0; border-bottom: 1px solid var(--border);
+      background: transparent; font: inherit; cursor: pointer; color: var(--text);
+    }
+    .abuse-asset-opt:last-child { border-bottom: 0; }
+    .abuse-asset-opt:hover, .abuse-asset-opt:focus { background: rgba(0,58,140,0.07); outline: none; }
+    .abuse-asset-opt .opt-id { font-weight: 700; font-family: var(--font-mono); font-size: 0.86rem; letter-spacing: 0.02em; }
+    .abuse-asset-opt .opt-sub { font-size: 0.74rem; color: var(--muted); margin-top: 3px; line-height: 1.35; }
+    .abuse-asset-dd .abuse-asset-empty { padding: 10px 12px; font-size: 0.82rem; color: var(--muted); }
     .abuse-charts canvas { max-width: 100%; height: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-elev); }
+    .abuse-ingest-wrap { margin-top: 4px; }
+    .abuse-ingest-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; margin-top: 8px; }
+    .abuse-ingest-table th, .abuse-ingest-table td { border: 1px solid var(--border); padding: 6px 8px; text-align: left; vertical-align: top; }
+    .abuse-ingest-table th { background: rgba(0,0,0,0.04); font-weight: 600; width: 11rem; white-space: nowrap; }
+    .abuse-ingest-table code { word-break: break-all; font-size: 0.8em; display: block; }
 
     /* ---- Waivers tab ---- */
     #panel-waivers .hidden { display: none; }
@@ -12472,28 +12644,29 @@ function renderDashboardHtml(): string {
 <body>
   <div class="app">
     <header class="top">
-      <div class="brand">
-        <div class="brand-mark" aria-hidden="true">USAF</div>
-        <div class="brand-text">
-          <h1>${escapedTitle}</h1>
-          <p id="brand-sub">Fleet readiness at a glance.</p>
+      <div class="top-shell">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">USAF</div>
+          <div class="brand-text">
+            <h1>${escapedTitle}</h1>
+            <p id="brand-sub">Fleet readiness at a glance.</p>
+          </div>
         </div>
+        <nav class="main-nav" id="main-nav" aria-label="Main sections">
+          <button type="button" id="tab-snapshot" class="active">Snapshot</button>
+          <button type="button" id="tab-work-orders">Work&nbsp;orders</button>
+          <button type="button" id="tab-schedule-mx">Schedule&nbsp;Mx</button>
+          <button type="button" id="tab-authz">Authorization</button>
+          <button type="button" id="tab-mel">MEL</button>
+          <button type="button" id="tab-meeting">ETIC&nbsp;Meeting</button>
+          <button type="button" id="tab-yard">Yard&nbsp;Check</button>
+          <button type="button" id="tab-waivers">Waivers</button>
+          <button type="button" id="tab-abuse-tracker">A/A&nbsp;tracker</button>
+          <button type="button" id="tab-ask">Ask&nbsp;AI</button>
+          <button type="button" id="tab-settings">Settings</button>
+        </nav>
       </div>
     </header>
-
-    <nav class="main-nav" id="main-nav" aria-label="Main sections">
-      <button type="button" id="tab-snapshot" class="active">Snapshot</button>
-      <button type="button" id="tab-work-orders">Work orders</button>
-      <button type="button" id="tab-schedule-mx">Schedule Mx</button>
-      <button type="button" id="tab-authz">Authorization</button>
-      <button type="button" id="tab-mel">MEL</button>
-      <button type="button" id="tab-meeting">ETIC Meeting</button>
-      <button type="button" id="tab-yard">Yard Check</button>
-      <button type="button" id="tab-waivers">Waivers</button>
-      <button type="button" id="tab-abuse-tracker">A/A tracker</button>
-      <button type="button" id="tab-ask">Ask AI</button>
-      <button type="button" id="tab-settings">Settings</button>
-    </nav>
 
     <div id="view-empty" class="empty-state hidden">
       <p><strong>No ETIC files yet.</strong><br />Email the Vehicle ETIC workbook to your ingest address to get dates here.</p>
@@ -12740,6 +12913,7 @@ function renderDashboardHtml(): string {
             <div id="wo-detail" class="hidden wo-detail-inner">
               <section class="wo-detail-overview" aria-label="Work order summary">
                 <div class="wo-hero" id="wo-hero"></div>
+                <div id="wo-abuse-strip" class="wo-abuse-strip hidden" aria-label="Open accident or abuse cases for this work order"></div>
                 <div class="wo-kpis" id="wo-kpis"></div>
               </section>
               <div id="wo-stale-banner" class="wo-stale-banner hidden"></div>
@@ -13380,22 +13554,68 @@ function renderDashboardHtml(): string {
             <div>
               <h2 style="margin:0">Accident / abuse tracker</h2>
               <p class="hint" style="margin:6px 0 0;max-width:52rem">
-                VFM/VMS cost recovery: open one accident and one abuse case per asset at a time. Email photos or PDFs to the ingest address on each case (no upload button required for field units).
+                VFM/VMS cost recovery: open one accident and one abuse case per asset at a time. Files arrive by email only — each case has separate addresses for damage photos, release letters, estimates, and other documents so attachments are labeled correctly.
               </p>
             </div>
             <div class="abuse-head-actions">
+              <div class="abuse-view-toggle" role="group" aria-label="A/A tracker view">
+                <button type="button" class="active" id="abuse-view-cases">Cases</button>
+                <button type="button" id="abuse-view-stats">Stats</button>
+              </div>
               <button type="button" class="ghost" id="abuse-export-csv">Export CSV</button>
               <button type="button" class="ghost" id="abuse-refresh">Refresh</button>
             </div>
           </header>
-          <div class="abuse-stats" id="abuse-stats"></div>
-          <div class="abuse-split">
-            <div class="abuse-list-card">
-              <div class="abuse-list-head">
+          <div id="abuse-view-cases-wrap">
+            <div class="abuse-new-card abuse-top-new">
+              <h3 style="margin:0 0 10px;font-size:0.95rem">New case</h3>
+              <div class="abuse-new-grid">
+                <label class="field"><span class="label">Case type</span>
+                  <select id="abuse-new-type">
+                    <option value="accident">Accident</option>
+                    <option value="abuse">Abuse / neglect</option>
+                  </select>
+                </label>
+                <label class="field"><span class="label">Asset ID</span>
+                  <div class="abuse-asset-combo">
+                    <input type="text" id="abuse-new-asset" placeholder="Type to search, then pick from the list…" autocapitalize="characters" autocomplete="off" aria-autocomplete="list" aria-controls="abuse-asset-dd" aria-expanded="false" />
+                    <div id="abuse-asset-dd" class="abuse-asset-dd hidden" role="listbox" hidden></div>
+                  </div>
+                </label>
+                <p class="hint" style="grid-column:1/-1;margin:0">At create time we snapshot <strong>unit, shop, and make/model</strong> from the fleet roster for this case file only. That snapshot does not update if the truck later moves.</p>
+                <label class="field" style="grid-column:1/-1"><span class="label">Work order ID</span>
+                  <input type="text" id="abuse-new-wo" placeholder="Optional — add anytime; not required to open a case" />
+                </label>
+              </div>
+              <button type="button" class="primary" id="abuse-new-btn" style="margin-top:10px">Create case</button>
+              <p class="hint" id="abuse-new-msg" style="margin:8px 0 0"></p>
+            </div>
+            <div class="abuse-cases-layout">
+            <div class="abuse-table-card">
+              <div class="abuse-table-head">
                 <h3 style="margin:0;font-size:0.95rem">Cases</h3>
+                <div class="abuse-type-filters" role="group" aria-label="Filter by case type">
+                  <span class="lbl">Show</span>
+                  <button type="button" class="abuse-type-chip active" id="abuse-filter-all" data-abuse-filter="all">All</button>
+                  <button type="button" class="abuse-type-chip acc" id="abuse-filter-accident" data-abuse-filter="accident">Accident</button>
+                  <button type="button" class="abuse-type-chip abu" id="abuse-filter-abuse" data-abuse-filter="abuse">Abuse</button>
+                </div>
                 <label class="abuse-filter"><input type="checkbox" id="abuse-open-only" checked /> Open only</label>
               </div>
-              <div id="abuse-list" class="abuse-list">Loading…</div>
+              <div class="abuse-table-scroll">
+                <table class="abuse-case-table" aria-label="Accident and abuse cases">
+                  <thead><tr>
+                    <th>Control</th>
+                    <th>Type</th>
+                    <th>Asset</th>
+                    <th>WO</th>
+                    <th>Stage</th>
+                    <th>Location</th>
+                    <th>Updated</th>
+                  </tr></thead>
+                  <tbody id="abuse-list-tbody"><tr><td colspan="7" class="muted" style="padding:12px">Loading…</td></tr></tbody>
+                </table>
+              </div>
             </div>
             <div class="abuse-detail-card" id="abuse-detail-card">
               <div id="abuse-detail-empty" class="muted" style="padding:24px">Select a case or create a new one.</div>
@@ -13407,36 +13627,80 @@ function renderDashboardHtml(): string {
                   </div>
                   <span class="abuse-type-pill" id="abuse-d-type"></span>
                 </div>
-                <p class="hint" id="abuse-d-ingest"></p>
+                <div class="hint abuse-ingest-wrap" id="abuse-d-ingest"></div>
                 <div class="abuse-grid">
-                  <label class="field"><span class="label">Stage</span>
-                    <select id="abuse-d-stage">
-                      <option value="intake">Intake</option>
-                      <option value="estimates">3 estimates</option>
-                      <option value="release_pending">Release letter (commander review)</option>
-                      <option value="approved_work">Approved — work in progress</option>
-                      <option value="closed">Closed</option>
+                  <div class="field abuse-stage-panel">
+                    <span class="label">Current status</span>
+                    <select id="abuse-d-stage" class="abuse-stage-select-native" tabindex="-1" aria-hidden="true">
+                      <option value="initial">initial</option>
+                      <option value="awaiting_estimates">awaiting_estimates</option>
+                      <option value="pending_legal_release">pending_legal_release</option>
+                      <option value="repair_in_mx_contract">repair_in_mx_contract</option>
+                      <option value="repair_downtown">repair_downtown</option>
+                      <option value="repair_on_base">repair_on_base</option>
+                      <option value="no_repair_tracking">no_repair_tracking</option>
+                      <option value="closed">closed</option>
                     </select>
+                    <div id="abuse-stage-strip" class="abuse-stage-strip" role="group" aria-label="Set case status"></div>
+                    <p class="abuse-stage-hint">Pick where the vehicle sits in the program. Status changes are logged on the timeline when you save.</p>
+                  </div>
+                  <div id="abuse-sub-package" class="abuse-sub-panel hidden">
+                    <p class="sub-h">Awaiting package — check off what you already have</p>
+                    <div class="abuse-pkg-grid">
+                      <label class="abuse-filter"><input type="checkbox" id="abuse-pkg-sf91" /> SF-91 received</label>
+                      <label class="abuse-filter"><input type="checkbox" id="abuse-pkg-photos" /> Damage photos in</label>
+                      <label class="abuse-filter"><input type="checkbox" id="abuse-pkg-vm" /> Vehicle at VM compound</label>
+                    </div>
+                  </div>
+                  <div id="abuse-sub-estimates" class="abuse-sub-panel hidden">
+                    <p class="sub-h">Awaiting estimates — who runs it downtown</p>
+                    <div class="abuse-est-sub-grid">
+                      <label class="field" style="margin:0"><span class="label">Runner</span>
+                        <select id="abuse-est-runner">
+                          <option value="">— Select —</option>
+                          <option value="gt">GT takes downtown</option>
+                          <option value="fma">FM&amp;A takes downtown</option>
+                          <option value="other">Other / self-arranged</option>
+                        </select>
+                      </label>
+                      <label class="field" style="margin:0"><span class="label">Planned downtown date</span>
+                        <input type="date" id="abuse-est-plan-date" />
+                      </label>
+                    </div>
+                  </div>
+                  <label class="field"><span class="label">Vehicle location (where it is now)</span>
+                    <input type="text" id="abuse-d-loc" placeholder="e.g. Downtown ABC Body · Lot B row 3 — logs to timeline + yard when saved" />
                   </label>
-                  <label class="field"><span class="label">Vehicle location</span>
-                    <input type="text" id="abuse-d-loc" placeholder="e.g. Bldg 123 bay 2" />
+                  <p class="hint" style="grid-column:1/-1;margin:0;font-size:0.78rem">
+                    Each location save is logged on the timeline below. If repair tracking is on, it also writes a yard check (present) so WO last-seen stays aligned.
+                  </p>
+                  <label class="field abuse-check" style="grid-column:1/-1">
+                    <input type="checkbox" id="abuse-d-tracking" checked /> Link work order &amp; sync yard on location (turn off for paperwork-only / no-repair cases)
                   </label>
                   <label class="field" style="grid-column:1/-1"><span class="label">Determination (VFM/VMS)</span>
                     <input type="text" id="abuse-d-det" placeholder="Accident vs abuse, brief rationale" />
                   </label>
-                  <label class="field" style="grid-column:1/-1"><span class="label">Responsible for cost</span>
-                    <input type="text" id="abuse-d-resp" placeholder="Unit / individual / org" />
+                  <label class="field" style="grid-column:1/-1"><span class="label">Unit responsible for cost</span>
+                    <input type="text" id="abuse-d-resp" list="abuse-resp-datalist" placeholder="Choose from list or type a unit name" autocomplete="organization" />
+                    <datalist id="abuse-resp-datalist"></datalist>
                   </label>
                   <label class="field" style="grid-column:1/-1"><span class="label">Work order ID</span>
-                    <input type="text" id="abuse-d-wo" placeholder="e.g. 2026040900016 (optional)" />
+                    <input type="text" id="abuse-d-wo" placeholder="Optional — clear if none; when tracking is on, latest WO may auto-fill" />
+                  </label>
+                  <label class="field" style="grid-column:1/-1"><span class="label">Your name (for timeline)</span>
+                    <input type="text" id="abuse-save-by" placeholder="e.g. MSgt Jones" autocomplete="name" />
                   </label>
                   <label class="field abuse-check"><input type="checkbox" id="abuse-d-reimb" /> Reimbursed to VM</label>
                   <label class="field"><span class="label">Reimbursement note</span>
                     <input type="text" id="abuse-d-reimb-note" />
                   </label>
                 </div>
-                <div class="abuse-estimates">
-                  <h4 style="margin:16px 0 8px;font-size:0.9rem">Three estimates</h4>
+                <div class="abuse-timeline" id="abuse-timeline-wrap" aria-label="Case timeline">
+                  <h4 style="margin:0 0 8px;font-size:0.88rem">Timeline</h4>
+                  <div id="abuse-timeline-list" class="muted">Load a case to see status and location history.</div>
+                </div>
+                <div class="abuse-estimates-wrap">
+                  <div class="abuse-section-title">Vendor estimates</div>
                   <div id="abuse-est-rows"></div>
                   <button type="button" class="ghost" id="abuse-est-add">+ Add estimate row</button>
                 </div>
@@ -13445,32 +13709,8 @@ function renderDashboardHtml(): string {
                   <button type="button" class="ghost" id="abuse-close-case">Close case</button>
                   <span class="status" id="abuse-case-status"></span>
                 </div>
-                <div class="abuse-upload">
-                  <h4 style="margin:18px 0 8px;font-size:0.9rem">Upload from browser</h4>
-                  <div class="abuse-up-grid">
-                    <label class="field"><span class="label">Kind</span>
-                      <select id="abuse-up-kind">
-                        <option value="damage_photo">Damage photo</option>
-                        <option value="release_letter">Release letter (PDF)</option>
-                        <option value="estimate">Estimate scan</option>
-                        <option value="other">Other</option>
-                      </select>
-                    </label>
-                    <label class="field"><span class="label">Your name</span>
-                      <input type="text" id="abuse-up-by" autocomplete="name" />
-                    </label>
-                    <label class="field" style="grid-column:1/-1"><span class="label">File</span>
-                      <input type="file" id="abuse-up-file" />
-                    </label>
-                  </div>
-                  <div id="abuse-up-bar" class="yard-upload-bar" style="margin-top:10px">
-                    <div class="yard-up-lbl" id="abuse-up-lbl">Uploading…</div>
-                    <div class="yard-up-track"><div class="yard-up-fill" id="abuse-up-fill"></div></div>
-                  </div>
-                  <button type="button" class="ghost" id="abuse-up-btn">Upload file</button>
-                </div>
                 <div class="abuse-notes">
-                  <h4 style="margin:18px 0 8px;font-size:0.9rem">Notes</h4>
+                  <div class="abuse-section-title">Notes</div>
                   <div id="abuse-notes-list" class="abuse-notes-list"></div>
                   <label class="field"><span class="label">Add note</span>
                     <textarea id="abuse-note-body" rows="3" placeholder="Program notes…"></textarea>
@@ -13481,36 +13721,19 @@ function renderDashboardHtml(): string {
                   </div>
                 </div>
                 <div class="abuse-atts">
-                  <h4 style="margin:18px 0 8px;font-size:0.9rem">Attachments</h4>
+                  <div class="abuse-section-title">Attachments (email)</div>
                   <div id="abuse-atts-list" class="abuse-atts-list"></div>
-                </div>
-                <div class="abuse-charts">
-                  <h4 style="margin:18px 0 8px;font-size:0.9rem">Charts</h4>
-                  <canvas id="abuse-chart-stage" width="360" height="200" aria-label="Open cases by stage"></canvas>
                 </div>
               </div>
             </div>
-          </div>
-          <div class="abuse-new-card">
-            <h3 style="margin:0 0 10px;font-size:0.95rem">New case</h3>
-            <div class="abuse-new-grid">
-              <label class="field"><span class="label">Case type</span>
-                <select id="abuse-new-type">
-                  <option value="accident">Accident</option>
-                  <option value="abuse">Abuse / neglect</option>
-                </select>
-              </label>
-              <label class="field"><span class="label">Asset ID</span>
-                <input type="text" id="abuse-new-asset" list="abuse-asset-datalist" placeholder="Type to search fleet roster…" autocapitalize="characters" autocomplete="off" />
-                <datalist id="abuse-asset-datalist"></datalist>
-              </label>
-              <p class="hint" style="grid-column:1/-1;margin:0">Unit / shop / make-model are copied from the latest Fleet roster <strong>once</strong> when you create the case and do not change if the vehicle moves later.</p>
-              <label class="field" style="grid-column:1/-1"><span class="label">Work order ID</span>
-                <input type="text" id="abuse-new-wo" placeholder="Optional — add anytime; not required to open a case" />
-              </label>
             </div>
-            <button type="button" class="primary" id="abuse-new-btn" style="margin-top:10px">Create case</button>
-            <p class="hint" id="abuse-new-msg" style="margin:8px 0 0"></p>
+          </div>
+          <div id="abuse-view-stats-wrap" class="hidden">
+            <div class="abuse-stats-full" id="abuse-stats-full"></div>
+            <div class="abuse-table-card" style="margin-top:12px">
+              <h3 style="margin:0 0 10px;font-size:0.95rem">Open cases by stage</h3>
+              <canvas id="abuse-chart-stage" width="520" height="220" aria-label="Open cases by stage"></canvas>
+            </div>
           </div>
         </div>
       </div>
@@ -14084,19 +14307,28 @@ function renderDashboardHtml(): string {
 
     function readHashRoute() {
       const raw = (location.hash || "").replace(/^#/, "");
-      if (!raw) return { tab: "snapshot", dateKey: null, workOrderId: null };
+      if (!raw) return { tab: "snapshot", dateKey: null, workOrderId: null, abuseCaseId: null };
       if (raw.indexOf("wo=") === 0) {
         const id = decodeURIComponent(raw.slice(3).trim());
-        return { tab: "wo", dateKey: null, workOrderId: id || null };
+        return { tab: "wo", dateKey: null, workOrderId: id || null, abuseCaseId: null };
       }
-      if (raw === "authz") return { tab: "authz", dateKey: null, workOrderId: null };
+      if (raw === "authz") return { tab: "authz", dateKey: null, workOrderId: null, abuseCaseId: null };
+      if (raw.indexOf("abuse-case=") === 0) {
+        const cid = parseInt(decodeURIComponent(raw.slice("abuse-case=".length).trim()), 10);
+        return {
+          tab: "abuse-tracker",
+          dateKey: null,
+          workOrderId: null,
+          abuseCaseId: Number.isFinite(cid) ? cid : null,
+        };
+      }
       if (raw === "abuse-tracker" || raw === "aa-tracker") {
-        return { tab: "abuse-tracker", dateKey: null, workOrderId: null };
+        return { tab: "abuse-tracker", dateKey: null, workOrderId: null, abuseCaseId: null };
       }
       if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
-        return { tab: "snapshot", dateKey: raw, workOrderId: null };
+        return { tab: "snapshot", dateKey: raw, workOrderId: null, abuseCaseId: null };
       }
-      return { tab: "snapshot", dateKey: null, workOrderId: null };
+      return { tab: "snapshot", dateKey: null, workOrderId: null, abuseCaseId: null };
     }
 
     let historyEntries = [];
@@ -14135,6 +14367,15 @@ function renderDashboardHtml(): string {
       const t = (woId || "").trim();
       if (!t) { location.hash = ""; return; }
       location.hash = "#wo=" + encodeURIComponent(t);
+    }
+
+    function setHashAbuseCase(caseId) {
+      const n = parseInt(String(caseId || ""), 10);
+      if (!Number.isFinite(n) || n <= 0) {
+        location.hash = "#abuse-tracker";
+        return;
+      }
+      location.hash = "#abuse-case=" + encodeURIComponent(String(n));
     }
 
     async function loadHistory() {
@@ -16708,6 +16949,7 @@ function renderDashboardHtml(): string {
         empty.classList.remove("hidden");
         wrap.classList.add("hidden");
         empty.innerHTML = "No work order <strong>" + esc(data.workOrderId || "") + "</strong> in the index yet.";
+        loadWoAbuseStrip("");
         return;
       }
       const r = data.row;
@@ -16718,6 +16960,7 @@ function renderDashboardHtml(): string {
       st.className = "status";
       st.textContent = "";
       renderWoHero(r, data.asOfDateKey);
+      loadWoAbuseStrip(r.workOrderId);
       renderWoKpis(r, data.asOfDateKey);
       renderWoRemarks(r);
       renderWoFacts(r);
@@ -16821,6 +17064,11 @@ function renderDashboardHtml(): string {
       }
       if (r.tab === "abuse-tracker") {
         setMainTab("abuse-tracker");
+        if (r.abuseCaseId) {
+          setTimeout(function () {
+            if (typeof abuseSelectCase === "function") abuseSelectCase(r.abuseCaseId, false);
+          }, 80);
+        }
         return;
       }
       setMainTab("snapshot");
@@ -22994,56 +23242,169 @@ function renderDashboardHtml(): string {
       selectedId: null,
       detail: null,
       stats: null,
+      view: "cases",
+      fleetUnits: [],
+      caseTypeFilter: "all",
       wired: false,
     };
 
-    function abusePostMultipart(url, fd, fillEl, lblEl, onOk, onErr) {
-      var xhr = new XMLHttpRequest();
-      xhr.open("POST", url);
-      xhr.upload.onprogress = function (ev) {
-        if (!fillEl || !lblEl) return;
-        fillEl.parentElement.classList.add("show");
-        if (!ev.lengthComputable) {
-          lblEl.textContent = "Uploading…";
-          fillEl.style.width = "8%";
-          return;
-        }
-        var pct = ev.total ? Math.round((ev.loaded / ev.total) * 100) : 0;
-        lblEl.textContent = "Uploading " + pct + "%";
-        fillEl.style.width = pct + "%";
-      };
-      xhr.onload = function () {
-        if (fillEl) fillEl.parentElement.classList.remove("show");
-        if (fillEl) fillEl.style.width = "0%";
-        if (xhr.status >= 200 && xhr.status < 300) {
-          try {
-            onOk(JSON.parse(xhr.responseText || "{}"));
-          } catch (e) {
-            onErr(new Error("Bad response"));
-          }
-        } else {
-          try {
-            var j = JSON.parse(xhr.responseText || "{}");
-            onErr(new Error(j.error || ("HTTP " + xhr.status)));
-          } catch (e2) {
-            onErr(new Error("Upload failed"));
-          }
-        }
-      };
-      xhr.onerror = function () {
-        if (fillEl) fillEl.parentElement.classList.remove("show");
-        onErr(new Error("Network error"));
-      };
-      xhr.send(fd);
+    var ABUSE_STAGE_STRIP_DEF = [
+      { v: "initial", cat: "cat-docs", line1: "Awaiting package", line2: "Track SF-91, photos, vehicle at VM…" },
+      { v: "awaiting_estimates", cat: "cat-docs", line1: "Awaiting estimates", line2: "Who runs it downtown + planned date" },
+      { v: "pending_legal_release", cat: "cat-legal", line1: "Pending release", line2: "Legal or commander sign-off" },
+      { v: "repair_in_mx_contract", cat: "cat-mx", line1: "Contract / depot MX", line2: "Vendor, GSA, or contract line" },
+      { v: "repair_downtown", cat: "cat-mx", line1: "Receiving MX · downtown", line2: "Off-base civilian repair" },
+      { v: "repair_on_base", cat: "cat-mx", line1: "Receiving MX · on base", line2: "VM maintenance bays" },
+      { v: "no_repair_tracking", cat: "cat-docs", line1: "Paperwork only", line2: "No vehicle repair to track" },
+      { v: "closed", cat: "cat-done", line1: "Closed", line2: "Case complete" },
+    ];
+
+    function abuseRenderStageStrip() {
+      var wrap = document.getElementById("abuse-stage-strip");
+      if (!wrap) return;
+      wrap.innerHTML = ABUSE_STAGE_STRIP_DEF.map(function (s) {
+        return (
+          "<button type='button' class='abuse-stage-btn " + s.cat + "' data-abuse-stage='" + s.v + "'>" +
+            "<span style='display:block'>" + esc(s.line1) + "</span>" +
+            "<span style='display:block;font-weight:500;opacity:0.82;font-size:0.72rem;margin-top:2px'>" + esc(s.line2) + "</span>" +
+          "</button>"
+        );
+      }).join("");
+      wrap.querySelectorAll("[data-abuse-stage]").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          var sel = document.getElementById("abuse-d-stage");
+          if (sel) sel.value = btn.getAttribute("data-abuse-stage") || "";
+          abuseSyncStageStripActive();
+        });
+      });
+    }
+
+    function abuseToggleSubPanels() {
+      var sel = document.getElementById("abuse-d-stage");
+      var v = sel ? sel.value : "";
+      var pkg = document.getElementById("abuse-sub-package");
+      var est = document.getElementById("abuse-sub-estimates");
+      if (pkg) pkg.classList.toggle("hidden", v !== "initial");
+      if (est) est.classList.toggle("hidden", v !== "awaiting_estimates");
+    }
+
+    function abuseSyncStageStripActive() {
+      var sel = document.getElementById("abuse-d-stage");
+      var v = sel ? sel.value : "";
+      document.querySelectorAll("#abuse-stage-strip [data-abuse-stage]").forEach(function (btn) {
+        btn.classList.toggle("active", (btn.getAttribute("data-abuse-stage") || "") === v);
+      });
+      abuseToggleSubPanels();
+    }
+
+    function abuseSetView(which) {
+      abuseTrackerState.view = which === "stats" ? "stats" : "cases";
+      var bCases = document.getElementById("abuse-view-cases");
+      var bStats = document.getElementById("abuse-view-stats");
+      var wrapCases = document.getElementById("abuse-view-cases-wrap");
+      var wrapStats = document.getElementById("abuse-view-stats-wrap");
+      if (bCases) bCases.classList.toggle("active", abuseTrackerState.view === "cases");
+      if (bStats) bStats.classList.toggle("active", abuseTrackerState.view === "stats");
+      if (wrapCases) wrapCases.classList.toggle("hidden", abuseTrackerState.view !== "cases");
+      if (wrapStats) wrapStats.classList.toggle("hidden", abuseTrackerState.view !== "stats");
+      if (abuseTrackerState.view === "stats") {
+        abuseLoadStats();
+        setTimeout(function () { abuseDrawStageChart(); }, 50);
+      }
     }
 
     function abuseStageLabel(s) {
-      if (s === "intake") return "Intake";
-      if (s === "estimates") return "3 estimates";
-      if (s === "release_pending") return "Release letter";
-      if (s === "approved_work") return "Approved / work";
-      if (s === "closed") return "Closed";
-      return s || "";
+      var k = String(s || "");
+      for (var i = 0; i < ABUSE_STAGE_STRIP_DEF.length; i++) {
+        if (ABUSE_STAGE_STRIP_DEF[i].v === k) return ABUSE_STAGE_STRIP_DEF[i].line1;
+      }
+      if (k === "intake") return abuseStageLabel("initial");
+      if (k === "estimates") return abuseStageLabel("awaiting_estimates");
+      if (k === "release_pending") return abuseStageLabel("pending_legal_release");
+      if (k === "approved_work") return abuseStageLabel("repair_in_mx_contract");
+      return k.replace(/_/g, " ") || "";
+    }
+
+    function abuseTimelineKindLabel(kind) {
+      if (kind === "case_opened") return "Case opened";
+      if (kind === "stage") return "Status";
+      if (kind === "location") return "Location";
+      if (kind === "responsible_unit") return "Responsible unit";
+      if (kind === "work_order") return "Work order";
+      if (kind === "tracking_mode") return "Repair / WO tracking";
+      if (kind === "note") return "Note";
+      if (kind === "attachment") return "File";
+      if (kind === "reimbursement") return "Reimbursement";
+      if (kind === "closed") return "Closed";
+      return kind || "Event";
+    }
+
+    function abuseFormatTimelineRow(t) {
+      var kind = String(t.kind || "");
+      var pay = {};
+      try { pay = JSON.parse(t.payload_json || "{}"); } catch (e) { pay = {}; }
+      var body = "";
+      if (kind === "stage") {
+        body = (pay.from ? esc(String(pay.from)) + " → " : "") + esc(String(pay.to || ""));
+      } else if (kind === "location") {
+        body = (pay.from ? esc(String(pay.from)) + " → " : "") + esc(String(pay.to || ""));
+      } else if (kind === "responsible_unit" || kind === "work_order") {
+        body = (pay.from ? esc(String(pay.from)) + " → " : "") + esc(String(pay.to || ""));
+      } else if (kind === "tracking_mode") {
+        body = pay.active ? "Tracking on (WO link + yard on location)" : "Tracking off (paperwork / no repair)";
+      } else if (kind === "note") {
+        body = esc(String(pay.snippet || ""));
+      } else if (kind === "attachment") {
+        body = esc(String(pay.kind || "")) + " · " + esc(String(pay.filename || ""));
+      } else if (kind === "reimbursement") {
+        body = (pay.to_vm ? "Marked reimbursed to VM" : "Reimbursement updated") +
+          (pay.note ? " · " + esc(String(pay.note)) : "");
+      } else if (kind === "case_opened") {
+        body = esc(String(pay.case_type || "")) + " · " + esc(String(pay.asset_id || ""));
+      } else if (kind === "other" && pay.detail === "package_checklist") {
+        body = "Package checklist updated";
+      } else if (kind === "other" && pay.detail === "estimates_handoff") {
+        body =
+          "Estimates downtown — runner: " + esc(String(pay.runner_to || pay.runner_from || "—")) +
+          (pay.planned_to || pay.planned_from
+            ? " · planned " + esc(String(pay.planned_to || pay.planned_from))
+            : "");
+      } else {
+        body = esc(JSON.stringify(pay).slice(0, 120));
+      }
+      return (
+        "<div class='abuse-tl-row'>" +
+          "<div class='abuse-tl-when'>" + esc(t.at_iso || "") + (t.created_by ? " · " + esc(t.created_by) : "") + "</div>" +
+          "<div class='abuse-tl-kind'>" + esc(abuseTimelineKindLabel(kind)) + "</div>" +
+          "<div>" + body + "</div>" +
+        "</div>"
+      );
+    }
+
+    function abuseIngestTableHtml(em) {
+      if (!em || typeof em !== "object") return "";
+      var rows = [
+        ["Damage photos", em.damage_photo],
+        ["Release letter (PDF)", em.release_letter],
+        ["Written estimates", em.estimate],
+        ["Other documents", em.other],
+        ["Any file type (auto-sorted by extension)", em.auto],
+      ];
+      var body = rows
+        .filter(function (r) { return r[1]; })
+        .map(function (r) {
+          return (
+            "<tr><th>" + esc(r[0]) + "</th><td><code>" + esc(String(r[1])) + "</code></td></tr>"
+          );
+        })
+        .join("");
+      if (!body) return "";
+      return (
+        "<table class='abuse-ingest-table'><tbody>" +
+          body +
+        "</tbody></table>" +
+        "<p class='hint' style='margin:8px 0 0'>Email the file to the row that matches what you are sending. The subject line does not matter.</p>"
+      );
     }
 
     function abuseDrawStageChart() {
@@ -23056,21 +23417,23 @@ function renderDashboardHtml(): string {
       ctx.clearRect(0, 0, w, h);
       var st = abuseTrackerState.stats;
       var by = (st && st.byStage) || {};
-      var labels = ["intake", "estimates", "release_pending", "approved_work"];
-      var vals = labels.map(function (k) { return by[k] || 0; });
+      var keys = [
+        "initial", "awaiting_estimates", "pending_legal_release", "repair_in_mx_contract",
+        "repair_downtown", "repair_on_base", "no_repair_tracking",
+      ];
+      var shortLabs = ["Pkg", "Est", "Legal", "Contract", "DT MX", "Base MX", "Paper"];
+      var vals = keys.map(function (k) { return by[k] || 0; });
       var max = Math.max.apply(null, vals.concat([1]));
-      var pad = 28;
-      var bw = (w - pad * 2) / labels.length - 8;
-      ctx.fillStyle = "#5b6675";
+      var pad = 32;
+      var bw = (w - pad * 2) / keys.length - 10;
       ctx.font = "11px system-ui,sans-serif";
-      for (var i = 0; i < labels.length; i++) {
-        var x = pad + i * ((w - pad * 2) / labels.length) + 4;
-        var vh = (vals[i] / max) * (h - pad - 36);
+      for (var i = 0; i < keys.length; i++) {
+        var x = pad + i * ((w - pad * 2) / keys.length) + 5;
+        var vh = (vals[i] / max) * (h - pad - 40);
         ctx.fillStyle = "rgba(0,58,140,0.85)";
         ctx.fillRect(x, h - pad - vh, bw, vh);
         ctx.fillStyle = "#5b6675";
-        var lab = labels[i].replace("_", " ");
-        ctx.fillText(lab.slice(0, 10), x, h - 10);
+        ctx.fillText(shortLabs[i], x, h - 12);
         ctx.fillText(String(vals[i]), x, h - pad - vh - 6);
       }
     }
@@ -23080,59 +23443,74 @@ function renderDashboardHtml(): string {
         var r = await fetch("/api/abuse-tracker/stats", { cache: "no-store" });
         var j = await r.json();
         abuseTrackerState.stats = j;
-        var el = document.getElementById("abuse-stats");
-        if (!el) return;
-        var bs = j.byStage || {};
-        el.innerHTML =
-          "<span class='abuse-stat-pill'><b>" + (j.open || 0) + "</b> open cases</span>" +
-          "<span class='abuse-stat-pill'><b>" + (j.closed || 0) + "</b> closed total</span>" +
-          "<span class='abuse-stat-pill'>Intake <b>" + (bs.intake || 0) + "</b></span>" +
-          "<span class='abuse-stat-pill'>Estimates <b>" + (bs.estimates || 0) + "</b></span>" +
-          "<span class='abuse-stat-pill'>Release <b>" + (bs.release_pending || 0) + "</b></span>" +
-          "<span class='abuse-stat-pill'>Work <b>" + (bs.approved_work || 0) + "</b></span>";
+        var elFull = document.getElementById("abuse-stats-full");
+        if (elFull) {
+          var bs = j.byStage || {};
+          elFull.innerHTML =
+            "<span class='abuse-stat-pill stat-open'><b>" + (j.open || 0) + "</b> open</span>" +
+            "<span class='abuse-stat-pill stat-neutral'>Awaiting pkg <b>" + ((bs.initial || 0) + (bs.intake || 0)) + "</b></span>" +
+            "<span class='abuse-stat-pill stat-warn'>Estimates <b>" + ((bs.awaiting_estimates || 0) + (bs.estimates || 0)) + "</b></span>" +
+            "<span class='abuse-stat-pill stat-warn'>Release <b>" + ((bs.pending_legal_release || 0) + (bs.release_pending || 0)) + "</b></span>" +
+            "<span class='abuse-stat-pill stat-neutral'>Contract MX <b>" + ((bs.repair_in_mx_contract || 0) + (bs.approved_work || 0)) + "</b></span>" +
+            "<span class='abuse-stat-pill stat-ok'>Downtown MX <b>" + (bs.repair_downtown || 0) + "</b></span>" +
+            "<span class='abuse-stat-pill stat-ok'>On-base MX <b>" + (bs.repair_on_base || 0) + "</b></span>" +
+            "<span class='abuse-stat-pill stat-neutral'>Paperwork <b>" + (bs.no_repair_tracking || 0) + "</b></span>";
+        }
         abuseDrawStageChart();
       } catch (e) {
-        var el2 = document.getElementById("abuse-stats");
+        var el2 = document.getElementById("abuse-stats-full");
         if (el2) el2.textContent = "Could not load stats.";
       }
     }
 
     async function abuseLoadList() {
       var openOnly = document.getElementById("abuse-open-only");
-      var q = openOnly && openOnly.checked ? "?open=1" : "";
-      var list = document.getElementById("abuse-list");
-      if (list) list.innerHTML = "Loading…";
+      var q = openOnly && openOnly.checked ? "?open=1&limit=3000" : "?limit=3000";
+      var tbody = document.getElementById("abuse-list-tbody");
+      if (tbody) tbody.innerHTML = "<tr><td colspan='7' class='muted' style='padding:12px'>Loading…</td></tr>";
       try {
         var r = await fetch("/api/abuse-tracker" + q, { cache: "no-store" });
         var j = await r.json();
         abuseTrackerState.cases = j.cases || [];
-        if (!list) return;
+        if (!tbody) return;
         if (!abuseTrackerState.cases.length) {
-          list.innerHTML = "<div class='muted' style='padding:12px'>No cases yet.</div>";
+          tbody.innerHTML = "<tr><td colspan='7' class='muted' style='padding:12px'>No cases yet.</td></tr>";
           return;
         }
-        list.innerHTML = abuseTrackerState.cases.map(function (c) {
-          var closed = !!c.closed_at_iso;
+        var filt = abuseTrackerState.caseTypeFilter || "all";
+        var rows = abuseTrackerState.cases.filter(function (c) {
+          if (filt === "all") return true;
+          return String(c.case_type || "") === filt;
+        });
+        if (!rows.length) {
+          tbody.innerHTML = "<tr><td colspan='7' class='muted' style='padding:12px'>No cases match this filter.</td></tr>";
+          return;
+        }
+        tbody.innerHTML = rows.map(function (c) {
           var wo = (c.work_order_id || "").trim();
-          var sub = (c.make_model || "—") +
-            (wo ? " · WO " + wo : "") +
-            " · " + abuseStageLabel(c.stage) + (closed ? " · CLOSED" : "");
-          var active = c.id === abuseTrackerState.selectedId ? " active" : "";
+          var loc = (c.vehicle_location || "").trim();
+          var active = c.id === abuseTrackerState.selectedId ? " class='active'" : "";
+          var typCls = c.case_type === "abuse" ? "type-abu" : "type-acc";
           return (
-            "<button type='button' class='abuse-row" + active + "' data-abuse-id='" + esc(String(c.id)) + "'>" +
-              "<div class='r1'>" + esc(c.control_number) + " · " + esc(c.asset_id) + " · " + esc(c.case_type) + "</div>" +
-              "<div class='r2'>" + esc(sub) + "</div>" +
-            "</button>"
+            "<tr" + active + " data-abuse-id='" + esc(String(c.id)) + "'>" +
+              "<td class='cn'>" + esc(c.control_number) + "</td>" +
+              "<td class='" + typCls + "'>" + esc(c.case_type) + "</td>" +
+              "<td>" + esc(c.asset_id) + "</td>" +
+              "<td>" + esc(wo || "—") + "</td>" +
+              "<td>" + esc(abuseStageLabel(c.stage)) + "</td>" +
+              "<td class='muted-cell'>" + esc(loc || "—") + "</td>" +
+              "<td class='muted-cell'>" + esc((c.updated_at_iso || "").slice(0, 10)) + "</td>" +
+            "</tr>"
           );
         }).join("");
-        list.querySelectorAll("[data-abuse-id]").forEach(function (btn) {
-          btn.addEventListener("click", function () {
-            var id = parseInt(btn.getAttribute("data-abuse-id"), 10);
-            if (Number.isFinite(id)) abuseSelectCase(id);
+        tbody.querySelectorAll("tr[data-abuse-id]").forEach(function (row) {
+          row.addEventListener("click", function () {
+            var id = parseInt(row.getAttribute("data-abuse-id"), 10);
+            if (Number.isFinite(id)) abuseSelectCase(id, true);
           });
         });
       } catch (e) {
-        if (list) list.innerHTML = "<div class='problem-empty'>Could not load cases.</div>";
+        if (tbody) tbody.innerHTML = "<tr><td colspan='7' class='problem-empty' style='padding:12px'>Could not load cases.</td></tr>";
       }
     }
 
@@ -23179,10 +23557,11 @@ function renderDashboardHtml(): string {
       return out;
     }
 
-    async function abuseSelectCase(id) {
+    async function abuseSelectCase(id, pushHash) {
       abuseTrackerState.selectedId = id;
-      document.querySelectorAll(".abuse-row").forEach(function (b) {
-        b.classList.toggle("active", parseInt(b.getAttribute("data-abuse-id"), 10) === id);
+      if (pushHash !== false) setHashAbuseCase(id);
+      document.querySelectorAll("#abuse-list-tbody tr[data-abuse-id]").forEach(function (row) {
+        row.classList.toggle("active", parseInt(row.getAttribute("data-abuse-id"), 10) === id);
       });
       var empty = document.getElementById("abuse-detail-empty");
       var det = document.getElementById("abuse-detail");
@@ -23203,14 +23582,44 @@ function renderDashboardHtml(): string {
         tp.className = "abuse-type-pill " + (c.case_type === "abuse" ? "abuse" : "accident");
         var ing = document.getElementById("abuse-d-ingest");
         if (ing) {
-          ing.innerHTML = j.ingestEmail
-            ? "<strong>Email ingest:</strong> <code style='font-size:0.85rem'>" + esc(j.ingestEmail) + "</code> — attach photos or PDFs; subject line is ignored."
-            : "";
+          var tbl = abuseIngestTableHtml(j.ingestEmails);
+          ing.innerHTML = tbl
+            ? "<strong>Send files by email</strong> — use the address in each row for that kind of file." + tbl
+            : j.ingestEmail
+              ? "<strong>Send files by email:</strong> <code style='font-size:0.85rem'>" + esc(j.ingestEmail) + "</code>"
+              : "";
         }
-        document.getElementById("abuse-d-stage").value = c.stage || "intake";
+        var stSel = document.getElementById("abuse-d-stage");
+        if (stSel) {
+          var sv = String(c.stage || "initial");
+          stSel.value = sv;
+          if (stSel.value !== sv) stSel.value = "initial";
+        }
+        abuseSyncStageStripActive();
+        var pkgJ = {};
+        try { pkgJ = JSON.parse(c.package_checklist_json || "{}"); } catch (e2) { pkgJ = {}; }
+        var sf = document.getElementById("abuse-pkg-sf91");
+        var ph = document.getElementById("abuse-pkg-photos");
+        var vm = document.getElementById("abuse-pkg-vm");
+        if (sf) sf.checked = !!pkgJ.sf91;
+        if (ph) ph.checked = !!pkgJ.photos;
+        if (vm) vm.checked = !!pkgJ.vehicleAtVmCompound;
+        var er = document.getElementById("abuse-est-runner");
+        if (er) {
+          var rv = String(c.estimates_runner || "").trim();
+          er.value = rv;
+          if (er.value !== rv) er.value = "";
+        }
+        var ep = document.getElementById("abuse-est-plan-date");
+        if (ep) {
+          var pd = String(c.estimates_downtown_planned_date || "").trim().slice(0, 10);
+          ep.value = /^\d{4}-\d{2}-\d{2}$/.test(pd) ? pd : "";
+        }
         document.getElementById("abuse-d-loc").value = c.vehicle_location || "";
         document.getElementById("abuse-d-det").value = c.determination || "";
         document.getElementById("abuse-d-resp").value = c.responsible_party || "";
+        var trk = document.getElementById("abuse-d-tracking");
+        if (trk) trk.checked = c.tracking_active !== 0 && c.tracking_active !== false;
         document.getElementById("abuse-d-reimb").checked = !!c.reimbursed_to_vm;
         document.getElementById("abuse-d-reimb-note").value = c.reimbursed_note || "";
         var woEl = document.getElementById("abuse-d-wo");
@@ -23231,9 +23640,59 @@ function renderDashboardHtml(): string {
               esc(a.kind) + "</a> · " + esc(a.filename || "") + " · " + esc(a.uploaded_by || "") + "</div>"
           );
         }).join("") || "<div class='muted'>No attachments yet.</div>";
+        var tl = document.getElementById("abuse-timeline-list");
+        if (tl) {
+          var rows = (j.timeline || []).slice().sort(function (a, b) {
+            return String(a.at_iso || "").localeCompare(String(b.at_iso || ""));
+          });
+          tl.innerHTML = rows.length
+            ? rows.map(abuseFormatTimelineRow).join("")
+            : "<div class='muted'>No timeline events yet. Save status or location changes to build the log.</div>";
+        }
         document.getElementById("abuse-case-status").textContent = "";
       } catch (e) {
         document.getElementById("abuse-case-status").textContent = "Could not load case.";
+      }
+    }
+
+    async function loadWoAbuseStrip(woId) {
+      var strip = document.getElementById("wo-abuse-strip");
+      if (!strip) return;
+      var wid = (woId || "").trim();
+      if (!wid) {
+        strip.classList.add("hidden");
+        strip.innerHTML = "";
+        return;
+      }
+      try {
+        var r = await fetch("/api/abuse-tracker/by-work-order/" + encodeURIComponent(wid), { cache: "no-store" });
+        var j = await r.json();
+        var cases = (j && j.cases) || [];
+        if (!cases.length) {
+          strip.classList.add("hidden");
+          strip.innerHTML = "";
+          return;
+        }
+        strip.classList.remove("hidden");
+        var btns = cases.map(function (c) {
+          var lab = esc(c.control_number) + " · " + esc(c.case_type);
+          var cls = "wo-abuse-btn" + (c.case_type === "abuse" ? " abuse" : "");
+          return (
+            "<button type='button' class='" + cls + "' data-abuse-open-id='" + esc(String(c.id)) + "'>" + lab + "</button>"
+          );
+        }).join("");
+        strip.innerHTML = "<span class='lbl'>A/A case</span>" + btns;
+        strip.querySelectorAll("[data-abuse-open-id]").forEach(function (btn) {
+          btn.addEventListener("click", function () {
+            var cid = parseInt(btn.getAttribute("data-abuse-open-id"), 10);
+            if (!Number.isFinite(cid)) return;
+            setMainTab("abuse-tracker");
+            abuseSelectCase(cid, true);
+          });
+        });
+      } catch (e) {
+        strip.classList.add("hidden");
+        strip.innerHTML = "";
       }
     }
 
@@ -23243,6 +23702,7 @@ function renderDashboardHtml(): string {
       var st = document.getElementById("abuse-case-status");
       st.textContent = "Saving…";
       try {
+        var trkEl = document.getElementById("abuse-d-tracking");
         var body = {
           stage: document.getElementById("abuse-d-stage").value,
           vehicleLocation: document.getElementById("abuse-d-loc").value,
@@ -23252,21 +23712,35 @@ function renderDashboardHtml(): string {
           reimbursedToVm: document.getElementById("abuse-d-reimb").checked,
           reimbursedNote: document.getElementById("abuse-d-reimb-note").value,
           estimates: abuseCollectEstimates(),
+          trackingActive: trkEl ? !!trkEl.checked : true,
+          timelineAuthor: (document.getElementById("abuse-save-by") && document.getElementById("abuse-save-by").value) || "",
+          packageChecklist: {
+            sf91: !!(document.getElementById("abuse-pkg-sf91") && document.getElementById("abuse-pkg-sf91").checked),
+            photos: !!(document.getElementById("abuse-pkg-photos") && document.getElementById("abuse-pkg-photos").checked),
+            vehicleAtVmCompound: !!(document.getElementById("abuse-pkg-vm") && document.getElementById("abuse-pkg-vm").checked),
+          },
+          estimatesRunner: (document.getElementById("abuse-est-runner") && document.getElementById("abuse-est-runner").value) || "",
+          estimatesDowntownPlannedDate: (document.getElementById("abuse-est-plan-date") && document.getElementById("abuse-est-plan-date").value) || "",
         };
         var r = await fetch("/api/abuse-tracker/" + id, {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
         });
+        var saved = await r.json().catch(function () { return {}; });
         if (!r.ok) {
-          var ej = await r.json().catch(function () { return {}; });
-          throw new Error(ej.error || "Save failed");
+          throw new Error(saved.error || "Save failed");
         }
         st.textContent = "Saved.";
         setTimeout(function () { if (st.textContent === "Saved.") st.textContent = ""; }, 1500);
         await abuseLoadList();
-        await abuseLoadStats();
-        await abuseSelectCase(id);
+        if (abuseTrackerState.view === "stats") await abuseLoadStats();
+        await abuseSelectCase(id, false);
+        var woAfter = (saved.case && saved.case.work_order_id) ? String(saved.case.work_order_id).trim() : "";
+        if (woAfter && selectedWoId === woAfter) {
+          await loadWoAbuseStrip(woAfter);
+          await loadSightings();
+        }
       } catch (e) {
         st.textContent = e.message || "Save failed";
       }
@@ -23288,7 +23762,7 @@ function renderDashboardHtml(): string {
         document.getElementById("abuse-detail").classList.add("hidden");
         document.getElementById("abuse-detail-empty").classList.remove("hidden");
         await abuseLoadList();
-        await abuseLoadStats();
+        if (abuseTrackerState.view === "stats") await abuseLoadStats();
       } catch (e) {
         st.textContent = e.message || "Could not close";
       }
@@ -23306,7 +23780,7 @@ function renderDashboardHtml(): string {
       });
       if (!r.ok) return;
       document.getElementById("abuse-note-body").value = "";
-      await abuseSelectCase(id);
+      await abuseSelectCase(id, false);
     }
 
     async function abuseCreateCase() {
@@ -23327,14 +23801,18 @@ function renderDashboardHtml(): string {
         });
         var j = await r.json();
         if (!r.ok) throw new Error(j.error || "Create failed");
-        msg.innerHTML = "Created <strong>" + esc(j.case.control_number) + "</strong>." +
-          (j.ingestEmail ? " Ingest: <code>" + esc(j.ingestEmail) + "</code>" : "");
+        var createdTbl = abuseIngestTableHtml(j.ingestEmails);
+        msg.innerHTML =
+          "Created <strong>" + esc(j.case.control_number) + "</strong>." +
+          (createdTbl ? " Use these addresses to email files in:" + createdTbl : j.ingestEmail ? " Ingest: <code>" + esc(j.ingestEmail) + "</code>" : "");
         document.getElementById("abuse-new-asset").value = "";
         var nwo = document.getElementById("abuse-new-wo");
         if (nwo) nwo.value = "";
         await abuseLoadList();
-        await abuseLoadStats();
-        await abuseSelectCase(j.case.id);
+        if (abuseTrackerState.view === "stats") await abuseLoadStats();
+        await abuseSelectCase(j.case.id, true);
+        var woNew = (j.case && j.case.work_order_id) ? String(j.case.work_order_id).trim() : "";
+        if (woNew && selectedWoId === woNew) await loadWoAbuseStrip(woNew);
       } catch (e) {
         msg.textContent = e.message || "Could not create";
       }
@@ -23345,44 +23823,139 @@ function renderDashboardHtml(): string {
     }
 
     function onEnterAbuseTrackerTab() {
-      abuseLoadStats();
+      abuseSetView(abuseTrackerState.view || "cases");
       abuseLoadList();
+      if (abuseTrackerState.view === "stats") abuseLoadStats();
+    }
+
+    function abuseRefreshFleetUnits() {
+      var dl = document.getElementById("abuse-resp-datalist");
+      if (!dl) return;
+      if (abuseTrackerState.fleetUnits && abuseTrackerState.fleetUnits.length) {
+        dl.innerHTML = abuseTrackerState.fleetUnits.map(function (u) {
+          return "<option value='" + esc(u) + "'></option>";
+        }).join("");
+        return;
+      }
+      fetch("/api/fleet/units?limit=1200", { cache: "no-store" })
+        .then(function (r) { return r.ok ? r.json() : { units: [] }; })
+        .then(function (j) {
+          abuseTrackerState.fleetUnits = Array.isArray(j.units) ? j.units : [];
+          if (dl) {
+            dl.innerHTML = abuseTrackerState.fleetUnits.map(function (u) {
+              return "<option value='" + esc(u) + "'></option>";
+            }).join("");
+          }
+        })
+        .catch(function () {});
     }
 
     function wireAbuseTrackerEvents() {
       if (abuseTrackerState.wired) return;
       abuseTrackerState.wired = true;
+      abuseRenderStageStrip();
+      abuseRefreshFleetUnits();
       var abuseAssetPickTimer = null;
       var abuseAssetInp = document.getElementById("abuse-new-asset");
-      var abuseAssetDl = document.getElementById("abuse-asset-datalist");
-      function refreshAbuseAssetDatalist() {
-        if (!abuseAssetInp || !abuseAssetDl) return;
-        var q = (abuseAssetInp.value || "").trim();
-        if (q.length < 2) {
-          abuseAssetDl.innerHTML = "";
+      var abuseAssetDd = document.getElementById("abuse-asset-dd");
+      var abuseAssetCombo = abuseAssetInp ? abuseAssetInp.closest(".abuse-asset-combo") : null;
+      function abuseAssetDdSetOpen(open) {
+        if (!abuseAssetDd || !abuseAssetInp) return;
+        abuseAssetDd.classList.toggle("hidden", !open);
+        abuseAssetDd.toggleAttribute("hidden", !open);
+        abuseAssetInp.setAttribute("aria-expanded", open ? "true" : "false");
+      }
+      function abuseAssetDdHide() {
+        abuseAssetDdSetOpen(false);
+      }
+      function abuseAssetDdRender(rows) {
+        if (!abuseAssetDd) return;
+        if (!rows.length) {
+          abuseAssetDd.innerHTML = "<div class='abuse-asset-empty'>No matches. Try another id or unit fragment.</div>";
+          abuseAssetDdSetOpen(true);
           return;
         }
-        fetch("/api/fleet/assets?q=" + encodeURIComponent(q) + "&limit=25", { cache: "no-store" })
+        abuseAssetDd.innerHTML = rows.map(function (a) {
+          var sub = [a.make_model || "", a.shop || "", a.owning_unit || ""].filter(Boolean).join(" · ");
+          return (
+            "<button type='button' class='abuse-asset-opt' role='option' data-asset-id='" + esc(a.asset_id) + "'>" +
+              "<div class='opt-id'>" + esc(a.asset_id) + "</div>" +
+              "<div class='opt-sub'>" + esc(sub || "—") + "</div>" +
+            "</button>"
+          );
+        }).join("");
+        abuseAssetDd.querySelectorAll(".abuse-asset-opt").forEach(function (btn) {
+          btn.addEventListener("mousedown", function (ev) {
+            ev.preventDefault();
+            var id = (btn.getAttribute("data-asset-id") || "").trim();
+            if (abuseAssetInp && id) abuseAssetInp.value = id;
+            abuseAssetDdHide();
+            if (abuseAssetInp) abuseAssetInp.focus();
+          });
+        });
+        abuseAssetDdSetOpen(true);
+      }
+      function refreshAbuseAssetDropdown() {
+        if (!abuseAssetInp || !abuseAssetDd) return;
+        var q = (abuseAssetInp.value || "").trim();
+        if (q.length < 2) {
+          abuseAssetDd.innerHTML = "";
+          abuseAssetDdHide();
+          return;
+        }
+        fetch("/api/fleet/assets?q=" + encodeURIComponent(q) + "&limit=80", { cache: "no-store" })
           .then(function (r) { return r.ok ? r.json() : { assets: [] }; })
           .then(function (j) {
-            var rows = (j && j.assets) || [];
-            abuseAssetDl.innerHTML = rows.map(function (a) {
-              var lab = a.asset_id + " — " + (a.make_model || "") + " · " + (a.shop || "") + " · " + (a.owning_unit || "");
-              return "<option value='" + esc(a.asset_id) + "' label='" + esc(lab) + "'></option>";
-            }).join("");
+            abuseAssetDdRender((j && j.assets) || []);
           })
-          .catch(function () { abuseAssetDl.innerHTML = ""; });
+          .catch(function () {
+            abuseAssetDd.innerHTML = "";
+            abuseAssetDdHide();
+          });
       }
-      if (abuseAssetInp && abuseAssetDl) {
+      if (abuseAssetInp && abuseAssetDd) {
         abuseAssetInp.addEventListener("input", function () {
           if (abuseAssetPickTimer) clearTimeout(abuseAssetPickTimer);
-          abuseAssetPickTimer = setTimeout(refreshAbuseAssetDatalist, 200);
+          abuseAssetPickTimer = setTimeout(refreshAbuseAssetDropdown, 200);
+        });
+        abuseAssetInp.addEventListener("focus", function () {
+          var q = (abuseAssetInp.value || "").trim();
+          if (q.length >= 2) refreshAbuseAssetDropdown();
+        });
+        abuseAssetInp.addEventListener("keydown", function (ev) {
+          if (ev.key === "Escape") abuseAssetDdHide();
+        });
+        document.addEventListener("click", function (ev) {
+          if (!abuseAssetDd) return;
+          var t = ev.target;
+          if (abuseAssetCombo && abuseAssetCombo.contains(t)) return;
+          abuseAssetDdHide();
         });
       }
       var rf = document.getElementById("abuse-refresh");
-      if (rf) rf.addEventListener("click", function () { abuseLoadStats(); abuseLoadList(); if (abuseTrackerState.selectedId) abuseSelectCase(abuseTrackerState.selectedId); });
+      if (rf) {
+        rf.addEventListener("click", function () {
+          if (abuseTrackerState.view === "stats") abuseLoadStats();
+          abuseLoadList();
+          if (abuseTrackerState.selectedId) abuseSelectCase(abuseTrackerState.selectedId, false);
+        });
+      }
+      var bCasesV = document.getElementById("abuse-view-cases");
+      var bStatsV = document.getElementById("abuse-view-stats");
+      if (bCasesV) bCasesV.addEventListener("click", function () { abuseSetView("cases"); });
+      if (bStatsV) bStatsV.addEventListener("click", function () { abuseSetView("stats"); });
       var oo = document.getElementById("abuse-open-only");
       if (oo) oo.addEventListener("change", abuseLoadList);
+      document.querySelectorAll("[data-abuse-filter]").forEach(function (chip) {
+        chip.addEventListener("click", function () {
+          var f = chip.getAttribute("data-abuse-filter") || "all";
+          abuseTrackerState.caseTypeFilter = f;
+          document.querySelectorAll("[data-abuse-filter]").forEach(function (c2) {
+            c2.classList.toggle("active", (c2.getAttribute("data-abuse-filter") || "") === f);
+          });
+          abuseLoadList();
+        });
+      });
       var ex = document.getElementById("abuse-export-csv");
       if (ex) ex.addEventListener("click", abuseExportCsv);
       var sv = document.getElementById("abuse-save-case");
@@ -23399,32 +23972,6 @@ function renderDashboardHtml(): string {
           var cur = abuseCollectEstimates();
           cur.push({ vendor: "", amount: null, note: "" });
           abuseRenderEstimates(cur);
-        });
-      }
-      var upBtn = document.getElementById("abuse-up-btn");
-      if (upBtn) {
-        upBtn.addEventListener("click", function () {
-          var id = abuseTrackerState.selectedId;
-          if (!id) return;
-          var f = document.getElementById("abuse-up-file").files && document.getElementById("abuse-up-file").files[0];
-          if (!f) return;
-          var by = (document.getElementById("abuse-up-by").value || "").trim();
-          if (!by) {
-            document.getElementById("abuse-case-status").textContent = "Enter your name for upload.";
-            return;
-          }
-          var fd = new FormData();
-          fd.append("file", f, f.name);
-          fd.append("kind", document.getElementById("abuse-up-kind").value);
-          fd.append("uploadedBy", by);
-          var fill = document.getElementById("abuse-up-fill");
-          var lbl = document.getElementById("abuse-up-lbl");
-          abusePostMultipart("/api/abuse-tracker/" + id + "/attachments", fd, fill, lbl, function () {
-            document.getElementById("abuse-up-file").value = "";
-            abuseSelectCase(id);
-          }, function (err) {
-            document.getElementById("abuse-case-status").textContent = err.message || "Upload failed";
-          });
         });
       }
     }
