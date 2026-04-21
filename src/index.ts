@@ -11074,15 +11074,30 @@ function renderDashboardHtml(): string {
     .meeting-setup-grid {
       display: grid;
       grid-template-columns: minmax(280px, 420px) minmax(320px, 1fr);
-      gap: 20px;
-      margin-bottom: 24px;
+      gap: 22px;
+      margin-bottom: 28px;
     }
     @media (max-width: 900px) { .meeting-setup-grid { grid-template-columns: 1fr; } }
     .meeting-setup-card {
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 18px 20px;
+      border-radius: 16px;
+      padding: 20px 22px;
+      box-shadow: var(--shadow-sm);
+    }
+    .meeting-setup-eyebrow {
+      margin: 0 0 6px;
+      font-size: 0.68rem;
+      font-weight: 700;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
+    .meeting-scope-hint {
+      margin: 0 0 14px;
+      font-size: 0.8rem;
+      line-height: 1.45;
+      color: var(--muted);
     }
     .meeting-asof-info {
       display: inline-flex;
@@ -11166,14 +11181,21 @@ function renderDashboardHtml(): string {
     .mini-toggle input { accent-color: var(--accent); }
 
     .meeting-preview {
-      margin: 8px 0 12px;
-      padding: 12px 14px;
-      border-radius: 10px;
-      background: rgba(0,58,140,0.06);
-      border: 1px solid rgba(0,58,140,0.2);
+      margin: 12px 0 14px;
+      padding: 14px 16px;
+      border-radius: 12px;
+      background: linear-gradient(165deg, rgba(0,58,140,0.07) 0%, rgba(0,58,140,0.04) 100%);
+      border: 1px solid rgba(0,58,140,0.22);
       color: var(--text);
       font-size: 0.88rem;
       font-variant-numeric: tabular-nums;
+      line-height: 1.4;
+    }
+    .meeting-preview strong {
+      font-size: 1.12rem;
+      font-weight: 800;
+      color: var(--accent-strong);
+      letter-spacing: -0.02em;
     }
     .meeting-preview .bdown {
       display: flex; flex-wrap: wrap; gap: 4px 12px;
@@ -11355,11 +11377,14 @@ function renderDashboardHtml(): string {
     }
     .meeting-queue-filters {
       display: grid;
-      grid-template-columns: 1fr 1fr;
-      grid-template-rows: auto auto;
-      gap: 6px;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 8px;
     }
     .meeting-queue-filters #meeting-queue-search { grid-column: 1 / -1; }
+    @media (max-width: 520px) {
+      .meeting-queue-filters { grid-template-columns: 1fr; }
+      .meeting-queue-filters #meeting-queue-search { grid-column: 1; }
+    }
     .meeting-queue-filters input, .meeting-queue-filters select {
       font-size: 0.8rem;
       padding: 7px 10px;
@@ -13244,7 +13269,9 @@ function renderDashboardHtml(): string {
         <div id="meeting-setup" class="meeting-view">
           <div class="meeting-setup-grid">
             <div class="meeting-setup-card">
+              <p class="meeting-setup-eyebrow">Start session</p>
               <h3 class="card-title">New ETIC meeting</h3>
+              <p class="meeting-scope-hint">Basics for the minutes header and timer. You can narrow by shop again from the live queue.</p>
               <label class="field">
                 <span class="label">Meeting title <span class="muted">(optional)</span></span>
                 <input type="text" id="meeting-title" placeholder="Daily ETIC stand-up" autocomplete="off" />
@@ -13267,7 +13294,9 @@ function renderDashboardHtml(): string {
             </div>
 
             <div class="meeting-setup-card">
+              <p class="meeting-setup-eyebrow">Agenda seed</p>
               <h3 class="card-title">Who are we covering?</h3>
+              <p class="meeting-scope-hint">These filters pick which work orders load into the meeting. Change shop anytime in the live view without ending the session.</p>
               <div class="meeting-filter-grid">
                 <label class="field">
                   <span class="label">Shop</span>
@@ -13347,6 +13376,9 @@ function renderDashboardHtml(): string {
             <aside class="meeting-queue">
               <div class="meeting-queue-filters">
                 <input type="text" id="meeting-queue-search" placeholder="Search this meeting…" />
+                <select id="meeting-queue-shop" aria-label="Filter by shop">
+                  <option value="">All shops</option>
+                </select>
                 <select id="meeting-queue-status" aria-label="Filter by status">
                   <option value="">All status</option>
                   <option value="pending">Pending</option>
@@ -18047,6 +18079,10 @@ function renderDashboardHtml(): string {
       asOfDate: null,
       autosaveTimer: null,
       lastPatch: null,
+      lastFocusWid: null,
+      controllerTimelineScroll: 0,
+      lastSentTimelineScroll: 0,
+      timelineScrollDebounce: null,
     };
 
     function pad2(n) { return n < 10 ? "0" + n : String(n); }
@@ -21848,6 +21884,7 @@ function renderDashboardHtml(): string {
     function enterLiveView() {
       meetingShowView("live");
       renderMeetingHead();
+      syncMeetingQueueShopOptions();
       renderMeetingQueue();
       renderMeetingFocus();
       startMeetingTick();
@@ -21923,13 +21960,37 @@ function renderDashboardHtml(): string {
       if (meetingState.tickHandle) { clearInterval(meetingState.tickHandle); meetingState.tickHandle = null; }
     }
 
+    function syncMeetingQueueShopOptions() {
+      const sel = document.getElementById("meeting-queue-shop");
+      if (!sel) return;
+      const prev = sel.value || "";
+      const set = new Set();
+      (meetingState.notes || []).forEach(function (n) {
+        const s = (n.shop || "").trim();
+        if (s) set.add(s);
+      });
+      const shops = Array.from(set).sort(function (a, b) {
+        return a.localeCompare(b, undefined, { sensitivity: "base" });
+      });
+      let html = "<option value=''>All shops</option>";
+      shops.forEach(function (s) {
+        html += "<option value='" + esc(s) + "'>" + esc(s) + "</option>";
+      });
+      sel.innerHTML = html;
+      if (prev && set.has(prev)) sel.value = prev;
+      else sel.value = "";
+    }
+
     function filterMeetingNotesForQueue() {
       const search = (document.getElementById("meeting-queue-search").value || "").trim().toLowerCase();
       const statusFilter = document.getElementById("meeting-queue-status").value || "";
+      const shopEl = document.getElementById("meeting-queue-shop");
+      const shopFilter = shopEl ? (shopEl.value || "").trim() : "";
       const sortEl = document.getElementById("meeting-queue-sort");
       const sortKey = sortEl ? sortEl.value : "order";
       const filtered = meetingState.notes.filter(function (n) {
         if (statusFilter && n.status !== statusFilter) return false;
+        if (shopFilter && (n.shop || "").trim() !== shopFilter) return false;
         if (search) {
           const hay = (n.work_order_id + " " + n.asset_id + " " + n.owning_unit + " " + n.mel_key + " " + n.shop + " " + (n.mgmt_cd || "") + " " + (n.make_model || "") + " " + (n.veh_nomen || "")).toLowerCase();
           if (hay.indexOf(search) < 0) return false;
@@ -21953,6 +22014,16 @@ function renderDashboardHtml(): string {
     function renderMeetingQueue() {
       const list = document.getElementById("meeting-queue-list");
       const notes = filterMeetingNotesForQueue();
+      if (
+        meetingState.selectedWid &&
+        notes.every(function (n) {
+          return n.work_order_id !== meetingState.selectedWid;
+        })
+      ) {
+        meetingState.selectedWid = notes.length ? notes[0].work_order_id : null;
+        renderMeetingFocus();
+        if (meetingState.selectedWid) void pushMeetingCursor(meetingState.selectedWid);
+      }
       if (notes.length === 0) {
         list.innerHTML = "<div class='muted' style='padding:12px;font-size:0.82rem'>No work orders match.</div>";
         return;
@@ -22252,11 +22323,12 @@ function renderDashboardHtml(): string {
 
     async function advanceToNextPending(afterMarkCovered) {
       if (afterMarkCovered) await setMeetingWoStatus("covered");
-      const pending = meetingState.notes.filter(function (n) { return n.status === "pending"; });
+      const visible = filterMeetingNotesForQueue();
+      const pending = visible.filter(function (n) { return n.status === "pending"; });
       let next = pending[0];
       if (next && meetingState.selectedWid) {
-        const idx = meetingState.notes.findIndex(function (n) { return n.work_order_id === meetingState.selectedWid; });
-        const after = meetingState.notes.slice(idx + 1).find(function (n) { return n.status === "pending"; });
+        const idx = visible.findIndex(function (n) { return n.work_order_id === meetingState.selectedWid; });
+        const after = idx >= 0 ? visible.slice(idx + 1).find(function (n) { return n.status === "pending"; }) : null;
         if (after) next = after;
       }
       if (next) selectMeetingWo(next.work_order_id);
@@ -24081,9 +24153,11 @@ function renderDashboardHtml(): string {
       });
 
       const qSearch = document.getElementById("meeting-queue-search");
+      const qShop = document.getElementById("meeting-queue-shop");
       const qStatus = document.getElementById("meeting-queue-status");
       const qSort = document.getElementById("meeting-queue-sort");
       if (qSearch) qSearch.addEventListener("input", renderMeetingQueue);
+      if (qShop) qShop.addEventListener("change", renderMeetingQueue);
       if (qStatus) qStatus.addEventListener("change", renderMeetingQueue);
       if (qSort) qSort.addEventListener("change", renderMeetingQueue);
 
