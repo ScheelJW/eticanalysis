@@ -1115,15 +1115,7 @@ async function handleRelabelSnapshot(env: Env, fromKey: string, toKey: string): 
 }
 
 async function handleSnapshotsList(env: Env): Promise<Response> {
-  const result = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT date_key, workbook_key, workbook_file_name, received_at_iso,
-            mc_rate, fleet_total, fmc, nmc, surplus, asset_manager_ok,
-            total_rows, mel_total, visible_sheets, hidden_sheets, updated_at_iso,
-            deleted_at_iso
-     FROM etic_snapshots
-     WHERE deleted_at_iso IS NULL
-     ORDER BY date_key DESC`,
-  ).all<{
+  type SnapRow = {
     date_key: string;
     workbook_key: string;
     workbook_file_name: string;
@@ -1140,7 +1132,29 @@ async function handleSnapshotsList(env: Env): Promise<Response> {
     hidden_sheets: number | null;
     updated_at_iso: string;
     deleted_at_iso: string | null;
-  }>();
+  };
+  const withSoftDelete = `SELECT date_key, workbook_key, workbook_file_name, received_at_iso,
+            mc_rate, fleet_total, fmc, nmc, surplus, asset_manager_ok,
+            total_rows, mel_total, visible_sheets, hidden_sheets, updated_at_iso,
+            deleted_at_iso
+     FROM etic_snapshots
+     WHERE deleted_at_iso IS NULL
+     ORDER BY date_key DESC`;
+  const withoutSoftDelete = `SELECT date_key, workbook_key, workbook_file_name, received_at_iso,
+            mc_rate, fleet_total, fmc, nmc, surplus, asset_manager_ok,
+            total_rows, mel_total, visible_sheets, hidden_sheets, updated_at_iso,
+            NULL AS deleted_at_iso
+     FROM etic_snapshots
+     ORDER BY date_key DESC`;
+  let result: D1Result<SnapRow>;
+  try {
+    result = await env.ETIC_SNAPSHOTS.prepare(withSoftDelete).all<SnapRow>();
+    if ((result as unknown as { success?: boolean }).success === false) {
+      result = await env.ETIC_SNAPSHOTS.prepare(withoutSoftDelete).all<SnapRow>();
+    }
+  } catch {
+    result = await env.ETIC_SNAPSHOTS.prepare(withoutSoftDelete).all<SnapRow>();
+  }
 
   const rows: SnapshotListRow[] = (result.results ?? []).map((r) => ({
     dateKey: r.date_key,
@@ -4469,13 +4483,29 @@ type EticSnapshotIndexRow = {
 };
 
 async function loadAllEticSnapshotIndexRows(env: Env): Promise<EticSnapshotIndexRow[]> {
-  const r = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT date_key, deleted_at_iso, workbook_key, workbook_file_name, received_at_iso,
+  const withSoftDelete = `SELECT date_key, deleted_at_iso, workbook_key, workbook_file_name, received_at_iso,
             visible_sheets AS total_visible_sheets, hidden_sheets AS total_hidden_sheets,
             total_rows, mel_total
-     FROM etic_snapshots`,
-  ).all<EticSnapshotIndexRow>();
-  return r.results ?? [];
+     FROM etic_snapshots`;
+  const withoutSoftDelete = `SELECT date_key, NULL AS deleted_at_iso, workbook_key, workbook_file_name, received_at_iso,
+            visible_sheets AS total_visible_sheets, hidden_sheets AS total_hidden_sheets,
+            total_rows, mel_total
+     FROM etic_snapshots`;
+  const runFallback = async () => {
+    const r = await env.ETIC_SNAPSHOTS.prepare(withoutSoftDelete).all<EticSnapshotIndexRow>();
+    return r.results ?? [];
+  };
+  try {
+    const r = await env.ETIC_SNAPSHOTS.prepare(withSoftDelete).all<EticSnapshotIndexRow>();
+    const meta = r as unknown as { success?: boolean; error?: string };
+    if (meta.success === false) {
+      return runFallback();
+    }
+    return r.results ?? [];
+  } catch {
+    // D1 before migrations/0033_etic_snapshots_soft_delete.sql — column absent.
+    return runFallback();
+  }
 }
 
 function syntheticHistoryEntryFromD1Row(r: EticSnapshotIndexRow): HistoryEntry {
