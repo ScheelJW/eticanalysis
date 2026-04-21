@@ -15824,6 +15824,33 @@ function renderDashboardHtml(): string {
       }
     }
 
+    /**
+     * After a new email ingest, /api/history + D1 move forward but this SPA
+     * can still have selectedDate stuck on an older day — every tab that keys
+     * off selectedDate or stale history looks "frozen". Refresh from server
+     * and jump to the newest snapshot unless the URL explicitly pins a date
+     * (#YYYY-MM-DD). Does not rewrite hash (avoids clobbering #wo= deep links).
+     */
+    async function syncGlobalSnapshotDateToServer() {
+      const raw = (location.hash || "").replace(/^#/, "");
+      if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return;
+      try {
+        const pair = await Promise.all([loadHistory(), loadSnapshots()]);
+        historyEntries = pair[0];
+        snapshotRows = pair[1];
+        const latest = latestSnapshotDate();
+        if (latest && latest !== selectedDate) {
+          await selectDate(latest, false);
+        } else {
+          renderDatePicker();
+          populateCompareDateSelects();
+          populateBreakdownCompareSelect();
+        }
+      } catch (_e) {
+        /* non-fatal */
+      }
+    }
+
     function setMainTab(which) {
       const snapBtn = document.getElementById("tab-snapshot");
       const woBtn = document.getElementById("tab-work-orders");
@@ -15912,19 +15939,23 @@ function renderDashboardHtml(): string {
       if (isWo) {
         watchCacheByDate.clear();
         woWatchResolvedAsOf = "";
-        void refreshWoTabIndexFromServer().then(function () {
+        void syncGlobalSnapshotDateToServer().then(function () {
           const asOf = woAsOfDate();
           if (asOf) loadAndRenderWoList(asOf, { force: true });
         });
       } else if (isSmx) {
+        void syncGlobalSnapshotDateToServer();
         loadScheduleMxTab();
       } else if (isAuthz) {
         loadAuthzManagerTab();
       } else if (isMel) {
+        void syncGlobalSnapshotDateToServer();
         onEnterMelTab();
       } else if (isMeet) {
+        void syncGlobalSnapshotDateToServer();
         onEnterMeetingTab();
       } else if (isYard) {
+        void syncGlobalSnapshotDateToServer();
         onEnterYardTab();
       } else if (isWv) {
         onEnterWaiversTab();
@@ -15938,6 +15969,7 @@ function renderDashboardHtml(): string {
         onEnterSettingsTab();
       }
       if (isSnap) {
+        void syncGlobalSnapshotDateToServer();
         mcChartLayoutDeferrals = 0;
         requestAnimationFrame(function () {
           requestAnimationFrame(function () {
@@ -17904,6 +17936,11 @@ function renderDashboardHtml(): string {
 
       window.addEventListener("hashchange", async () => {
         await applyHashRoute();
+      });
+
+      document.addEventListener("visibilitychange", function () {
+        if (document.visibilityState !== "visible") return;
+        void syncGlobalSnapshotDateToServer();
       });
 
       document.getElementById("tab-snapshot").addEventListener("click", function () {
