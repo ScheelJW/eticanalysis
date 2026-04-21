@@ -3348,6 +3348,26 @@ function renderWaiverPrintCardHtml(assetId: string, waivers: Waiver[]): string {
     if (d.toLowerCase() === String(w.title ?? "").trim().toLowerCase()) return "";
     return d;
   };
+  const fmtCardDate = (iso: string): string => {
+    const t = Date.parse(iso);
+    if (!Number.isFinite(t)) return (iso ?? "").trim().slice(0, 10) || "—";
+    return new Date(t).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" });
+  };
+  const lastVerifiedLineHtml = (w: Waiver): string => {
+    const at = (w.lastVerifiedAtIso ?? "").trim();
+    const by = (w.lastVerifiedBy ?? "").trim();
+    if (at) {
+      const who = by ? ` · ${escHtml(by)}` : "";
+      return `Last verified: ${escHtml(fmtCardDate(at))}${who}`;
+    }
+    const rap = (w.reviewedAtIso ?? "").trim();
+    const rb = (w.reviewedBy ?? "").trim();
+    if (rap) {
+      const who = rb ? ` · ${escHtml(rb)}` : "";
+      return `On card since: ${escHtml(fmtCardDate(rap))}${who}`;
+    }
+    return "Last verified: —";
+  };
   const n = printRows.length;
   const densityClass =
     n >= 16 ? "wv-print--vheavy" : n >= 10 ? "wv-print--heavy" : n >= 6 ? "wv-print--medium" : "";
@@ -3363,7 +3383,7 @@ function renderWaiverPrintCardHtml(assetId: string, waivers: Waiver[]): string {
           <div class="body">
             <div class="title">${escHtml(w.title)}</div>
             ${descPrint ? `<div class="desc">${escHtml(descPrint)}</div>` : ""}
-            <div class="last-verified">Last verified: legacy</div>
+            <div class="last-verified">${lastVerifiedLineHtml(w)}</div>
           </div>
         </article>`;
     })
