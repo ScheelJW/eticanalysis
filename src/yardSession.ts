@@ -125,7 +125,7 @@ export function normalizeEntryStatus(s: string | null | undefined): YardEntrySta
 
 async function getLatestSnapshotDateKey(env: Env): Promise<string> {
   const row = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT date_key FROM etic_snapshots ORDER BY date_key DESC LIMIT 1`,
+    `SELECT date_key FROM etic_snapshots WHERE deleted_at_iso IS NULL ORDER BY date_key DESC LIMIT 1`,
   ).first<{ date_key: string }>();
   return row?.date_key ?? "";
 }
@@ -721,7 +721,7 @@ export async function getRollingRoster(env: Env): Promise<RollingRoster> {
     ).all<{ asset_id: string; c: number }>(),
     env.ETIC_SNAPSHOTS.prepare(
       `SELECT date_key FROM etic_snapshots
-        WHERE date_key < ? ORDER BY date_key DESC LIMIT 1`,
+        WHERE deleted_at_iso IS NULL AND date_key < ? ORDER BY date_key DESC LIMIT 1`,
     ).bind(dateKey).first<{ date_key: string }>(),
     env.ETIC_SNAPSHOTS.prepare(
       `SELECT yc.asset_id AS asset_id, yc.location AS location

@@ -936,7 +936,7 @@ export async function getScheduleMxFleetForDate(
   const woCounts = await loadWoCountsPerAsset(env, dateKey);
 
   const snap = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT workbook_key FROM etic_snapshots WHERE date_key = ?`,
+    `SELECT workbook_key FROM etic_snapshots WHERE date_key = ? AND deleted_at_iso IS NULL`,
   )
     .bind(dateKey)
     .first<{ workbook_key: string | null }>();

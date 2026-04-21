@@ -368,8 +368,8 @@ export default {
     }
 
     if (url.pathname === "/api/history") {
-      const history = await loadHistory(env);
-      return Response.json(history, { headers: cacheHeaders() });
+      const merged = await mergeHistoryWithActiveSnapshots(env, await loadHistory(env));
+      return Response.json(merged, { headers: cacheHeaders() });
     }
 
     if (url.pathname === "/api/snapshots") {
@@ -385,6 +385,30 @@ export default {
       const relabelTo = url.searchParams.get("to");
       if (request.method === "POST" && relabelFrom && relabelTo) {
         return handleRelabelSnapshot(env, relabelFrom, relabelTo);
+      }
+      if (request.method === "POST") {
+        let body: Record<string, unknown>;
+        try {
+          body = (await request.json()) as Record<string, unknown>;
+        } catch {
+          return Response.json({ error: "Invalid JSON" }, { status: 400, headers: cacheHeaders() });
+        }
+        const dateKey = String(body.dateKey ?? "").trim();
+        const action = String(body.action ?? "soft_delete").trim().toLowerCase();
+        if (action === "soft_delete" || action === "delete") {
+          const r = await setSnapshotSoftDeleted(env, dateKey, true);
+          if (!r.ok) return Response.json({ error: r.error }, { status: r.error?.includes("No snapshot") ? 404 : 400, headers: cacheHeaders() });
+          return Response.json({ ok: true, dateKey, softDeleted: true }, { headers: cacheHeaders() });
+        }
+        if (action === "restore" || action === "undelete") {
+          const r = await setSnapshotSoftDeleted(env, dateKey, false);
+          if (!r.ok) return Response.json({ error: r.error }, { status: r.error?.includes("No snapshot") ? 404 : 400, headers: cacheHeaders() });
+          return Response.json({ ok: true, dateKey, restored: true }, { headers: cacheHeaders() });
+        }
+        return Response.json(
+          { error: "Unknown action (use soft_delete or restore)" },
+          { status: 400, headers: cacheHeaders() },
+        );
       }
       return handleSnapshotsList(env);
     }
@@ -730,7 +754,7 @@ async function resolveYardCheckWorkbook(
   | { ok: true; workbookKey: string; sourceFileName: string; sourceDateKey: string }
   | { ok: false; error: string }
 > {
-  const history = await loadHistory(env);
+  const history = await mergeHistoryWithActiveSnapshots(env, await loadHistory(env));
   const latest = await readJson<AnalysisResult>(env, "analyses/latest.json");
 
   if (dateKey) {
@@ -899,6 +923,7 @@ async function upsertSnapshotRow(env: Env, analysis: AnalysisResult, workbookKey
       visible_sheets = excluded.visible_sheets,
       hidden_sheets = excluded.hidden_sheets,
       updated_at_iso = excluded.updated_at_iso,
+      deleted_at_iso = NULL,
       asset_manager_breakdown = CASE
         WHEN excluded.asset_manager_breakdown <> '' THEN excluded.asset_manager_breakdown
         ELSE etic_snapshots.asset_manager_breakdown
@@ -941,6 +966,7 @@ type SnapshotListRow = {
   visibleSheets: number | null;
   hiddenSheets: number | null;
   updatedAtIso: string;
+  deletedAtIso: string | null;
 };
 
 /**
@@ -1088,8 +1114,11 @@ async function handleSnapshotsList(env: Env): Promise<Response> {
   const result = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT date_key, workbook_key, workbook_file_name, received_at_iso,
             mc_rate, fleet_total, fmc, nmc, surplus, asset_manager_ok,
-            total_rows, mel_total, visible_sheets, hidden_sheets, updated_at_iso
-     FROM etic_snapshots ORDER BY date_key DESC`,
+            total_rows, mel_total, visible_sheets, hidden_sheets, updated_at_iso,
+            deleted_at_iso
+     FROM etic_snapshots
+     WHERE deleted_at_iso IS NULL
+     ORDER BY date_key DESC`,
   ).all<{
     date_key: string;
     workbook_key: string;
@@ -1106,6 +1135,7 @@ async function handleSnapshotsList(env: Env): Promise<Response> {
     visible_sheets: number | null;
     hidden_sheets: number | null;
     updated_at_iso: string;
+    deleted_at_iso: string | null;
   }>();
 
   const rows: SnapshotListRow[] = (result.results ?? []).map((r) => ({
@@ -1124,6 +1154,7 @@ async function handleSnapshotsList(env: Env): Promise<Response> {
     visibleSheets: r.visible_sheets,
     hiddenSheets: r.hidden_sheets,
     updatedAtIso: r.updated_at_iso,
+    deletedAtIso: r.deleted_at_iso,
   }));
 
   return Response.json({ updatedAtIso: new Date().toISOString(), snapshots: rows }, { headers: cacheHeaders() });
@@ -1146,7 +1177,7 @@ async function handleMcSeriesApi(env: Env, url: URL): Promise<Response> {
   if (mode === "fleet") {
     const r = await env.ETIC_SNAPSHOTS.prepare(
       `SELECT date_key, mc_rate, fmc, nmc FROM etic_snapshots
-       WHERE date_key >= ? AND date_key <= ? ORDER BY date_key ASC`,
+       WHERE deleted_at_iso IS NULL AND date_key >= ? AND date_key <= ? ORDER BY date_key ASC`,
     )
       .bind(from, to)
       .all<{ date_key: string; mc_rate: number | null; fmc: number | null; nmc: number | null }>();
@@ -1169,7 +1200,7 @@ async function handleMcSeriesApi(env: Env, url: URL): Promise<Response> {
     const keyLc = key.toLowerCase();
     const r = await env.ETIC_SNAPSHOTS.prepare(
       `SELECT date_key, asset_manager_breakdown FROM etic_snapshots
-       WHERE date_key >= ? AND date_key <= ? ORDER BY date_key ASC`,
+       WHERE deleted_at_iso IS NULL AND date_key >= ? AND date_key <= ? ORDER BY date_key ASC`,
     )
       .bind(from, to)
       .all<{ date_key: string; asset_manager_breakdown: string | null }>();
@@ -1346,7 +1377,7 @@ async function handleMcSeriesDimensionsApi(env: Env, url: URL): Promise<Response
       .all<{ v: string }>(),
     env.ETIC_SNAPSHOTS.prepare(
       `SELECT asset_manager_breakdown AS j FROM etic_snapshots
-       WHERE date_key >= ? AND date_key <= ?
+       WHERE deleted_at_iso IS NULL AND date_key >= ? AND date_key <= ?
          AND asset_manager_breakdown IS NOT NULL AND TRIM(asset_manager_breakdown) != ''`,
     )
       .bind(from, to)
@@ -1408,7 +1439,7 @@ async function enrichAnalysisAssetManagerFromR2(env: Env, analysis: AnalysisResu
   // empty and re-extract from R2.
   const dbRow = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT mc_rate, fleet_total, fmc, nmc, surplus, asset_manager_ok, asset_manager_breakdown
-       FROM etic_snapshots WHERE date_key = ?`,
+       FROM etic_snapshots WHERE date_key = ? AND deleted_at_iso IS NULL`,
   )
     .bind(analysis.dateKey)
     .first<{
@@ -4174,7 +4205,7 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
     return new Response("Invalid date", { status: 400 });
   }
   if (!asOf) {
-    const history = await loadHistory(env);
+    const history = await mergeHistoryWithActiveSnapshots(env, await loadHistory(env));
     const latest = history.entries.length
       ? [...history.entries].sort((a, b) => b.dateKey.localeCompare(a.dateKey))[0]
       : null;
@@ -4211,7 +4242,7 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
   // replay it on the fly and re-query. Cheap one-shot, idempotent.
   let healed = false;
   if (scope !== "all" && rows.length === 0) {
-    const history = await loadHistory(env);
+    const history = await mergeHistoryWithActiveSnapshots(env, await loadHistory(env));
     const entry = history.entries.find((e) => e.dateKey === asOf);
     if (entry) {
       const replayed = await replayWorkOrderWatchForDate(env, asOf);
@@ -4235,7 +4266,7 @@ async function handleScheduleMxApi(env: Env, request: Request): Promise<Response
   const url = new URL(request.url);
   let dateKey = url.searchParams.get("date")?.trim() ?? "";
   if (!dateKey) {
-    const history = await loadHistory(env);
+    const history = await mergeHistoryWithActiveSnapshots(env, await loadHistory(env));
     const latest = history.entries.length
       ? [...history.entries].sort((a, b) => b.dateKey.localeCompare(a.dateKey))[0]
       : null;
@@ -4411,6 +4442,112 @@ async function loadHistory(env: Env): Promise<HistoryIndex> {
     return existing;
   }
   return { updatedAtIso: new Date().toISOString(), entries: [] };
+}
+
+type EticSnapshotIndexRow = {
+  date_key: string;
+  deleted_at_iso: string | null;
+  workbook_key: string;
+  workbook_file_name: string;
+  received_at_iso: string;
+  total_visible_sheets: number | null;
+  total_hidden_sheets: number | null;
+  total_rows: number | null;
+  mel_total: number | null;
+};
+
+async function loadAllEticSnapshotIndexRows(env: Env): Promise<EticSnapshotIndexRow[]> {
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT date_key, deleted_at_iso, workbook_key, workbook_file_name, received_at_iso,
+            visible_sheets AS total_visible_sheets, hidden_sheets AS total_hidden_sheets,
+            total_rows, mel_total
+     FROM etic_snapshots`,
+  ).all<EticSnapshotIndexRow>();
+  return r.results ?? [];
+}
+
+function syntheticHistoryEntryFromD1Row(r: EticSnapshotIndexRow): HistoryEntry {
+  return {
+    dateKey: r.date_key,
+    receivedAtIso: r.received_at_iso,
+    workbookFileName: r.workbook_file_name,
+    workbookKey: r.workbook_key,
+    analysisKey: `analyses/${r.date_key}.json`,
+    totalVisibleSheets: r.total_visible_sheets ?? 0,
+    totalHiddenSheets: r.total_hidden_sheets ?? 0,
+    totalRowsAcrossSheets: r.total_rows ?? 0,
+    melMentionsTotal: r.mel_total ?? 0,
+    diff: {
+      previousDateKey: null,
+      deltaTotalRows: null,
+      deltaMelMentionsTotal: null,
+      deltaSheetsVisible: null,
+    },
+  };
+}
+
+/**
+ * R2 history/index.json can lag behind D1 (or miss a day entirely). The
+ * dashboard date picker and "Latest" use merged history: R2 entries minus
+ * D1-soft-deleted dates, plus D1-active rows missing from R2.
+ */
+async function mergeHistoryWithActiveSnapshots(env: Env, history: HistoryIndex): Promise<HistoryIndex> {
+  const rows = await loadAllEticSnapshotIndexRows(env);
+  const deleted = new Set<string>();
+  const activeByKey = new Map<string, EticSnapshotIndexRow>();
+  for (const row of rows) {
+    if (row.deleted_at_iso) deleted.add(row.date_key);
+    else activeByKey.set(row.date_key, row);
+  }
+
+  const fromHist = history.entries.filter((e) => !deleted.has(e.dateKey));
+  const keysFromHist = new Set(fromHist.map((e) => e.dateKey));
+  const merged: HistoryEntry[] = [...fromHist];
+  for (const [dk, row] of activeByKey) {
+    if (!keysFromHist.has(dk)) merged.push(syntheticHistoryEntryFromD1Row(row));
+  }
+  merged.sort((a, b) => a.dateKey.localeCompare(b.dateKey));
+  return {
+    updatedAtIso: history.updatedAtIso,
+    entries: merged,
+  };
+}
+
+async function setSnapshotSoftDeleted(
+  env: Env,
+  dateKey: string,
+  deleted: boolean,
+): Promise<{ ok: boolean; error?: string; rowCount?: number }> {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) {
+    return { ok: false, error: "dateKey must be YYYY-MM-DD" };
+  }
+  const iso = deleted ? new Date().toISOString() : null;
+  const res = await env.ETIC_SNAPSHOTS.prepare(
+    `UPDATE etic_snapshots SET deleted_at_iso = ?, updated_at_iso = ? WHERE date_key = ?`,
+  )
+    .bind(iso, new Date().toISOString(), dateKey)
+    .run();
+  const rowCount = res.meta?.changes ?? 0;
+  if (!rowCount) return { ok: false, error: `No snapshot row for ${dateKey}` };
+  await syncAnalysesLatestJsonFromActiveSnapshots(env);
+  return { ok: true, rowCount };
+}
+
+async function getLatestActiveAnalysisFromD1(env: Env): Promise<AnalysisResult | null> {
+  const row = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT date_key FROM etic_snapshots WHERE deleted_at_iso IS NULL ORDER BY date_key DESC LIMIT 1`,
+  ).first<{ date_key: string }>();
+  if (!row?.date_key) return null;
+  return readJson<AnalysisResult>(env, `analyses/${row.date_key}.json`);
+}
+
+/** Keep R2 analyses/latest.json aligned with the newest non-deleted D1 snapshot. */
+async function syncAnalysesLatestJsonFromActiveSnapshots(env: Env): Promise<void> {
+  const analysis = await getLatestActiveAnalysisFromD1(env);
+  if (!analysis) return;
+  await env.ETIC_BUCKET.put("analyses/latest.json", JSON.stringify(analysis, null, 2), {
+    httpMetadata: { contentType: "application/json; charset=utf-8" },
+  });
 }
 
 function upsertHistoryEntry(
@@ -7625,6 +7762,12 @@ function renderDashboardHtml(): string {
     .compare-table .fmc { color: var(--success); }
     .compare-table .nmc { color: var(--danger); }
     .compare-table .surp { color: var(--warn); }
+    .compare-table .snap-actions {
+      width: 1%;
+      white-space: nowrap;
+      text-align: right;
+    }
+    .compare-table .snap-actions .snap-del { font-size: 0.78rem; padding: 2px 8px; }
     .compare-table tr[data-in-range="true"] td,
     .compare-table tr[data-in-range="true"] td:first-child {
       background: rgba(0,58,140,0.06);
@@ -12537,8 +12680,8 @@ function renderDashboardHtml(): string {
             <div class="cmp-summary" id="cmp-summary"></div>
             <div class="table-wrap">
               <table class="compare-table" id="compare-table" aria-label="Snapshot history">
-                <thead><tr><th>Report date</th><th>MC %</th><th>Δ MC</th><th>Fleet</th><th>FMC</th><th>NMC</th><th>Surplus</th></tr></thead>
-                <tbody id="compare-body"><tr><td colspan="7" style="text-align:center;color:var(--muted)">Loading…</td></tr></tbody>
+                <thead><tr><th>Report date</th><th>MC %</th><th>Δ MC</th><th>Fleet</th><th>FMC</th><th>NMC</th><th>Surplus</th><th></th></tr></thead>
+                <tbody id="compare-body"><tr><td colspan="8" style="text-align:center;color:var(--muted)">Loading…</td></tr></tbody>
               </table>
             </div>
           </div>
@@ -13895,6 +14038,16 @@ function renderDashboardHtml(): string {
       return [...entries].sort((a, b) => b.dateKey.localeCompare(a.dateKey));
     }
 
+    /** Merged /api/history already excludes soft-deleted D1 snapshots. */
+    function activeHistoryDesc() {
+      return sortDesc(historyEntries);
+    }
+
+    function latestHistoryDateKey() {
+      const a = activeHistoryDesc();
+      return a.length ? a[0].dateKey : "";
+    }
+
     function dayOfWeekShort(dateKey) {
       try {
         const [y, m, d] = dateKey.split("-").map(Number);
@@ -14062,7 +14215,7 @@ function renderDashboardHtml(): string {
      * Latest / Prev / Next jump buttons — scales cleanly to years of files.
      * --------------------------------------------------------------------- */
     function latestSnapshotDate() {
-      const sorted = sortDesc(historyEntries);
+      const sorted = activeHistoryDesc();
       return sorted.length ? sorted[0].dateKey : null;
     }
 
@@ -14073,7 +14226,7 @@ function renderDashboardHtml(): string {
       const nextBtn = document.getElementById("date-jump-next");
       const meta = document.getElementById("date-picker-meta");
       if (!sel) return;
-      const sorted = sortDesc(historyEntries);
+      const sorted = activeHistoryDesc();
       const latestKey = sorted[0] ? sorted[0].dateKey : null;
 
       // Group by year so users with hundreds of snapshots get a tidy picker.
@@ -14108,7 +14261,7 @@ function renderDashboardHtml(): string {
     }
 
     function jumpDateRel(delta) {
-      const sorted = sortDesc(historyEntries);
+      const sorted = activeHistoryDesc();
       const idx = sorted.findIndex(function (e) { return e.dateKey === selectedDate; });
       if (idx < 0) return;
       const nextIdx = Math.max(0, Math.min(sorted.length - 1, idx + delta));
@@ -14126,7 +14279,7 @@ function renderDashboardHtml(): string {
       const body = document.getElementById("compare-body");
       const hint = document.getElementById("compare-hint");
       if (!snapshotRows.length) {
-        body.innerHTML = "<tr><td colspan='7' style='text-align:center;color:var(--muted)'>No rows in index yet. Reload after a moment, or ingest a new ETIC.</td></tr>";
+        body.innerHTML = "<tr><td colspan='8' style='text-align:center;color:var(--muted)'>No rows in index yet. Reload after a moment, or ingest a new ETIC.</td></tr>";
         return;
       }
       const sorted = [...snapshotRows].sort((a, b) => b.dateKey.localeCompare(a.dateKey));
@@ -14163,6 +14316,9 @@ function renderDashboardHtml(): string {
           "<td class='fmc'>" + esc(fmc) + "</td>" +
           "<td class='nmc'>" + esc(nmc) + "</td>" +
           "<td class='surp'>" + esc(sur) + "</td>" +
+          "<td class='snap-actions'>" +
+          "<button type='button' class='ghost snap-del' data-snap-del='" + esc(r.dateKey) + "' title='Hide this snapshot from lists (soft delete)'>Delete</button>" +
+          "</td>" +
           "</tr>"
         );
       }).join("");
@@ -14170,6 +14326,41 @@ function renderDashboardHtml(): string {
         tr.addEventListener("click", function () {
           const dk = tr.getAttribute("data-date");
           if (dk && dk !== selectedDate) selectDate(dk, true);
+        });
+      });
+      body.querySelectorAll("button[data-snap-del]").forEach(function (btn) {
+        btn.addEventListener("click", function (ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          const dk = btn.getAttribute("data-snap-del");
+          if (!dk) return;
+          if (!confirm("Hide snapshot " + fmtKeyShort(dk) + " from the dashboard? (You can restore it later.)")) return;
+          fetch("/api/snapshots", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ dateKey: dk, action: "soft_delete" }),
+          })
+            .then(function (res) { return res.json().then(function (j) { return { res: res, j: j }; }); })
+            .then(function (o) {
+              if (!o.res.ok) throw new Error((o.j && o.j.error) || "Delete failed");
+              return Promise.all([loadHistory(), loadSnapshots()]);
+            })
+            .then(function (pair) {
+              historyEntries = pair[0];
+              snapshotRows = pair[1];
+              const still = snapshotRows.some(function (r) { return r.dateKey === selectedDate; });
+              if (selectedDate === dk || !still) {
+                const next = latestSnapshotDate();
+                selectedDate = next || (snapshotRows[0] && snapshotRows[0].dateKey) || null;
+              }
+              renderDatePicker();
+              populateCompareDateSelects();
+              populateBreakdownCompareSelect();
+              renderCompareTable();
+              renderCompareSummary();
+              if (selectedDate) return selectDate(selectedDate, true);
+            })
+            .catch(function (e) { alert(e.message || String(e)); });
         });
       });
     }
@@ -14197,7 +14388,7 @@ function renderDashboardHtml(): string {
      * available snapshot key so the answer always fits the data we have.
      */
     function presetRange(preset, latestKey) {
-      const latest = latestKey || (historyEntries[0] && historyEntries[0].dateKey) || new Date().toISOString().slice(0, 10);
+      const latest = latestKey || latestHistoryDateKey() || new Date().toISOString().slice(0, 10);
       const ld = new Date(latest + "T00:00:00Z");
       const ly = ld.getUTCFullYear();
       const lm = ld.getUTCMonth();
@@ -14240,7 +14431,7 @@ function renderDashboardHtml(): string {
      */
     function snapPresetToSnapshots(range) {
       if (!range) return null;
-      const sorted = sortDesc(historyEntries).slice().reverse(); // ascending
+      const sorted = activeHistoryDesc().slice().reverse(); // ascending
       const inRange = sorted.filter(function (e) {
         return e.dateKey >= range.fromISO && e.dateKey <= range.toISO;
       });
@@ -14254,7 +14445,7 @@ function renderDashboardHtml(): string {
     function refreshPresetChipsState(containerId, activeFrom, activeTo) {
       const root = document.getElementById(containerId);
       if (!root) return;
-      const latest = (historyEntries[0] && historyEntries[0].dateKey) || "";
+      const latest = latestHistoryDateKey();
       root.querySelectorAll(".preset-chip").forEach(function (btn) {
         const key = btn.getAttribute("data-preset");
         const snap = snapPresetToSnapshots(presetRange(key, latest));
@@ -14269,7 +14460,7 @@ function renderDashboardHtml(): string {
       const fromSel = document.getElementById("cmp-from");
       const toSel = document.getElementById("cmp-to");
       if (!fromSel || !toSel) return;
-      const sorted = sortDesc(historyEntries);
+      const sorted = activeHistoryDesc();
       const opts = '<option value="">— pick a date —</option>' + sorted.map(function (e) {
         return "<option value='" + esc(e.dateKey) + "'>" + esc(fmtKeyShort(e.dateKey)) + "</option>";
       }).join("");
@@ -14566,7 +14757,7 @@ function renderDashboardHtml(): string {
     }
 
     function setMcChartDefaultRange() {
-      const sorted = sortDesc(historyEntries);
+      const sorted = activeHistoryDesc();
       if (!sorted.length) return;
       const fromEl = document.getElementById("mc-chart-from");
       const toEl = document.getElementById("mc-chart-to");
@@ -15114,7 +15305,7 @@ function renderDashboardHtml(): string {
           const chip = ev.target.closest(".preset-chip");
           if (!chip || chip.disabled) return;
           const key = chip.getAttribute("data-preset");
-          const latest = (historyEntries[0] && historyEntries[0].dateKey) || "";
+          const latest = latestHistoryDateKey();
           const snap = snapPresetToSnapshots(presetRange(key, latest));
           if (!snap) return;
           const fromEl = document.getElementById("mc-chart-from");
@@ -16640,7 +16831,7 @@ function renderDashboardHtml(): string {
         // load analysis; otherwise the UI stays blank until the user changes date.
         await selectDate(selectedDate, false);
       } else {
-        const sorted = sortDesc(historyEntries);
+        const sorted = activeHistoryDesc();
         if (sorted.length) await selectDate(sorted[0].dateKey, false);
       }
     }
@@ -17163,7 +17354,7 @@ function renderDashboardHtml(): string {
         populateBreakdownCompareSelect();
       }, 3000);
 
-      const sorted = sortDesc(historyEntries);
+      const sorted = activeHistoryDesc();
       const route = readHashRoute();
       const start =
         route.tab === "snapshot" && route.dateKey && sorted.some((e) => e.dateKey === route.dateKey)
@@ -17221,7 +17412,7 @@ function renderDashboardHtml(): string {
           const btn = ev.target.closest(".preset-chip");
           if (!btn || btn.disabled) return;
           const key = btn.getAttribute("data-preset");
-          const latest = (historyEntries[0] && historyEntries[0].dateKey) || "";
+          const latest = latestHistoryDateKey();
           const snap = snapPresetToSnapshots(presetRange(key, latest));
           if (!snap) return;
           compareState.from = snap.from;
@@ -17263,7 +17454,7 @@ function renderDashboardHtml(): string {
           const btn = ev.target.closest(".preset-chip");
           if (!btn || btn.disabled) return;
           const key = btn.getAttribute("data-preset");
-          const anchor = selectedDate || (historyEntries[0] && historyEntries[0].dateKey) || "";
+          const anchor = selectedDate || latestHistoryDateKey();
           const snap = snapPresetToSnapshots(presetRange(key, anchor));
           if (!snap || !snap.from) return;
           // For single-date compare we only need the FROM. Avoid picking
@@ -17550,8 +17741,7 @@ function renderDashboardHtml(): string {
     }
 
     function latestSnapshotDateKey() {
-      const entries = sortDesc(historyEntries);
-      return entries[0] ? entries[0].dateKey : "";
+      return latestHistoryDateKey();
     }
 
     /* ============================ MEL tab ================================ */
