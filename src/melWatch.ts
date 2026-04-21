@@ -259,14 +259,16 @@ export async function ingestMelSnapshot(
   ];
 
   const changeStmts: D1PreparedStatement[] = [];
-  // INSERT OR IGNORE pairs with the UNIQUE(mel_key, snapshot_date_key, field) index
-  // added in migration 0017. Same rationale as the WO changelog: re-ingest of a
-  // snapshot is now idempotent instead of producing a duplicate row per field per
-  // day. We also keep ON CONFLICT semantics simple — first observation wins.
+  // One row per (mel_key, snapshot_date_key, field) — migration 0017. Re-ingest of
+  // the same date with updated cells must refresh old/new values, not ignore.
   const insertChange = env.ETIC_SNAPSHOTS.prepare(
-    `INSERT OR IGNORE INTO mel_changelog
+    `INSERT INTO mel_changelog
        (mel_key, snapshot_date_key, field, old_value, new_value, created_at_iso)
-     VALUES (?,?,?,?,?,?)`,
+     VALUES (?,?,?,?,?,?)
+     ON CONFLICT(mel_key, snapshot_date_key, field) DO UPDATE SET
+       created_at_iso = excluded.created_at_iso,
+       old_value = excluded.old_value,
+       new_value = excluded.new_value`,
   );
   let changes = 0;
   for (const r of rows) {
