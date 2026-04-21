@@ -230,14 +230,17 @@ export async function ingestWorkOrderSnapshot(
     }
   }
 
-  // INSERT OR IGNORE pairs with the UNIQUE(work_order_id, snapshot_date_key, field)
-  // index added in migration 0017. Re-ingesting the same snapshot (rebuild history,
-  // replay, or a re-emailed workbook for the same day) is now a no-op for the
-  // changelog instead of doubling every change row, which was the root cause of the
-  // duplicated MEL TIER / PARTS entries showing up on the WO change timeline.
+  // One row per (work_order_id, snapshot_date_key, field) — migration 0017 unique index.
+  // Re-ingesting the **same report date** with a corrected workbook must UPDATE the
+  // changelog row; INSERT OR IGNORE left stale old_value/new_value so the UI looked
+  // like "nothing changed" between spreadsheets.
   const insertLog = env.ETIC_SNAPSHOTS.prepare(
-    `INSERT OR IGNORE INTO work_order_changelog (work_order_id, snapshot_date_key, changed_at_iso, field, old_value, new_value)
-     VALUES (?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO work_order_changelog (work_order_id, snapshot_date_key, changed_at_iso, field, old_value, new_value)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(work_order_id, snapshot_date_key, field) DO UPDATE SET
+       changed_at_iso = excluded.changed_at_iso,
+       old_value = excluded.old_value,
+       new_value = excluded.new_value`,
   );
   const upsert = env.ETIC_SNAPSHOTS.prepare(
     `INSERT INTO work_order_state (

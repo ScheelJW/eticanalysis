@@ -85,6 +85,7 @@ import {
 import {
   deleteMelConfig,
   deleteMelSubdivision,
+  diagnoseMelExtractFromBinary,
   extractMelRowsFromBinary,
   getAllAppConfig,
   getAllMelConfig,
@@ -314,6 +315,31 @@ export default {
       await ingestWorkOrderSnapshot(env, dateKey, rawWos, now.toISOString(), workbookBytes);
 
       const melRows = await extractMelRowsFromBinary(workbookBytes);
+      if (!melRows.length) {
+        try {
+          const diag = await diagnoseMelExtractFromBinary(workbookBytes);
+          const stamp = now.toISOString().replace(/[:.]/g, "-");
+          await env.ETIC_BUCKET.put(
+            `ingest-warnings/mel-extract-empty_${dateKey}_${stamp}.json`,
+            JSON.stringify({ ...ingestContext, melExtract: diag }, null, 2),
+            { httpMetadata: { contentType: "application/json; charset=utf-8" } },
+          );
+          await env.ETIC_BUCKET.put(
+            "ingest-warnings/mel-extract-empty-latest.json",
+            JSON.stringify({ ...ingestContext, melExtract: diag }, null, 2),
+            { httpMetadata: { contentType: "application/json; charset=utf-8" } },
+          );
+        } catch (_w) {
+          /* best-effort */
+        }
+        console.warn(
+          JSON.stringify({
+            level: "warn",
+            message: "MEL Calculator extract returned 0 rows — MEL tab will not advance for this ingest date",
+            ...ingestContext,
+          }),
+        );
+      }
       await ingestMelSnapshot(env, dateKey, melRows, now.toISOString());
 
       const history = await loadHistory(env);
@@ -371,7 +397,7 @@ export default {
     }
 
     if (url.pathname === "/api/history") {
-      const merged = await mergeHistoryWithActiveSnapshots(env, await loadHistory(env));
+      const merged = await getMergedHistoryIndexMaybeRepairR2(env);
       return Response.json(merged, { headers: cacheHeaders() });
     }
 
@@ -758,7 +784,7 @@ async function resolveYardCheckWorkbook(
   | { ok: true; workbookKey: string; sourceFileName: string; sourceDateKey: string }
   | { ok: false; error: string }
 > {
-  const history = await mergeHistoryWithActiveSnapshots(env, await loadHistory(env));
+  const history = await getMergedHistoryIndexMaybeRepairR2(env);
   const latest = await readJson<AnalysisResult>(env, "analyses/latest.json");
 
   if (dateKey) {
@@ -1697,13 +1723,19 @@ async function handleDebugMelHeaders(env: Env, url: URL): Promise<Response> {
 /** Latest (or for-a-given-date) per-key MEL state plus rollup. */
 async function handleMelApi(env: Env, url: URL): Promise<Response> {
   const dateParam = url.searchParams.get("date");
-  const [rows, dates, configs, subdivisions] = await Promise.all([
+  const [rows, dates, configs, subdivisions, woSnapMax] = await Promise.all([
     dateParam ? getMelForDate(env, dateParam) : getMelLatest(env),
     getMelSnapshotDates(env),
     getAllMelConfig(env),
     getMelSubdivisions(env),
+    env.ETIC_SNAPSHOTS.prepare(
+      `SELECT MAX(snapshot_date_key) AS d FROM work_order_snapshot WHERE TRIM(COALESCE(asset_id, '')) != ''`,
+    ).first<{ d: string | null }>(),
   ]);
   const latestDate = dates[0] ?? null;
+  const workOrderSnapshotLatestDate = (woSnapMax?.d ?? "").trim() || null;
+  const melIngestBehindWorkOrders =
+    !!workOrderSnapshotLatestDate && !!latestDate && workOrderSnapshotLatestDate > latestDate;
   const configByKey = new Map(configs.map((c) => [c.mel_key, c]));
   const subsByKey = new Map<string, typeof subdivisions>();
   for (const s of subdivisions) {
@@ -1740,6 +1772,8 @@ async function handleMelApi(env: Env, url: URL): Promise<Response> {
     {
       asOfDate: dateParam ?? latestDate,
       latestDate,
+      workOrderSnapshotLatestDate,
+      melIngestBehindWorkOrders,
       availableDates: dates,
       totals: {
         keys: rows.length,
@@ -4231,7 +4265,7 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
     return new Response("Invalid date", { status: 400 });
   }
   if (!asOf) {
-    const history = await mergeHistoryWithActiveSnapshots(env, await loadHistory(env));
+    const history = await getMergedHistoryIndexMaybeRepairR2(env);
     const latest = history.entries.length
       ? [...history.entries].sort((a, b) => b.dateKey.localeCompare(a.dateKey))[0]
       : null;
@@ -4260,29 +4294,55 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
   }
 
   const scope = (url.searchParams.get("scope") ?? "snapshot").toLowerCase();
+  const requestedAsOf = asOf;
+  let resolvedAsOf = asOf;
   let rows = scope === "all"
-    ? await getWatchRowsLatest(env, asOf)
-    : await getWatchRowsForDate(env, asOf);
+    ? await getWatchRowsLatest(env, resolvedAsOf)
+    : await getWatchRowsForDate(env, resolvedAsOf);
   // Self-heal: if scope=snapshot returned 0 rows for a date that does have a
   // workbook in R2 (e.g. ingest never wrote per-row history for that date),
   // replay it on the fly and re-query. Cheap one-shot, idempotent.
   let healed = false;
   if (scope !== "all" && rows.length === 0) {
-    const history = await mergeHistoryWithActiveSnapshots(env, await loadHistory(env));
-    const entry = history.entries.find((e) => e.dateKey === asOf);
+    const history = await getMergedHistoryIndexMaybeRepairR2(env);
+    const entry = history.entries.find((e) => e.dateKey === resolvedAsOf);
     if (entry) {
-      const replayed = await replayWorkOrderWatchForDate(env, asOf);
+      const replayed = await replayWorkOrderWatchForDate(env, resolvedAsOf);
       if (replayed > 0) {
-        rows = await getWatchRowsForDate(env, asOf);
+        rows = await getWatchRowsForDate(env, resolvedAsOf);
         healed = true;
       }
+    }
+  }
+  // History/D1 index can list a date (e.g. new etic_snapshots row) before
+  // work_order_snapshot rows exist for that day — WO tab would go blank.
+  // Fall back to the newest snapshot_date_key that actually has rows.
+  let snapshotFallback = false;
+  if (scope !== "all" && rows.length === 0) {
+    const row = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT MAX(snapshot_date_key) AS d FROM work_order_snapshot WHERE TRIM(COALESCE(work_order_id, '')) != ''`,
+    ).first<{ d: string | null }>();
+    const fb = (row?.d ?? "").trim();
+    if (fb && fb !== resolvedAsOf) {
+      resolvedAsOf = fb;
+      rows = await getWatchRowsForDate(env, resolvedAsOf);
+      snapshotFallback = true;
     }
   }
   const staleOnly = url.searchParams.get("stale") === "1";
   const filtered = staleOnly ? rows.filter((r) => r.remarkStale) : rows;
   const staleCount = rows.filter((r) => r.remarkStale).length;
   return Response.json(
-    { asOfDateKey: asOf, scope, staleCount, total: rows.length, rows: filtered, healed },
+    {
+      asOfDateKey: resolvedAsOf,
+      requestedAsOfDateKey: snapshotFallback ? requestedAsOf : null,
+      snapshotFallback,
+      scope,
+      staleCount,
+      total: rows.length,
+      rows: filtered,
+      healed,
+    },
     { headers: cacheHeaders() },
   );
 }
@@ -4292,7 +4352,7 @@ async function handleScheduleMxApi(env: Env, request: Request): Promise<Response
   const url = new URL(request.url);
   let dateKey = url.searchParams.get("date")?.trim() ?? "";
   if (!dateKey) {
-    const history = await mergeHistoryWithActiveSnapshots(env, await loadHistory(env));
+    const history = await getMergedHistoryIndexMaybeRepairR2(env);
     const latest = history.entries.length
       ? [...history.entries].sort((a, b) => b.dateKey.localeCompare(a.dateKey))[0]
       : null;
@@ -4553,6 +4613,51 @@ async function mergeHistoryWithActiveSnapshots(env: Env, history: HistoryIndex):
     updatedAtIso: history.updatedAtIso,
     entries: merged,
   };
+}
+
+/**
+ * Email ingest can write D1 `etic_snapshots` + workbook keys but fail before
+ * `history/index.json` is updated (or R2 was never written for that day). The
+ * dashboard merge adds synthetic entries in memory only — the next page load
+ * still reads stale R2 and "Latest" stays on yesterday. When merged history
+ * contains any date missing from raw R2, rewrite `history/index.json` so R2
+ * catches up to D1.
+ */
+async function getMergedHistoryIndexMaybeRepairR2(env: Env): Promise<HistoryIndex> {
+  const raw = await loadHistory(env);
+  const merged = await mergeHistoryWithActiveSnapshots(env, raw);
+  const rawKeys = new Set((raw.entries ?? []).map((e) => e.dateKey));
+  let needsRepair = false;
+  for (const e of merged.entries) {
+    if (!rawKeys.has(e.dateKey)) {
+      needsRepair = true;
+      break;
+    }
+  }
+  if (needsRepair) {
+    const repaired: HistoryIndex = {
+      ...merged,
+      updatedAtIso: new Date().toISOString(),
+    };
+    try {
+      await env.ETIC_BUCKET.put(
+        "history/index.json",
+        JSON.stringify(repaired, null, 2),
+        {
+          httpMetadata: { contentType: "application/json; charset=utf-8" },
+        },
+      );
+    } catch (err) {
+      console.error(
+        JSON.stringify({
+          level: "error",
+          message: "Failed to repair history/index.json from D1 etic_snapshots",
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
+    }
+  }
+  return merged;
 }
 
 async function setSnapshotSoftDeleted(
@@ -10831,6 +10936,18 @@ function renderDashboardHtml(): string {
     @media (max-width: 980px) { .mel-layout { grid-template-columns: 1fr; } }
     .mel-sidebar { min-width: 0; }
     .mel-list-meta { color: var(--muted); font-size: 0.8rem; margin-bottom: 10px; }
+    .mel-ingest-warn {
+      display: none;
+      margin: 0 0 14px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid #c9a227;
+      background: #fff8e6;
+      color: #3d3200;
+      font-size: 0.82rem;
+      line-height: 1.45;
+    }
+    .mel-ingest-warn.show { display: block; }
     .mel-list { display: flex; flex-direction: column; gap: 8px; max-height: 72vh; overflow-y: auto; padding-right: 4px; }
     .mel-card {
       text-align: left; width: 100%; cursor: pointer;
@@ -13137,6 +13254,8 @@ function renderDashboardHtml(): string {
           <div class="mel-trend-body" id="mel-trend-body"></div>
         </details>
 
+        <div id="mel-ingest-warn" class="mel-ingest-warn" role="status" aria-live="polite"></div>
+
         <div class="mel-compare-bar">
           <label class="mel-cmp-field">
             <span>Compare to</span>
@@ -14370,6 +14489,8 @@ function renderDashboardHtml(): string {
     let selectedDate = null;
     let snapshotRows = [];
     const watchCacheByDate = new Map();
+    /** Last /api/watch list response asOfDateKey (may differ from requested date when server falls back). */
+    let woWatchResolvedAsOf = "";
     const changelogCache = new Map();
     let selectedWoId = null;
     let woFilter = "all";
@@ -14458,7 +14579,10 @@ function renderDashboardHtml(): string {
       if (!res.ok) { watchCacheByDate.set(dateKey, []); return []; }
       const data = await res.json();
       const rows = Array.isArray(data.rows) ? data.rows : [];
+      const resolved = String(data.asOfDateKey || dateKey || "").trim();
+      if (resolved) woWatchResolvedAsOf = resolved;
       watchCacheByDate.set(dateKey, rows);
+      if (resolved && resolved !== dateKey) watchCacheByDate.set(resolved, rows);
       return rows;
     }
 
@@ -15722,10 +15846,54 @@ function renderDashboardHtml(): string {
     /**
      * Work Orders tab is locked to the most-recent snapshot — the change
      * timeline already preserves history, so a date selector adds noise.
-     * This helper centralizes that decision.
+     * Prefer D1 /api/snapshots (real work_order_snapshot days) over merged
+     * /api/history alone, which can list a date before WO rows exist for it.
      */
     function woAsOfDate() {
+      if (woWatchResolvedAsOf) return woWatchResolvedAsOf;
+      const snaps = (snapshotRows || []).slice().sort(function (a, b) { return b.dateKey.localeCompare(a.dateKey); });
+      if (snaps.length) return snaps[0].dateKey;
       return latestSnapshotDate() || selectedDate || "";
+    }
+
+    async function refreshWoTabIndexFromServer() {
+      try {
+        const pair = await Promise.all([loadHistory(), loadSnapshots()]);
+        historyEntries = pair[0];
+        snapshotRows = pair[1];
+        renderDatePicker();
+        populateCompareDateSelects();
+        populateBreakdownCompareSelect();
+      } catch (_e) {
+        /* non-fatal — woAsOfDate still falls back */
+      }
+    }
+
+    /**
+     * After a new email ingest, /api/history + D1 move forward but this SPA
+     * can still have selectedDate stuck on an older day — every tab that keys
+     * off selectedDate or stale history looks "frozen". Refresh from server
+     * and jump to the newest snapshot unless the URL explicitly pins a date
+     * (#YYYY-MM-DD). Does not rewrite hash (avoids clobbering #wo= deep links).
+     */
+    async function syncGlobalSnapshotDateToServer() {
+      const raw = (location.hash || "").replace(/^#/, "");
+      if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return;
+      try {
+        const pair = await Promise.all([loadHistory(), loadSnapshots()]);
+        historyEntries = pair[0];
+        snapshotRows = pair[1];
+        const latest = latestSnapshotDate();
+        if (latest && latest !== selectedDate) {
+          await selectDate(latest, false);
+        } else {
+          renderDatePicker();
+          populateCompareDateSelects();
+          populateBreakdownCompareSelect();
+        }
+      } catch (_e) {
+        /* non-fatal */
+      }
     }
 
     function setMainTab(which) {
@@ -15814,17 +15982,25 @@ function renderDashboardHtml(): string {
         ? "Tune thresholds, mark MEL keys as critical, and define type subdivisions."
         : "Fleet readiness at a glance.";
       if (isWo) {
-        const asOf = woAsOfDate();
-        if (asOf) loadAndRenderWoList(asOf, { force: true });
+        watchCacheByDate.clear();
+        woWatchResolvedAsOf = "";
+        void syncGlobalSnapshotDateToServer().then(function () {
+          const asOf = woAsOfDate();
+          if (asOf) loadAndRenderWoList(asOf, { force: true });
+        });
       } else if (isSmx) {
+        void syncGlobalSnapshotDateToServer();
         loadScheduleMxTab();
       } else if (isAuthz) {
         loadAuthzManagerTab();
       } else if (isMel) {
+        void syncGlobalSnapshotDateToServer();
         onEnterMelTab();
       } else if (isMeet) {
+        void syncGlobalSnapshotDateToServer();
         onEnterMeetingTab();
       } else if (isYard) {
+        void syncGlobalSnapshotDateToServer();
         onEnterYardTab();
       } else if (isWv) {
         onEnterWaiversTab();
@@ -15838,6 +16014,7 @@ function renderDashboardHtml(): string {
         onEnterSettingsTab();
       }
       if (isSnap) {
+        void syncGlobalSnapshotDateToServer();
         mcChartLayoutDeferrals = 0;
         requestAnimationFrame(function () {
           requestAnimationFrame(function () {
@@ -16367,6 +16544,7 @@ function renderDashboardHtml(): string {
 
     async function loadAndRenderWoList(dateKey, opts) {
       const meta = document.getElementById("wo-list-meta");
+      const pill = document.getElementById("wo-asof-pill");
       meta.textContent = "Loading…";
       try {
         // Pull WO rows + last-yard-sighting map + waiver counts in parallel
@@ -16379,6 +16557,12 @@ function renderDashboardHtml(): string {
           loadYardPhotoLatest(!!(opts && opts.force)),
         ]);
         renderWoList(rows);
+        const asOf = woAsOfDate();
+        if (pill) {
+          pill.textContent = asOf ? fmtKeyLong(asOf) : "Latest";
+          pill.title = "Work order list is keyed to snapshot " + (asOf || "—") +
+            ". Refreshes when you open this tab after a new ingest.";
+        }
       } catch (e) {
         meta.textContent = "Could not load work orders.";
       }
@@ -17799,6 +17983,11 @@ function renderDashboardHtml(): string {
         await applyHashRoute();
       });
 
+      document.addEventListener("visibilitychange", function () {
+        if (document.visibilityState !== "visible") return;
+        void syncGlobalSnapshotDateToServer();
+      });
+
       document.getElementById("tab-snapshot").addEventListener("click", function () {
         // Switch the tab directly so we don't depend on a hashchange firing —
         // if the user came from the meeting tab the hash is already on a
@@ -18076,6 +18265,8 @@ function renderDashboardHtml(): string {
     /* ============================ MEL tab ================================ */
     const melState = {
       asOfDate: "",
+      melIngestBehindWorkOrders: false,
+      workOrderSnapshotLatestDate: "",
       availableDates: [],
       rows: [],
       filter: "all",
@@ -18438,7 +18629,46 @@ function renderDashboardHtml(): string {
       }
       melState.rows = data.rows || [];
       melState.availableDates = data.availableDates || [];
-      if (!melState.asOfDate) melState.asOfDate = data.asOfDate || data.latestDate || "";
+      melState.melIngestBehindWorkOrders = !!data.melIngestBehindWorkOrders;
+      melState.workOrderSnapshotLatestDate = String(data.workOrderSnapshotLatestDate || "").trim();
+      const latest = (data.latestDate || "").trim();
+      if (!melState.asOfDate) {
+        melState.asOfDate = (data.asOfDate || latest || "").trim();
+      } else if (latest && melState.asOfDate !== latest) {
+        // Sticky asOfDate is useful while browsing history, but after a new
+        // workbook ingest the newest snapshot date moves forward — if we keep
+        // the old date the tab looks "stuck" on e.g. 17 Apr forever.
+        const hasNewer = melState.availableDates.some(function (d) { return d > melState.asOfDate; });
+        if (hasNewer) {
+          melState.asOfDate = latest;
+          try {
+            const r2 = await fetch("/api/mel?date=" + encodeURIComponent(melState.asOfDate));
+            data = await r2.json();
+            melState.rows = data.rows || [];
+            melState.availableDates = data.availableDates || [];
+            melState.melIngestBehindWorkOrders = !!data.melIngestBehindWorkOrders;
+            melState.workOrderSnapshotLatestDate = String(data.workOrderSnapshotLatestDate || "").trim();
+          } catch (_e2) {
+            /* keep first payload */
+          }
+        }
+      }
+      (function updateMelIngestWarn() {
+        var box = document.getElementById("mel-ingest-warn");
+        if (!box) return;
+        if (melState.melIngestBehindWorkOrders && melState.workOrderSnapshotLatestDate) {
+          box.classList.add("show");
+          box.innerHTML =
+            "<strong>MEL data may be stale.</strong> Work orders were ingested for <strong>" +
+            esc(fmtKeyLong(melState.workOrderSnapshotLatestDate)) +
+            "</strong>, but the newest MEL Calculator snapshot in the database is still <strong>" +
+            esc(fmtKeyLong(melState.asOfDate || melState.availableDates[0] || "")) +
+            "</strong>. The workbook MEL sheet may have failed to parse (check R2 ingest-warnings/mel-extract-empty-latest.json) or the email subject date may not match the report.";
+        } else {
+          box.classList.remove("show");
+          box.textContent = "";
+        }
+      })();
       loadYardPhotoLatest(false);
 
       // Populate date select
