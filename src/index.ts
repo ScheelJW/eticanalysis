@@ -397,7 +397,7 @@ export default {
     }
 
     if (url.pathname === "/api/history") {
-      const merged = await mergeHistoryWithActiveSnapshots(env, await loadHistory(env));
+      const merged = await getMergedHistoryIndexMaybeRepairR2(env);
       return Response.json(merged, { headers: cacheHeaders() });
     }
 
@@ -784,7 +784,7 @@ async function resolveYardCheckWorkbook(
   | { ok: true; workbookKey: string; sourceFileName: string; sourceDateKey: string }
   | { ok: false; error: string }
 > {
-  const history = await mergeHistoryWithActiveSnapshots(env, await loadHistory(env));
+  const history = await getMergedHistoryIndexMaybeRepairR2(env);
   const latest = await readJson<AnalysisResult>(env, "analyses/latest.json");
 
   if (dateKey) {
@@ -4265,7 +4265,7 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
     return new Response("Invalid date", { status: 400 });
   }
   if (!asOf) {
-    const history = await mergeHistoryWithActiveSnapshots(env, await loadHistory(env));
+    const history = await getMergedHistoryIndexMaybeRepairR2(env);
     const latest = history.entries.length
       ? [...history.entries].sort((a, b) => b.dateKey.localeCompare(a.dateKey))[0]
       : null;
@@ -4304,7 +4304,7 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
   // replay it on the fly and re-query. Cheap one-shot, idempotent.
   let healed = false;
   if (scope !== "all" && rows.length === 0) {
-    const history = await mergeHistoryWithActiveSnapshots(env, await loadHistory(env));
+    const history = await getMergedHistoryIndexMaybeRepairR2(env);
     const entry = history.entries.find((e) => e.dateKey === resolvedAsOf);
     if (entry) {
       const replayed = await replayWorkOrderWatchForDate(env, resolvedAsOf);
@@ -4352,7 +4352,7 @@ async function handleScheduleMxApi(env: Env, request: Request): Promise<Response
   const url = new URL(request.url);
   let dateKey = url.searchParams.get("date")?.trim() ?? "";
   if (!dateKey) {
-    const history = await mergeHistoryWithActiveSnapshots(env, await loadHistory(env));
+    const history = await getMergedHistoryIndexMaybeRepairR2(env);
     const latest = history.entries.length
       ? [...history.entries].sort((a, b) => b.dateKey.localeCompare(a.dateKey))[0]
       : null;
@@ -4613,6 +4613,51 @@ async function mergeHistoryWithActiveSnapshots(env: Env, history: HistoryIndex):
     updatedAtIso: history.updatedAtIso,
     entries: merged,
   };
+}
+
+/**
+ * Email ingest can write D1 `etic_snapshots` + workbook keys but fail before
+ * `history/index.json` is updated (or R2 was never written for that day). The
+ * dashboard merge adds synthetic entries in memory only — the next page load
+ * still reads stale R2 and "Latest" stays on yesterday. When merged history
+ * contains any date missing from raw R2, rewrite `history/index.json` so R2
+ * catches up to D1.
+ */
+async function getMergedHistoryIndexMaybeRepairR2(env: Env): Promise<HistoryIndex> {
+  const raw = await loadHistory(env);
+  const merged = await mergeHistoryWithActiveSnapshots(env, raw);
+  const rawKeys = new Set((raw.entries ?? []).map((e) => e.dateKey));
+  let needsRepair = false;
+  for (const e of merged.entries) {
+    if (!rawKeys.has(e.dateKey)) {
+      needsRepair = true;
+      break;
+    }
+  }
+  if (needsRepair) {
+    const repaired: HistoryIndex = {
+      ...merged,
+      updatedAtIso: new Date().toISOString(),
+    };
+    try {
+      await env.ETIC_BUCKET.put(
+        "history/index.json",
+        JSON.stringify(repaired, null, 2),
+        {
+          httpMetadata: { contentType: "application/json; charset=utf-8" },
+        },
+      );
+    } catch (err) {
+      console.error(
+        JSON.stringify({
+          level: "error",
+          message: "Failed to repair history/index.json from D1 etic_snapshots",
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
+    }
+  }
+  return merged;
 }
 
 async function setSnapshotSoftDeleted(
