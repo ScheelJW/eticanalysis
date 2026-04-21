@@ -85,6 +85,7 @@ import {
 import {
   deleteMelConfig,
   deleteMelSubdivision,
+  diagnoseMelExtractFromBinary,
   extractMelRowsFromBinary,
   getAllAppConfig,
   getAllMelConfig,
@@ -314,6 +315,31 @@ export default {
       await ingestWorkOrderSnapshot(env, dateKey, rawWos, now.toISOString(), workbookBytes);
 
       const melRows = await extractMelRowsFromBinary(workbookBytes);
+      if (!melRows.length) {
+        try {
+          const diag = await diagnoseMelExtractFromBinary(workbookBytes);
+          const stamp = now.toISOString().replace(/[:.]/g, "-");
+          await env.ETIC_BUCKET.put(
+            `ingest-warnings/mel-extract-empty_${dateKey}_${stamp}.json`,
+            JSON.stringify({ ...ingestContext, melExtract: diag }, null, 2),
+            { httpMetadata: { contentType: "application/json; charset=utf-8" } },
+          );
+          await env.ETIC_BUCKET.put(
+            "ingest-warnings/mel-extract-empty-latest.json",
+            JSON.stringify({ ...ingestContext, melExtract: diag }, null, 2),
+            { httpMetadata: { contentType: "application/json; charset=utf-8" } },
+          );
+        } catch (_w) {
+          /* best-effort */
+        }
+        console.warn(
+          JSON.stringify({
+            level: "warn",
+            message: "MEL Calculator extract returned 0 rows — MEL tab will not advance for this ingest date",
+            ...ingestContext,
+          }),
+        );
+      }
       await ingestMelSnapshot(env, dateKey, melRows, now.toISOString());
 
       const history = await loadHistory(env);
@@ -1697,13 +1723,19 @@ async function handleDebugMelHeaders(env: Env, url: URL): Promise<Response> {
 /** Latest (or for-a-given-date) per-key MEL state plus rollup. */
 async function handleMelApi(env: Env, url: URL): Promise<Response> {
   const dateParam = url.searchParams.get("date");
-  const [rows, dates, configs, subdivisions] = await Promise.all([
+  const [rows, dates, configs, subdivisions, woSnapMax] = await Promise.all([
     dateParam ? getMelForDate(env, dateParam) : getMelLatest(env),
     getMelSnapshotDates(env),
     getAllMelConfig(env),
     getMelSubdivisions(env),
+    env.ETIC_SNAPSHOTS.prepare(
+      `SELECT MAX(snapshot_date_key) AS d FROM work_order_snapshot WHERE TRIM(COALESCE(asset_id, '')) != ''`,
+    ).first<{ d: string | null }>(),
   ]);
   const latestDate = dates[0] ?? null;
+  const workOrderSnapshotLatestDate = (woSnapMax?.d ?? "").trim() || null;
+  const melIngestBehindWorkOrders =
+    !!workOrderSnapshotLatestDate && !!latestDate && workOrderSnapshotLatestDate > latestDate;
   const configByKey = new Map(configs.map((c) => [c.mel_key, c]));
   const subsByKey = new Map<string, typeof subdivisions>();
   for (const s of subdivisions) {
@@ -1740,6 +1772,8 @@ async function handleMelApi(env: Env, url: URL): Promise<Response> {
     {
       asOfDate: dateParam ?? latestDate,
       latestDate,
+      workOrderSnapshotLatestDate,
+      melIngestBehindWorkOrders,
       availableDates: dates,
       totals: {
         keys: rows.length,
@@ -10831,6 +10865,18 @@ function renderDashboardHtml(): string {
     @media (max-width: 980px) { .mel-layout { grid-template-columns: 1fr; } }
     .mel-sidebar { min-width: 0; }
     .mel-list-meta { color: var(--muted); font-size: 0.8rem; margin-bottom: 10px; }
+    .mel-ingest-warn {
+      display: none;
+      margin: 0 0 14px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid #c9a227;
+      background: #fff8e6;
+      color: #3d3200;
+      font-size: 0.82rem;
+      line-height: 1.45;
+    }
+    .mel-ingest-warn.show { display: block; }
     .mel-list { display: flex; flex-direction: column; gap: 8px; max-height: 72vh; overflow-y: auto; padding-right: 4px; }
     .mel-card {
       text-align: left; width: 100%; cursor: pointer;
@@ -13136,6 +13182,8 @@ function renderDashboardHtml(): string {
           </summary>
           <div class="mel-trend-body" id="mel-trend-body"></div>
         </details>
+
+        <div id="mel-ingest-warn" class="mel-ingest-warn" role="status" aria-live="polite"></div>
 
         <div class="mel-compare-bar">
           <label class="mel-cmp-field">
@@ -18076,6 +18124,8 @@ function renderDashboardHtml(): string {
     /* ============================ MEL tab ================================ */
     const melState = {
       asOfDate: "",
+      melIngestBehindWorkOrders: false,
+      workOrderSnapshotLatestDate: "",
       availableDates: [],
       rows: [],
       filter: "all",
@@ -18438,7 +18488,46 @@ function renderDashboardHtml(): string {
       }
       melState.rows = data.rows || [];
       melState.availableDates = data.availableDates || [];
-      if (!melState.asOfDate) melState.asOfDate = data.asOfDate || data.latestDate || "";
+      melState.melIngestBehindWorkOrders = !!data.melIngestBehindWorkOrders;
+      melState.workOrderSnapshotLatestDate = String(data.workOrderSnapshotLatestDate || "").trim();
+      const latest = (data.latestDate || "").trim();
+      if (!melState.asOfDate) {
+        melState.asOfDate = (data.asOfDate || latest || "").trim();
+      } else if (latest && melState.asOfDate !== latest) {
+        // Sticky asOfDate is useful while browsing history, but after a new
+        // workbook ingest the newest snapshot date moves forward — if we keep
+        // the old date the tab looks "stuck" on e.g. 17 Apr forever.
+        const hasNewer = melState.availableDates.some(function (d) { return d > melState.asOfDate; });
+        if (hasNewer) {
+          melState.asOfDate = latest;
+          try {
+            const r2 = await fetch("/api/mel?date=" + encodeURIComponent(melState.asOfDate));
+            data = await r2.json();
+            melState.rows = data.rows || [];
+            melState.availableDates = data.availableDates || [];
+            melState.melIngestBehindWorkOrders = !!data.melIngestBehindWorkOrders;
+            melState.workOrderSnapshotLatestDate = String(data.workOrderSnapshotLatestDate || "").trim();
+          } catch (_e2) {
+            /* keep first payload */
+          }
+        }
+      }
+      (function updateMelIngestWarn() {
+        var box = document.getElementById("mel-ingest-warn");
+        if (!box) return;
+        if (melState.melIngestBehindWorkOrders && melState.workOrderSnapshotLatestDate) {
+          box.classList.add("show");
+          box.innerHTML =
+            "<strong>MEL data may be stale.</strong> Work orders were ingested for <strong>" +
+            esc(fmtKeyLong(melState.workOrderSnapshotLatestDate)) +
+            "</strong>, but the newest MEL Calculator snapshot in the database is still <strong>" +
+            esc(fmtKeyLong(melState.asOfDate || melState.availableDates[0] || "")) +
+            "</strong>. The workbook MEL sheet may have failed to parse (check R2 ingest-warnings/mel-extract-empty-latest.json) or the email subject date may not match the report.";
+        } else {
+          box.classList.remove("show");
+          box.textContent = "";
+        }
+      })();
       loadYardPhotoLatest(false);
 
       // Populate date select
