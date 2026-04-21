@@ -3722,6 +3722,9 @@ async function handleAbuseTrackerListApi(env: Env, request: Request): Promise<Re
         "reimbursed_to_vm",
         "reimbursed_at_iso",
         "vehicle_location",
+        "package_checklist_json",
+        "estimates_runner",
+        "estimates_downtown_planned_date",
         "created_at_iso",
         "closed_at_iso",
         "tracking_active",
@@ -3748,6 +3751,9 @@ async function handleAbuseTrackerListApi(env: Env, request: Request): Promise<Re
           r.reimbursed_to_vm ? "1" : "0",
           escCsv(r.reimbursed_at_iso ?? ""),
           escCsv(r.vehicle_location),
+          escCsv(r.package_checklist_json ?? "{}"),
+          escCsv(r.estimates_runner ?? ""),
+          escCsv(r.estimates_downtown_planned_date ?? ""),
           escCsv(r.created_at_iso),
           escCsv(r.closed_at_iso ?? ""),
           r.tracking_active ? "1" : "0",
@@ -3851,6 +3857,9 @@ async function handleAbuseTrackerCaseApi(env: Env, request: Request, caseId: num
     closed?: unknown;
     trackingActive?: unknown;
     timelineAuthor?: unknown;
+    packageChecklist?: unknown;
+    estimatesRunner?: unknown;
+    estimatesDowntownPlannedDate?: unknown;
   }>(request);
   if (!body) return Response.json({ error: "JSON body required" }, { status: 400, headers: cacheHeaders() });
   const patch: Parameters<typeof updateAbuseCase>[2] = {};
@@ -3893,6 +3902,18 @@ async function handleAbuseTrackerCaseApi(env: Env, request: Request, caseId: num
     });
   }
   if (body.closed !== undefined) patch.closed = !!body.closed;
+  if (body.packageChecklist !== undefined && body.packageChecklist && typeof body.packageChecklist === "object") {
+    const pc = body.packageChecklist as Record<string, unknown>;
+    patch.packageChecklist = {
+      sf91: !!pc.sf91,
+      photos: !!pc.photos,
+      vehicleAtVmCompound: !!pc.vehicleAtVmCompound,
+    };
+  }
+  if (body.estimatesRunner !== undefined) patch.estimatesRunner = String(body.estimatesRunner ?? "");
+  if (body.estimatesDowntownPlannedDate !== undefined) {
+    patch.estimatesDowntownPlannedDate = String(body.estimatesDowntownPlannedDate ?? "");
+  }
   const updated = await updateAbuseCase(env, caseId, patch);
   if (!updated) return new Response("Not Found", { status: 404 });
   return Response.json({ case: updated }, { headers: cacheHeaders() });
@@ -9879,10 +9900,21 @@ function renderDashboardHtml(): string {
     .abuse-stat-pill.stat-warn { background: var(--abuse-warn-bg); border-color: rgba(180,83,9,0.35); color: var(--abuse-warn); }
     .abuse-stat-pill.stat-ok { background: var(--abuse-ok-bg); border-color: rgba(13,107,58,0.3); color: var(--abuse-ok); }
     .abuse-stat-pill.stat-neutral { background: var(--abuse-muted-bg); }
+    .abuse-top-new { margin-bottom: 16px; }
     .abuse-cases-layout {
       display: grid; grid-template-columns: 1fr minmax(300px, 400px); gap: 16px; align-items: start;
     }
     @media (max-width: 1100px) { .abuse-cases-layout { grid-template-columns: 1fr; } }
+    .abuse-sub-panel {
+      grid-column: 1 / -1; margin-top: 12px; padding: 14px 16px; border-radius: 12px;
+      border: 1px solid var(--border); background: rgba(0,58,140,0.04);
+    }
+    .abuse-sub-panel .sub-h {
+      font-size: 0.72rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.08em; color: var(--accent); margin: 0 0 10px;
+    }
+    .abuse-pkg-grid { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: center; }
+    .abuse-est-sub-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 16px; max-width: 36rem; }
+    @media (max-width: 640px) { .abuse-est-sub-grid { grid-template-columns: 1fr; } }
     .abuse-table-card, .abuse-detail-card, .abuse-new-card {
       background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 16px 18px;
       box-shadow: 0 1px 0 rgba(255,255,255,0.6) inset, var(--shadow-sm);
@@ -13392,6 +13424,29 @@ function renderDashboardHtml(): string {
             </div>
           </header>
           <div id="abuse-view-cases-wrap">
+            <div class="abuse-new-card abuse-top-new">
+              <h3 style="margin:0 0 10px;font-size:0.95rem">New case</h3>
+              <div class="abuse-new-grid">
+                <label class="field"><span class="label">Case type</span>
+                  <select id="abuse-new-type">
+                    <option value="accident">Accident</option>
+                    <option value="abuse">Abuse / neglect</option>
+                  </select>
+                </label>
+                <label class="field"><span class="label">Asset ID</span>
+                  <div class="abuse-asset-combo">
+                    <input type="text" id="abuse-new-asset" placeholder="Type to search, then pick from the list…" autocapitalize="characters" autocomplete="off" aria-autocomplete="list" aria-controls="abuse-asset-dd" aria-expanded="false" />
+                    <div id="abuse-asset-dd" class="abuse-asset-dd hidden" role="listbox" hidden></div>
+                  </div>
+                </label>
+                <p class="hint" style="grid-column:1/-1;margin:0">At create time we snapshot <strong>unit, shop, and make/model</strong> from the fleet roster for this case file only. That snapshot does not update if the truck later moves.</p>
+                <label class="field" style="grid-column:1/-1"><span class="label">Work order ID</span>
+                  <input type="text" id="abuse-new-wo" placeholder="Optional — add anytime; not required to open a case" />
+                </label>
+              </div>
+              <button type="button" class="primary" id="abuse-new-btn" style="margin-top:10px">Create case</button>
+              <p class="hint" id="abuse-new-msg" style="margin:8px 0 0"></p>
+            </div>
             <div class="abuse-cases-layout">
             <div class="abuse-table-card">
               <div class="abuse-table-head">
@@ -13446,6 +13501,30 @@ function renderDashboardHtml(): string {
                     <div id="abuse-stage-strip" class="abuse-stage-strip" role="group" aria-label="Set case status"></div>
                     <p class="abuse-stage-hint">Pick where the vehicle sits in the program. Status changes are logged on the timeline when you save.</p>
                   </div>
+                  <div id="abuse-sub-package" class="abuse-sub-panel hidden">
+                    <p class="sub-h">Awaiting package — check off what you already have</p>
+                    <div class="abuse-pkg-grid">
+                      <label class="abuse-filter"><input type="checkbox" id="abuse-pkg-sf91" /> SF-91 received</label>
+                      <label class="abuse-filter"><input type="checkbox" id="abuse-pkg-photos" /> Damage photos in</label>
+                      <label class="abuse-filter"><input type="checkbox" id="abuse-pkg-vm" /> Vehicle at VM compound</label>
+                    </div>
+                  </div>
+                  <div id="abuse-sub-estimates" class="abuse-sub-panel hidden">
+                    <p class="sub-h">Awaiting estimates — who runs it downtown</p>
+                    <div class="abuse-est-sub-grid">
+                      <label class="field" style="margin:0"><span class="label">Runner</span>
+                        <select id="abuse-est-runner">
+                          <option value="">— Select —</option>
+                          <option value="gt">GT takes downtown</option>
+                          <option value="fma">FM&amp;A takes downtown</option>
+                          <option value="other">Other / self-arranged</option>
+                        </select>
+                      </label>
+                      <label class="field" style="margin:0"><span class="label">Planned downtown date</span>
+                        <input type="date" id="abuse-est-plan-date" />
+                      </label>
+                    </div>
+                  </div>
                   <label class="field"><span class="label">Vehicle location (where it is now)</span>
                     <input type="text" id="abuse-d-loc" placeholder="e.g. Downtown ABC Body · Lot B row 3 — logs to timeline + yard when saved" />
                   </label>
@@ -13458,8 +13537,8 @@ function renderDashboardHtml(): string {
                   <label class="field" style="grid-column:1/-1"><span class="label">Determination (VFM/VMS)</span>
                     <input type="text" id="abuse-d-det" placeholder="Accident vs abuse, brief rationale" />
                   </label>
-                  <label class="field" style="grid-column:1/-1"><span class="label">Unit responsible (Fleet P&amp;A)</span>
-                    <input type="text" id="abuse-d-resp" list="abuse-resp-datalist" placeholder="Pick a unit or type custom" autocomplete="organization" />
+                  <label class="field" style="grid-column:1/-1"><span class="label">Unit responsible for cost</span>
+                    <input type="text" id="abuse-d-resp" list="abuse-resp-datalist" placeholder="Choose from list or type a unit name" autocomplete="organization" />
                     <datalist id="abuse-resp-datalist"></datalist>
                   </label>
                   <label class="field" style="grid-column:1/-1"><span class="label">Work order ID</span>
@@ -13512,29 +13591,6 @@ function renderDashboardHtml(): string {
               <h3 style="margin:0 0 10px;font-size:0.95rem">Open cases by stage</h3>
               <canvas id="abuse-chart-stage" width="520" height="220" aria-label="Open cases by stage"></canvas>
             </div>
-          </div>
-          <div class="abuse-new-card">
-            <h3 style="margin:0 0 10px;font-size:0.95rem">New case</h3>
-            <div class="abuse-new-grid">
-              <label class="field"><span class="label">Case type</span>
-                <select id="abuse-new-type">
-                  <option value="accident">Accident</option>
-                  <option value="abuse">Abuse / neglect</option>
-                </select>
-              </label>
-              <label class="field"><span class="label">Asset ID</span>
-                <div class="abuse-asset-combo">
-                  <input type="text" id="abuse-new-asset" placeholder="Type to search, then pick from the list…" autocapitalize="characters" autocomplete="off" aria-autocomplete="list" aria-controls="abuse-asset-dd" aria-expanded="false" />
-                  <div id="abuse-asset-dd" class="abuse-asset-dd hidden" role="listbox" hidden></div>
-                </div>
-              </label>
-              <p class="hint" style="grid-column:1/-1;margin:0">Unit / shop / make-model are copied from the latest Fleet roster <strong>once</strong> when you create the case and do not change if the vehicle moves later.</p>
-              <label class="field" style="grid-column:1/-1"><span class="label">Work order ID</span>
-                <input type="text" id="abuse-new-wo" placeholder="Optional — add anytime; not required to open a case" />
-              </label>
-            </div>
-            <button type="button" class="primary" id="abuse-new-btn" style="margin-top:10px">Create case</button>
-            <p class="hint" id="abuse-new-msg" style="margin:8px 0 0"></p>
           </div>
         </div>
       </div>
@@ -23003,12 +23059,12 @@ function renderDashboardHtml(): string {
     };
 
     var ABUSE_STAGE_STRIP_DEF = [
-      { v: "initial", cat: "cat-docs", line1: "Awaiting package", line2: "Photos, SF-91, WO, estimates in…" },
-      { v: "awaiting_estimates", cat: "cat-docs", line1: "Awaiting estimates", line2: "Three bids / quotes" },
+      { v: "initial", cat: "cat-docs", line1: "Awaiting package", line2: "Track SF-91, photos, vehicle at VM…" },
+      { v: "awaiting_estimates", cat: "cat-docs", line1: "Awaiting estimates", line2: "Who runs it downtown + planned date" },
       { v: "pending_legal_release", cat: "cat-legal", line1: "Pending release", line2: "Legal or commander sign-off" },
       { v: "repair_in_mx_contract", cat: "cat-mx", line1: "Contract / depot MX", line2: "Vendor, GSA, or contract line" },
       { v: "repair_downtown", cat: "cat-mx", line1: "Receiving MX · downtown", line2: "Off-base civilian repair" },
-      { v: "repair_on_base", cat: "cat-mx", line1: "Receiving MX · on base", line2: "Base shop / CE bays" },
+      { v: "repair_on_base", cat: "cat-mx", line1: "Receiving MX · on base", line2: "VM maintenance bays" },
       { v: "no_repair_tracking", cat: "cat-docs", line1: "Paperwork only", line2: "No vehicle repair to track" },
       { v: "closed", cat: "cat-done", line1: "Closed", line2: "Case complete" },
     ];
@@ -23033,12 +23089,22 @@ function renderDashboardHtml(): string {
       });
     }
 
+    function abuseToggleSubPanels() {
+      var sel = document.getElementById("abuse-d-stage");
+      var v = sel ? sel.value : "";
+      var pkg = document.getElementById("abuse-sub-package");
+      var est = document.getElementById("abuse-sub-estimates");
+      if (pkg) pkg.classList.toggle("hidden", v !== "initial");
+      if (est) est.classList.toggle("hidden", v !== "awaiting_estimates");
+    }
+
     function abuseSyncStageStripActive() {
       var sel = document.getElementById("abuse-d-stage");
       var v = sel ? sel.value : "";
       document.querySelectorAll("#abuse-stage-strip [data-abuse-stage]").forEach(function (btn) {
         btn.classList.toggle("active", (btn.getAttribute("data-abuse-stage") || "") === v);
       });
+      abuseToggleSubPanels();
     }
 
     function abuseSetView(which) {
@@ -23105,6 +23171,14 @@ function renderDashboardHtml(): string {
           (pay.note ? " · " + esc(String(pay.note)) : "");
       } else if (kind === "case_opened") {
         body = esc(String(pay.case_type || "")) + " · " + esc(String(pay.asset_id || ""));
+      } else if (kind === "other" && pay.detail === "package_checklist") {
+        body = "Package checklist updated";
+      } else if (kind === "other" && pay.detail === "estimates_handoff") {
+        body =
+          "Estimates downtown — runner: " + esc(String(pay.runner_to || pay.runner_from || "—")) +
+          (pay.planned_to || pay.planned_from
+            ? " · planned " + esc(String(pay.planned_to || pay.planned_from))
+            : "");
       } else {
         body = esc(JSON.stringify(pay).slice(0, 120));
       }
@@ -23120,11 +23194,11 @@ function renderDashboardHtml(): string {
     function abuseIngestTableHtml(em) {
       if (!em || typeof em !== "object") return "";
       var rows = [
-        ["Damage photos (images)", em.damage_photo],
+        ["Damage photos", em.damage_photo],
         ["Release letter (PDF)", em.release_letter],
-        ["Written estimates (PDF or scan)", em.estimate],
-        ["Other supporting docs", em.other],
-        ["Legacy auto-detect (any type)", em.auto],
+        ["Written estimates", em.estimate],
+        ["Other documents", em.other],
+        ["Any file type (auto-sorted by extension)", em.auto],
       ];
       var body = rows
         .filter(function (r) { return r[1]; })
@@ -23139,7 +23213,7 @@ function renderDashboardHtml(): string {
         "<table class='abuse-ingest-table'><tbody>" +
           body +
         "</tbody></table>" +
-        "<p class='hint' style='margin:8px 0 0'>Use the address that matches the attachment type. Subject line is ignored.</p>"
+        "<p class='hint' style='margin:8px 0 0'>Email the file to the row that matches what you are sending. The subject line does not matter.</p>"
       );
     }
 
@@ -23320,9 +23394,9 @@ function renderDashboardHtml(): string {
         if (ing) {
           var tbl = abuseIngestTableHtml(j.ingestEmails);
           ing.innerHTML = tbl
-            ? "<strong>Email ingest</strong> (one address per file type)" + tbl
+            ? "<strong>Send files by email</strong> — use the address in each row for that kind of file." + tbl
             : j.ingestEmail
-              ? "<strong>Email ingest:</strong> <code style='font-size:0.85rem'>" + esc(j.ingestEmail) + "</code>"
+              ? "<strong>Send files by email:</strong> <code style='font-size:0.85rem'>" + esc(j.ingestEmail) + "</code>"
               : "";
         }
         var stSel = document.getElementById("abuse-d-stage");
@@ -23332,6 +23406,25 @@ function renderDashboardHtml(): string {
           if (stSel.value !== sv) stSel.value = "initial";
         }
         abuseSyncStageStripActive();
+        var pkgJ = {};
+        try { pkgJ = JSON.parse(c.package_checklist_json || "{}"); } catch (e2) { pkgJ = {}; }
+        var sf = document.getElementById("abuse-pkg-sf91");
+        var ph = document.getElementById("abuse-pkg-photos");
+        var vm = document.getElementById("abuse-pkg-vm");
+        if (sf) sf.checked = !!pkgJ.sf91;
+        if (ph) ph.checked = !!pkgJ.photos;
+        if (vm) vm.checked = !!pkgJ.vehicleAtVmCompound;
+        var er = document.getElementById("abuse-est-runner");
+        if (er) {
+          var rv = String(c.estimates_runner || "").trim();
+          er.value = rv;
+          if (er.value !== rv) er.value = "";
+        }
+        var ep = document.getElementById("abuse-est-plan-date");
+        if (ep) {
+          var pd = String(c.estimates_downtown_planned_date || "").trim().slice(0, 10);
+          ep.value = /^\d{4}-\d{2}-\d{2}$/.test(pd) ? pd : "";
+        }
         document.getElementById("abuse-d-loc").value = c.vehicle_location || "";
         document.getElementById("abuse-d-det").value = c.determination || "";
         document.getElementById("abuse-d-resp").value = c.responsible_party || "";
@@ -23431,6 +23524,13 @@ function renderDashboardHtml(): string {
           estimates: abuseCollectEstimates(),
           trackingActive: trkEl ? !!trkEl.checked : true,
           timelineAuthor: (document.getElementById("abuse-save-by") && document.getElementById("abuse-save-by").value) || "",
+          packageChecklist: {
+            sf91: !!(document.getElementById("abuse-pkg-sf91") && document.getElementById("abuse-pkg-sf91").checked),
+            photos: !!(document.getElementById("abuse-pkg-photos") && document.getElementById("abuse-pkg-photos").checked),
+            vehicleAtVmCompound: !!(document.getElementById("abuse-pkg-vm") && document.getElementById("abuse-pkg-vm").checked),
+          },
+          estimatesRunner: (document.getElementById("abuse-est-runner") && document.getElementById("abuse-est-runner").value) || "",
+          estimatesDowntownPlannedDate: (document.getElementById("abuse-est-plan-date") && document.getElementById("abuse-est-plan-date").value) || "",
         };
         var r = await fetch("/api/abuse-tracker/" + id, {
           method: "PATCH",

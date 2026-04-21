@@ -65,6 +65,14 @@ export type AbuseEstimate = {
   note: string;
 };
 
+/** While status is “awaiting package” — what is still outstanding. */
+export type AbusePackageChecklist = {
+  sf91?: boolean;
+  photos?: boolean;
+  /** Vehicle has arrived at the VM maintenance compound / lot for intake. */
+  vehicleAtVmCompound?: boolean;
+};
+
 export type AbuseCaseRow = {
   id: number;
   control_number: string;
@@ -90,6 +98,9 @@ export type AbuseCaseRow = {
   closed_at_iso: string | null;
   work_order_id: string;
   tracking_active: number;
+  package_checklist_json: string;
+  estimates_runner: string;
+  estimates_downtown_planned_date: string;
 };
 
 export type AbuseNoteRow = {
@@ -302,8 +313,9 @@ export async function createAbuseCase(env: Env, input: CreateAbuseCaseInput): Pr
     `INSERT INTO abuse_tracker_case (
        control_number, case_type, asset_id, work_order_id, owning_unit, shop, make_model, veh_nomen, mgmt_cd,
        determination, responsible_party, reimbursed_to_vm, reimbursed_at_iso, reimbursed_note,
-       stage, vehicle_location, estimates_json, email_token, created_at_iso, updated_at_iso, created_by, tracking_active
-     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,0,NULL,'','initial',?,?,?,?,?,?,1)`,
+       stage, vehicle_location, estimates_json, email_token, created_at_iso, updated_at_iso, created_by, tracking_active,
+       package_checklist_json, estimates_runner, estimates_downtown_planned_date
+     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,0,NULL,'','initial',?,?,?,?,?,?,1,?,?,?)`,
   )
     .bind(
       control,
@@ -323,6 +335,9 @@ export async function createAbuseCase(env: Env, input: CreateAbuseCaseInput): Pr
       now,
       now,
       (input.createdBy ?? "").trim(),
+      "{}",
+      "",
+      "",
     )
     .run();
   const id = Number(ins.meta.last_row_id ?? 0);
@@ -362,7 +377,24 @@ export type UpdateAbuseCaseInput = {
   closed?: boolean;
   trackingActive?: boolean;
   timelineAuthor?: string;
+  packageChecklist?: AbusePackageChecklist;
+  estimatesRunner?: string;
+  estimatesDowntownPlannedDate?: string;
 };
+
+function parsePackageChecklistJson(raw: string | null | undefined): AbusePackageChecklist {
+  try {
+    const o = JSON.parse(raw || "{}");
+    if (!o || typeof o !== "object") return {};
+    return {
+      sf91: !!o.sf91,
+      photos: !!o.photos,
+      vehicleAtVmCompound: !!o.vehicleAtVmCompound,
+    };
+  } catch {
+    return {};
+  }
+}
 
 async function insertAbuseTimeline(
   env: Env,
@@ -477,11 +509,35 @@ export async function updateAbuseCase(
     patch.reimbursedAtIso !== undefined ||
     patch.reimbursedNote !== undefined;
 
+  const curPkg = parsePackageChecklistJson(cur.package_checklist_json);
+  let packageJson = cur.package_checklist_json ?? "{}";
+  if (patch.packageChecklist !== undefined) {
+    packageJson = JSON.stringify({
+      sf91: !!patch.packageChecklist.sf91,
+      photos: !!patch.packageChecklist.photos,
+      vehicleAtVmCompound: !!patch.packageChecklist.vehicleAtVmCompound,
+    });
+  }
+  const estimatesRunner =
+    patch.estimatesRunner !== undefined ? patch.estimatesRunner.trim() : cur.estimates_runner ?? "";
+  const estimatesPlanned =
+    patch.estimatesDowntownPlannedDate !== undefined
+      ? patch.estimatesDowntownPlannedDate.trim()
+      : cur.estimates_downtown_planned_date ?? "";
+
+  const pkgChanged = patch.packageChecklist !== undefined && packageJson !== (cur.package_checklist_json ?? "{}");
+  const runnerChanged =
+    patch.estimatesRunner !== undefined && estimatesRunner !== (cur.estimates_runner ?? "").trim();
+  const planChanged =
+    patch.estimatesDowntownPlannedDate !== undefined &&
+    estimatesPlanned !== (cur.estimates_downtown_planned_date ?? "").trim();
+
   await env.ETIC_SNAPSHOTS.prepare(
     `UPDATE abuse_tracker_case SET
        work_order_id = ?, determination = ?, responsible_party = ?, reimbursed_to_vm = ?, reimbursed_at_iso = ?,
        reimbursed_note = ?, stage = ?, vehicle_location = ?, estimates_json = ?,
-       updated_at_iso = ?, closed_at_iso = ?, tracking_active = ?
+       updated_at_iso = ?, closed_at_iso = ?, tracking_active = ?,
+       package_checklist_json = ?, estimates_runner = ?, estimates_downtown_planned_date = ?
      WHERE id = ?`,
   )
     .bind(
@@ -497,6 +553,9 @@ export async function updateAbuseCase(
       now,
       closedAt,
       trackingActive,
+      packageJson,
+      estimatesRunner,
+      estimatesPlanned,
       caseId,
     )
     .run();
@@ -564,6 +623,30 @@ export async function updateAbuseCase(
       caseId,
       kind: "closed",
       payload: {},
+      createdBy: tlAuthor,
+      atIso: now,
+    });
+  }
+  if (pkgChanged) {
+    await insertAbuseTimeline(env, {
+      caseId,
+      kind: "other",
+      payload: { detail: "package_checklist", from: curPkg, to: parsePackageChecklistJson(packageJson) },
+      createdBy: tlAuthor,
+      atIso: now,
+    });
+  }
+  if (runnerChanged || planChanged) {
+    await insertAbuseTimeline(env, {
+      caseId,
+      kind: "other",
+      payload: {
+        detail: "estimates_handoff",
+        runner_from: (cur.estimates_runner ?? "").trim(),
+        runner_to: estimatesRunner,
+        planned_from: (cur.estimates_downtown_planned_date ?? "").trim(),
+        planned_to: estimatesPlanned,
+      },
       createdBy: tlAuthor,
       atIso: now,
     });
