@@ -9842,51 +9842,84 @@ function renderDashboardHtml(): string {
 
     /* ---- Accident / abuse tracker tab ---- */
     #panel-abuse-tracker .hidden { display: none; }
+    #panel-abuse-tracker {
+      --abuse-accent: #003a8c;
+      --abuse-accent-soft: rgba(0, 58, 140, 0.12);
+      --abuse-warn: #b45309;
+      --abuse-warn-bg: rgba(245, 158, 11, 0.14);
+      --abuse-ok: #0d6b3a;
+      --abuse-ok-bg: rgba(13, 107, 58, 0.1);
+      --abuse-muted-bg: rgba(91, 102, 117, 0.1);
+    }
     .abuse-wrap { max-width: 1400px; margin: 0 auto; padding: 0 0 48px; }
     .abuse-head {
       display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between;
-      gap: 14px; margin-bottom: 16px; padding-bottom: 14px; border-bottom: 1px solid var(--border);
+      gap: 14px; margin-bottom: 18px; padding: 18px 20px; border-radius: 14px;
+      border: 1px solid var(--border); background: linear-gradient(135deg, rgba(0,58,140,0.07) 0%, var(--surface) 55%);
+      box-shadow: var(--shadow-sm);
     }
+    .abuse-head h2 { letter-spacing: -0.02em; }
     .abuse-head-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-    .abuse-view-toggle { display: inline-flex; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+    .abuse-view-toggle { display: inline-flex; border: 1px solid var(--border-strong); border-radius: 10px; overflow: hidden; background: var(--bg-elev); }
     .abuse-view-toggle button {
-      font: inherit; font-size: 0.82rem; font-weight: 600; padding: 8px 14px; border: 0; cursor: pointer;
-      background: var(--bg-elev); color: var(--muted);
+      font: inherit; font-size: 0.82rem; font-weight: 600; padding: 9px 16px; border: 0; cursor: pointer;
+      background: transparent; color: var(--muted);
     }
-    .abuse-view-toggle button:hover { color: var(--text); }
-    .abuse-view-toggle button.active { background: var(--surface); color: var(--accent); box-shadow: inset 0 -2px 0 var(--accent); }
+    .abuse-view-toggle button:hover { color: var(--text); background: rgba(0,0,0,0.03); }
+    .abuse-view-toggle button.active { background: var(--accent); color: #fff; box-shadow: none; }
     .abuse-stats-full {
-      display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px;
+      display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px;
     }
     .abuse-stat-pill {
-      padding: 8px 14px; border-radius: 10px; background: var(--surface); border: 1px solid var(--border);
-      font-size: 0.85rem;
+      padding: 8px 14px; border-radius: 999px; border: 1px solid var(--border);
+      font-size: 0.8rem; font-weight: 500; background: var(--surface);
     }
-    .abuse-stat-pill b { color: var(--accent); }
+    .abuse-stat-pill b { color: var(--accent); font-weight: 800; }
+    .abuse-stat-pill.stat-open { background: var(--abuse-accent-soft); border-color: rgba(0,58,140,0.25); }
+    .abuse-stat-pill.stat-warn { background: var(--abuse-warn-bg); border-color: rgba(180,83,9,0.35); color: var(--abuse-warn); }
+    .abuse-stat-pill.stat-ok { background: var(--abuse-ok-bg); border-color: rgba(13,107,58,0.3); color: var(--abuse-ok); }
+    .abuse-stat-pill.stat-neutral { background: var(--abuse-muted-bg); }
     .abuse-cases-layout {
       display: grid; grid-template-columns: 1fr minmax(300px, 400px); gap: 16px; align-items: start;
     }
     @media (max-width: 1100px) { .abuse-cases-layout { grid-template-columns: 1fr; } }
     .abuse-table-card, .abuse-detail-card, .abuse-new-card {
-      background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 14px 16px;
+      background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 16px 18px;
+      box-shadow: 0 1px 0 rgba(255,255,255,0.6) inset, var(--shadow-sm);
     }
-    .abuse-table-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; gap: 8px; flex-wrap: wrap; }
+    .abuse-detail-card {
+      border-left: 4px solid var(--accent);
+    }
+    .abuse-table-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; gap: 10px; flex-wrap: wrap; }
+    .abuse-type-filters { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .abuse-type-filters .lbl { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-right: 4px; }
+    .abuse-type-chip {
+      font: inherit; font-size: 0.78rem; font-weight: 600; padding: 6px 12px; border-radius: 999px; cursor: pointer;
+      border: 1px solid var(--border); background: var(--bg-elev); color: var(--muted);
+    }
+    .abuse-type-chip:hover { border-color: var(--accent); color: var(--text); }
+    .abuse-type-chip.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+    .abuse-type-chip.acc.active { background: #0b4a9e; border-color: #0b4a9e; }
+    .abuse-type-chip.abu.active { background: #9b1c2e; border-color: #9b1c2e; }
     .abuse-filter { font-size: 0.82rem; color: var(--muted); display: flex; align-items: center; gap: 6px; cursor: pointer; }
-    .abuse-table-scroll { overflow: auto; max-height: min(70vh, 720px); border: 1px solid var(--border); border-radius: 10px; }
+    .abuse-table-scroll { overflow: auto; max-height: min(70vh, 720px); border: 1px solid var(--border-strong); border-radius: 12px; background: var(--bg-elev); }
     .abuse-case-table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
     .abuse-case-table thead th {
       position: sticky; top: 0; z-index: 1;
-      background: var(--surface); border-bottom: 1px solid var(--border);
-      text-align: left; padding: 8px 10px; font-weight: 700; white-space: nowrap;
+      background: linear-gradient(180deg, rgba(0,58,140,0.12) 0%, rgba(0,58,140,0.06) 100%);
+      border-bottom: 2px solid rgba(0,58,140,0.2);
+      text-align: left; padding: 10px 12px; font-weight: 800; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--accent);
     }
-    .abuse-case-table tbody td { border-bottom: 1px solid var(--border); padding: 7px 10px; vertical-align: top; }
+    .abuse-case-table tbody td { border-bottom: 1px solid var(--border); padding: 9px 12px; vertical-align: top; }
     .abuse-case-table tbody tr { cursor: pointer; }
-    .abuse-case-table tbody tr:hover { background: rgba(0,58,140,0.04); }
-    .abuse-case-table tbody tr.active { background: rgba(0,58,140,0.08); }
-    .abuse-case-table .cn { font-weight: 800; white-space: nowrap; }
+    .abuse-case-table tbody tr:hover { background: rgba(0,58,140,0.06); }
+    .abuse-case-table tbody tr.active { background: rgba(0,58,140,0.11); box-shadow: inset 3px 0 0 var(--accent); }
+    .abuse-case-table .cn { font-weight: 800; white-space: nowrap; font-family: var(--font-mono); font-size: 0.82rem; }
     .abuse-case-table .muted-cell { color: var(--muted); font-size: 0.76rem; max-width: 14rem; }
-    .abuse-cn { font-size: 1.05rem; font-weight: 800; letter-spacing: 0.02em; }
-    .abuse-detail-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+    .abuse-case-table .type-acc { color: #0b4a9e; font-weight: 700; }
+    .abuse-case-table .type-abu { color: #9b1c2e; font-weight: 700; }
+    .abuse-cn { font-size: 1.08rem; font-weight: 800; letter-spacing: 0.02em; font-family: var(--font-mono); }
+    .abuse-detail-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
     .abuse-type-pill {
       font-size: 0.68rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.08em;
       padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border);
@@ -9896,7 +9929,39 @@ function renderDashboardHtml(): string {
     .abuse-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; margin-top: 8px; }
     @media (max-width: 640px) { .abuse-grid { grid-template-columns: 1fr; } }
     .abuse-check { display: flex; align-items: center; gap: 8px; padding-top: 22px; }
-    .abuse-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 14px; }
+    .abuse-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 16px; }
+    .abuse-actions .primary { padding: 10px 20px; font-weight: 700; box-shadow: 0 2px 8px rgba(0,58,140,0.25); }
+    .abuse-actions .ghost { padding: 10px 16px; font-weight: 600; border-width: 2px; }
+    .abuse-section-title {
+      margin: 18px 0 10px; font-size: 0.72rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.1em;
+      color: var(--accent); padding-left: 10px; border-left: 3px solid var(--accent);
+    }
+    .abuse-stage-panel { grid-column: 1 / -1; margin-top: 4px; }
+    .abuse-stage-select-native {
+      position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
+    }
+    .abuse-stage-strip {
+      display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px;
+    }
+    .abuse-stage-btn {
+      font: inherit; font-size: 0.76rem; font-weight: 700; padding: 8px 12px; border-radius: 10px; cursor: pointer;
+      border: 2px solid var(--border); background: var(--bg-elev); color: var(--text); line-height: 1.25; text-align: left;
+      transition: transform 0.08s ease, border-color 0.12s ease, box-shadow 0.12s ease;
+    }
+    .abuse-stage-btn:hover { border-color: var(--accent); transform: translateY(-1px); }
+    .abuse-stage-btn.active {
+      border-color: var(--accent); background: rgba(0,58,140,0.12); box-shadow: 0 0 0 1px rgba(0,58,140,0.15);
+    }
+    .abuse-stage-btn.cat-docs.active { border-color: #5b6675; background: rgba(91,102,117,0.12); }
+    .abuse-stage-btn.cat-legal.active { border-color: #b45309; background: var(--abuse-warn-bg); }
+    .abuse-stage-btn.cat-mx.active { border-color: #0b4a9e; background: rgba(11,74,158,0.12); }
+    .abuse-stage-btn.cat-done.active { border-color: #0d6b3a; background: var(--abuse-ok-bg); }
+    .abuse-stage-hint { margin: 10px 0 0; font-size: 0.76rem; color: var(--muted); line-height: 1.45; }
+    .abuse-estimates-wrap {
+      margin-top: 8px; padding: 14px; border-radius: 12px; border: 1px solid var(--border);
+      background: linear-gradient(180deg, rgba(0,58,140,0.04) 0%, var(--bg-elev) 100%);
+    }
+    .abuse-estimates-wrap .abuse-est-del { min-width: 40px; border-radius: 8px; font-weight: 700; color: var(--danger); border-color: rgba(176,0,32,0.35); }
     .abuse-notes-list {
       max-height: 220px; overflow-y: auto; border: 1px solid var(--border); border-radius: 10px;
       padding: 8px 10px; margin-bottom: 10px; background: var(--bg-elev); font-size: 0.85rem;
@@ -13331,6 +13396,12 @@ function renderDashboardHtml(): string {
             <div class="abuse-table-card">
               <div class="abuse-table-head">
                 <h3 style="margin:0;font-size:0.95rem">Cases</h3>
+                <div class="abuse-type-filters" role="group" aria-label="Filter by case type">
+                  <span class="lbl">Show</span>
+                  <button type="button" class="abuse-type-chip active" id="abuse-filter-all" data-abuse-filter="all">All</button>
+                  <button type="button" class="abuse-type-chip acc" id="abuse-filter-accident" data-abuse-filter="accident">Accident</button>
+                  <button type="button" class="abuse-type-chip abu" id="abuse-filter-abuse" data-abuse-filter="abuse">Abuse</button>
+                </div>
                 <label class="abuse-filter"><input type="checkbox" id="abuse-open-only" checked /> Open only</label>
               </div>
               <div class="abuse-table-scroll">
@@ -13360,18 +13431,21 @@ function renderDashboardHtml(): string {
                 </div>
                 <div class="hint abuse-ingest-wrap" id="abuse-d-ingest"></div>
                 <div class="abuse-grid">
-                  <label class="field"><span class="label">Current status</span>
-                    <select id="abuse-d-stage">
-                      <option value="initial">Initial — awaiting documents (photos, SF-91, WO, etc.)</option>
-                      <option value="awaiting_estimates">Awaiting estimates</option>
-                      <option value="pending_legal_release">Pending legal / commander release</option>
-                      <option value="repair_in_mx_contract">In MX (contract shop)</option>
-                      <option value="repair_downtown">Repair downtown (off base)</option>
-                      <option value="repair_on_base">Repair on base (org maintenance)</option>
-                      <option value="no_repair_tracking">Tracking only — no repair in progress</option>
-                      <option value="closed">Closed</option>
+                  <div class="field abuse-stage-panel">
+                    <span class="label">Current status</span>
+                    <select id="abuse-d-stage" class="abuse-stage-select-native" tabindex="-1" aria-hidden="true">
+                      <option value="initial">initial</option>
+                      <option value="awaiting_estimates">awaiting_estimates</option>
+                      <option value="pending_legal_release">pending_legal_release</option>
+                      <option value="repair_in_mx_contract">repair_in_mx_contract</option>
+                      <option value="repair_downtown">repair_downtown</option>
+                      <option value="repair_on_base">repair_on_base</option>
+                      <option value="no_repair_tracking">no_repair_tracking</option>
+                      <option value="closed">closed</option>
                     </select>
-                  </label>
+                    <div id="abuse-stage-strip" class="abuse-stage-strip" role="group" aria-label="Set case status"></div>
+                    <p class="abuse-stage-hint">Pick where the vehicle sits in the program. Status changes are logged on the timeline when you save.</p>
+                  </div>
                   <label class="field"><span class="label">Vehicle location (where it is now)</span>
                     <input type="text" id="abuse-d-loc" placeholder="e.g. Downtown ABC Body · Lot B row 3 — logs to timeline + yard when saved" />
                   </label>
@@ -13403,8 +13477,8 @@ function renderDashboardHtml(): string {
                   <h4 style="margin:0 0 8px;font-size:0.88rem">Timeline</h4>
                   <div id="abuse-timeline-list" class="muted">Load a case to see status and location history.</div>
                 </div>
-                <div class="abuse-estimates">
-                  <h4 style="margin:16px 0 8px;font-size:0.9rem">Three estimates</h4>
+                <div class="abuse-estimates-wrap">
+                  <div class="abuse-section-title">Vendor estimates</div>
                   <div id="abuse-est-rows"></div>
                   <button type="button" class="ghost" id="abuse-est-add">+ Add estimate row</button>
                 </div>
@@ -13414,7 +13488,7 @@ function renderDashboardHtml(): string {
                   <span class="status" id="abuse-case-status"></span>
                 </div>
                 <div class="abuse-notes">
-                  <h4 style="margin:18px 0 8px;font-size:0.9rem">Notes</h4>
+                  <div class="abuse-section-title">Notes</div>
                   <div id="abuse-notes-list" class="abuse-notes-list"></div>
                   <label class="field"><span class="label">Add note</span>
                     <textarea id="abuse-note-body" rows="3" placeholder="Program notes…"></textarea>
@@ -13425,7 +13499,7 @@ function renderDashboardHtml(): string {
                   </div>
                 </div>
                 <div class="abuse-atts">
-                  <h4 style="margin:18px 0 8px;font-size:0.9rem">Attachments</h4>
+                  <div class="abuse-section-title">Attachments (email)</div>
                   <div id="abuse-atts-list" class="abuse-atts-list"></div>
                 </div>
               </div>
@@ -22924,8 +22998,48 @@ function renderDashboardHtml(): string {
       stats: null,
       view: "cases",
       fleetUnits: [],
+      caseTypeFilter: "all",
       wired: false,
     };
+
+    var ABUSE_STAGE_STRIP_DEF = [
+      { v: "initial", cat: "cat-docs", line1: "Awaiting package", line2: "Photos, SF-91, WO, estimates in…" },
+      { v: "awaiting_estimates", cat: "cat-docs", line1: "Awaiting estimates", line2: "Three bids / quotes" },
+      { v: "pending_legal_release", cat: "cat-legal", line1: "Pending release", line2: "Legal or commander sign-off" },
+      { v: "repair_in_mx_contract", cat: "cat-mx", line1: "Contract / depot MX", line2: "Vendor, GSA, or contract line" },
+      { v: "repair_downtown", cat: "cat-mx", line1: "Receiving MX · downtown", line2: "Off-base civilian repair" },
+      { v: "repair_on_base", cat: "cat-mx", line1: "Receiving MX · on base", line2: "Base shop / CE bays" },
+      { v: "no_repair_tracking", cat: "cat-docs", line1: "Paperwork only", line2: "No vehicle repair to track" },
+      { v: "closed", cat: "cat-done", line1: "Closed", line2: "Case complete" },
+    ];
+
+    function abuseRenderStageStrip() {
+      var wrap = document.getElementById("abuse-stage-strip");
+      if (!wrap) return;
+      wrap.innerHTML = ABUSE_STAGE_STRIP_DEF.map(function (s) {
+        return (
+          "<button type='button' class='abuse-stage-btn " + s.cat + "' data-abuse-stage='" + s.v + "'>" +
+            "<span style='display:block'>" + esc(s.line1) + "</span>" +
+            "<span style='display:block;font-weight:500;opacity:0.82;font-size:0.72rem;margin-top:2px'>" + esc(s.line2) + "</span>" +
+          "</button>"
+        );
+      }).join("");
+      wrap.querySelectorAll("[data-abuse-stage]").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          var sel = document.getElementById("abuse-d-stage");
+          if (sel) sel.value = btn.getAttribute("data-abuse-stage") || "";
+          abuseSyncStageStripActive();
+        });
+      });
+    }
+
+    function abuseSyncStageStripActive() {
+      var sel = document.getElementById("abuse-d-stage");
+      var v = sel ? sel.value : "";
+      document.querySelectorAll("#abuse-stage-strip [data-abuse-stage]").forEach(function (btn) {
+        btn.classList.toggle("active", (btn.getAttribute("data-abuse-stage") || "") === v);
+      });
+    }
 
     function abuseSetView(which) {
       abuseTrackerState.view = which === "stats" ? "stats" : "cases";
@@ -22945,14 +23059,13 @@ function renderDashboardHtml(): string {
 
     function abuseStageLabel(s) {
       var k = String(s || "");
-      if (k === "initial" || k === "intake") return "Initial — awaiting documents";
-      if (k === "awaiting_estimates" || k === "estimates") return "Awaiting estimates";
-      if (k === "pending_legal_release" || k === "release_pending") return "Pending legal / release";
-      if (k === "repair_in_mx_contract" || k === "approved_work") return "In MX (contract)";
-      if (k === "repair_downtown") return "Repair downtown";
-      if (k === "repair_on_base") return "Repair on base";
-      if (k === "no_repair_tracking") return "Tracking only (no repair)";
-      if (k === "closed") return "Closed";
+      for (var i = 0; i < ABUSE_STAGE_STRIP_DEF.length; i++) {
+        if (ABUSE_STAGE_STRIP_DEF[i].v === k) return ABUSE_STAGE_STRIP_DEF[i].line1;
+      }
+      if (k === "intake") return abuseStageLabel("initial");
+      if (k === "estimates") return abuseStageLabel("awaiting_estimates");
+      if (k === "release_pending") return abuseStageLabel("pending_legal_release");
+      if (k === "approved_work") return abuseStageLabel("repair_in_mx_contract");
       return k.replace(/_/g, " ") || "";
     }
 
@@ -23044,7 +23157,7 @@ function renderDashboardHtml(): string {
         "initial", "awaiting_estimates", "pending_legal_release", "repair_in_mx_contract",
         "repair_downtown", "repair_on_base", "no_repair_tracking",
       ];
-      var shortLabs = ["Initial", "Est.", "Legal", "MX ctr", "Downtown", "On base", "No repair"];
+      var shortLabs = ["Pkg", "Est", "Legal", "Contract", "DT MX", "Base MX", "Paper"];
       var vals = keys.map(function (k) { return by[k] || 0; });
       var max = Math.max.apply(null, vals.concat([1]));
       var pad = 32;
@@ -23070,14 +23183,14 @@ function renderDashboardHtml(): string {
         if (elFull) {
           var bs = j.byStage || {};
           elFull.innerHTML =
-            "<span class='abuse-stat-pill'><b>" + (j.open || 0) + "</b> open cases</span>" +
-            "<span class='abuse-stat-pill'>Initial <b>" + ((bs.initial || 0) + (bs.intake || 0)) + "</b></span>" +
-            "<span class='abuse-stat-pill'>Estimates <b>" + ((bs.awaiting_estimates || 0) + (bs.estimates || 0)) + "</b></span>" +
-            "<span class='abuse-stat-pill'>Legal / release <b>" + ((bs.pending_legal_release || 0) + (bs.release_pending || 0)) + "</b></span>" +
-            "<span class='abuse-stat-pill'>MX contract <b>" + ((bs.repair_in_mx_contract || 0) + (bs.approved_work || 0)) + "</b></span>" +
-            "<span class='abuse-stat-pill'>Downtown <b>" + (bs.repair_downtown || 0) + "</b></span>" +
-            "<span class='abuse-stat-pill'>On base <b>" + (bs.repair_on_base || 0) + "</b></span>" +
-            "<span class='abuse-stat-pill'>No repair <b>" + (bs.no_repair_tracking || 0) + "</b></span>";
+            "<span class='abuse-stat-pill stat-open'><b>" + (j.open || 0) + "</b> open</span>" +
+            "<span class='abuse-stat-pill stat-neutral'>Awaiting pkg <b>" + ((bs.initial || 0) + (bs.intake || 0)) + "</b></span>" +
+            "<span class='abuse-stat-pill stat-warn'>Estimates <b>" + ((bs.awaiting_estimates || 0) + (bs.estimates || 0)) + "</b></span>" +
+            "<span class='abuse-stat-pill stat-warn'>Release <b>" + ((bs.pending_legal_release || 0) + (bs.release_pending || 0)) + "</b></span>" +
+            "<span class='abuse-stat-pill stat-neutral'>Contract MX <b>" + ((bs.repair_in_mx_contract || 0) + (bs.approved_work || 0)) + "</b></span>" +
+            "<span class='abuse-stat-pill stat-ok'>Downtown MX <b>" + (bs.repair_downtown || 0) + "</b></span>" +
+            "<span class='abuse-stat-pill stat-ok'>On-base MX <b>" + (bs.repair_on_base || 0) + "</b></span>" +
+            "<span class='abuse-stat-pill stat-neutral'>Paperwork <b>" + (bs.no_repair_tracking || 0) + "</b></span>";
         }
         abuseDrawStageChart();
       } catch (e) {
@@ -23100,14 +23213,24 @@ function renderDashboardHtml(): string {
           tbody.innerHTML = "<tr><td colspan='7' class='muted' style='padding:12px'>No cases yet.</td></tr>";
           return;
         }
-        tbody.innerHTML = abuseTrackerState.cases.map(function (c) {
+        var filt = abuseTrackerState.caseTypeFilter || "all";
+        var rows = abuseTrackerState.cases.filter(function (c) {
+          if (filt === "all") return true;
+          return String(c.case_type || "") === filt;
+        });
+        if (!rows.length) {
+          tbody.innerHTML = "<tr><td colspan='7' class='muted' style='padding:12px'>No cases match this filter.</td></tr>";
+          return;
+        }
+        tbody.innerHTML = rows.map(function (c) {
           var wo = (c.work_order_id || "").trim();
           var loc = (c.vehicle_location || "").trim();
           var active = c.id === abuseTrackerState.selectedId ? " class='active'" : "";
+          var typCls = c.case_type === "abuse" ? "type-abu" : "type-acc";
           return (
             "<tr" + active + " data-abuse-id='" + esc(String(c.id)) + "'>" +
               "<td class='cn'>" + esc(c.control_number) + "</td>" +
-              "<td>" + esc(c.case_type) + "</td>" +
+              "<td class='" + typCls + "'>" + esc(c.case_type) + "</td>" +
               "<td>" + esc(c.asset_id) + "</td>" +
               "<td>" + esc(wo || "—") + "</td>" +
               "<td>" + esc(abuseStageLabel(c.stage)) + "</td>" +
@@ -23208,6 +23331,7 @@ function renderDashboardHtml(): string {
           stSel.value = sv;
           if (stSel.value !== sv) stSel.value = "initial";
         }
+        abuseSyncStageStripActive();
         document.getElementById("abuse-d-loc").value = c.vehicle_location || "";
         document.getElementById("abuse-d-det").value = c.determination || "";
         document.getElementById("abuse-d-resp").value = c.responsible_party || "";
@@ -23439,6 +23563,7 @@ function renderDashboardHtml(): string {
     function wireAbuseTrackerEvents() {
       if (abuseTrackerState.wired) return;
       abuseTrackerState.wired = true;
+      abuseRenderStageStrip();
       abuseRefreshFleetUnits();
       var abuseAssetPickTimer = null;
       var abuseAssetInp = document.getElementById("abuse-new-asset");
@@ -23531,6 +23656,16 @@ function renderDashboardHtml(): string {
       if (bStatsV) bStatsV.addEventListener("click", function () { abuseSetView("stats"); });
       var oo = document.getElementById("abuse-open-only");
       if (oo) oo.addEventListener("change", abuseLoadList);
+      document.querySelectorAll("[data-abuse-filter]").forEach(function (chip) {
+        chip.addEventListener("click", function () {
+          var f = chip.getAttribute("data-abuse-filter") || "all";
+          abuseTrackerState.caseTypeFilter = f;
+          document.querySelectorAll("[data-abuse-filter]").forEach(function (c2) {
+            c2.classList.toggle("active", (c2.getAttribute("data-abuse-filter") || "") === f);
+          });
+          abuseLoadList();
+        });
+      });
       var ex = document.getElementById("abuse-export-csv");
       if (ex) ex.addEventListener("click", abuseExportCsv);
       var sv = document.getElementById("abuse-save-case");
