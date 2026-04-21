@@ -8,7 +8,7 @@
 // card that lives in the cab so the driver also knows.
 //
 // Lifecycle:
-//   pending  → mechanic submits with photo + description
+//   pending  → mechanic submits with description (photos optional)
 //   approved → management approves; appears on the card
 //   rejected → management rejects with a reason; kept for audit
 //

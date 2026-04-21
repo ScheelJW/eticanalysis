@@ -2503,7 +2503,7 @@ function renderWaiverAppHtml(): string {
       <textarea id="sub-desc" maxlength="2000"></textarea>
       <label for="sub-submit-by">Your name (required)</label>
       <input id="sub-submit-by" type="text" autocomplete="name" placeholder="First Last" maxlength="120" />
-      <label>Photos or video of the defect (one or more files)</label>
+      <label>Photos or video (optional — add if you have them)</label>
       <div class="file-row">
         <label class="file-btn" for="sub-photo">📷 🎬 Add photos or video</label>
         <input id="sub-photo" type="file" accept="image/*,video/mp4,video/quicktime,video/webm,video/3gpp,video/*" multiple />
@@ -2896,7 +2896,6 @@ function renderWaiverAppHtml(): string {
     var title = $("sub-title").value.trim();
     if (!title) { $("sub-err").textContent = "Title is required."; $("sub-err").hidden = false; return; }
     var files = $("sub-photo").files ? Array.from($("sub-photo").files) : [];
-    if (!files.length) { $("sub-err").textContent = "Add at least one photo or video of the defect."; $("sub-err").hidden = false; return; }
     var fd = new FormData();
     fd.append("assetId", state.assetId);
     fd.append("title", title);
@@ -3544,7 +3543,7 @@ function isAllowedWaiverDefectMediaType(ct: string): boolean {
 
 /**
  * POST /api/waivers — submit a new waiver request.
- * multipart/form-data: assetId, title, description?, submittedBy, and one or
+ * multipart/form-data: assetId, title, description?, submittedBy, and zero or
  * more `photo` file fields (same name repeated). Up to 8 files, 50MB each;
  * images and short video clips (mp4, mov, webm, etc.).
  */
@@ -13634,7 +13633,7 @@ function renderDashboardHtml(): string {
                 <input type="text" id="wv-submit-by" autocomplete="name" placeholder="First Last" />
               </label>
               <label class="field" style="grid-column:1/-1">
-                <span class="label">Photos or video (one or more)</span>
+                <span class="label">Photos or video (optional)</span>
                 <input type="file" id="wv-submit-files" multiple accept="image/*,video/mp4,video/quicktime,video/webm,video/3gpp,video/*" />
               </label>
             </div>
@@ -20394,11 +20393,6 @@ function renderDashboardHtml(): string {
       }
       if (!submittedBy) {
         err.textContent = "Your name is required.";
-        err.hidden = false;
-        return;
-      }
-      if (!fileList.length) {
-        err.textContent = "Add at least one photo or video.";
         err.hidden = false;
         return;
       }
