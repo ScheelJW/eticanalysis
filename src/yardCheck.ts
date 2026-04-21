@@ -162,7 +162,17 @@ export const WORK_ORDER_SYNONYMS: Record<WorkOrderField, string[]> = {
 };
 
 export const FLEET_SYNONYMS: Record<FleetField, string[]> = {
-  assetId: ["asset id", "asset", "asset number", "asset #"],
+  // Keep in sync with WORK_ORDER_SYNONYMS.assetId — Fleet (P&A) headers often
+  // use the same phrasing as the WO sheet; a narrower list yields empty fleet maps.
+  assetId: [
+    "asset id",
+    "asset",
+    "asset number",
+    "asset #",
+    "equipment id",
+    "equip id",
+    "unit id",
+  ],
   vinSerial: [
     "serial nbr",
     "serial number",
