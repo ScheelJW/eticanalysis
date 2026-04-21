@@ -4294,29 +4294,55 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
   }
 
   const scope = (url.searchParams.get("scope") ?? "snapshot").toLowerCase();
+  const requestedAsOf = asOf;
+  let resolvedAsOf = asOf;
   let rows = scope === "all"
-    ? await getWatchRowsLatest(env, asOf)
-    : await getWatchRowsForDate(env, asOf);
+    ? await getWatchRowsLatest(env, resolvedAsOf)
+    : await getWatchRowsForDate(env, resolvedAsOf);
   // Self-heal: if scope=snapshot returned 0 rows for a date that does have a
   // workbook in R2 (e.g. ingest never wrote per-row history for that date),
   // replay it on the fly and re-query. Cheap one-shot, idempotent.
   let healed = false;
   if (scope !== "all" && rows.length === 0) {
     const history = await mergeHistoryWithActiveSnapshots(env, await loadHistory(env));
-    const entry = history.entries.find((e) => e.dateKey === asOf);
+    const entry = history.entries.find((e) => e.dateKey === resolvedAsOf);
     if (entry) {
-      const replayed = await replayWorkOrderWatchForDate(env, asOf);
+      const replayed = await replayWorkOrderWatchForDate(env, resolvedAsOf);
       if (replayed > 0) {
-        rows = await getWatchRowsForDate(env, asOf);
+        rows = await getWatchRowsForDate(env, resolvedAsOf);
         healed = true;
       }
+    }
+  }
+  // History/D1 index can list a date (e.g. new etic_snapshots row) before
+  // work_order_snapshot rows exist for that day — WO tab would go blank.
+  // Fall back to the newest snapshot_date_key that actually has rows.
+  let snapshotFallback = false;
+  if (scope !== "all" && rows.length === 0) {
+    const row = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT MAX(snapshot_date_key) AS d FROM work_order_snapshot WHERE TRIM(COALESCE(work_order_id, '')) != ''`,
+    ).first<{ d: string | null }>();
+    const fb = (row?.d ?? "").trim();
+    if (fb && fb !== resolvedAsOf) {
+      resolvedAsOf = fb;
+      rows = await getWatchRowsForDate(env, resolvedAsOf);
+      snapshotFallback = true;
     }
   }
   const staleOnly = url.searchParams.get("stale") === "1";
   const filtered = staleOnly ? rows.filter((r) => r.remarkStale) : rows;
   const staleCount = rows.filter((r) => r.remarkStale).length;
   return Response.json(
-    { asOfDateKey: asOf, scope, staleCount, total: rows.length, rows: filtered, healed },
+    {
+      asOfDateKey: resolvedAsOf,
+      requestedAsOfDateKey: snapshotFallback ? requestedAsOf : null,
+      snapshotFallback,
+      scope,
+      staleCount,
+      total: rows.length,
+      rows: filtered,
+      healed,
+    },
     { headers: cacheHeaders() },
   );
 }
@@ -15770,9 +15796,12 @@ function renderDashboardHtml(): string {
     /**
      * Work Orders tab is locked to the most-recent snapshot — the change
      * timeline already preserves history, so a date selector adds noise.
-     * This helper centralizes that decision.
+     * Prefer D1 /api/snapshots (real work_order_snapshot days) over merged
+     * /api/history alone, which can list a date before WO rows exist for it.
      */
     function woAsOfDate() {
+      const snaps = (snapshotRows || []).slice().sort(function (a, b) { return b.dateKey.localeCompare(a.dateKey); });
+      if (snaps.length) return snaps[0].dateKey;
       return latestSnapshotDate() || selectedDate || "";
     }
 
@@ -15862,6 +15891,7 @@ function renderDashboardHtml(): string {
         ? "Tune thresholds, mark MEL keys as critical, and define type subdivisions."
         : "Fleet readiness at a glance.";
       if (isWo) {
+        watchCacheByDate.clear();
         const asOf = woAsOfDate();
         if (asOf) loadAndRenderWoList(asOf, { force: true });
       } else if (isSmx) {
