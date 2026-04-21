@@ -11,7 +11,52 @@ type Env = { ETIC_SNAPSHOTS: D1Database; ETIC_BUCKET: R2Bucket };
 export const ABUSE_TRACKER_R2_PREFIX = "abuse-tracker/";
 
 export type AbuseCaseType = "accident" | "abuse";
-export type AbuseCaseStage = "intake" | "estimates" | "release_pending" | "approved_work" | "closed";
+export type AbuseCaseStage =
+  | "initial"
+  | "awaiting_estimates"
+  | "pending_legal_release"
+  | "repair_in_mx_contract"
+  | "repair_downtown"
+  | "repair_on_base"
+  | "no_repair_tracking"
+  | "closed";
+
+/** Map legacy DB/UI stage values to current enum (migration already normalizes DB). */
+export const LEGACY_ABUSE_STAGE_MAP: Record<string, AbuseCaseStage> = {
+  intake: "initial",
+  estimates: "awaiting_estimates",
+  release_pending: "pending_legal_release",
+  approved_work: "repair_in_mx_contract",
+  initial: "initial",
+  awaiting_estimates: "awaiting_estimates",
+  pending_legal_release: "pending_legal_release",
+  repair_in_mx_contract: "repair_in_mx_contract",
+  repair_downtown: "repair_downtown",
+  repair_on_base: "repair_on_base",
+  no_repair_tracking: "no_repair_tracking",
+  closed: "closed",
+};
+
+export function normalizeAbuseCaseStage(raw: string | null | undefined): AbuseCaseStage {
+  const k = (raw ?? "").trim();
+  return LEGACY_ABUSE_STAGE_MAP[k] ?? "initial";
+}
+
+export const ABUSE_STAGE_VALUES: readonly AbuseCaseStage[] = [
+  "initial",
+  "awaiting_estimates",
+  "pending_legal_release",
+  "repair_in_mx_contract",
+  "repair_downtown",
+  "repair_on_base",
+  "no_repair_tracking",
+  "closed",
+] as const;
+
+export function isValidAbuseStageInput(raw: string): boolean {
+  const n = normalizeAbuseCaseStage(raw);
+  return (ABUSE_STAGE_VALUES as readonly string[]).includes(n);
+}
 export type AbuseAttachmentKind = "damage_photo" | "release_letter" | "estimate" | "other";
 
 export type AbuseEstimate = {
@@ -44,6 +89,7 @@ export type AbuseCaseRow = {
   created_by: string;
   closed_at_iso: string | null;
   work_order_id: string;
+  tracking_active: number;
 };
 
 export type AbuseNoteRow = {
@@ -67,6 +113,28 @@ export type AbuseAttachmentRow = {
   source: "web" | "email";
 };
 
+export type AbuseTimelineKind =
+  | "case_opened"
+  | "stage"
+  | "location"
+  | "responsible_unit"
+  | "work_order"
+  | "tracking_mode"
+  | "note"
+  | "attachment"
+  | "reimbursement"
+  | "closed"
+  | "other";
+
+export type AbuseTimelineRow = {
+  id: number;
+  case_id: number;
+  at_iso: string;
+  kind: AbuseTimelineKind;
+  payload_json: string;
+  created_by: string;
+};
+
 function randomToken(len: number): string {
   const bytes = new Uint8Array(len);
   crypto.getRandomValues(bytes);
@@ -79,7 +147,7 @@ function safeFileName(name: string): string {
   return name.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120) || "file";
 }
 
-export async function allocateControlNumber(env: Env): Promise<string> {
+export async function allocateControlNumber(env: Env, caseType: AbuseCaseType): Promise<string> {
   const y = new Date().getUTCFullYear();
   await env.ETIC_SNAPSHOTS.prepare(`INSERT INTO abuse_tracker_seq (year, last_n) VALUES (?, 0) ON CONFLICT DO NOTHING`)
     .bind(y)
@@ -91,7 +159,8 @@ export async function allocateControlNumber(env: Env): Promise<string> {
     .bind(y)
     .first<{ last_n: number }>();
   const n = r?.last_n ?? 1;
-  return `AA-${y}-${String(n).padStart(5, "0")}`;
+  const prefix = caseType === "abuse" ? "ABU" : "ACC";
+  return `${prefix}-${y}-${String(n).padStart(5, "0")}`;
 }
 
 export async function findCaseByEmailToken(env: Env, token: string): Promise<AbuseCaseRow | null> {
@@ -215,7 +284,7 @@ export async function createAbuseCase(env: Env, input: CreateAbuseCaseInput): Pr
     .first<{ id: number }>();
   if (open) throw new Error(`An open ${caseType} case already exists for this asset.`);
 
-  const control = await allocateControlNumber(env);
+  const control = await allocateControlNumber(env, caseType);
   const token = randomToken(16);
   const now = new Date().toISOString();
   // Snapshot org fields at case creation only — never updated from later ingests.
@@ -233,8 +302,8 @@ export async function createAbuseCase(env: Env, input: CreateAbuseCaseInput): Pr
     `INSERT INTO abuse_tracker_case (
        control_number, case_type, asset_id, work_order_id, owning_unit, shop, make_model, veh_nomen, mgmt_cd,
        determination, responsible_party, reimbursed_to_vm, reimbursed_at_iso, reimbursed_note,
-       stage, vehicle_location, estimates_json, email_token, created_at_iso, updated_at_iso, created_by
-     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,0,NULL,'','intake',?,?,?,?,?,?)`,
+       stage, vehicle_location, estimates_json, email_token, created_at_iso, updated_at_iso, created_by, tracking_active
+     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,0,NULL,'','initial',?,?,?,?,?,?,1)`,
   )
     .bind(
       control,
@@ -270,6 +339,13 @@ export async function createAbuseCase(env: Env, input: CreateAbuseCaseInput): Pr
     .bind(id)
     .first<AbuseCaseRow>();
   if (!row) throw new Error("case not found after insert");
+  await insertAbuseTimeline(env, {
+    caseId: id,
+    kind: "case_opened",
+    payload: { control_number: control, case_type: caseType, asset_id: assetId },
+    createdBy: (input.createdBy ?? "").trim() || "system",
+    atIso: now,
+  });
   return row;
 }
 
@@ -284,7 +360,64 @@ export type UpdateAbuseCaseInput = {
   vehicleLocation?: string;
   estimates?: AbuseEstimate[];
   closed?: boolean;
+  trackingActive?: boolean;
+  timelineAuthor?: string;
 };
+
+async function insertAbuseTimeline(
+  env: Env,
+  opts: { caseId: number; kind: AbuseTimelineKind; payload: Record<string, unknown>; createdBy: string; atIso?: string },
+): Promise<void> {
+  const at = opts.atIso ?? new Date().toISOString();
+  const payload = JSON.stringify(opts.payload ?? {});
+  const by = (opts.createdBy ?? "").trim() || "system";
+  try {
+    await env.ETIC_SNAPSHOTS.prepare(
+      `INSERT INTO abuse_tracker_timeline (case_id, at_iso, kind, payload_json, created_by) VALUES (?,?,?,?,?)`,
+    )
+      .bind(opts.caseId, at, opts.kind, payload, by)
+      .run();
+  } catch (e) {
+    console.warn(
+      JSON.stringify({
+        level: "warn",
+        message: "abuse_tracker_timeline insert skipped (migration 0031 applied?)",
+        err: e instanceof Error ? e.message : String(e),
+      }),
+    );
+  }
+}
+
+export async function listAbuseTimeline(env: Env, caseId: number): Promise<AbuseTimelineRow[]> {
+  try {
+    const r = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT * FROM abuse_tracker_timeline WHERE case_id = ? ORDER BY datetime(at_iso) ASC, id ASC`,
+    )
+      .bind(caseId)
+      .all<AbuseTimelineRow>();
+    return r.results ?? [];
+  } catch {
+    return [];
+  }
+}
+
+/** Distinct owning_unit values from fleet_asset_current (Fleet P&A). */
+export async function listFleetOwningUnits(env: Env, limit: number): Promise<string[]> {
+  const lim = Math.min(2000, Math.max(1, limit || 500));
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT DISTINCT trim(owning_unit) AS u FROM fleet_asset_current
+     WHERE trim(owning_unit) != ''
+     ORDER BY u ASC LIMIT ?`,
+  )
+    .bind(lim)
+    .all<{ u: string }>();
+  const out: string[] = [];
+  for (const row of r.results ?? []) {
+    const u = (row.u ?? "").trim();
+    if (u && !out.includes(u)) out.push(u);
+  }
+  return out;
+}
 
 export async function updateAbuseCase(
   env: Env,
@@ -296,6 +429,7 @@ export async function updateAbuseCase(
     .first<AbuseCaseRow>();
   if (!cur) return null;
   const now = new Date().toISOString();
+  const tlAuthor = (patch.timelineAuthor ?? "").trim() || "Manager";
   let estimatesJson = cur.estimates_json;
   if (patch.estimates !== undefined) {
     estimatesJson = JSON.stringify(patch.estimates);
@@ -309,7 +443,8 @@ export async function updateAbuseCase(
   const determination = patch.determination !== undefined ? patch.determination.trim() : cur.determination;
   const responsibleParty =
     patch.responsibleParty !== undefined ? patch.responsibleParty.trim() : cur.responsible_party;
-  const stage = patch.stage !== undefined ? patch.stage : cur.stage;
+  const stageRaw = patch.stage !== undefined ? patch.stage : normalizeAbuseCaseStage(String(cur.stage));
+  const stage = normalizeAbuseCaseStage(stageRaw);
   const vehicleLocation =
     patch.vehicleLocation !== undefined ? patch.vehicleLocation.trim() : cur.vehicle_location;
   let workOrderId =
@@ -318,21 +453,35 @@ export async function updateAbuseCase(
   if (patch.closed === true) closedAt = now;
   if (patch.closed === false) closedAt = null;
 
-  if (!workOrderId && !closedAt) {
+  const trackingActive =
+    patch.trackingActive !== undefined ? (patch.trackingActive ? 1 : 0) : (cur.tracking_active ?? 1);
+
+  if (!workOrderId && !closedAt && trackingActive) {
     const linked = await resolveLatestWorkOrderIdForAsset(env, cur.asset_id);
     if (linked) workOrderId = linked;
   }
 
+  const curStage = normalizeAbuseCaseStage(String(cur.stage));
   const locChanged =
     patch.vehicleLocation !== undefined &&
     patch.vehicleLocation.trim() !== (cur.vehicle_location ?? "").trim();
   const newLoc = patch.vehicleLocation !== undefined ? patch.vehicleLocation.trim() : cur.vehicle_location;
+  const stageChanged = patch.stage !== undefined && stage !== curStage;
+  const respChanged =
+    patch.responsibleParty !== undefined &&
+    (patch.responsibleParty ?? "").trim() !== (cur.responsible_party ?? "").trim();
+  const woChanged = patch.workOrderId !== undefined && workOrderId !== (cur.work_order_id ?? "").trim();
+  const trackChanged = patch.trackingActive !== undefined && trackingActive !== (cur.tracking_active ?? 1);
+  const reimbChanged =
+    patch.reimbursedToVm !== undefined ||
+    patch.reimbursedAtIso !== undefined ||
+    patch.reimbursedNote !== undefined;
 
   await env.ETIC_SNAPSHOTS.prepare(
     `UPDATE abuse_tracker_case SET
        work_order_id = ?, determination = ?, responsible_party = ?, reimbursed_to_vm = ?, reimbursed_at_iso = ?,
        reimbursed_note = ?, stage = ?, vehicle_location = ?, estimates_json = ?,
-       updated_at_iso = ?, closed_at_iso = ?
+       updated_at_iso = ?, closed_at_iso = ?, tracking_active = ?
      WHERE id = ?`,
   )
     .bind(
@@ -347,18 +496,87 @@ export async function updateAbuseCase(
       estimatesJson,
       now,
       closedAt,
+      trackingActive,
       caseId,
     )
     .run();
 
-  if (locChanged && newLoc.trim() && !closedAt) {
+  if (stageChanged) {
+    await insertAbuseTimeline(env, {
+      caseId,
+      kind: "stage",
+      payload: { from: curStage, to: stage },
+      createdBy: tlAuthor,
+      atIso: now,
+    });
+  }
+  if (locChanged && newLoc.trim()) {
+    await insertAbuseTimeline(env, {
+      caseId,
+      kind: "location",
+      payload: { from: (cur.vehicle_location ?? "").trim(), to: newLoc.trim() },
+      createdBy: tlAuthor,
+      atIso: now,
+    });
+  }
+  if (respChanged) {
+    await insertAbuseTimeline(env, {
+      caseId,
+      kind: "responsible_unit",
+      payload: { from: (cur.responsible_party ?? "").trim(), to: responsibleParty },
+      createdBy: tlAuthor,
+      atIso: now,
+    });
+  }
+  if (woChanged) {
+    await insertAbuseTimeline(env, {
+      caseId,
+      kind: "work_order",
+      payload: { from: (cur.work_order_id ?? "").trim(), to: workOrderId },
+      createdBy: tlAuthor,
+      atIso: now,
+    });
+  }
+  if (trackChanged) {
+    await insertAbuseTimeline(env, {
+      caseId,
+      kind: "tracking_mode",
+      payload: { active: !!trackingActive },
+      createdBy: tlAuthor,
+      atIso: now,
+    });
+  }
+  if (reimbChanged && (reimbursedToVm !== cur.reimbursed_to_vm || reimbursedNote !== cur.reimbursed_note || reimbursedAtIso !== cur.reimbursed_at_iso)) {
+    await insertAbuseTimeline(env, {
+      caseId,
+      kind: "reimbursement",
+      payload: {
+        to_vm: !!reimbursedToVm,
+        at: reimbursedAtIso,
+        note: reimbursedNote,
+      },
+      createdBy: tlAuthor,
+      atIso: now,
+    });
+  }
+  if (patch.closed === true && !cur.closed_at_iso) {
+    await insertAbuseTimeline(env, {
+      caseId,
+      kind: "closed",
+      payload: {},
+      createdBy: tlAuthor,
+      atIso: now,
+    });
+  }
+
+  if (locChanged && newLoc.trim() && !closedAt && trackingActive) {
     try {
       await recordCheck(env, {
         assetId: cur.asset_id,
         location: newLoc.trim(),
         discrepancies: "A/A tracker (manager location update)",
         status: "present",
-        checkedBy: "A/A program",
+        checkedBy: tlAuthor || "A/A program",
       });
     } catch (e) {
       console.warn(
@@ -387,7 +605,21 @@ export async function addAbuseNote(env: Env, caseId: number, body: string, autho
     .run();
   const nid = Number(ins.meta.last_row_id ?? 0);
   await env.ETIC_SNAPSHOTS.prepare(`UPDATE abuse_tracker_case SET updated_at_iso = ? WHERE id = ?`).bind(now, caseId).run();
-  return env.ETIC_SNAPSHOTS.prepare(`SELECT * FROM abuse_tracker_note WHERE id = ?`).bind(nid).first<AbuseNoteRow>();
+  const noteRow = await env.ETIC_SNAPSHOTS.prepare(`SELECT * FROM abuse_tracker_note WHERE id = ?`).bind(nid).first<AbuseNoteRow>();
+  if (noteRow) {
+    await insertAbuseTimeline(env, {
+      caseId,
+      kind: "note",
+      payload: {
+        note_id: nid,
+        author: (author ?? "").trim(),
+        snippet: b.slice(0, 200),
+      },
+      createdBy: (author ?? "").trim() || "system",
+      atIso: now,
+    });
+  }
+  return noteRow;
 }
 
 export async function addAbuseAttachment(
@@ -431,6 +663,18 @@ export async function addAbuseAttachment(
     .bind(aid)
     .first<AbuseAttachmentRow>();
   if (!row) throw new Error("attachment row missing");
+  await insertAbuseTimeline(env, {
+    caseId: opts.caseId,
+    kind: "attachment",
+    payload: {
+      kind: opts.kind,
+      filename: opts.filename,
+      source: opts.source,
+      attachment_id: aid,
+    },
+    createdBy: (opts.uploadedBy ?? "").trim() || "system",
+    atIso: now,
+  });
   return row;
 }
 
@@ -485,6 +729,7 @@ export async function getAbuseCaseDetail(env: Env, caseId: number): Promise<{
   case: AbuseCaseRow;
   notes: AbuseNoteRow[];
   attachments: AbuseAttachmentRow[];
+  timeline: AbuseTimelineRow[];
 } | null> {
   const c = await env.ETIC_SNAPSHOTS.prepare(`SELECT * FROM abuse_tracker_case WHERE id = ?`).bind(caseId).first<AbuseCaseRow>();
   if (!c) return null;
@@ -498,7 +743,8 @@ export async function getAbuseCaseDetail(env: Env, caseId: number): Promise<{
   )
     .bind(caseId)
     .all<AbuseAttachmentRow>();
-  return { case: c, notes: notes.results ?? [], attachments: atts.results ?? [] };
+  const timeline = await listAbuseTimeline(env, caseId);
+  return { case: c, notes: notes.results ?? [], attachments: atts.results ?? [], timeline };
 }
 
 export async function getAbuseAttachmentMeta(

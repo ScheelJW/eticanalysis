@@ -112,8 +112,11 @@ import {
   ingestAbuseDamEmailFiles,
   listAbuseCases,
   listOpenAbuseCasesForWorkOrder,
+  listFleetOwningUnits,
   searchFleetAssetsForPicker,
   parseAbuseEmailIngestFromTo,
+  normalizeAbuseCaseStage,
+  isValidAbuseStageInput,
   updateAbuseCase,
   abuseDamEmailLocalPart,
   abuseIngestEmailAddresses,
@@ -575,6 +578,9 @@ export default {
 
     if (url.pathname === "/api/fleet/assets") {
       return handleFleetAssetsSearchApi(env, request);
+    }
+    if (url.pathname === "/api/fleet/units") {
+      return handleFleetOwningUnitsApi(env, request);
     }
     if (url.pathname === "/api/abuse-tracker/stats") {
       return handleAbuseTrackerStatsApi(env, request);
@@ -3662,7 +3668,7 @@ function isAbuseCaseType(s: unknown): s is AbuseCaseType {
   return s === "accident" || s === "abuse";
 }
 function isAbuseCaseStage(s: unknown): s is AbuseCaseStage {
-  return s === "intake" || s === "estimates" || s === "release_pending" || s === "approved_work" || s === "closed";
+  return typeof s === "string" && isValidAbuseStageInput(s);
 }
 
 async function handleFleetAssetsSearchApi(env: Env, request: Request): Promise<Response> {
@@ -3672,6 +3678,14 @@ async function handleFleetAssetsSearchApi(env: Env, request: Request): Promise<R
   const limit = Number.parseInt(url.searchParams.get("limit") ?? "20", 10) || 20;
   const rows = await searchFleetAssetsForPicker(env, q, limit);
   return Response.json({ assets: rows }, { headers: cacheHeaders() });
+}
+
+async function handleFleetOwningUnitsApi(env: Env, request: Request): Promise<Response> {
+  if (request.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
+  const url = new URL(request.url);
+  const limit = Number.parseInt(url.searchParams.get("limit") ?? "800", 10) || 800;
+  const units = await listFleetOwningUnits(env, limit);
+  return Response.json({ units }, { headers: cacheHeaders() });
 }
 
 async function handleAbuseTrackerStatsApi(env: Env, request: Request): Promise<Response> {
@@ -3709,6 +3723,8 @@ async function handleAbuseTrackerListApi(env: Env, request: Request): Promise<Re
         "reimbursed_at_iso",
         "vehicle_location",
         "created_at_iso",
+        "closed_at_iso",
+        "tracking_active",
         "email_ingest_damage_photo",
         "email_ingest_release_letter",
         "email_ingest_estimate",
@@ -3734,6 +3750,7 @@ async function handleAbuseTrackerListApi(env: Env, request: Request): Promise<Re
           escCsv(r.vehicle_location),
           escCsv(r.created_at_iso),
           escCsv(r.closed_at_iso ?? ""),
+          r.tracking_active ? "1" : "0",
           escCsv(`${em.damage_photo}@${host}`),
           escCsv(`${em.release_letter}@${host}`),
           escCsv(`${em.estimate}@${host}`),
@@ -3832,6 +3849,8 @@ async function handleAbuseTrackerCaseApi(env: Env, request: Request, caseId: num
     vehicleLocation?: unknown;
     estimates?: unknown;
     closed?: unknown;
+    trackingActive?: unknown;
+    timelineAuthor?: unknown;
   }>(request);
   if (!body) return Response.json({ error: "JSON body required" }, { status: 400, headers: cacheHeaders() });
   const patch: Parameters<typeof updateAbuseCase>[2] = {};
@@ -3848,8 +3867,10 @@ async function handleAbuseTrackerCaseApi(env: Env, request: Request, caseId: num
     if (!isAbuseCaseStage(body.stage)) {
       return Response.json({ error: "invalid stage" }, { status: 400, headers: cacheHeaders() });
     }
-    patch.stage = body.stage;
+    patch.stage = normalizeAbuseCaseStage(String(body.stage));
   }
+  if (body.trackingActive !== undefined) patch.trackingActive = !!body.trackingActive;
+  if (body.timelineAuthor !== undefined) patch.timelineAuthor = String(body.timelineAuthor ?? "");
   if (body.vehicleLocation !== undefined) patch.vehicleLocation = String(body.vehicleLocation);
   if (body.estimates !== undefined) {
     if (!Array.isArray(body.estimates)) {
@@ -9886,6 +9907,14 @@ function renderDashboardHtml(): string {
     .abuse-atts-list { display: flex; flex-direction: column; gap: 6px; }
     .abuse-att-row { font-size: 0.84rem; }
     .abuse-att-row a { color: var(--accent); font-weight: 600; }
+    .abuse-timeline {
+      margin-top: 14px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px;
+      background: var(--bg-elev); max-height: 280px; overflow-y: auto; font-size: 0.8rem;
+    }
+    .abuse-tl-row { padding: 8px 0; border-bottom: 1px dashed var(--border); }
+    .abuse-tl-row:last-child { border-bottom: none; }
+    .abuse-tl-when { font-size: 0.72rem; color: var(--muted); margin-bottom: 2px; }
+    .abuse-tl-kind { font-weight: 700; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--accent); }
     .abuse-est-row { display: grid; grid-template-columns: 1fr 100px 1fr auto; gap: 8px; margin-bottom: 8px; align-items: end; }
     @media (max-width: 720px) { .abuse-est-row { grid-template-columns: 1fr; } }
     .abuse-new-card { margin-top: 16px; }
@@ -13314,34 +13343,48 @@ function renderDashboardHtml(): string {
                 </div>
                 <div class="hint abuse-ingest-wrap" id="abuse-d-ingest"></div>
                 <div class="abuse-grid">
-                  <label class="field"><span class="label">Stage</span>
+                  <label class="field"><span class="label">Current status</span>
                     <select id="abuse-d-stage">
-                      <option value="intake">Initial — awaiting documents</option>
-                      <option value="estimates">Awaiting estimates</option>
-                      <option value="release_pending">Release letter (commander review)</option>
-                      <option value="approved_work">Approved — work in progress</option>
+                      <option value="initial">Initial — awaiting documents (photos, SF-91, WO, etc.)</option>
+                      <option value="awaiting_estimates">Awaiting estimates</option>
+                      <option value="pending_legal_release">Pending legal / commander release</option>
+                      <option value="repair_in_mx_contract">In MX (contract shop)</option>
+                      <option value="repair_downtown">Repair downtown (off base)</option>
+                      <option value="repair_on_base">Repair on base (org maintenance)</option>
+                      <option value="no_repair_tracking">Tracking only — no repair in progress</option>
                       <option value="closed">Closed</option>
                     </select>
                   </label>
-                  <label class="field"><span class="label">Vehicle location</span>
-                    <input type="text" id="abuse-d-loc" placeholder="e.g. Bldg 123 bay 2 — also writes yard check" />
+                  <label class="field"><span class="label">Vehicle location (where it is now)</span>
+                    <input type="text" id="abuse-d-loc" placeholder="e.g. Downtown ABC Body · Lot B row 3 — logs to timeline + yard when saved" />
                   </label>
                   <p class="hint" style="grid-column:1/-1;margin:0;font-size:0.78rem">
-                    Saving location records a yard check as present for this asset (same as walker last-seen data) so the work order tab stays aligned.
+                    Each location save is logged on the timeline below. If repair tracking is on, it also writes a yard check (present) so WO last-seen stays aligned.
                   </p>
+                  <label class="field abuse-check" style="grid-column:1/-1">
+                    <input type="checkbox" id="abuse-d-tracking" checked /> Link work order &amp; sync yard on location (turn off for paperwork-only / no-repair cases)
+                  </label>
                   <label class="field" style="grid-column:1/-1"><span class="label">Determination (VFM/VMS)</span>
                     <input type="text" id="abuse-d-det" placeholder="Accident vs abuse, brief rationale" />
                   </label>
-                  <label class="field" style="grid-column:1/-1"><span class="label">Responsible for cost</span>
-                    <input type="text" id="abuse-d-resp" placeholder="Unit / individual / org" />
+                  <label class="field" style="grid-column:1/-1"><span class="label">Unit responsible (Fleet P&amp;A)</span>
+                    <input type="text" id="abuse-d-resp" list="abuse-resp-datalist" placeholder="Pick a unit or type custom" autocomplete="organization" />
+                    <datalist id="abuse-resp-datalist"></datalist>
                   </label>
                   <label class="field" style="grid-column:1/-1"><span class="label">Work order ID</span>
-                    <input type="text" id="abuse-d-wo" placeholder="e.g. 2026040900016 (optional)" />
+                    <input type="text" id="abuse-d-wo" placeholder="Optional — clear if none; when tracking is on, latest WO may auto-fill" />
+                  </label>
+                  <label class="field" style="grid-column:1/-1"><span class="label">Your name (for timeline)</span>
+                    <input type="text" id="abuse-save-by" placeholder="e.g. MSgt Jones" autocomplete="name" />
                   </label>
                   <label class="field abuse-check"><input type="checkbox" id="abuse-d-reimb" /> Reimbursed to VM</label>
                   <label class="field"><span class="label">Reimbursement note</span>
                     <input type="text" id="abuse-d-reimb-note" />
                   </label>
+                </div>
+                <div class="abuse-timeline" id="abuse-timeline-wrap" aria-label="Case timeline">
+                  <h4 style="margin:0 0 8px;font-size:0.88rem">Timeline</h4>
+                  <div id="abuse-timeline-list" class="muted">Load a case to see status and location history.</div>
                 </div>
                 <div class="abuse-estimates">
                   <h4 style="margin:16px 0 8px;font-size:0.9rem">Three estimates</h4>
@@ -22861,6 +22904,7 @@ function renderDashboardHtml(): string {
       detail: null,
       stats: null,
       view: "cases",
+      fleetUnits: [],
       wired: false,
     };
 
@@ -22881,12 +22925,64 @@ function renderDashboardHtml(): string {
     }
 
     function abuseStageLabel(s) {
-      if (s === "intake") return "Initial — awaiting documents";
-      if (s === "estimates") return "Awaiting estimates";
-      if (s === "release_pending") return "Release letter";
-      if (s === "approved_work") return "Approved / work";
-      if (s === "closed") return "Closed";
-      return s || "";
+      var k = String(s || "");
+      if (k === "initial" || k === "intake") return "Initial — awaiting documents";
+      if (k === "awaiting_estimates" || k === "estimates") return "Awaiting estimates";
+      if (k === "pending_legal_release" || k === "release_pending") return "Pending legal / release";
+      if (k === "repair_in_mx_contract" || k === "approved_work") return "In MX (contract)";
+      if (k === "repair_downtown") return "Repair downtown";
+      if (k === "repair_on_base") return "Repair on base";
+      if (k === "no_repair_tracking") return "Tracking only (no repair)";
+      if (k === "closed") return "Closed";
+      return k.replace(/_/g, " ") || "";
+    }
+
+    function abuseTimelineKindLabel(kind) {
+      if (kind === "case_opened") return "Case opened";
+      if (kind === "stage") return "Status";
+      if (kind === "location") return "Location";
+      if (kind === "responsible_unit") return "Responsible unit";
+      if (kind === "work_order") return "Work order";
+      if (kind === "tracking_mode") return "Repair / WO tracking";
+      if (kind === "note") return "Note";
+      if (kind === "attachment") return "File";
+      if (kind === "reimbursement") return "Reimbursement";
+      if (kind === "closed") return "Closed";
+      return kind || "Event";
+    }
+
+    function abuseFormatTimelineRow(t) {
+      var kind = String(t.kind || "");
+      var pay = {};
+      try { pay = JSON.parse(t.payload_json || "{}"); } catch (e) { pay = {}; }
+      var body = "";
+      if (kind === "stage") {
+        body = (pay.from ? esc(String(pay.from)) + " → " : "") + esc(String(pay.to || ""));
+      } else if (kind === "location") {
+        body = (pay.from ? esc(String(pay.from)) + " → " : "") + esc(String(pay.to || ""));
+      } else if (kind === "responsible_unit" || kind === "work_order") {
+        body = (pay.from ? esc(String(pay.from)) + " → " : "") + esc(String(pay.to || ""));
+      } else if (kind === "tracking_mode") {
+        body = pay.active ? "Tracking on (WO link + yard on location)" : "Tracking off (paperwork / no repair)";
+      } else if (kind === "note") {
+        body = esc(String(pay.snippet || ""));
+      } else if (kind === "attachment") {
+        body = esc(String(pay.kind || "")) + " · " + esc(String(pay.filename || ""));
+      } else if (kind === "reimbursement") {
+        body = (pay.to_vm ? "Marked reimbursed to VM" : "Reimbursement updated") +
+          (pay.note ? " · " + esc(String(pay.note)) : "");
+      } else if (kind === "case_opened") {
+        body = esc(String(pay.case_type || "")) + " · " + esc(String(pay.asset_id || ""));
+      } else {
+        body = esc(JSON.stringify(pay).slice(0, 120));
+      }
+      return (
+        "<div class='abuse-tl-row'>" +
+          "<div class='abuse-tl-when'>" + esc(t.at_iso || "") + (t.created_by ? " · " + esc(t.created_by) : "") + "</div>" +
+          "<div class='abuse-tl-kind'>" + esc(abuseTimelineKindLabel(kind)) + "</div>" +
+          "<div>" + body + "</div>" +
+        "</div>"
+      );
     }
 
     function abuseIngestTableHtml(em) {
@@ -22925,8 +23021,11 @@ function renderDashboardHtml(): string {
       ctx.clearRect(0, 0, w, h);
       var st = abuseTrackerState.stats;
       var by = (st && st.byStage) || {};
-      var keys = ["intake", "estimates", "release_pending", "approved_work"];
-      var shortLabs = ["Initial", "Estimates", "Release", "Work"];
+      var keys = [
+        "initial", "awaiting_estimates", "pending_legal_release", "repair_in_mx_contract",
+        "repair_downtown", "repair_on_base", "no_repair_tracking",
+      ];
+      var shortLabs = ["Initial", "Est.", "Legal", "MX ctr", "Downtown", "On base", "No repair"];
       var vals = keys.map(function (k) { return by[k] || 0; });
       var max = Math.max.apply(null, vals.concat([1]));
       var pad = 32;
@@ -22953,10 +23052,13 @@ function renderDashboardHtml(): string {
           var bs = j.byStage || {};
           elFull.innerHTML =
             "<span class='abuse-stat-pill'><b>" + (j.open || 0) + "</b> open cases</span>" +
-            "<span class='abuse-stat-pill'>Initial <b>" + (bs.intake || 0) + "</b></span>" +
-            "<span class='abuse-stat-pill'>Awaiting estimates <b>" + (bs.estimates || 0) + "</b></span>" +
-            "<span class='abuse-stat-pill'>Release <b>" + (bs.release_pending || 0) + "</b></span>" +
-            "<span class='abuse-stat-pill'>Approved / work <b>" + (bs.approved_work || 0) + "</b></span>";
+            "<span class='abuse-stat-pill'>Initial <b>" + ((bs.initial || 0) + (bs.intake || 0)) + "</b></span>" +
+            "<span class='abuse-stat-pill'>Estimates <b>" + ((bs.awaiting_estimates || 0) + (bs.estimates || 0)) + "</b></span>" +
+            "<span class='abuse-stat-pill'>Legal / release <b>" + ((bs.pending_legal_release || 0) + (bs.release_pending || 0)) + "</b></span>" +
+            "<span class='abuse-stat-pill'>MX contract <b>" + ((bs.repair_in_mx_contract || 0) + (bs.approved_work || 0)) + "</b></span>" +
+            "<span class='abuse-stat-pill'>Downtown <b>" + (bs.repair_downtown || 0) + "</b></span>" +
+            "<span class='abuse-stat-pill'>On base <b>" + (bs.repair_on_base || 0) + "</b></span>" +
+            "<span class='abuse-stat-pill'>No repair <b>" + (bs.no_repair_tracking || 0) + "</b></span>";
         }
         abuseDrawStageChart();
       } catch (e) {
@@ -23081,10 +23183,17 @@ function renderDashboardHtml(): string {
               ? "<strong>Email ingest:</strong> <code style='font-size:0.85rem'>" + esc(j.ingestEmail) + "</code>"
               : "";
         }
-        document.getElementById("abuse-d-stage").value = c.stage || "intake";
+        var stSel = document.getElementById("abuse-d-stage");
+        if (stSel) {
+          var sv = String(c.stage || "initial");
+          stSel.value = sv;
+          if (stSel.value !== sv) stSel.value = "initial";
+        }
         document.getElementById("abuse-d-loc").value = c.vehicle_location || "";
         document.getElementById("abuse-d-det").value = c.determination || "";
         document.getElementById("abuse-d-resp").value = c.responsible_party || "";
+        var trk = document.getElementById("abuse-d-tracking");
+        if (trk) trk.checked = c.tracking_active !== 0 && c.tracking_active !== false;
         document.getElementById("abuse-d-reimb").checked = !!c.reimbursed_to_vm;
         document.getElementById("abuse-d-reimb-note").value = c.reimbursed_note || "";
         var woEl = document.getElementById("abuse-d-wo");
@@ -23105,6 +23214,15 @@ function renderDashboardHtml(): string {
               esc(a.kind) + "</a> · " + esc(a.filename || "") + " · " + esc(a.uploaded_by || "") + "</div>"
           );
         }).join("") || "<div class='muted'>No attachments yet.</div>";
+        var tl = document.getElementById("abuse-timeline-list");
+        if (tl) {
+          var rows = (j.timeline || []).slice().sort(function (a, b) {
+            return String(a.at_iso || "").localeCompare(String(b.at_iso || ""));
+          });
+          tl.innerHTML = rows.length
+            ? rows.map(abuseFormatTimelineRow).join("")
+            : "<div class='muted'>No timeline events yet. Save status or location changes to build the log.</div>";
+        }
         document.getElementById("abuse-case-status").textContent = "";
       } catch (e) {
         document.getElementById("abuse-case-status").textContent = "Could not load case.";
@@ -23158,6 +23276,7 @@ function renderDashboardHtml(): string {
       var st = document.getElementById("abuse-case-status");
       st.textContent = "Saving…";
       try {
+        var trkEl = document.getElementById("abuse-d-tracking");
         var body = {
           stage: document.getElementById("abuse-d-stage").value,
           vehicleLocation: document.getElementById("abuse-d-loc").value,
@@ -23167,6 +23286,8 @@ function renderDashboardHtml(): string {
           reimbursedToVm: document.getElementById("abuse-d-reimb").checked,
           reimbursedNote: document.getElementById("abuse-d-reimb-note").value,
           estimates: abuseCollectEstimates(),
+          trackingActive: trkEl ? !!trkEl.checked : true,
+          timelineAuthor: (document.getElementById("abuse-save-by") && document.getElementById("abuse-save-by").value) || "",
         };
         var r = await fetch("/api/abuse-tracker/" + id, {
           method: "PATCH",
@@ -23274,9 +23395,32 @@ function renderDashboardHtml(): string {
       if (abuseTrackerState.view === "stats") abuseLoadStats();
     }
 
+    function abuseRefreshFleetUnits() {
+      var dl = document.getElementById("abuse-resp-datalist");
+      if (!dl) return;
+      if (abuseTrackerState.fleetUnits && abuseTrackerState.fleetUnits.length) {
+        dl.innerHTML = abuseTrackerState.fleetUnits.map(function (u) {
+          return "<option value='" + esc(u) + "'></option>";
+        }).join("");
+        return;
+      }
+      fetch("/api/fleet/units?limit=1200", { cache: "no-store" })
+        .then(function (r) { return r.ok ? r.json() : { units: [] }; })
+        .then(function (j) {
+          abuseTrackerState.fleetUnits = Array.isArray(j.units) ? j.units : [];
+          if (dl) {
+            dl.innerHTML = abuseTrackerState.fleetUnits.map(function (u) {
+              return "<option value='" + esc(u) + "'></option>";
+            }).join("");
+          }
+        })
+        .catch(function () {});
+    }
+
     function wireAbuseTrackerEvents() {
       if (abuseTrackerState.wired) return;
       abuseTrackerState.wired = true;
+      abuseRefreshFleetUnits();
       var abuseAssetPickTimer = null;
       var abuseAssetInp = document.getElementById("abuse-new-asset");
       var abuseAssetDl = document.getElementById("abuse-asset-datalist");
