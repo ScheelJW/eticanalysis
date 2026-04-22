@@ -8182,30 +8182,22 @@ function renderDashboardHtml(): string {
     .wo-refine-sel option { background: var(--surface); color: var(--text); }
 
     .wo-fma-followup-block {
-      margin: 0 0 8px;
+      margin: 0 0 10px;
+      flex: 0 0 auto;
       border-radius: 10px;
-      border: 1px solid var(--border);
-      background: rgba(15,30,60,0.03);
-      overflow: hidden;
+      border: 1px solid rgba(0,58,140,0.22);
+      background: var(--accent-soft);
+      box-shadow: 0 1px 0 rgba(15,30,60,0.06);
     }
-    .wo-fma-followup-summary {
-      cursor: pointer;
-      list-style: none;
-      padding: 10px 12px;
-      font-size: 0.82rem;
-      font-weight: 600;
-      color: var(--text);
+    .wo-fma-followup-title {
+      margin: 0;
+      padding: 10px 12px 0;
+      font-size: 0.9rem;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+      color: var(--accent-strong);
     }
-    .wo-fma-followup-summary::-webkit-details-marker { display: none; }
-    .wo-fma-followup-summary::before {
-      content: "▸";
-      display: inline-block;
-      margin-right: 8px;
-      color: var(--muted);
-      transition: transform 0.12s ease;
-    }
-    .wo-fma-followup-block[open] .wo-fma-followup-summary::before { transform: rotate(90deg); }
-    .wo-fma-followup-inner { padding: 0 12px 12px; }
+    .wo-fma-followup-inner { padding: 8px 12px 12px; }
     .wo-fma-followup-hint { margin: 0 0 10px; font-size: 0.72rem; }
     .wo-fma-followup-controls {
       display: flex;
@@ -8235,6 +8227,7 @@ function renderDashboardHtml(): string {
     .wo-fma-followup-field input#fma-rpt-shop { width: 9rem; }
     .wo-fma-followup-controls .fma-rpt-btn {
       width: auto;
+      min-height: 40px;
       padding: 8px 14px;
       font-size: 0.8rem;
     }
@@ -12070,8 +12063,8 @@ function renderDashboardHtml(): string {
                 <option value="slip">Sort: Total slip</option>
               </select>
             </div>
-            <details class="wo-fma-followup-block" id="wo-fma-followup-block">
-              <summary class="wo-fma-followup-summary">FM&amp;A shop follow-up report</summary>
+            <section class="wo-fma-followup-block" id="wo-fma-followup-block" aria-label="FM and A shop follow-up report">
+              <h3 class="wo-fma-followup-title">FM&amp;A shop follow-up</h3>
               <div class="wo-fma-followup-inner">
                 <p class="hint wo-fma-followup-hint">
                   Logged actions that include a note (from “Log FM&amp;A action”). <strong>Pending</strong> means not yet verified against a newer ETIC.
@@ -12089,13 +12082,13 @@ function renderDashboardHtml(): string {
                       <option value="all">All</option>
                     </select>
                   </label>
-                  <button type="button" class="btn-etic fma-rpt-btn" id="fma-rpt-load">Load</button>
+                  <button type="button" class="primary fma-rpt-btn" id="fma-rpt-load">Load report</button>
                   <button type="button" class="btn-etic fma-rpt-btn" id="fma-rpt-copy">Copy email body</button>
                 </div>
                 <p class="status" id="fma-rpt-msg" role="status"></p>
                 <div class="wo-fma-followup-table-wrap table-wrap" id="fma-rpt-table-wrap"></div>
               </div>
-            </details>
+            </section>
             <div class="wo-list-meta" id="wo-list-meta">Loading…</div>
             <div class="wo-list" id="wo-list"></div>
           </aside>
