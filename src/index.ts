@@ -22,6 +22,7 @@ import {
   getWorkOrderActions,
   getWorkOrderTimeline,
   ingestWorkOrderSnapshot,
+  listFmaFollowUpActionsForReport,
   logWorkOrderAction,
   type WorkOrderActionType,
 } from "./workOrderWatch";
@@ -351,6 +352,10 @@ export default {
 
     if (url.pathname === "/api/wo-action") {
       return handleWoActionApi(env, request);
+    }
+
+    if (url.pathname === "/api/fma-follow-up-report") {
+      return handleFmaFollowUpReportApi(env, request);
     }
 
     if (url.pathname === "/api/yard-check.xlsx") {
@@ -3949,6 +3954,48 @@ async function handleWoActionApi(env: Env, request: Request): Promise<Response> 
   }
 
   return new Response("Method Not Allowed", { status: 405 });
+}
+
+/**
+ * GET /api/fma-follow-up-report?days=14&shop=&status=pending|all&limit=400
+ * FM&A actions with non-empty notes, for shop follow-up emails. Each row includes timelineUrl (#wo=).
+ */
+async function handleFmaFollowUpReportApi(env: Env, request: Request): Promise<Response> {
+  if (request.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
+  const url = new URL(request.url);
+  const daysRaw = url.searchParams.get("days") ?? "14";
+  const days = Math.min(365, Math.max(1, Number.parseInt(daysRaw, 10) || 14));
+  const cutoff = Date.now() - days * 86400000;
+  const sinceIso = new Date(cutoff).toISOString();
+  const shop = url.searchParams.get("shop")?.trim() ?? "";
+  const status = url.searchParams.get("status") === "all" ? "all" : "pending";
+  const limitRaw = url.searchParams.get("limit") ?? "400";
+  const limit = Math.min(800, Math.max(1, Number.parseInt(limitRaw, 10) || 400));
+  const rows = await listFmaFollowUpActionsForReport(env, {
+    sinceIso,
+    shopContains: shop,
+    status,
+    limit,
+  });
+  const origin = url.origin;
+  const baseUrl = `${origin}/`;
+  const payload = rows.map((r) => ({
+    ...r,
+    timelineUrl: `${origin}/#wo=${encodeURIComponent(r.workOrderId)}`,
+  }));
+  return Response.json(
+    {
+      baseUrl,
+      days,
+      sinceIso,
+      shopFilter: shop,
+      status,
+      limit,
+      count: payload.length,
+      rows: payload,
+    },
+    { headers: cacheHeaders() },
+  );
 }
 
 async function handleWorkbookDownload(env: Env, request: Request): Promise<Response> {
@@ -8134,6 +8181,84 @@ function renderDashboardHtml(): string {
     }
     .wo-refine-sel option { background: var(--surface); color: var(--text); }
 
+    .wo-fma-followup-block {
+      margin: 0 0 8px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: rgba(15,30,60,0.03);
+      overflow: hidden;
+    }
+    .wo-fma-followup-summary {
+      cursor: pointer;
+      list-style: none;
+      padding: 10px 12px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .wo-fma-followup-summary::-webkit-details-marker { display: none; }
+    .wo-fma-followup-summary::before {
+      content: "▸";
+      display: inline-block;
+      margin-right: 8px;
+      color: var(--muted);
+      transition: transform 0.12s ease;
+    }
+    .wo-fma-followup-block[open] .wo-fma-followup-summary::before { transform: rotate(90deg); }
+    .wo-fma-followup-inner { padding: 0 12px 12px; }
+    .wo-fma-followup-hint { margin: 0 0 10px; font-size: 0.72rem; }
+    .wo-fma-followup-controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 10px;
+      align-items: flex-end;
+    }
+    .wo-fma-followup-field {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 0.72rem;
+      color: var(--muted);
+      min-width: 0;
+    }
+    .wo-fma-followup-field input,
+    .wo-fma-followup-field select {
+      font-size: 0.78rem;
+      padding: 6px 10px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      min-width: 0;
+      width: 7rem;
+    }
+    .wo-fma-followup-field input#fma-rpt-shop { width: 9rem; }
+    .wo-fma-followup-controls .fma-rpt-btn {
+      width: auto;
+      padding: 8px 14px;
+      font-size: 0.8rem;
+    }
+    .wo-fma-followup-table-wrap {
+      margin-top: 8px;
+      max-height: 220px;
+      overflow: auto;
+      font-size: 0.74rem;
+    }
+    .wo-fma-followup-table-wrap table { width: 100%; }
+    .wo-fma-followup-table-wrap th,
+    .wo-fma-followup-table-wrap td {
+      padding: 5px 8px;
+      text-align: left;
+      vertical-align: top;
+      border-bottom: 1px solid var(--border);
+    }
+    .wo-fma-followup-table-wrap .fma-rpt-note {
+      word-break: break-word;
+      color: var(--text-dim);
+      max-width: 12rem;
+    }
+    .wo-fma-followup-table-wrap a { color: var(--accent-strong); }
+
     .wo-card .meta-chips {
       display: flex;
       flex-wrap: wrap;
@@ -11945,6 +12070,32 @@ function renderDashboardHtml(): string {
                 <option value="slip">Sort: Total slip</option>
               </select>
             </div>
+            <details class="wo-fma-followup-block" id="wo-fma-followup-block">
+              <summary class="wo-fma-followup-summary">FM&amp;A shop follow-up report</summary>
+              <div class="wo-fma-followup-inner">
+                <p class="hint wo-fma-followup-hint">
+                  Logged actions that include a note (from “Log FM&amp;A action”). <strong>Pending</strong> means not yet verified against a newer ETIC.
+                </p>
+                <div class="wo-fma-followup-controls">
+                  <label class="wo-fma-followup-field">Days back
+                    <input type="number" id="fma-rpt-days" min="1" max="365" value="14" />
+                  </label>
+                  <label class="wo-fma-followup-field">Shop contains
+                    <input type="text" id="fma-rpt-shop" placeholder="optional" autocomplete="off" />
+                  </label>
+                  <label class="wo-fma-followup-field">Status
+                    <select id="fma-rpt-verification" aria-label="Verification status filter">
+                      <option value="pending">Pending only</option>
+                      <option value="all">All</option>
+                    </select>
+                  </label>
+                  <button type="button" class="btn-etic fma-rpt-btn" id="fma-rpt-load">Load</button>
+                  <button type="button" class="btn-etic fma-rpt-btn" id="fma-rpt-copy">Copy email body</button>
+                </div>
+                <p class="status" id="fma-rpt-msg" role="status"></p>
+                <div class="wo-fma-followup-table-wrap table-wrap" id="fma-rpt-table-wrap"></div>
+              </div>
+            </details>
             <div class="wo-list-meta" id="wo-list-meta">Loading…</div>
             <div class="wo-list" id="wo-list"></div>
           </aside>
@@ -16489,6 +16640,120 @@ function renderDashboardHtml(): string {
         woSort = ev.target.value || "default";
         rerenderCurrentWoList();
       });
+
+      var fmaRptLastRows = null;
+
+      function fmaRptStatusLabel(st) {
+        if (st === "confirmed") return "confirmed";
+        if (st === "missed") return "missed";
+        return "pending";
+      }
+
+      function buildFmaFollowUpEmailBody(rows) {
+        const lines = [
+          "FM&A follow-up — shops",
+          "",
+          "Each block is one logged action with a note. Open the link for the full change timeline.",
+          "",
+        ];
+        rows.forEach(function (r) {
+          const shop = r.shop || "(unknown shop)";
+          const asset = r.assetId ? " · " + r.assetId : "";
+          lines.push(shop + " · WO " + r.workOrderId + asset);
+          lines.push((r.note || "").replace(/\s+/g, " ").trim());
+          lines.push(r.timelineUrl || "");
+          lines.push("");
+        });
+        return lines.join("\n").trim();
+      }
+
+      async function loadFmaFollowUpReport() {
+        const msg = document.getElementById("fma-rpt-msg");
+        const wrap = document.getElementById("fma-rpt-table-wrap");
+        const daysEl = document.getElementById("fma-rpt-days");
+        const shopEl = document.getElementById("fma-rpt-shop");
+        const verEl = document.getElementById("fma-rpt-verification");
+        const days = Math.min(365, Math.max(1, parseInt(daysEl && daysEl.value ? daysEl.value : "14", 10) || 14));
+        const shop = (shopEl && shopEl.value) ? shopEl.value.trim() : "";
+        const status = verEl && verEl.value === "all" ? "all" : "pending";
+        if (msg) msg.textContent = "Loading…";
+        try {
+          const qs =
+            "?days=" + encodeURIComponent(String(days)) +
+            "&shop=" + encodeURIComponent(shop) +
+            "&status=" + encodeURIComponent(status) +
+            "&limit=400";
+          const res = await fetch("/api/fma-follow-up-report" + qs, { cache: "no-store" });
+          const j = await res.json();
+          if (!res.ok) throw new Error(j.error || "Request failed");
+          fmaRptLastRows = Array.isArray(j.rows) ? j.rows : [];
+          if (msg) {
+            msg.textContent =
+              (j.count === 0
+                ? "No rows match."
+                : j.count + " row" + (j.count === 1 ? "" : "s") + ".") +
+              (j.sinceIso
+                ? " Since " + new Date(j.sinceIso).toLocaleString(undefined, { dateStyle: "short", timeStyle: "short" }) + "."
+                : "");
+          }
+          if (!wrap) return;
+          if (!fmaRptLastRows.length) {
+            wrap.innerHTML = "";
+            return;
+          }
+          wrap.innerHTML =
+            "<table class='fma-rpt-table' aria-label='FM and A follow-up rows'><thead><tr>" +
+            "<th>Shop</th><th>WO</th><th>Asset</th><th>Note</th><th>Status</th><th>Timeline</th>" +
+            "</tr></thead><tbody>" +
+            fmaRptLastRows
+              .map(function (r) {
+                const st = r.status || "pending";
+                const stLab = fmaRptStatusLabel(st);
+                return (
+                  "<tr>" +
+                  "<td>" + esc(r.shop || "—") + "</td>" +
+                  "<td>" + esc(r.workOrderId) + "</td>" +
+                  "<td>" + esc(r.assetId || "—") + "</td>" +
+                  "<td class='fma-rpt-note'>" + esc(r.note || "") + "</td>" +
+                  "<td><span class='fma-status " + esc(st) + "'>" + esc(stLab) + "</span></td>" +
+                  "<td><a href='" + esc(r.timelineUrl) + "'>Open</a></td>" +
+                  "</tr>"
+                );
+              })
+              .join("") +
+            "</tbody></table>";
+        } catch (e) {
+          fmaRptLastRows = null;
+          if (msg) msg.textContent = String(e && e.message ? e.message : e);
+          if (wrap) wrap.innerHTML = "";
+        }
+      }
+
+      function copyFmaFollowUpEmail() {
+        const msg = document.getElementById("fma-rpt-msg");
+        if (!fmaRptLastRows || !fmaRptLastRows.length) {
+          if (msg) msg.textContent = "Load the report first.";
+          return;
+        }
+        const body = buildFmaFollowUpEmailBody(fmaRptLastRows);
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(body).then(
+            function () {
+              if (msg) msg.textContent = "Copied " + fmaRptLastRows.length + " row(s) to clipboard.";
+            },
+            function () {
+              if (msg) msg.textContent = "Could not copy — try again or copy from the table.";
+            },
+          );
+        } else if (msg) {
+          msg.textContent = "Clipboard not available in this browser.";
+        }
+      }
+
+      const fmaLoadBtn = document.getElementById("fma-rpt-load");
+      const fmaCopyBtn = document.getElementById("fma-rpt-copy");
+      if (fmaLoadBtn) fmaLoadBtn.addEventListener("click", function () { loadFmaFollowUpReport(); });
+      if (fmaCopyBtn) fmaCopyBtn.addEventListener("click", function () { copyFmaFollowUpEmail(); });
 
       document.getElementById("watch-rebuild").addEventListener("click", async function () {
         const st = document.getElementById("watch-rebuild-status");

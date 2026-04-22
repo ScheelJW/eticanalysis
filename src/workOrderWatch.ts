@@ -1510,6 +1510,101 @@ export async function getWorkOrderActions(
   return (r.results ?? []).map(rowToAction);
 }
 
+/** FM&A actions that include a note — for shop email / follow-up reports. Shop/asset from live state or last snapshot if WO closed. */
+export type FmaFollowUpReportRow = {
+  id: number;
+  workOrderId: string;
+  createdAtIso: string;
+  actionType: string;
+  actorName: string;
+  note: string;
+  status: string;
+  shop: string;
+  assetId: string;
+};
+
+export async function listFmaFollowUpActionsForReport(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  opts?: {
+    sinceIso?: string;
+    limit?: number;
+    /** Substring match on resolved shop (case-insensitive). Empty = no filter. */
+    shopContains?: string;
+    /** pending = only rows still awaiting verification; all = include confirmed/missed */
+    status?: "pending" | "all";
+  },
+): Promise<FmaFollowUpReportRow[]> {
+  const lim = Math.min(800, Math.max(1, opts?.limit ?? 400));
+  let sinceIso = (opts?.sinceIso ?? "").trim();
+  if (!sinceIso) {
+    const cutoff = Date.now() - 14 * 86400000;
+    sinceIso = new Date(cutoff).toISOString();
+  }
+  const shopQ = (opts?.shopContains ?? "").trim();
+  const statusMode = opts?.status === "all" ? "all" : "pending";
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT * FROM (
+        SELECT
+          a.id AS id,
+          a.work_order_id AS work_order_id,
+          a.created_at_iso AS created_at_iso,
+          a.action_type AS action_type,
+          a.actor_name AS actor_name,
+          a.note AS note,
+          a.status AS status,
+          COALESCE(
+            NULLIF(trim(ws.shop), ''),
+            (SELECT trim(s.shop)
+               FROM work_order_snapshot s
+              WHERE s.work_order_id = a.work_order_id
+              ORDER BY s.snapshot_date_key DESC
+              LIMIT 1),
+            ''
+          ) AS shop_resolved,
+          COALESCE(
+            NULLIF(trim(ws.asset_id), ''),
+            (SELECT trim(s.asset_id)
+               FROM work_order_snapshot s
+              WHERE s.work_order_id = a.work_order_id
+              ORDER BY s.snapshot_date_key DESC
+              LIMIT 1),
+            ''
+          ) AS asset_resolved
+         FROM work_order_action a
+         LEFT JOIN work_order_state ws ON ws.work_order_id = a.work_order_id
+        WHERE length(trim(ifnull(a.note, ''))) > 0
+          AND datetime(a.created_at_iso) >= datetime(?)
+          AND (? = 'all' OR a.status = 'pending')
+      ) AS t
+      WHERE (length(trim(?)) = 0 OR t.shop_resolved LIKE '%' || trim(?) || '%' COLLATE NOCASE)
+      ORDER BY t.shop_resolved COLLATE NOCASE, t.created_at_iso DESC
+      LIMIT ?`,
+  )
+    .bind(sinceIso, statusMode, shopQ, shopQ, lim)
+    .all<{
+      id: number;
+      work_order_id: string;
+      created_at_iso: string;
+      action_type: string;
+      actor_name: string;
+      note: string;
+      status: string;
+      shop_resolved: string;
+      asset_resolved: string;
+    }>();
+  return (r.results ?? []).map((row) => ({
+    id: row.id,
+    workOrderId: row.work_order_id,
+    createdAtIso: row.created_at_iso,
+    actionType: row.action_type,
+    actorName: row.actor_name ?? "",
+    note: row.note ?? "",
+    status: row.status,
+    shop: row.shop_resolved ?? "",
+    assetId: row.asset_resolved ?? "",
+  }));
+}
+
 export async function deleteWorkOrderAction(
   env: { ETIC_SNAPSHOTS: D1Database },
   id: number,
