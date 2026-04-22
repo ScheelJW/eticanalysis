@@ -16664,7 +16664,7 @@ function renderDashboardHtml(): string {
           lines.push(r.timelineUrl || "");
           lines.push("");
         });
-        return lines.join("\n").trim();
+        return lines.join("\\n").trim();
       }
 
       async function loadFmaFollowUpReport() {
