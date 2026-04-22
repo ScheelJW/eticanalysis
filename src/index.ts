@@ -8181,24 +8181,39 @@ function renderDashboardHtml(): string {
     }
     .wo-refine-sel option { background: var(--surface); color: var(--text); }
 
-    .wo-fma-followup-block {
-      margin: 0 0 10px;
+    /* Tucked at bottom of WO sidebar: internal FM&A tool, not primary UI */
+    .wo-fma-aside {
+      margin-top: auto;
+      padding-top: 10px;
       flex: 0 0 auto;
-      border-radius: 10px;
-      border: 1px solid rgba(0,58,140,0.22);
-      background: var(--accent-soft);
-      box-shadow: 0 1px 0 rgba(15,30,60,0.06);
+      border-top: 1px solid var(--border);
     }
-    .wo-fma-followup-title {
-      margin: 0;
-      padding: 10px 12px 0;
-      font-size: 0.9rem;
-      font-weight: 700;
-      letter-spacing: 0.01em;
-      color: var(--accent-strong);
+    .wo-fma-followup-block {
+      border-radius: 8px;
+      border: 1px dashed var(--border);
+      background: rgba(15,30,60,0.02);
     }
-    .wo-fma-followup-inner { padding: 8px 12px 12px; }
-    .wo-fma-followup-hint { margin: 0 0 10px; font-size: 0.72rem; }
+    .wo-fma-followup-summary {
+      list-style: none;
+      cursor: pointer;
+      padding: 6px 8px;
+      font-size: 0.68rem;
+      font-weight: 500;
+      color: var(--subtle);
+      text-align: left;
+    }
+    .wo-fma-followup-summary::-webkit-details-marker { display: none; }
+    .wo-fma-followup-summary::before {
+      content: "▸";
+      display: inline-block;
+      width: 0.9em;
+      color: var(--subtle);
+      transition: transform 0.12s ease;
+    }
+    .wo-fma-followup-block[open] .wo-fma-followup-summary::before { transform: rotate(90deg); }
+    .wo-fma-followup-block[open] { border-style: solid; }
+    .wo-fma-followup-inner { padding: 0 8px 8px; }
+    .wo-fma-followup-hint { margin: 0 0 8px; font-size: 0.7rem; color: var(--subtle); }
     .wo-fma-followup-controls {
       display: flex;
       flex-wrap: wrap;
@@ -8227,13 +8242,13 @@ function renderDashboardHtml(): string {
     .wo-fma-followup-field input#fma-rpt-shop { width: 9rem; }
     .wo-fma-followup-controls .fma-rpt-btn {
       width: auto;
-      min-height: 40px;
-      padding: 8px 14px;
-      font-size: 0.8rem;
+      min-height: 34px;
+      padding: 6px 10px;
+      font-size: 0.76rem;
     }
     .wo-fma-followup-table-wrap {
-      margin-top: 8px;
-      max-height: 220px;
+      margin-top: 6px;
+      max-height: 140px;
       overflow: auto;
       font-size: 0.74rem;
     }
@@ -12063,34 +12078,36 @@ function renderDashboardHtml(): string {
                 <option value="slip">Sort: Total slip</option>
               </select>
             </div>
-            <section class="wo-fma-followup-block" id="wo-fma-followup-block" aria-label="FM and A shop follow-up report">
-              <h3 class="wo-fma-followup-title">FM&amp;A shop follow-up</h3>
-              <div class="wo-fma-followup-inner">
-                <p class="hint wo-fma-followup-hint">
-                  Logged actions that include a note (from “Log FM&amp;A action”). <strong>Pending</strong> means not yet verified against a newer ETIC.
-                </p>
-                <div class="wo-fma-followup-controls">
-                  <label class="wo-fma-followup-field">Days back
-                    <input type="number" id="fma-rpt-days" min="1" max="365" value="14" />
-                  </label>
-                  <label class="wo-fma-followup-field">Shop contains
-                    <input type="text" id="fma-rpt-shop" placeholder="optional" autocomplete="off" />
-                  </label>
-                  <label class="wo-fma-followup-field">Status
-                    <select id="fma-rpt-verification" aria-label="Verification status filter">
-                      <option value="pending">Pending only</option>
-                      <option value="all">All</option>
-                    </select>
-                  </label>
-                  <button type="button" class="primary fma-rpt-btn" id="fma-rpt-load">Load report</button>
-                  <button type="button" class="btn-etic fma-rpt-btn" id="fma-rpt-copy">Copy email body</button>
-                </div>
-                <p class="status" id="fma-rpt-msg" role="status"></p>
-                <div class="wo-fma-followup-table-wrap table-wrap" id="fma-rpt-table-wrap"></div>
-              </div>
-            </section>
             <div class="wo-list-meta" id="wo-list-meta">Loading…</div>
             <div class="wo-list" id="wo-list"></div>
+            <div class="wo-fma-aside">
+              <details class="wo-fma-followup-block" id="wo-fma-followup-block" aria-label="Internal shop follow-up (FM and A)">
+                <summary class="wo-fma-followup-summary">Internal · shop follow-up</summary>
+                <div class="wo-fma-followup-inner">
+                  <p class="wo-fma-followup-hint">
+                    For FM&amp;A: logged actions with a note, for follow-up email. <strong>Pending</strong> = not yet checked against a newer ETIC. Kept down here so it does not get in the way of everyday WO triage.
+                  </p>
+                  <div class="wo-fma-followup-controls">
+                    <label class="wo-fma-followup-field">Days
+                      <input type="number" id="fma-rpt-days" min="1" max="365" value="14" />
+                    </label>
+                    <label class="wo-fma-followup-field">Shop
+                      <input type="text" id="fma-rpt-shop" placeholder="contains…" autocomplete="off" />
+                    </label>
+                    <label class="wo-fma-followup-field">Status
+                      <select id="fma-rpt-verification" aria-label="Verification status filter">
+                        <option value="pending">Pending only</option>
+                        <option value="all">All</option>
+                      </select>
+                    </label>
+                    <button type="button" class="btn-etic fma-rpt-btn" id="fma-rpt-load">Load</button>
+                    <button type="button" class="btn-etic fma-rpt-btn" id="fma-rpt-copy">Copy email</button>
+                  </div>
+                  <p class="status" id="fma-rpt-msg" role="status"></p>
+                  <div class="wo-fma-followup-table-wrap table-wrap" id="fma-rpt-table-wrap"></div>
+                </div>
+              </details>
+            </div>
           </aside>
 
           <section class="wo-detail-pane">
