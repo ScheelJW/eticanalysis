@@ -16,6 +16,7 @@ import {
   getYardWalksForAsset,
   getWatchRowById,
   getWatchRowByIdForDate,
+  listWorkOrderIdsForAssetHistorical,
   getWatchRowsForDate,
   getScheduleMxFleetForDate,
   getWatchRowsLatest,
@@ -444,6 +445,10 @@ export default {
 
     if (url.pathname === "/api/workbook.xlsx") {
       return handleWorkbookDownload(env, request);
+    }
+
+    if (url.pathname === "/api/watch/history-by-asset") {
+      return handleWatchHistoryByAssetApi(env, request);
     }
 
     if (url.pathname === "/api/watch") {
@@ -4178,6 +4183,18 @@ async function handleMeetingZoomApi(env: Env, request: Request, id: number): Pro
   const updated = await setMeetingPresenterScale(env, id, next);
   if (!updated) return Response.json({ error: "Not found" }, { status: 404, headers: cacheHeaders() });
   return Response.json({ meeting: updated }, { headers: cacheHeaders() });
+}
+
+async function handleWatchHistoryByAssetApi(env: Env, request: Request): Promise<Response> {
+  if (request.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
+  const url = new URL(request.url);
+  const assetId = url.searchParams.get("assetId")?.trim() ?? "";
+  if (!assetId) {
+    return Response.json({ ok: false, error: "Missing assetId query parameter." }, { status: 400, headers: cacheHeaders() });
+  }
+  const limit = Number.parseInt(url.searchParams.get("limit") ?? "150", 10) || 150;
+  const rows = await listWorkOrderIdsForAssetHistorical(env, assetId, limit);
+  return Response.json({ assetId, total: rows.length, workOrders: rows }, { headers: cacheHeaders() });
 }
 
 async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext): Promise<Response> {
@@ -8793,6 +8810,60 @@ function renderDashboardHtml(): string {
     .wo-searchbar input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
     .wo-searchbar select { padding: 10px 38px 10px 12px; font-size: 0.86rem; background-color: var(--bg1); }
 
+    .wo-hist-by-asset {
+      margin-bottom: 12px;
+      padding: 10px 12px;
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius-sm);
+      background: var(--surface);
+    }
+    .wo-hist-by-asset > summary {
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 0.82rem;
+      color: var(--text);
+    }
+    .wo-hist-asset-row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+      align-items: center;
+    }
+    .wo-hist-asset-row input {
+      flex: 1 1 160px;
+      min-width: 0;
+      padding: 9px 12px;
+      font-family: var(--font-mono);
+      font-size: 0.86rem;
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius-sm);
+      background: var(--bg1);
+      color: var(--text);
+    }
+    .wo-hist-asset-list {
+      margin-top: 10px;
+      max-height: 220px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .wo-hist-wo-btn {
+      text-align: left;
+      width: 100%;
+      padding: 8px 10px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border-strong);
+      background: var(--bg1);
+      color: var(--text);
+      font-family: var(--font-mono);
+      font-size: 0.82rem;
+      cursor: pointer;
+    }
+    .wo-hist-wo-btn:hover { border-color: var(--accent); }
+    .wo-hist-wo-btn .meta { display: block; font-size: 0.72rem; color: var(--muted); margin-top: 2px; font-family: var(--font); }
+
     .wo-filters {
       display: flex;
       flex-wrap: wrap;
@@ -12906,6 +12977,16 @@ function renderDashboardHtml(): string {
               <input type="text" id="wo-id-input" placeholder="Search work orders…" autocomplete="off" aria-label="Search work orders" />
               <span class="wo-asof-pill" id="wo-asof-pill" title="Always shows the most recent ETIC workbook (history is preserved in the change timeline).">Latest</span>
             </div>
+            <details class="wo-hist-by-asset" id="wo-hist-by-asset">
+              <summary>Historical work orders by asset ID</summary>
+              <p class="hint" style="margin:8px 0 10px">Lists every WO number that ever appeared on this asset in an ingested workbook (including closed). Open one to see the full change timeline, FM&amp;A notes, ETIC meeting notes, and yard checks.</p>
+              <div class="wo-hist-asset-row">
+                <input type="text" id="wo-hist-asset-input" placeholder="e.g. AF00C00488" autocapitalize="characters" autocomplete="off" spellcheck="false" aria-label="Asset ID for history lookup" />
+                <button type="button" class="ghost" id="wo-hist-asset-go">Look up</button>
+              </div>
+              <p class="hint" id="wo-hist-asset-status" style="margin:6px 0 0" hidden></p>
+              <div id="wo-hist-asset-list" class="wo-hist-asset-list"></div>
+            </details>
             <div class="wo-filters" id="wo-filters" role="tablist" aria-label="Filter work orders">
               <button type="button" class="wo-filter-btn active" data-filter="all">All <span class="count" data-count="all">·</span></button>
               <button type="button" class="wo-filter-btn" data-filter="below">Below-MEL <span class="count" data-count="below">·</span></button>
@@ -17024,7 +17105,9 @@ function renderDashboardHtml(): string {
       if (!data.found || !data.row) {
         empty.classList.remove("hidden");
         wrap.classList.add("hidden");
-        empty.innerHTML = "No work order <strong>" + esc(data.workOrderId || "") + "</strong> in the index yet.";
+        empty.innerHTML =
+          "No work order <strong>" + esc(data.workOrderId || "") + "</strong> in the current workbook list. " +
+          "If it closed, use <strong>Historical work orders by asset ID</strong> above (same timeline + meeting notes are kept).";
         loadWoAbuseStrip("");
         return;
       }
@@ -17889,6 +17972,82 @@ function renderDashboardHtml(): string {
           }
         }
       });
+
+      function renderWoHistAssetList(rows) {
+        const box = document.getElementById("wo-hist-asset-list");
+        if (!box) return;
+        if (!rows || !rows.length) {
+          box.innerHTML = "<p class='hint' style='margin:0'>No work orders found for that asset in stored history.</p>";
+          return;
+        }
+        box.innerHTML = rows
+          .map(function (r) {
+            var wid = esc(r.workOrderId || "");
+            var fs = esc(r.firstSeenDateKey || "");
+            var ls = esc(r.lastSeenDateKey || "");
+            return (
+              "<button type='button' class='wo-hist-wo-btn' data-hist-wo='" + wid + "'>" +
+              wid +
+              "<span class='meta'>Seen " + fs + " – " + ls + "</span></button>"
+            );
+          })
+          .join("");
+        box.querySelectorAll("[data-hist-wo]").forEach(function (b) {
+          b.addEventListener("click", function () {
+            var id = b.getAttribute("data-hist-wo");
+            if (id) {
+              woInput.value = id;
+              woQuery = id;
+              selectWo(id, true);
+            }
+          });
+        });
+      }
+
+      async function runWoHistByAssetLookup() {
+        var inp = document.getElementById("wo-hist-asset-input");
+        var st = document.getElementById("wo-hist-asset-status");
+        var box = document.getElementById("wo-hist-asset-list");
+        if (!inp || !st || !box) return;
+        var aid = (inp.value || "").trim();
+        if (!aid) {
+          st.hidden = false;
+          st.textContent = "Enter an asset ID.";
+          st.style.color = "var(--danger)";
+          return;
+        }
+        st.hidden = false;
+        st.textContent = "Loading…";
+        st.style.color = "var(--muted)";
+        box.innerHTML = "";
+        try {
+          var res = await fetch(
+            "/api/watch/history-by-asset?assetId=" + encodeURIComponent(aid) + "&limit=200",
+            { cache: "no-store" },
+          );
+          var j = await res.json();
+          if (!res.ok) throw new Error((j && j.error) || ("HTTP " + res.status));
+          var rows = (j && j.workOrders) || [];
+          st.textContent = rows.length ? rows.length + " work order(s) found (newest last-seen first)." : "No rows for that asset.";
+          st.style.color = rows.length ? "var(--muted)" : "var(--danger)";
+          renderWoHistAssetList(rows);
+        } catch (e) {
+          st.textContent = String(e && e.message ? e.message : e);
+          st.style.color = "var(--danger)";
+        }
+      }
+
+      var woHistGo = document.getElementById("wo-hist-asset-go");
+      var woHistInp = document.getElementById("wo-hist-asset-input");
+      if (woHistGo) woHistGo.addEventListener("click", runWoHistByAssetLookup);
+      if (woHistInp) {
+        woHistInp.addEventListener("keydown", function (ev) {
+          if (ev.key === "Enter") {
+            ev.preventDefault();
+            runWoHistByAssetLookup();
+          }
+        });
+      }
 
       document.querySelectorAll("#wo-filters .wo-filter-btn").forEach(function (btn) {
         btn.addEventListener("click", function () {
