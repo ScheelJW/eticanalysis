@@ -1,6 +1,7 @@
 import type { FleetRecord, RawWorkOrder } from "./yardCheck";
 import { extractFleetMapsFromBinary, FLEET_SYNONYMS, WORK_ORDER_SYNONYMS, scoreHeaderMatch } from "./yardCheck";
 import { getStalenessThresholds } from "./melWatch";
+import { buildLineCompletions } from "./meeting";
 
 export type MelTier = "below" | "at" | "above" | "unknown";
 
@@ -1124,12 +1125,17 @@ export async function getChangelog(env: { ETIC_SNAPSHOTS: D1Database }, workOrde
 
 /** ETIC meeting rows for this WO (notes / due-outs) for the work-order timeline. */
 export type WoTimelineMeetingNote = {
+  workOrderId: string;
   meetingId: number;
   meetingTitle: string;
   startedAtIso: string;
   updatedAtIso: string;
   notes: string;
   dueOuts: string;
+  /** 0/1 per line, same order as notes.split(newline) */
+  notesLineDone: number[];
+  /** 0/1 per line, same order as dueOuts.split(newline) */
+  dueOutsLineDone: number[];
 };
 
 /** Rolling yard_check rows for the asset tied to this WO. */
@@ -1161,9 +1167,9 @@ export async function getMeetingNotesForWorkOrder(
   workOrderId: string,
 ): Promise<WoTimelineMeetingNote[]> {
   const r = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT n.notes, n.due_outs, n.updated_at_iso, m.id AS meeting_id, m.title AS meeting_title, m.started_at_iso
+    `SELECT n.work_order_id, n.notes, n.due_outs, n.line_completions, n.updated_at_iso, m.id AS meeting_id, m.title AS meeting_title, m.started_at_iso
        FROM meeting_wo_note n
-       JOIN meeting m ON m.id = n.meeting_id
+      JOIN meeting m ON m.id = n.meeting_id
       WHERE n.work_order_id = ?
         AND (length(trim(ifnull(n.notes,''))) > 0 OR length(trim(ifnull(n.due_outs,''))) > 0)
       ORDER BY n.updated_at_iso DESC
@@ -1171,21 +1177,33 @@ export async function getMeetingNotesForWorkOrder(
   )
     .bind(workOrderId)
     .all<{
+      work_order_id: string;
       notes: string;
       due_outs: string;
+      line_completions: string;
       updated_at_iso: string;
       meeting_id: number;
       meeting_title: string;
       started_at_iso: string;
     }>();
-  return (r.results ?? []).map((row) => ({
-    meetingId: row.meeting_id,
-    meetingTitle: row.meeting_title ?? "",
-    startedAtIso: row.started_at_iso ?? "",
-    updatedAtIso: row.updated_at_iso ?? "",
-    notes: row.notes ?? "",
-    dueOuts: row.due_outs ?? "",
-  }));
+  return (r.results ?? []).map((row) => {
+    const lc = buildLineCompletions(
+      row.line_completions ?? "",
+      row.notes ?? "",
+      row.due_outs ?? "",
+    );
+    return {
+      workOrderId: row.work_order_id ?? "",
+      meetingId: row.meeting_id,
+      meetingTitle: row.meeting_title ?? "",
+      startedAtIso: row.started_at_iso ?? "",
+      updatedAtIso: row.updated_at_iso ?? "",
+      notes: row.notes ?? "",
+      dueOuts: row.due_outs ?? "",
+      notesLineDone: lc.n,
+      dueOutsLineDone: lc.d,
+    };
+  });
 }
 
 export async function getYardWalksForAsset(
@@ -1416,6 +1434,8 @@ export type WorkOrderAction = {
   verifiedAtIso: string | null;
   verifiedInSnapshot: string | null;
   snapshotsChecked: number;
+  /** When set, FM&A marked this follow-up note as done (shop email / internal). */
+  followupDoneAtIso: string | null;
 };
 
 type WorkOrderActionRow = {
@@ -1430,6 +1450,7 @@ type WorkOrderActionRow = {
   verified_at_iso: string | null;
   verified_in_snapshot: string | null;
   snapshots_checked: number;
+  followup_done_at_iso: string | null;
 };
 
 function rowToAction(r: WorkOrderActionRow): WorkOrderAction {
@@ -1445,6 +1466,7 @@ function rowToAction(r: WorkOrderActionRow): WorkOrderAction {
     verifiedAtIso: r.verified_at_iso,
     verifiedInSnapshot: r.verified_in_snapshot,
     snapshotsChecked: r.snapshots_checked,
+    followupDoneAtIso: r.followup_done_at_iso,
   };
 }
 
@@ -1477,7 +1499,7 @@ export async function logWorkOrderAction(
        (work_order_id, created_at_iso, action_type, expected_field, actor_name, note, status, snapshots_checked)
      VALUES (?, ?, ?, ?, ?, ?, 'pending', 0)
      RETURNING id, work_order_id, created_at_iso, action_type, expected_field, actor_name, note, status,
-               verified_at_iso, verified_in_snapshot, snapshots_checked`,
+               verified_at_iso, verified_in_snapshot, snapshots_checked, followup_done_at_iso`,
   )
     .bind(
       wid,
@@ -1499,7 +1521,7 @@ export async function getWorkOrderActions(
 ): Promise<WorkOrderAction[]> {
   const r = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT id, work_order_id, created_at_iso, action_type, expected_field, actor_name, note, status,
-            verified_at_iso, verified_in_snapshot, snapshots_checked
+            verified_at_iso, verified_in_snapshot, snapshots_checked, followup_done_at_iso
      FROM work_order_action
      WHERE work_order_id = ?
      ORDER BY id DESC
@@ -1573,6 +1595,7 @@ export async function listFmaFollowUpActionsForReport(
          FROM work_order_action a
          LEFT JOIN work_order_state ws ON ws.work_order_id = a.work_order_id
         WHERE length(trim(ifnull(a.note, ''))) > 0
+          AND (a.followup_done_at_iso IS NULL OR length(trim(a.followup_done_at_iso)) = 0)
           AND datetime(a.created_at_iso) >= datetime(?)
           AND (? = 'all' OR a.status = 'pending')
       ) AS t
@@ -1603,6 +1626,24 @@ export async function listFmaFollowUpActionsForReport(
     shop: row.shop_resolved ?? "",
     assetId: row.asset_resolved ?? "",
   }));
+}
+
+/** Mark an FM&A action as follow-up done (or clear). Independent of auto-verify. */
+export async function setWorkOrderActionFollowupDone(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  actionId: number,
+  done: boolean,
+): Promise<boolean> {
+  if (!Number.isFinite(actionId) || actionId <= 0) return false;
+  const at = done ? new Date().toISOString() : null;
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `UPDATE work_order_action
+        SET followup_done_at_iso = ?
+      WHERE id = ?`,
+  )
+    .bind(at, actionId)
+    .run();
+  return (r.meta?.changes ?? 0) > 0;
 }
 
 export async function deleteWorkOrderAction(
@@ -1639,7 +1680,7 @@ export async function verifyWorkOrderActionsForSnapshot(
   const cutoffIso = snapshotDateKey + "T23:59:59.999Z";
   const pending = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT id, work_order_id, created_at_iso, action_type, expected_field, actor_name, note, status,
-            verified_at_iso, verified_in_snapshot, snapshots_checked
+            verified_at_iso, verified_in_snapshot, snapshots_checked, followup_done_at_iso
      FROM work_order_action
      WHERE status = 'pending' AND created_at_iso <= ?`,
   )

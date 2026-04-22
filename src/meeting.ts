@@ -55,6 +55,8 @@ export type MeetingNoteRow = {
   status: MeetingNoteStatus;
   notes: string;
   due_outs: string;
+  /** JSON: {"n":[0,1],"d":[0,0]} = done flags per line (notes / due-outs). */
+  line_completions: string;
   sort_order: number;
   updated_at_iso: string;
 };
@@ -87,6 +89,53 @@ export type UpsertNoteInput = {
   dueOuts?: string;
 };
 
+function lineCount(s: string): number {
+  if (!s || !s.trim()) return 0;
+  return s.split(/\r?\n/).length;
+}
+
+/** @internal — exported for workOrderWatch timeline + tests */
+export function buildLineCompletions(
+  lineCompletionsJson: string,
+  notes: string,
+  dueOuts: string,
+): { n: number[]; d: number[] } {
+  const nLen = lineCount(notes);
+  const dLen = lineCount(dueOuts);
+  const n: number[] = Array.from({ length: nLen }, () => 0);
+  const d: number[] = Array.from({ length: dLen }, () => 0);
+  if (!lineCompletionsJson.trim()) return { n, d };
+  try {
+    const o = JSON.parse(lineCompletionsJson) as { n?: unknown; d?: unknown };
+    if (Array.isArray(o.n)) for (let i = 0; i < nLen; i++) n[i] = o.n[i] ? 1 : 0;
+    if (Array.isArray(o.d)) for (let i = 0; i < dLen; i++) d[i] = o.d[i] ? 1 : 0;
+  } catch {
+    /* keep zeros */
+  }
+  return { n, d };
+}
+
+function serializeLineCompletions(c: { n: number[]; d: number[] }): string {
+  return JSON.stringify({ n: c.n, d: c.d });
+}
+
+function mergeCompletionsOnTextChange(
+  prevJson: string,
+  oldNotes: string,
+  newNotes: string,
+  oldDue: string,
+  newDue: string,
+): string {
+  const c = buildLineCompletions(prevJson, oldNotes, oldDue);
+  const nLen = lineCount(newNotes);
+  const dLen = lineCount(newDue);
+  const n: number[] = Array.from({ length: nLen }, () => 0);
+  const d: number[] = Array.from({ length: dLen }, () => 0);
+  for (let i = 0; i < nLen; i++) n[i] = i < c.n.length ? c.n[i] : 0;
+  for (let i = 0; i < dLen; i++) d[i] = i < c.d.length ? c.d[i] : 0;
+  return serializeLineCompletions({ n, d });
+}
+
 type Env = { ETIC_SNAPSHOTS: D1Database };
 
 export async function createMeeting(env: Env, input: CreateMeetingInput): Promise<MeetingRow> {
@@ -111,8 +160,8 @@ export async function createMeeting(env: Env, input: CreateMeetingInput): Promis
   if (seed.length > 0) {
     const insertNote = env.ETIC_SNAPSHOTS.prepare(
       `INSERT OR IGNORE INTO meeting_wo_note
-         (meeting_id, work_order_id, asset_id, owning_unit, mel_key, mel_tier, shop, mgmt_cd, make_model, veh_nomen, etic_date, status, notes, due_outs, sort_order, updated_at_iso)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '', '', ?, ?)`,
+         (meeting_id, work_order_id, asset_id, owning_unit, mel_key, mel_tier, shop, mgmt_cd, make_model, veh_nomen, etic_date, status, notes, due_outs, line_completions, sort_order, updated_at_iso)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '', '', '', ?, ?)`,
     );
     const batch: D1PreparedStatement[] = [];
     let i = 0;
@@ -297,6 +346,16 @@ export async function upsertMeetingNote(
   const nowIso = new Date().toISOString();
   const sets: string[] = [];
   const binds: unknown[] = [];
+
+  let prev: MeetingNoteRow | null = null;
+  if (patch.notes !== undefined || patch.dueOuts !== undefined) {
+    prev = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT notes, due_outs, line_completions FROM meeting_wo_note WHERE meeting_id = ? AND work_order_id = ?`,
+    )
+      .bind(meetingId, workOrderId)
+      .first<MeetingNoteRow>();
+  }
+
   if (patch.status !== undefined) {
     sets.push("status = ?");
     binds.push(patch.status);
@@ -309,6 +368,17 @@ export async function upsertMeetingNote(
     sets.push("due_outs = ?");
     binds.push(patch.dueOuts);
   }
+  if (prev && (patch.notes !== undefined || patch.dueOuts !== undefined)) {
+    const merged = mergeCompletionsOnTextChange(
+      prev.line_completions ?? "",
+      prev.notes ?? "",
+      patch.notes !== undefined ? patch.notes : (prev.notes ?? ""),
+      prev.due_outs ?? "",
+      patch.dueOuts !== undefined ? patch.dueOuts : (prev.due_outs ?? ""),
+    );
+    sets.push("line_completions = ?");
+    binds.push(merged);
+  }
   sets.push("updated_at_iso = ?");
   binds.push(nowIso);
   binds.push(meetingId, workOrderId);
@@ -318,6 +388,48 @@ export async function upsertMeetingNote(
     .bind(...binds)
     .run();
 
+  return env.ETIC_SNAPSHOTS.prepare(
+    `SELECT * FROM meeting_wo_note WHERE meeting_id = ? AND work_order_id = ?`,
+  )
+    .bind(meetingId, workOrderId)
+    .first<MeetingNoteRow>();
+}
+
+/**
+ * Toggle a single “done” line for meeting notes or due-outs. Persists in line_completions JSON.
+ */
+export async function toggleMeetingNoteLineDone(
+  env: Env,
+  meetingId: number,
+  workOrderId: string,
+  which: "notes" | "dueOuts",
+  lineIndex: number,
+  done: boolean,
+): Promise<MeetingNoteRow | null> {
+  if (!Number.isInteger(lineIndex) || lineIndex < 0) return null;
+  const row = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT * FROM meeting_wo_note WHERE meeting_id = ? AND work_order_id = ?`,
+  )
+    .bind(meetingId, workOrderId)
+    .first<MeetingNoteRow>();
+  if (!row) return null;
+  const notes = row.notes ?? "";
+  const dueOuts = row.due_outs ?? "";
+  const c = buildLineCompletions(row.line_completions ?? "", notes, dueOuts);
+  if (which === "notes") {
+    if (lineIndex >= c.n.length) return null;
+    c.n[lineIndex] = done ? 1 : 0;
+  } else {
+    if (lineIndex >= c.d.length) return null;
+    c.d[lineIndex] = done ? 1 : 0;
+  }
+  const nowIso = new Date().toISOString();
+  const json = serializeLineCompletions(c);
+  await env.ETIC_SNAPSHOTS.prepare(
+    `UPDATE meeting_wo_note SET line_completions = ?, updated_at_iso = ? WHERE meeting_id = ? AND work_order_id = ?`,
+  )
+    .bind(json, nowIso, meetingId, workOrderId)
+    .run();
   return env.ETIC_SNAPSHOTS.prepare(
     `SELECT * FROM meeting_wo_note WHERE meeting_id = ? AND work_order_id = ?`,
   )
@@ -344,8 +456,8 @@ export async function addWorkOrdersToMeeting(
   let nextOrder = (currentMax?.m ?? -1) + 1;
   const insertNote = env.ETIC_SNAPSHOTS.prepare(
     `INSERT OR IGNORE INTO meeting_wo_note
-       (meeting_id, work_order_id, asset_id, owning_unit, mel_key, mel_tier, shop, mgmt_cd, make_model, veh_nomen, etic_date, status, notes, due_outs, sort_order, updated_at_iso)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '', '', ?, ?)`,
+       (meeting_id, work_order_id, asset_id, owning_unit, mel_key, mel_tier, shop, mgmt_cd, make_model, veh_nomen, etic_date, status, notes, due_outs, line_completions, sort_order, updated_at_iso)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '', '', '', ?, ?)`,
   );
   const batch: D1PreparedStatement[] = [];
   for (const wo of workOrders) {

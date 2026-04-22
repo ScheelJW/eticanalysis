@@ -24,6 +24,7 @@ import {
   ingestWorkOrderSnapshot,
   listFmaFollowUpActionsForReport,
   logWorkOrderAction,
+  setWorkOrderActionFollowupDone,
   type WorkOrderActionType,
 } from "./workOrderWatch";
 import {
@@ -39,6 +40,7 @@ import {
   setMeetingPresenterScale,
   setMeetingTimelineScroll,
   upsertMeetingNote,
+  toggleMeetingNoteLineDone,
   type CreateMeetingInput,
   type MeetingNoteStatus,
   type SeedWorkOrder,
@@ -491,12 +493,13 @@ export default {
     if (url.pathname === "/api/meeting") {
       return handleMeetingCreateApi(env, request);
     }
-    const meetingMatch = url.pathname.match(/^\/api\/meeting\/(\d+)(?:\/(notes|end|add|cursor|pause|zoom))?$/);
+    const meetingMatch = url.pathname.match(/^\/api\/meeting\/(\d+)(?:\/(notes|end|add|cursor|pause|zoom|note-line))?$/);
     if (meetingMatch) {
       const id = Number.parseInt(meetingMatch[1] ?? "", 10);
       const action = meetingMatch[2] ?? "";
       if (!Number.isFinite(id)) return new Response("Invalid meeting id", { status: 400 });
       if (action === "notes") return handleMeetingNoteUpsertApi(env, request, id);
+      if (action === "note-line") return handleMeetingNoteLineApi(env, request, id);
       if (action === "end") return handleMeetingEndApi(env, request, id);
       if (action === "add") return handleMeetingAddWosApi(env, request, id);
       if (action === "cursor") return handleMeetingCursorApi(env, request, id);
@@ -3620,6 +3623,36 @@ async function handleMeetingNoteUpsertApi(env: Env, request: Request, id: number
   return Response.json({ note }, { headers: cacheHeaders() });
 }
 
+async function handleMeetingNoteLineApi(env: Env, request: Request, id: number): Promise<Response> {
+  if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+  const body = await readJsonBody<{
+    workOrderId?: string;
+    which?: string;
+    lineIndex?: number;
+    done?: boolean;
+  }>(request);
+  if (!body || typeof body.workOrderId !== "string" || !body.workOrderId.trim()) {
+    return Response.json(
+      { error: "Body must include workOrderId" },
+      { status: 400, headers: cacheHeaders() },
+    );
+  }
+  if (body.which !== "notes" && body.which !== "dueOuts") {
+    return Response.json(
+      { error: "which must be notes or dueOuts" },
+      { status: 400, headers: cacheHeaders() },
+    );
+  }
+  const lineIndex = Number(body.lineIndex);
+  if (!Number.isInteger(lineIndex) || lineIndex < 0) {
+    return Response.json({ error: "lineIndex must be a non-negative integer" }, { status: 400, headers: cacheHeaders() });
+  }
+  const done = body.done === true;
+  const note = await toggleMeetingNoteLineDone(env, id, body.workOrderId.trim(), body.which, lineIndex, done);
+  if (!note) return Response.json({ error: "Not found" }, { status: 404, headers: cacheHeaders() });
+  return Response.json({ note }, { headers: cacheHeaders() });
+}
+
 async function handleMeetingAddWosApi(env: Env, request: Request, id: number): Promise<Response> {
   if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
   const body = await readJsonBody<{ workOrders?: SeedWorkOrder[] }>(request);
@@ -3909,6 +3942,7 @@ const VALID_ACTION_TYPES: ReadonlySet<WorkOrderActionType> = new Set([
  * GET  /api/wo-action?workOrderId=...        -> list actions for a WO
  * POST /api/wo-action  body: { workOrderId, actionType, actorName?, note? }
  *                                            -> log a new action
+ * PATCH /api/wo-action  body: { id, followupDone: true|false }  -> mark FM&A follow-up cleared
  * DELETE /api/wo-action?id=NN                -> remove an action (typo'd entry)
  */
 async function handleWoActionApi(env: Env, request: Request): Promise<Response> {
@@ -3941,6 +3975,22 @@ async function handleWoActionApi(env: Env, request: Request): Promise<Response> 
       note: typeof body.note === "string" ? body.note : "",
     });
     return Response.json({ action }, { headers: cacheHeaders() });
+  }
+
+  if (request.method === "PATCH") {
+    let body: Record<string, unknown>;
+    try {
+      body = (await request.json()) as Record<string, unknown>;
+    } catch {
+      return Response.json({ error: "Invalid JSON" }, { status: 400, headers: cacheHeaders() });
+    }
+    const id = Number(body.id);
+    if (!Number.isFinite(id) || id <= 0) {
+      return Response.json({ error: "Missing or invalid id" }, { status: 400, headers: cacheHeaders() });
+    }
+    const done = body.followupDone === true;
+    const ok = await setWorkOrderActionFollowupDone(env, id, done);
+    return Response.json({ ok }, { headers: cacheHeaders() });
   }
 
   if (request.method === "DELETE") {
@@ -8853,6 +8903,16 @@ function renderDashboardHtml(): string {
     .fma-status.pending  { background: rgba(255,196,61,0.14); color: var(--warn); }
     .fma-status.confirmed{ background: rgba(94,227,151,0.14); color: var(--success); }
     .fma-status.missed   { background: rgba(255,138,138,0.14); color: var(--danger); }
+    .fma-followup-wrap { display: inline-flex; align-items: center; gap: 8px; margin-right: 8px; flex-wrap: wrap; }
+    .fma-followup-btn { font-size: 0.72rem !important; padding: 4px 10px !important; min-height: 0 !important; }
+    .fma-followup-ok { font-size: 0.72rem; color: var(--success); font-weight: 600; }
+    .fma-followup-undo { font-size: 0.72rem !important; padding: 0 !important; min-height: 0 !important; }
+    .ev-meet-lines { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; font-size: 0.86rem; }
+    .ev-meet-line { display: flex; align-items: flex-start; gap: 8px; cursor: pointer; margin: 0; font-weight: 400; }
+    .ev-meet-line input { margin-top: 3px; flex-shrink: 0; }
+    .ev-meet-line .meet-line-done { text-decoration: line-through; color: var(--subtle); }
+    .meet-line-done { text-decoration: line-through; color: var(--subtle); }
+    .ev-meet-dueouts.ev-meet-lines { white-space: pre-wrap; font-family: var(--font); }
     .fma-note {
       display: block;
       margin-top: 4px;
@@ -14491,6 +14551,16 @@ function renderDashboardHtml(): string {
       return latestSnapshotDate() || selectedDate || "";
     }
 
+    function getSelectedWatchRow() {
+      const asOf = woAsOfDate();
+      if (!asOf || !selectedWoId) return null;
+      const rows = watchCacheByDate.get(asOf) || [];
+      for (let i = 0; i < rows.length; i++) {
+        if (rows[i].workOrderId === selectedWoId) return rows[i];
+      }
+      return null;
+    }
+
     function setMainTab(which) {
       const snapBtn = document.getElementById("tab-snapshot");
       const woBtn = document.getElementById("tab-work-orders");
@@ -15471,6 +15541,23 @@ function renderDashboardHtml(): string {
           return !slipKeys.has(eticChangelogPairKey(ev.old_value, ev.new_value));
         });
       }
+      function renderMeetLineRows(text, which, m) {
+        const lines = (text || "").split(/\\r?\\n/);
+        const doneArr = which === "notes" ? (m.notesLineDone || []) : (m.dueOutsLineDone || []);
+        const mid = String(m.meetingId);
+        const widAttr = esc(String(m.workOrderId || ""));
+        return lines
+          .map(function (line, i) {
+            const isDone = !!doneArr[i];
+            return (
+              "<label class='ev-meet-line'>" +
+              "<input type='checkbox' data-meet-line='1' data-mid='" + esc(mid) + "' data-wid='" + widAttr + "' data-which='" + esc(which) + "' data-idx='" + String(i) + "' " + (isDone ? "checked " : "") + "/>" +
+              "<span class='" + (isDone ? "meet-line-done" : "") + "'>" + esc(line) + "</span>" +
+              "</label>"
+            );
+          })
+          .join("");
+      }
       // Backwards-compat: older callers passed just an array of changelog entries.
       const entries = Array.isArray(payload) ? payload : ((payload && payload.entries) || []);
       const actions = (payload && Array.isArray(payload.actions)) ? payload.actions : [];
@@ -15562,10 +15649,16 @@ function renderDashboardHtml(): string {
             const actor = (a.actorName || "").trim();
             const note = (a.note || "").trim();
             const verifiedSnap = a.verifiedInSnapshot ? " (" + esc(fmtKeyShort(a.verifiedInSnapshot)) + ")" : "";
+            const fup = a.followupDoneAtIso
+              ? "<span class='fma-followup-ok'>Follow-up done</span> <button type='button' class='linkish fma-followup-undo' data-fma-undo='" + esc(String(a.id)) + "'>Undo</button>"
+              : note
+                ? "<button type='button' class='btn-etic fma-followup-btn' data-fma-done='" + esc(String(a.id)) + "'>Follow-up done</button>"
+                : "";
             const body =
               (actor ? "<span class='fma-actor'>" + esc(actor) + "</span>" : "") +
               "<span class='fma-status " + esc(status) + "'>" + esc(statusLabel) + "</span>" +
               (status !== "pending" ? "<span style='color:var(--muted);font-size:0.74rem'>" + verifiedSnap + "</span>" : "") +
+              (fup ? "<span class='fma-followup-wrap'>" + fup + "</span>" : "") +
               "<button type='button' class='fma-delete' data-fma-del='" + esc(String(a.id)) + "' title='Delete this entry'>✕</button>" +
               (note ? "<span class='fma-note'>" + esc(note) + "</span>" : "");
             return (
@@ -15580,10 +15673,10 @@ function renderDashboardHtml(): string {
             const title = (m.meetingTitle || "ETIC meeting").trim();
             let body = "";
             if ((m.notes || "").trim()) {
-              body += "<div class='ev-meet-block'><strong>Notes</strong><div class='ev-meet-text'>" + esc(m.notes.trim()) + "</div></div>";
+              body += "<div class='ev-meet-block'><strong>Notes</strong><div class='ev-meet-lines'>" + renderMeetLineRows(m.notes, "notes", m) + "</div></div>";
             }
             if ((m.dueOuts || "").trim()) {
-              body += "<div class='ev-meet-block'><strong>Due-outs</strong><pre class='ev-meet-dueouts'>" + esc(m.dueOuts.trim()) + "</pre></div>";
+              body += "<div class='ev-meet-block'><strong>Due-outs</strong><div class='ev-meet-lines ev-meet-dueouts'>" + renderMeetLineRows(m.dueOuts, "dueOuts", m) + "</div></div>";
             }
             const sub = (m.startedAtIso || "").slice(0, 10);
             return (
@@ -16670,7 +16763,7 @@ function renderDashboardHtml(): string {
           const shop = r.shop || "(unknown shop)";
           const asset = r.assetId ? " · " + r.assetId : "";
           lines.push(shop + " · WO " + r.workOrderId + asset);
-          lines.push((r.note || "").replace(/\s+/g, " ").trim());
+          lines.push((r.note || "").replace(/\\s+/g, " ").trim());
           lines.push(r.timelineUrl || "");
           lines.push("");
         });
@@ -16713,7 +16806,7 @@ function renderDashboardHtml(): string {
           }
           wrap.innerHTML =
             "<table class='fma-rpt-table' aria-label='FM and A follow-up rows'><thead><tr>" +
-            "<th>Shop</th><th>WO</th><th>Asset</th><th>Note</th><th>Status</th><th>Timeline</th>" +
+            "<th>Shop</th><th>WO</th><th>Asset</th><th>Note</th><th>Status</th><th>Follow-up</th><th>Timeline</th>" +
             "</tr></thead><tbody>" +
             fmaRptLastRows
               .map(function (r) {
@@ -16726,6 +16819,7 @@ function renderDashboardHtml(): string {
                   "<td>" + esc(r.assetId || "—") + "</td>" +
                   "<td class='fma-rpt-note'>" + esc(r.note || "") + "</td>" +
                   "<td><span class='fma-status " + esc(st) + "'>" + esc(stLab) + "</span></td>" +
+                  "<td><button type='button' class='btn-etic fma-rpt-btn' data-fma-rpt-done='" + esc(String(r.id)) + "'>Done</button></td>" +
                   "<td><a href='" + esc(r.timelineUrl) + "'>Open</a></td>" +
                   "</tr>"
                 );
@@ -16764,6 +16858,28 @@ function renderDashboardHtml(): string {
       const fmaCopyBtn = document.getElementById("fma-rpt-copy");
       if (fmaLoadBtn) fmaLoadBtn.addEventListener("click", function () { loadFmaFollowUpReport(); });
       if (fmaCopyBtn) fmaCopyBtn.addEventListener("click", function () { copyFmaFollowUpEmail(); });
+
+      const fmaRptWrap = document.getElementById("fma-rpt-table-wrap");
+      if (fmaRptWrap) {
+        fmaRptWrap.addEventListener("click", async function (ev) {
+          const b = ev.target.closest("[data-fma-rpt-done]");
+          if (!b) return;
+          const id = b.getAttribute("data-fma-rpt-done");
+          if (!id) return;
+          try {
+            const res = await fetch("/api/wo-action", {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ id: Number(id), followupDone: true }),
+              cache: "no-store",
+            });
+            if (!res.ok) throw new Error("Update failed");
+            loadFmaFollowUpReport();
+          } catch (e) {
+            alert(String(e && e.message ? e.message : e));
+          }
+        });
+      }
 
       document.getElementById("watch-rebuild").addEventListener("click", async function () {
         const st = document.getElementById("watch-rebuild-status");
@@ -16829,7 +16945,7 @@ function renderDashboardHtml(): string {
             // Re-load timeline so the new entry shows up immediately.
             changelogCache.delete(selectedWoId);
             const fresh = await loadChangelog(selectedWoId, { force: true });
-            renderTimeline(fresh);
+            renderTimeline(fresh, getSelectedWatchRow());
             setTimeout(function () { if (stEl.textContent.indexOf("Logged") === 0) stEl.textContent = ""; }, 4000);
           } catch (err) {
             stEl.className = "wo-action-status err";
@@ -16840,28 +16956,100 @@ function renderDashboardHtml(): string {
         });
       }
 
-      // Delete-button delegation for FM&A entries inside the timeline.
+      // Delete / follow-up / meeting line delegation on the work order timeline.
       const tlEl = document.getElementById("wo-timeline");
       if (tlEl) {
-        tlEl.addEventListener("click", async function (ev) {
-          const btn = ev.target.closest(".fma-delete");
-          if (!btn) return;
-          const id = btn.getAttribute("data-fma-del");
-          if (!id) return;
-          if (!confirm("Delete this FM&A entry?")) return;
+        tlEl.addEventListener("change", async function (ev) {
+          const t = ev.target;
+          if (!t || t.getAttribute("data-meet-line") !== "1") return;
+          const mid = t.getAttribute("data-mid");
+          const wid = t.getAttribute("data-wid");
+          const which = t.getAttribute("data-which");
+          const idx = t.getAttribute("data-idx");
+          if (mid == null || wid == null || which == null || idx == null) return;
+          const done = t.checked;
           try {
-            const res = await fetch("/api/wo-action?id=" + encodeURIComponent(id), {
-              method: "DELETE",
+            const res = await fetch("/api/meeting/" + encodeURIComponent(mid) + "/note-line", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ workOrderId: wid, which: which, lineIndex: Number(idx), done: done }),
               cache: "no-store",
             });
-            if (!res.ok) throw new Error("Delete failed");
+            if (!res.ok) throw new Error("Save failed");
             if (selectedWoId) {
               changelogCache.delete(selectedWoId);
               const fresh = await loadChangelog(selectedWoId, { force: true });
-              renderTimeline(fresh);
+              renderTimeline(fresh, getSelectedWatchRow());
             }
           } catch (err) {
-            alert("Could not delete: " + (err && err.message ? err.message : err));
+            t.checked = !done;
+            alert(String(err && err.message ? err.message : err));
+          }
+        });
+        tlEl.addEventListener("click", async function (ev) {
+          const delBtn = ev.target.closest(".fma-delete");
+          if (delBtn) {
+            const id = delBtn.getAttribute("data-fma-del");
+            if (!id) return;
+            if (!confirm("Delete this FM&A entry?")) return;
+            try {
+              const res = await fetch("/api/wo-action?id=" + encodeURIComponent(id), {
+                method: "DELETE",
+                cache: "no-store",
+              });
+              if (!res.ok) throw new Error("Delete failed");
+              if (selectedWoId) {
+                changelogCache.delete(selectedWoId);
+                const fresh = await loadChangelog(selectedWoId, { force: true });
+                renderTimeline(fresh, getSelectedWatchRow());
+              }
+            } catch (err) {
+              alert("Could not delete: " + (err && err.message ? err.message : err));
+            }
+            return;
+          }
+          const fDone = ev.target.closest("[data-fma-done]");
+          if (fDone) {
+            const id = fDone.getAttribute("data-fma-done");
+            if (!id) return;
+            try {
+              const res = await fetch("/api/wo-action", {
+                method: "PATCH",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ id: Number(id), followupDone: true }),
+                cache: "no-store",
+              });
+              if (!res.ok) throw new Error("Update failed");
+              if (selectedWoId) {
+                changelogCache.delete(selectedWoId);
+                const fresh = await loadChangelog(selectedWoId, { force: true });
+                renderTimeline(fresh, getSelectedWatchRow());
+              }
+            } catch (err) {
+              alert(String(err && err.message ? err.message : err));
+            }
+            return;
+          }
+          const fUnd = ev.target.closest("[data-fma-undo]");
+          if (fUnd) {
+            const id = fUnd.getAttribute("data-fma-undo");
+            if (!id) return;
+            try {
+              const res = await fetch("/api/wo-action", {
+                method: "PATCH",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ id: Number(id), followupDone: false }),
+                cache: "no-store",
+              });
+              if (!res.ok) throw new Error("Update failed");
+              if (selectedWoId) {
+                changelogCache.delete(selectedWoId);
+                const fresh = await loadChangelog(selectedWoId, { force: true });
+                renderTimeline(fresh, getSelectedWatchRow());
+              }
+            } catch (err) {
+              alert(String(err && err.message ? err.message : err));
+            }
           }
         });
       }
@@ -21991,10 +22179,12 @@ function renderDashboardHtml(): string {
         const actor = (a.actorName || "").trim();
         const note = (a.note || "").trim();
         const verifiedSnap = a.verifiedInSnapshot ? " (" + esc(fmtKeyShort(a.verifiedInSnapshot)) + ")" : "";
+        const fup = a.followupDoneAtIso ? "<span class='p-tl-muted'>[Follow-up done]</span> " : "";
         const body =
           (actor ? "<span class='fma-actor'>" + esc(actor) + "</span>" : "") +
           "<span class='fma-status " + esc(status) + "'>" + esc(statusLabel) + "</span>" +
           (status !== "pending" ? "<span class='p-tl-muted' style='font-size:0.88em'>" + verifiedSnap + "</span>" : "") +
+          fup +
           (note ? "<span class='fma-note'>" + esc(note) + "</span>" : "");
         return (
           '<div class="p-tl-row tl-action">' +
@@ -22006,12 +22196,20 @@ function renderDashboardHtml(): string {
       if (item.kind === "meeting") {
         const m = item.ev;
         const title = (m.meetingTitle || "ETIC meeting").trim();
+        const notesDone = m.notesLineDone || [];
+        const dueDone = m.dueOutsLineDone || [];
+        function pLines(text, doneArr) {
+          const L = (text || "").split(/\\r?\\n/);
+          return L.map(function (line, i) {
+            return "<div class='" + (doneArr[i] ? "meet-line-done" : "") + "' style='font-size:0.92em'>" + esc(line) + "</div>";
+          }).join("");
+        }
         let inner = "";
         if ((m.notes || "").trim()) {
-          inner += "<div><strong>Notes</strong> " + esc(m.notes.trim()) + "</div>";
+          inner += "<div><strong>Notes</strong> " + pLines(m.notes, notesDone) + "</div>";
         }
         if ((m.dueOuts || "").trim()) {
-          inner += "<div><strong>Due-outs</strong> " + esc(m.dueOuts.trim()) + "</div>";
+          inner += "<div><strong>Due-outs</strong> " + pLines(m.dueOuts, dueDone) + "</div>";
         }
         const sub = (m.startedAtIso || "").slice(0, 10);
         const head =
