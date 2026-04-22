@@ -1089,13 +1089,33 @@ export async function getWatchRowById(
   )
     .bind(workOrderId)
     .first<WatchReadRow>();
-  if (!row) return null;
+  if (row) {
+    const [firstSeen, earliest, intervals] = await Promise.all([
+      getFirstSeenDate(env, workOrderId),
+      getEarliestSnapshotDate(env),
+      getStalenessThresholds(env).then(resolveStaleness),
+    ]);
+    return rowToWatchRow(row, asOfDateKey, { firstSeenDate: firstSeen, earliestSnapshot: earliest, intervals });
+  }
+  // WO closed / dropped from the live workbook — still show last ingested row from history.
+  const snap = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT work_order_id, asset_id, mel_tier, parts_status, etic_raw, etic_date, remarks,
+            last_remark_change_date, etic_push_count, cumulative_etic_slip_days, first_etic_date, last_etic_date,
+            snapshot_date_key AS last_snapshot_date, owning_unit, mel_key, shop, mgmt_cd, make_model, veh_nomen, raw_row_json
+       FROM work_order_snapshot
+      WHERE work_order_id = ?
+      ORDER BY snapshot_date_key DESC
+      LIMIT 1`,
+  )
+    .bind(workOrderId)
+    .first<WatchReadRow>();
+  if (!snap) return null;
   const [firstSeen, earliest, intervals] = await Promise.all([
     getFirstSeenDate(env, workOrderId),
     getEarliestSnapshotDate(env),
     getStalenessThresholds(env).then(resolveStaleness),
   ]);
-  return rowToWatchRow(row, asOfDateKey, { firstSeenDate: firstSeen, earliestSnapshot: earliest, intervals });
+  return rowToWatchRow(snap, asOfDateKey, { firstSeenDate: firstSeen, earliestSnapshot: earliest, intervals });
 }
 
 /** Latest state per WO; remark staleness computed vs asOfDateKey (report date). */
@@ -1270,7 +1290,42 @@ export async function getAssetIdForWorkOrder(
     .bind(workOrderId)
     .first<{ asset_id: string }>();
   const a = (r?.asset_id ?? "").trim();
-  return a || null;
+  if (a) return a;
+  const r2 = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT asset_id FROM work_order_snapshot WHERE work_order_id = ? ORDER BY snapshot_date_key DESC LIMIT 1`,
+  )
+    .bind(workOrderId)
+    .first<{ asset_id: string }>();
+  const b = (r2?.asset_id ?? "").trim();
+  return b || null;
+}
+
+/** Every distinct WO id that ever appeared on this asset in ingested snapshots (incl. closed). */
+export async function listWorkOrderIdsForAssetHistorical(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  assetId: string,
+  limit = 150,
+): Promise<Array<{ workOrderId: string; firstSeenDateKey: string; lastSeenDateKey: string }>> {
+  const aid = assetId.trim();
+  if (!aid) return [];
+  const lim = Math.min(500, Math.max(1, limit));
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT work_order_id,
+            MIN(snapshot_date_key) AS first_seen,
+            MAX(snapshot_date_key) AS last_seen
+       FROM work_order_snapshot
+      WHERE trim(asset_id) != '' AND upper(trim(asset_id)) = upper(?)
+      GROUP BY work_order_id
+      ORDER BY last_seen DESC
+      LIMIT ?`,
+  )
+    .bind(aid, lim)
+    .all<{ work_order_id: string; first_seen: string; last_seen: string }>();
+  return (r.results ?? []).map((row) => ({
+    workOrderId: row.work_order_id,
+    firstSeenDateKey: row.first_seen ?? "",
+    lastSeenDateKey: row.last_seen ?? "",
+  }));
 }
 
 export async function getMeetingNotesForWorkOrder(
