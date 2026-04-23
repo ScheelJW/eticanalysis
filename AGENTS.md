@@ -72,6 +72,29 @@ JSON APIs.
 - **CI**: `.github/workflows/ci.yml` runs `wrangler types` + `tsc --noEmit`
   + `vitest` on every push/PR to `main`.
 
+### Default for AI agents: always deploy when work is ready
+
+The project owner **expects production to be updated** after substantive changes
+to the Worker or anything that affects the live dashboard / APIs. When you have
+shell access and the change is in good shape:
+
+1. Run `npm run typecheck` (and `npm test` if you touched logic).
+2. Run **`npm run deploy`** (`wrangler deploy` to `minot.2t3.app` and the
+   `*.workers.dev` URL — see wrangler output for the current version id).
+
+Do **not** stop at “here’s what to run” — run deploy yourself unless the user
+explicitly asked to skip deployment or you cannot (no network, deploy failure
+that needs human account action). Typos-only or doc-only edits don’t require
+a deploy unless they asked for it.
+
+**Rebuild WO/MEL watch from R2 (materialize `work_order_changelog` in D1 per report):**
+After deploy, `POST /api/watch?rebuild=1` replays every workbook in `history/index.json`
+in **chronological order** (report `dateKey`, then `receivedAtIso`, then `workbookKey` for
+ties). Each ingested report writes/updates D1’s `work_order_changelog` and snapshots;
+`changed_at_iso` comes from that entry’s `receivedAtIso` (not one wall-clock for the
+whole run). Runs in the background (`waitUntil`); large histories take several minutes.
+The dashboard reads changelog from D1, not on-the-fly R2.
+
 ---
 
 ## 3. Repo layout

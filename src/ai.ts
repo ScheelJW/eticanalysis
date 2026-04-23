@@ -10,7 +10,7 @@
  *
  * The orchestration loop runs at most MAX_ROUNDS iterations to bound cost.
  */
-import { getChangelog, getWatchRowsLatest, getWorkOrderTimeline, getWatchRowById } from "./workOrderWatch";
+import { getChangelogForDisplay, getWatchRowsLatest, getWorkOrderTimeline, getWatchRowById } from "./workOrderWatch";
 import { listMeetings, getMeetingWithNotes } from "./meeting";
 
 type AiEnv = {
@@ -429,7 +429,7 @@ async function tool_get_work_order(env: AiEnv, args: { id: string; changelog_lim
   const state = await getWatchRowById(env, args.id, latest);
   if (!state) return { error: `No work order ${args.id}.` };
   const [changelog, timeline] = await Promise.all([
-    getChangelog(env, args.id, args.changelog_limit ?? 25),
+    getChangelogForDisplay(env, args.id, args.changelog_limit ?? 200),
     getWorkOrderTimeline(env, args.id),
   ]);
   return {

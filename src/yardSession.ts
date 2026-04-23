@@ -870,9 +870,9 @@ export async function getRollingRoster(env: Env): Promise<RollingRoster> {
       isBelowMel: false,
     });
     totals.total += 1;
-    if (state === "fresh") totals.fresh += 1;
-    else if (state === "due") totals.due += 1;
-    else if (state === "overdue") totals.overdue += 1;
+    // Unlisted = not on latest ETIC roster (finding / floor-to-book). Do not
+    // fold into walk cadence due/overdue/fresh — those are for the fleet list
+    // only. Findings are tracked in the Findings UI instead.
     if (last.at.slice(0, 10) === todayPrefix) totals.checkedToday += 1;
     if (days < 7) totals.checkedThisWeek += 1;
   }

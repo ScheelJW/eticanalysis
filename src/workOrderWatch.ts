@@ -1,5 +1,11 @@
 import type { FleetRecord, RawWorkOrder } from "./yardCheck";
-import { extractFleetMapsFromBinary, FLEET_SYNONYMS, WORK_ORDER_SYNONYMS, scoreHeaderMatch } from "./yardCheck";
+import {
+  extractFleetMapsFromBinary,
+  extractRawWorkOrdersFromBinary,
+  FLEET_SYNONYMS,
+  WORK_ORDER_SYNONYMS,
+  scoreHeaderMatch,
+} from "./yardCheck";
 import { getStalenessThresholds } from "./melWatch";
 import { buildLineCompletions } from "./meeting";
 
@@ -176,10 +182,12 @@ export async function ingestWorkOrderSnapshot(
               snapshot_date_key AS last_snapshot_date
        FROM work_order_snapshot
        WHERE work_order_id IN (${placeholders})
-         AND snapshot_date_key < ?
+         AND snapshot_date_key <= ?
        ORDER BY work_order_id ASC, snapshot_date_key DESC`,
     ).bind(...chunk.map((c) => c.wid), dateKey);
     const r = await stmt.all<WoStateRow>();
+    // First row per WO wins (ORDER BY snapshot_date_key DESC): same-day
+    // re-ingest uses this morning's row as prev, not yesterday's.
     for (const row of r.results ?? []) {
       if (priorByWid.has(row.work_order_id)) continue;
       priorByWid.set(row.work_order_id, row);
@@ -1111,6 +1119,15 @@ export async function getWatchRowByIdForDate(
   return rowToWatchRow(row, dateKey, { firstSeenDate: firstSeen, earliestSnapshot: earliest, intervals });
 }
 
+export type WorkOrderChangelogEntry = {
+  id: number;
+  snapshot_date_key: string;
+  changed_at_iso: string;
+  field: string;
+  old_value: string | null;
+  new_value: string | null;
+};
+
 export async function getChangelog(env: { ETIC_SNAPSHOTS: D1Database }, workOrderId: string, limit = 200) {
   const r = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT id, snapshot_date_key, changed_at_iso, field, old_value, new_value
@@ -1126,6 +1143,142 @@ export async function getChangelog(env: { ETIC_SNAPSHOTS: D1Database }, workOrde
       new_value: string | null;
     }>();
   return r.results ?? [];
+}
+
+type SnapChangelogRow = {
+  snapshot_date_key: string;
+  remarks: string;
+  parts_status: string;
+  etic_raw: string;
+  etic_date: string | null;
+  mel_tier: string;
+  shop: string | null;
+};
+
+/**
+ * Reconstruct field changes by diffing consecutive work_order_snapshot rows (ingest
+ * order). This is the correct timeline for "when did the workbook first show a
+ * change" even when work_order_changelog is stale, rebuilt in one pass, or all rows
+ * share one snapshot_date_key. Uses the same field rules as ingestWorkOrderSnapshot.
+ */
+export async function getChangelogFromSnapshots(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  workOrderId: string,
+  limit = 500,
+): Promise<WorkOrderChangelogEntry[]> {
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT snapshot_date_key, remarks, parts_status, etic_raw, etic_date, mel_tier, shop
+     FROM work_order_snapshot
+     WHERE work_order_id = ?
+     ORDER BY snapshot_date_key ASC`,
+  )
+    .bind(workOrderId)
+    .all<SnapChangelogRow>();
+  const rows = r.results ?? [];
+  const out: WorkOrderChangelogEntry[] = [];
+  let id = 0;
+  const nowIso = new Date().toISOString();
+  let tick = 0;
+  const stamp = (k: string) => {
+    const t = Date.parse(k + "T00:00:00.000Z");
+    if (Number.isNaN(t)) return nowIso;
+    return new Date(t + tick++).toISOString();
+  };
+  for (let i = 0; i < rows.length; i++) {
+    const cur = rows[i]!;
+    if (i === 0) {
+      out.push({
+        id: ++id,
+        snapshot_date_key: cur.snapshot_date_key,
+        changed_at_iso: stamp(cur.snapshot_date_key),
+        field: "initial",
+        old_value: "",
+        new_value: "first_seen",
+      });
+      continue;
+    }
+    const prev = rows[i - 1]!;
+    const k = cur.snapshot_date_key;
+    if (cur.remarks !== (prev.remarks ?? "")) {
+      out.push({
+        id: ++id,
+        snapshot_date_key: k,
+        changed_at_iso: stamp(k),
+        field: "remarks",
+        old_value: prev.remarks ?? "",
+        new_value: cur.remarks,
+      });
+    }
+    if (cur.parts_status !== (prev.parts_status ?? "")) {
+      out.push({
+        id: ++id,
+        snapshot_date_key: k,
+        changed_at_iso: stamp(k),
+        field: "parts_status",
+        old_value: prev.parts_status ?? "",
+        new_value: cur.parts_status,
+      });
+    }
+    if (cur.etic_raw !== (prev.etic_raw ?? "")) {
+      out.push({
+        id: ++id,
+        snapshot_date_key: k,
+        changed_at_iso: stamp(k),
+        field: "etic",
+        old_value: prev.etic_raw ?? "",
+        new_value: cur.etic_raw,
+      });
+    }
+    if ((cur.mel_tier || "unknown") !== (prev.mel_tier || "unknown")) {
+      out.push({
+        id: ++id,
+        snapshot_date_key: k,
+        changed_at_iso: stamp(k),
+        field: "mel_tier",
+        old_value: prev.mel_tier ?? "",
+        new_value: cur.mel_tier,
+      });
+    }
+    if ((cur.shop ?? "") !== (prev.shop ?? "")) {
+      out.push({
+        id: ++id,
+        snapshot_date_key: k,
+        changed_at_iso: stamp(k),
+        field: "shop",
+        old_value: prev.shop ?? "",
+        new_value: cur.shop ?? "",
+      });
+    }
+    const oldD = prev.etic_date;
+    const newD = cur.etic_date;
+    if (oldD && newD && newD > oldD) {
+      out.push({
+        id: ++id,
+        snapshot_date_key: k,
+        changed_at_iso: stamp(k),
+        field: "etic_date_slip",
+        old_value: oldD,
+        new_value: newD,
+      });
+    }
+  }
+  if (out.length <= limit) return out;
+  return out.slice(-limit);
+}
+
+/**
+ * Changelog for the work-order screen: `work_order_changelog` in D1 (populated on every
+ * ingest and by POST /api/watch?rebuild=1) first; if empty, derive from
+ * `work_order_snapshot` rows (still D1).
+ */
+export async function getChangelogForDisplay(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  workOrderId: string,
+  limit = 500,
+): Promise<WorkOrderChangelogEntry[]> {
+  const fromTable = await getChangelog(env, workOrderId, limit);
+  if (fromTable.length > 0) return fromTable;
+  return getChangelogFromSnapshots(env, workOrderId, limit);
 }
 
 /** ETIC meeting rows for this WO (notes / due-outs) for the work-order timeline. */

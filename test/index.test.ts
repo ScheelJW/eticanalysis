@@ -17,6 +17,16 @@ describe("ETIC email subject → report date (ingest path only)", () => {
     expect(parseReportDateKeyFromSubject(subject)).toBe("2026-02-14");
   });
 
+  it("parses space-separated DD MMM YY (common in forwarded subjects)", () => {
+    expect(parseReportDateKeyFromSubject("FW: ETIC Report 17 APR 26")).toBe("2026-04-17");
+    expect(parseReportDateKeyFromSubject("Vehicle MC Rate — 3 April 2026")).toBe("2026-04-03");
+  });
+
+  it("parses last ISO date in subject when present", () => {
+    const subject = "notes for 2026-04-01 then file for 2026-04-17";
+    expect(parseReportDateKeyFromSubject(subject)).toBe("2026-04-17");
+  });
+
   it("resolveAnalysisDateKey prefers parsed report date over receipt day", () => {
     const received = new Date("2026-04-18T12:00:00.000Z");
     const subject = "Fw: Vehicle MC Rate: 10% - ETIC & Below MEL/Critical Report: 15-APR-26";

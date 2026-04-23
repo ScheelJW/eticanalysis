@@ -10,7 +10,7 @@ import {
 import {
   backfillTypedColumnsFromJson,
   deleteWorkOrderAction,
-  getChangelog,
+  getChangelogForDisplay,
   getAssetIdForWorkOrder,
   getMeetingNotesForWorkOrder,
   getYardWalksForAsset,
@@ -203,6 +203,18 @@ type HistoryIndex = {
   entries: HistoryEntry[];
 };
 
+/** Report order for rebuild / replay: calendar day, then ingest time (ties: workbook key). */
+function sortHistoryEntriesChronologically(entries: HistoryEntry[]): HistoryEntry[] {
+  return [...entries].sort((a, b) => {
+    const d = a.dateKey.localeCompare(b.dateKey);
+    if (d !== 0) return d;
+    const t1 = a.receivedAtIso ?? "";
+    const t2 = b.receivedAtIso ?? "";
+    if (t1 !== t2) return t1.localeCompare(t2);
+    return a.workbookKey.localeCompare(b.workbookKey);
+  });
+}
+
 export default {
   async email(message: ForwardableEmailMessage, env: Env, ctx: ExecutionContext): Promise<void> {
     if (!isAuthorizedSender(message.from, env)) {
@@ -264,7 +276,19 @@ export default {
 
     const now = new Date();
     const subject = parsed.subject ?? "";
-    const dateKey = resolveAnalysisDateKey(subject, now);
+    const dateKeyFromSubject = parseReportDateKeyFromSubject(subject);
+    const dateKey = dateKeyFromSubject ?? isoDateKey(now);
+    console.log(
+      JSON.stringify({
+        level: "info",
+        message: "etic_workbook_email_received",
+        dateKey,
+        dateKeySource: dateKeyFromSubject ? "subject" : "utc-receipt-day",
+        subjectLen: subject.length,
+        from: message.from,
+        to: message.to,
+      }),
+    );
     const safeName = sanitizeFileName(workbookAttachment.filename ?? "vehicle-etic.xlsx");
     const workbookKey = `workbooks/${dateKey}/${safeName}`;
     const analysisKey = `analyses/${dateKey}.json`;
@@ -398,6 +422,10 @@ export default {
       const history = await loadHistory(env);
       const merged = await mergeHistoryWithActiveSnapshots(env, history);
       return Response.json(merged, { headers: cacheHeaders() });
+    }
+
+    if (url.pathname === "/api/snapshot/delete" && request.method === "POST") {
+      return handleDeleteSnapshotApi(env, request, ctx);
     }
 
     if (url.pathname === "/api/snapshots") {
@@ -1124,6 +1152,99 @@ async function handleRelabelSnapshot(env: Env, fromKey: string, toKey: string): 
   );
 }
 
+/**
+ * Remove one day's ETIC from R2 + history + D1 index, then rebuild WO/MEL
+ * watch tables from the remaining workbooks (same as a full replay).
+ * Body: { dateKey, confirmDateKey } — both must match (double-confirm in UI).
+ */
+async function handleDeleteSnapshotApi(env: Env, request: Request, ctx: ExecutionContext): Promise<Response> {
+  if (request.method !== "POST") {
+    return new Response("Method Not Allowed", { status: 405, headers: cacheHeaders() });
+  }
+  const body = (await readJsonBody<{ dateKey?: string; confirmDateKey?: string }>(request)) ?? {};
+  const dateKey = String(body.dateKey ?? "").trim();
+  const confirmDateKey = String(body.confirmDateKey ?? "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) {
+    return Response.json({ error: "dateKey must be YYYY-MM-DD" }, { status: 400, headers: cacheHeaders() });
+  }
+  if (confirmDateKey !== dateKey) {
+    return Response.json({ error: "confirmDateKey must exactly match dateKey" }, { status: 400, headers: cacheHeaders() });
+  }
+
+  const history = await loadHistory(env);
+  const entry = history.entries.find((e) => e.dateKey === dateKey);
+  if (!entry) {
+    return Response.json({ error: `No snapshot in history for ${dateKey}` }, { status: 404, headers: cacheHeaders() });
+  }
+
+  const remaining = history.entries.filter((e) => e.dateKey !== dateKey);
+  const newestRemaining =
+    remaining.length > 0
+      ? [...remaining].sort((a, b) => b.dateKey.localeCompare(a.dateKey))[0]?.dateKey ?? null
+      : null;
+
+  try {
+    await env.ETIC_BUCKET.delete(entry.workbookKey);
+  } catch {
+    /* missing object */
+  }
+  try {
+    await env.ETIC_BUCKET.delete(entry.analysisKey || `analyses/${dateKey}.json`);
+  } catch {
+    /* missing object */
+  }
+
+  await env.ETIC_BUCKET.put(
+    "history/index.json",
+    JSON.stringify(
+      { updatedAtIso: new Date().toISOString(), entries: remaining.sort((a, b) => a.dateKey.localeCompare(b.dateKey)) },
+      null,
+      2,
+    ),
+    { httpMetadata: { contentType: "application/json; charset=utf-8" } },
+  );
+
+  if (newestRemaining) {
+    const analysis = await readJson<AnalysisResult>(env, `analyses/${newestRemaining}.json`);
+    if (analysis) {
+      await env.ETIC_BUCKET.put("analyses/latest.json", JSON.stringify(analysis, null, 2), {
+        httpMetadata: { contentType: "application/json; charset=utf-8" },
+      });
+    }
+  } else {
+    try {
+      await env.ETIC_BUCKET.delete("analyses/latest.json");
+    } catch {
+      /* */
+    }
+  }
+
+  await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM etic_snapshots WHERE date_key = ?`).bind(dateKey).run();
+  if (newestRemaining) {
+    await env.ETIC_SNAPSHOTS.prepare(
+      `UPDATE meeting SET snapshot_date_key = ? WHERE snapshot_date_key = ?`,
+    )
+      .bind(newestRemaining, dateKey)
+      .run();
+  } else {
+    await env.ETIC_SNAPSHOTS.prepare(`UPDATE meeting SET snapshot_date_key = '' WHERE snapshot_date_key = ?`)
+      .bind(dateKey)
+      .run();
+  }
+  await env.ETIC_SNAPSHOTS.prepare(
+    `UPDATE work_order_action SET verified_in_snapshot = NULL WHERE verified_in_snapshot = ?`,
+  )
+    .bind(dateKey)
+    .run();
+
+  ctx.waitUntil(rebuildWorkOrderWatchFromHistory(env));
+
+  return Response.json(
+    { ok: true, deletedDateKey: dateKey, newLatestDateKey: newestRemaining },
+    { headers: cacheHeaders() },
+  );
+}
+
 type EticSnapshotIndexRow = {
   date_key: string;
   workbook_key: string;
@@ -1568,22 +1689,43 @@ async function backfillSnapshotsFromHistory(env: Env): Promise<void> {
   }
 }
 
-/** Replay a single snapshot into the watch tables (used by chunked rebuilds). */
-async function replayWorkOrderWatchForDate(env: Env, dateKey: string): Promise<number> {
-  const history = await loadHistory(env);
-  const entry = history.entries.find((e) => e.dateKey === dateKey);
-  if (!entry) return 0;
-  const obj = await env.ETIC_BUCKET.get(entry.workbookKey);
-  if (!obj) return 0;
-  const bytes = await obj.arrayBuffer();
-  const raw = await extractRawWorkOrdersFromBinary(bytes);
-  await ingestWorkOrderSnapshot(env, dateKey, raw, new Date().toISOString());
-  const melRows = await extractMelRowsFromBinary(bytes);
-  await ingestMelSnapshot(env, dateKey, melRows, new Date().toISOString());
-  return raw.length;
+/**
+ * Wall-clock time for changelog / state rows when (re)playing a day.
+ * Rebuild used to pass one global timestamp so every change looked like it
+ * happened at the same moment; use each report's ingest time from history.
+ */
+function ingestTimestampForHistoryEntry(entry: HistoryEntry): string {
+  const r = (entry.receivedAtIso ?? "").trim();
+  if (r && !Number.isNaN(Date.parse(r))) return r;
+  return `${entry.dateKey}T12:00:00.000Z`;
 }
 
-/** Replay all workbooks in date order so changelog + ETIC push counts are correct. */
+/** Replay one report day into the watch tables (all workbooks for that day, in ingest order). */
+async function replayWorkOrderWatchForDate(env: Env, dateKey: string): Promise<number> {
+  const history = await loadHistory(env);
+  const forDay = history.entries.filter((e) => e.dateKey === dateKey);
+  if (forDay.length === 0) return 0;
+  const sorted = sortHistoryEntriesChronologically(forDay);
+  let lastRowCount = 0;
+  for (const entry of sorted) {
+    const obj = await env.ETIC_BUCKET.get(entry.workbookKey);
+    if (!obj) continue;
+    const bytes = await obj.arrayBuffer();
+    const raw = await extractRawWorkOrdersFromBinary(bytes);
+    const ts = ingestTimestampForHistoryEntry(entry);
+    await ingestWorkOrderSnapshot(env, dateKey, raw, ts);
+    const melRows = await extractMelRowsFromBinary(bytes);
+    await ingestMelSnapshot(env, dateKey, melRows, ts);
+    lastRowCount = raw.length;
+  }
+  return lastRowCount;
+}
+
+/**
+ * Replays every stored workbook from R2 in order, repopulating work_order_changelog
+ * and snapshots in D1 so each report day (and re-upload) is a persisted row, not
+ * something computed on read.
+ */
 async function rebuildWorkOrderWatchFromHistory(env: Env): Promise<void> {
   await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM work_order_changelog`).run();
   await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM work_order_state`).run();
@@ -1592,16 +1734,16 @@ async function rebuildWorkOrderWatchFromHistory(env: Env): Promise<void> {
   await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM mel_state`).run();
   await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM mel_snapshot`).run();
   const history = await loadHistory(env);
-  const sorted = [...history.entries].sort((a, b) => a.dateKey.localeCompare(b.dateKey));
-  const nowIso = new Date().toISOString();
+  const sorted = sortHistoryEntriesChronologically(history.entries);
   for (const entry of sorted) {
     const obj = await env.ETIC_BUCKET.get(entry.workbookKey);
     if (!obj) continue;
     const bytes = await obj.arrayBuffer();
     const raw = await extractRawWorkOrdersFromBinary(bytes);
-    await ingestWorkOrderSnapshot(env, entry.dateKey, raw, nowIso);
+    const ts = ingestTimestampForHistoryEntry(entry);
+    await ingestWorkOrderSnapshot(env, entry.dateKey, raw, ts);
     const melRows = await extractMelRowsFromBinary(bytes);
-    await ingestMelSnapshot(env, entry.dateKey, melRows, nowIso);
+    await ingestMelSnapshot(env, entry.dateKey, melRows, ts);
   }
 }
 
@@ -4423,7 +4565,7 @@ async function handleWorkOrderChangelogApi(env: Env, request: Request): Promise<
   }
   const assetId = await getAssetIdForWorkOrder(env, wo);
   const [entries, actions, meetingNotes, yardWalks] = await Promise.all([
-    getChangelog(env, wo, 500),
+    getChangelogForDisplay(env, wo, 500),
     getWorkOrderActions(env, wo, 200),
     getMeetingNotesForWorkOrder(env, wo),
     assetId ? getYardWalksForAsset(env, assetId) : Promise.resolve([]),
@@ -4729,24 +4871,74 @@ const MONTH_TOKEN: Record<string, number> = {
   dec: 12,
 };
 
-/** Last DD-MMM-YY (or DD-MMM-YYYY) token in the subject → YYYY-MM-DD for R2 paths. */
+const MONTH_LONG: Record<string, number> = {
+  january: 1,
+  february: 2,
+  march: 3,
+  april: 4,
+  june: 6,
+  july: 7,
+  august: 8,
+  september: 9,
+  october: 10,
+  november: 11,
+  december: 12,
+};
+
+function monthFromToken(raw: string): number | null {
+  const t = raw.toLowerCase().replace(/\.$/, "").replace(/,/g, "").trim();
+  if (!t) return null;
+  const long = MONTH_LONG[t];
+  if (long) return long;
+  return MONTH_TOKEN[t.slice(0, 3)] ?? null;
+}
+
+function buildReportDateKey(day: number, month: number, yRaw: string): string | null {
+  if (!Number.isFinite(day) || day < 1 || day > 31 || !month) return null;
+  const yNum = Number.parseInt(yRaw, 10);
+  if (!Number.isFinite(yNum)) return null;
+  const year = yRaw.length <= 2 ? (yNum >= 70 ? 1900 + yNum : 2000 + yNum) : yNum;
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+type SubjectDateHit = { index: number; key: string };
+
+/** Collect DD-MMM-YY, DD MMM YY / DD April YYYY, and ISO dates; return the last hit in the subject (thread-safe). */
 function parseReportDateKeyFromSubject(subject: string): string | null {
   const s = subject.trim();
-  let reportDateKey: string | null = null;
-  const dateRe = /\b(\d{1,2})-([A-Za-z]{3})\.?-(\d{2,4})\b/g;
+  const hits: SubjectDateHit[] = [];
+
+  const dashRe = /\b(\d{1,2})-([A-Za-z]{3})\.?-(\d{2,4})\b/g;
   let dm: RegExpExecArray | null;
-  while ((dm = dateRe.exec(s)) !== null) {
+  while ((dm = dashRe.exec(s)) !== null) {
     const day = Number.parseInt(dm[1] ?? "", 10);
-    const monToken = (dm[2] ?? "").toLowerCase().replace(/\.$/, "").slice(0, 3);
-    const month = MONTH_TOKEN[monToken];
-    if (!month || !Number.isFinite(day) || day < 1 || day > 31) continue;
-    const yRaw = dm[3] ?? "";
-    const yNum = Number.parseInt(yRaw, 10);
-    if (!Number.isFinite(yNum)) continue;
-    const year = yRaw.length <= 2 ? (yNum >= 70 ? 1900 + yNum : 2000 + yNum) : yNum;
-    reportDateKey = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+    const month = monthFromToken(dm[2] ?? "");
+    const key = buildReportDateKey(day, month ?? 0, dm[3] ?? "");
+    if (key) hits.push({ index: dm.index, key });
   }
-  return reportDateKey;
+
+  const spaceRe = /\b(\d{1,2})\s+([A-Za-z]{3,9})\.?,?\s+(\d{2,4})\b/g;
+  while ((dm = spaceRe.exec(s)) !== null) {
+    const day = Number.parseInt(dm[1] ?? "", 10);
+    const month = monthFromToken(dm[2] ?? "");
+    const key = buildReportDateKey(day, month ?? 0, dm[3] ?? "");
+    if (key) hits.push({ index: dm.index, key });
+  }
+
+  const isoRe = /\b(20\d{2})-(\d{2})-(\d{2})\b/g;
+  while ((dm = isoRe.exec(s)) !== null) {
+    const y = Number.parseInt(dm[1] ?? "", 10);
+    const m = Number.parseInt(dm[2] ?? "", 10);
+    const d = Number.parseInt(dm[3] ?? "", 10);
+    if (!Number.isFinite(y) || !Number.isFinite(m) || !Number.isFinite(d)) continue;
+    if (m < 1 || m > 12 || d < 1 || d > 31) continue;
+    const key = `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+    hits.push({ index: dm.index, key });
+  }
+
+  if (!hits.length) return null;
+  hits.sort((a, b) => a.index - b.index);
+  return hits[hits.length - 1]?.key ?? null;
 }
 
 /** Prefer report date from subject (forwarded ETICs); else UTC day of receipt. */
@@ -6186,9 +6378,11 @@ function renderYardAppHtml(): string {
       return String(s == null ? "" : s).trim().toUpperCase();
     }
 
-    /** True for the "Due for check" filter: cadence bucket only, plus unlisted floor-to-book. NCE / below MEL stay as row badges only (WO context). */
+    /** True for the "Due for check" filter: check cadence only (never / due / overdue / fresh+never path).
+     *  Floor-to-book unlisted assets (isUnlisted) are a separate FM&A / Findings queue — not "due for another walk"
+     *  because they are not on the latest ETIC roster. NCE / below MEL stay as row badges only. */
     function yardDueForCheck(a){
-      if (a.isUnlisted) return true;
+      if (a.isUnlisted) return false;
       if (a.rollingState === "due" || a.rollingState === "overdue" || a.rollingState === "never") return true;
       return false;
     }
@@ -7536,37 +7730,78 @@ function renderDashboardHtml(): string {
       outline-offset: 2px;
     }
 
-    /* --- Segmented nav ---------------------------------------------------- */
+    /* --- Main nav: equal chips, aligned rows, readable at narrow widths --- */
     .main-nav {
-      display: inline-flex;
-      gap: 2px;
-      padding: 4px;
-      margin-bottom: 24px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: stretch;
+      justify-content: center;
+      gap: 6px;
+      padding: 8px;
+      margin: 0 auto 24px;
+      width: 100%;
+      max-width: 100%;
+      box-sizing: border-box;
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 8px;
+      border-radius: 10px;
       box-shadow: var(--shadow-sm);
     }
     .main-nav button {
       font-family: var(--font);
-      font-size: 0.88rem;
-      font-weight: 500;
-      padding: 9px 18px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      line-height: 1.2;
+      text-align: center;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex: 1 1 5.5rem;
+      min-width: 4.75rem;
+      max-width: 10rem;
+      min-height: 2.75rem;
+      padding: 8px 6px;
       border-radius: 8px;
-      border: 1px solid transparent;
-      background: transparent;
-      color: var(--muted);
+      border: 1px solid rgba(15, 30, 60, 0.1);
+      background: linear-gradient(180deg, #fbfcfe 0%, #f0f3f8 100%);
+      color: var(--text-dim);
       cursor: pointer;
-      transition: color 0.15s ease, background 0.15s ease;
+      transition: color 0.12s ease, background 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
+      box-shadow: 0 1px 0 rgba(255, 255, 255, 0.85) inset;
     }
-    .main-nav button:hover { color: var(--text); }
+    .main-nav button:hover {
+      color: var(--text);
+      background: #ffffff;
+      border-color: rgba(0, 58, 140, 0.22);
+      box-shadow: 0 1px 3px rgba(15, 30, 60, 0.06);
+    }
     .main-nav button.active {
       background: var(--accent);
       color: #ffffff;
-      border-color: var(--accent);
-      box-shadow: 0 1px 2px rgba(0,0,0,0.08);
+      border-color: var(--accent-strong);
+      box-shadow: 0 2px 6px rgba(0, 58, 140, 0.25);
     }
-    .main-nav button.active:hover { color: #ffffff; }
+    .main-nav button.active:hover {
+      color: #ffffff;
+      background: var(--accent-strong);
+      border-color: var(--accent-strong);
+    }
+    @media (max-width: 720px) {
+      .main-nav {
+        justify-content: stretch;
+        gap: 5px;
+        padding: 6px;
+      }
+      .main-nav button {
+        font-size: 0.72rem;
+        flex: 1 1 calc(33.333% - 5px);
+        min-width: 0;
+        max-width: none;
+        padding: 7px 4px;
+        min-height: 2.5rem;
+      }
+    }
 
     .construction-banner {
       display: flex;
@@ -8291,6 +8526,10 @@ function renderDashboardHtml(): string {
       border: 1px solid var(--border);
       border-radius: 12px;
       background: var(--surface);
+      /* Keep Latest / date / Delete on one row on narrow viewports; scroll instead of losing the end controls. */
+      flex-wrap: nowrap;
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
     }
     .date-picker .date-pick-btn {
       display: inline-flex;
@@ -8335,6 +8574,15 @@ function renderDashboardHtml(): string {
       cursor: pointer;
     }
     .date-picker .date-select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+    .date-picker .date-pick-delete {
+      color: var(--danger);
+      border-color: rgba(176, 0, 32, 0.4);
+      font-size: 0.8rem;
+      margin-left: 6px;
+    }
+    .date-picker .date-pick-delete:hover:not(:disabled) {
+      background: rgba(176, 0, 32, 0.08);
+    }
     .date-picker-meta {
       flex: 0 0 auto;
       margin-left: auto;
@@ -12821,15 +13069,15 @@ function renderDashboardHtml(): string {
 
     <nav class="main-nav" id="main-nav" aria-label="Main sections">
       <button type="button" id="tab-snapshot" class="active">Snapshot</button>
-      <button type="button" id="tab-work-orders">Work orders</button>
-      <button type="button" id="tab-schedule-mx">Schedule Mx</button>
+      <button type="button" id="tab-work-orders">Work&nbsp;orders</button>
+      <button type="button" id="tab-schedule-mx">Schedule&nbsp;Mx</button>
       <button type="button" id="tab-authz">Authorization</button>
       <button type="button" id="tab-mel">MEL</button>
-      <button type="button" id="tab-meeting">ETIC Meeting</button>
-      <button type="button" id="tab-yard">Yard Check</button>
+      <button type="button" id="tab-meeting">ETIC&nbsp;Meeting</button>
+      <button type="button" id="tab-yard">Yard&nbsp;Check</button>
       <button type="button" id="tab-waivers">Waivers</button>
-      <button type="button" id="tab-abuse-tracker">A/A tracker</button>
-      <button type="button" id="tab-ask">Ask AI</button>
+      <button type="button" id="tab-abuse-tracker">A/A&nbsp;tracker</button>
+      <button type="button" id="tab-ask">Ask&nbsp;AI</button>
       <button type="button" id="tab-settings">Settings</button>
     </nav>
 
@@ -12848,6 +13096,7 @@ function renderDashboardHtml(): string {
           <button type="button" id="date-jump-prev" class="date-pick-btn date-pick-arrow" title="Previous snapshot" aria-label="Previous snapshot">◂</button>
           <select id="date-select" class="date-select" aria-label="Pick a snapshot date"></select>
           <button type="button" id="date-jump-next" class="date-pick-btn date-pick-arrow" title="Next snapshot" aria-label="Next snapshot">▸</button>
+          <button type="button" id="date-delete-snapshot" class="date-pick-btn date-pick-delete" data-snapshot-delete title="Delete this snapshot from storage and history">Delete snapshot</button>
           <span class="date-picker-meta" id="date-picker-meta"></span>
         </div>
 
@@ -13937,6 +14186,28 @@ function renderDashboardHtml(): string {
             <div id="settings-status" class="settings-status hidden"></div>
           </header>
 
+          <section class="settings-card" style="border-color: rgba(176,0,32,0.25)">
+            <h3 class="card-title">Remove a report snapshot</h3>
+            <p class="hint" style="margin-top:6px">
+              Deletes the <strong>one report date</strong> selected in the <strong>Snapshot</strong> tab&rsquo;s date control (⤒ Latest / calendar dropdown) — the same as the red <strong>Delete snapshot</strong> control there. It removes the workbook and analysis for that day from storage, updates history, and rebuilds work-order and MEL data. This cannot be undone.
+            </p>
+            <div class="settings-actions">
+              <button type="button" class="ghost" id="settings-delete-snapshot" data-snapshot-delete style="border-color: rgba(176,0,32,0.4); color: var(--danger);">
+                Delete snapshot (current report date)
+              </button>
+            </div>
+          </section>
+
+          <section class="settings-card" style="border-color: rgba(176,0,32,0.25)">
+            <h3 class="card-title">Email ingest security</h3>
+            <p class="hint" style="margin-top:6px">
+              The Vehicle ETIC workbook is ingested only when an <strong>email</strong> reaches your Cloudflare Email Routing address with the attachment.
+              If <code>ALLOWED_SENDERS</code> is <code>*</code> in Worker vars (this repo’s default), <strong>any sender</strong> can trigger ingest — spam, misconfigured auto-forward, or another mailbox on the same rule.
+              For production, set <code>ALLOWED_SENDERS</code> to a comma-separated allowlist (e.g. deploy with explicit vars).
+              In observability logs, search for <code>etic_workbook_email_received</code> to see <code>from</code>, <code>to</code>, and <code>dateKeySource</code> when a file lands.
+            </p>
+          </section>
+
           <section class="settings-card">
             <h3 class="card-title">Work-order remark staleness</h3>
             <p class="hint">A WO is considered "stale" when its last remark is older than this many days. Tunable per MEL status so below-MEL keys can be held to a tighter cadence.</p>
@@ -14445,7 +14716,9 @@ function renderDashboardHtml(): string {
         const [y, m, d] = dateKey.split("-").map(Number);
         const a = Date.UTC(y, m - 1, d, 12, 0, 0);
         const now = new Date();
-        const b = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate(), 12, 0, 0);
+        // dateKey is always a UTC calendar day (see isoDateKey); compare using UTC
+        // "today" so relDate matches the picker label, not the browser's local date.
+        const b = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 12, 0, 0);
         return Math.round((b - a) / 86400000);
       } catch (_) { return null; }
     }
@@ -16823,7 +17096,10 @@ function renderDashboardHtml(): string {
         byKey.get(k).push({ kind: "opened", ev: { date: k, raw: woRow.establishedDate } });
       }
       const keys = Array.from(byKey.keys()).sort(function (a, b) { return a < b ? 1 : a > b ? -1 : 0; });
-      const today = selectedDate || keys[0];
+      // Relative "today / N days ago" must use the real calendar date — NOT the
+      // work-order "as of" (selectedDate), or every event on the current report
+      // date reads as "today" and looks like the last ingest invented the change.
+      const calendarAsOf = new Date().toISOString().slice(0, 10);
 
       const days = keys.map(function (k) {
         const grp = byKey.get(k);
@@ -16847,8 +17123,17 @@ function renderDashboardHtml(): string {
         }
         if (!dayCls && grp.some(function (g) { return g.kind === "meeting"; })) dayCls = "has-meeting";
         if (!dayCls && grp.some(function (g) { return g.kind === "yard"; })) dayCls = "has-yard";
-        const ago = daysBetweenKeys(today, k);
-        const agoLabel = ago == null ? "" : (ago === 0 ? "today" : ago === 1 ? "1 day ago" : ago + " days ago");
+        const ago = daysBetweenKeys(calendarAsOf, k);
+        const agoLabel =
+          ago == null
+            ? ""
+            : ago < 0
+              ? "in " + -ago + "d"
+              : ago === 0
+                ? "today"
+                : ago === 1
+                  ? "1 day ago"
+                  : ago + " days ago";
 
         const grpDisplay = dedupeEticTimelineGroup(grp);
         const evs = grpDisplay.map(function (item) {
@@ -17324,16 +17609,18 @@ function renderDashboardHtml(): string {
     function askRenderMd(src) {
       let s = String(src == null ? "" : src);
       const codeBlocks = [];
-      s = s.replace(/\`\`\`([\\s\\S]*?)\`\`\`/g, function (_m, body) {
+      var _bt = String.fromCharCode(96);
+      var _fence = _bt + _bt + _bt;
+      s = s.replace(new RegExp(_fence + "([\\\\s\\\\S]*?)" + _fence, "g"), function (_m, body) {
         codeBlocks.push(body);
         return "\\u0000CODE" + (codeBlocks.length - 1) + "\\u0000";
       });
       s = askEscape(s);
-      s = s.replace(/\`([^\`\\n]+)\`/g, function (_m, c) { return "<code>" + c + "</code>"; });
+      s = s.replace(new RegExp(_bt + "([^" + _bt + "\\\\n]+)" + _bt, "g"), function (_m, c) { return "<code>" + c + "</code>"; });
       s = s.replace(/\\*\\*([^*]+)\\*\\*/g, "<strong>$1</strong>");
       s = s.replace(/\\*([^*\\n]+)\\*/g, "<em>$1</em>");
-      s = s.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, function (_m, t, u) {
-        return "<a href=\\"" + u + "\\" target=\\"_blank\\" rel=\\"noopener\\">" + t + "</a>";
+      s = s.replace(new RegExp("\\\\[([^\\\\]]+)\\\\]\\\\(([^)]+)\\\\)", "g"), function (_m, t, u) {
+        return '<a href="' + u + '" target="_blank" rel="noopener">' + t + "</a>";
       });
       const lines = s.split(/\\r?\\n/);
       const out = [];
@@ -17373,25 +17660,25 @@ function renderDashboardHtml(): string {
       if (askState.context) {
         const c = askState.context;
         const sugs = (c.suggestions || []).map(function (q) {
-          return "<button type=\\"button\\" class=\\"ask-ctx-chip\\" data-ask-ctx-q=\\"" + askEscape(q) + "\\">" + askEscape(q) + "</button>";
+          return '<button type="button" class="ask-ctx-chip" data-ask-ctx-q="' + askEscape(q) + '">' + askEscape(q) + "</button>";
         }).join("");
         parts.push(
-          "<div class=\\"ask-ctx-card\\">" +
-            "<div class=\\"ask-ctx-head\\">" +
-              "<span class=\\"ask-ctx-eyebrow\\">Asking about</span>" +
-              "<span class=\\"ask-ctx-title\\">" + askEscape(c.title) + "</span>" +
-              "<button type=\\"button\\" class=\\"ask-ctx-clear\\" data-ask-ctx-clear=\\"1\\" title=\\"Clear context\\">✕</button>" +
+          '<div class="ask-ctx-card">' +
+            '<div class="ask-ctx-head">' +
+              '<span class="ask-ctx-eyebrow">Asking about</span>' +
+              '<span class="ask-ctx-title">' + askEscape(c.title) + "</span>" +
+              '<button type="button" class="ask-ctx-clear" data-ask-ctx-clear="1" title="Clear context">✕</button>' +
             "</div>" +
-            (c.summary ? "<div class=\\"ask-ctx-summary\\">" + askEscape(c.summary) + "</div>" : "") +
-            (sugs ? "<div class=\\"ask-ctx-sugs\\">" + sugs + "</div>" : "") +
+            (c.summary ? '<div class="ask-ctx-summary">' + askEscape(c.summary) + "</div>" : "") +
+            (sugs ? '<div class="ask-ctx-sugs">' + sugs + "</div>" : "") +
           "</div>"
         );
       }
       if (askState.messages.length === 0 && !askState.pending) {
         if (askState.context) {
-          parts.push("<div class=\\"hint\\" style=\\"opacity:0.55;text-align:center;padding:14px 8px;font-size:0.78rem\\">Pick a suggestion above or type your own question.</div>");
+          parts.push('<div class="hint" style="opacity:0.55;text-align:center;padding:14px 8px;font-size:0.78rem">Pick a suggestion above or type your own question.</div>');
         } else {
-          parts.push("<div class=\\"hint\\" style=\\"opacity:0.6;text-align:center;padding:20px\\">Ask anything about your fleet data — pick a suggestion above or type a question below.</div>");
+          parts.push('<div class="hint" style="opacity:0.6;text-align:center;padding:20px">Ask anything about your fleet data — pick a suggestion above or type a question below.</div>');
         }
         el.innerHTML = parts.join("");
         wireAskCtxClicks(el);
@@ -17402,16 +17689,16 @@ function renderDashboardHtml(): string {
         const body = m.role === "user" ? "<p>" + askEscape(m.content) + "</p>" : askRenderMd(m.content);
         let trace = "";
         if (m.trace && m.trace.length) {
-          trace = "<details class=\\"ask-trace\\"><summary>" + m.trace.length + " tool call" + (m.trace.length === 1 ? "" : "s") + "</summary><ul>";
+          trace = '<details class="ask-trace"><summary>' + m.trace.length + " tool call" + (m.trace.length === 1 ? "" : "s") + "</summary><ul>";
           for (const t of m.trace) {
-            trace += "<li><code>" + askEscape(t.tool) + "(" + askEscape(JSON.stringify(t.args)) + ")</code> — " + t.ms + "ms" + (t.ok ? "" : " <strong style=\\"color:var(--danger)\\">err</strong>") + "</li>";
+            trace += "<li><code>" + askEscape(t.tool) + "(" + askEscape(JSON.stringify(t.args)) + ")</code> — " + t.ms + "ms" + (t.ok ? "" : ' <strong style="color:var(--danger)">err</strong>') + "</li>";
           }
           trace += "</ul></details>";
         }
-        parts.push("<div class=\\"ask-msg " + cls + "\\"><div class=\\"ask-bubble\\">" + body + trace + "</div></div>");
+        parts.push('<div class="ask-msg ' + cls + '"><div class="ask-bubble">' + body + trace + "</div></div>");
       }
       if (askState.pending) {
-        parts.push("<div class=\\"ask-msg assistant\\"><div class=\\"ask-bubble\\"><div class=\\"ask-typing\\"><span></span><span></span><span></span></div></div></div>");
+        parts.push('<div class="ask-msg assistant"><div class="ask-bubble"><div class="ask-typing"><span></span><span></span><span></span></div></div></div>');
       }
       el.innerHTML = parts.join("");
       el.scrollTop = el.scrollHeight;
@@ -17759,6 +18046,69 @@ function renderDashboardHtml(): string {
       document.getElementById("date-jump-latest").addEventListener("click", jumpDateLatest);
       document.getElementById("date-jump-prev").addEventListener("click", function () { jumpDateRel(1); });
       document.getElementById("date-jump-next").addEventListener("click", function () { jumpDateRel(-1); });
+      (function () {
+        function setDeleteSnapshotControlsBusy(b) {
+          document.querySelectorAll("[data-snapshot-delete]").forEach(function (el) {
+            if (el instanceof HTMLButtonElement) el.disabled = b;
+          });
+        }
+        async function runDeleteCurrentSnapshot() {
+          if (!selectedDate) return;
+          const dk = selectedDate;
+          if (
+            !confirm(
+              "Delete snapshot for " +
+                dk +
+                "?\\n\\nThis removes that workbook and analysis from storage, drops it from the date list, and rebuilds work-order / MEL history from what is left. It cannot be undone.",
+            )
+          ) {
+            return;
+          }
+          const again = window.prompt("Type the same date again to confirm (YYYY-MM-DD):", "");
+          if (again !== dk) {
+            showToast(again == null || again === "" ? "Cancelled" : "Date did not match — nothing deleted", true);
+            return;
+          }
+          setDeleteSnapshotControlsBusy(true);
+          try {
+            const res = await fetch("/api/snapshot/delete", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ dateKey: dk, confirmDateKey: again }),
+            });
+            const j = await res.json().catch(function () {
+              return null;
+            });
+            if (!res.ok) {
+              showToast((j && j.error) || "Delete failed", true);
+              return;
+            }
+            historyEntries = await loadHistory();
+            watchCacheByDate.delete(dk);
+            snapshotRows = await loadSnapshots();
+            renderCompareTable();
+            populateCompareDateSelects();
+            populateBreakdownCompareSelect();
+            const sorted = sortDesc(historyEntries);
+            if (!sorted.length) {
+              document.getElementById("view-main").classList.add("hidden");
+              document.getElementById("view-empty").classList.remove("hidden");
+              showToast("Last snapshot removed", false);
+              return;
+            }
+            const next = sorted[0].dateKey;
+            await selectDate(next, true);
+            showToast("Snapshot deleted — rebuilding watch data in the background", false);
+          } catch (e) {
+            showToast(e && e.message ? e.message : String(e), true);
+          } finally {
+            setDeleteSnapshotControlsBusy(false);
+          }
+        }
+        document.querySelectorAll("[data-snapshot-delete]").forEach(function (el) {
+          el.addEventListener("click", function () { void runDeleteCurrentSnapshot(); });
+        });
+      })();
 
       // Compare panel controls.
       const cmpFrom = document.getElementById("cmp-from");
@@ -20928,7 +21278,7 @@ function renderDashboardHtml(): string {
       const w = waiversState.bv.waivers.find(function (x) { return x.id === id; });
       if (!w) return;
       const cachedName = localStorage.getItem("waiver.reviewerName") || "";
-      const by = window.prompt("Verify \\"" + w.title + "\\" — your name (required):", cachedName);
+      const by = window.prompt('Verify "' + w.title + '" — your name (required):', cachedName);
       if (!by || !by.trim()) return;
       localStorage.setItem("waiver.reviewerName", by.trim());
       const note = window.prompt("Optional note:", "") || "";
@@ -20952,7 +21302,7 @@ function renderDashboardHtml(): string {
       if (!w) return;
       const cachedName = localStorage.getItem("waiver.reviewerName") || "";
       const deletedBy = window.prompt(
-        "Remove \\"" + w.title + "\\" from the printed waiver card. Your name (required, stored in audit):",
+        'Remove "' + w.title + '" from the printed waiver card. Your name (required, stored in audit):',
         cachedName,
       );
       if (!deletedBy || !deletedBy.trim()) return;

@@ -32,6 +32,7 @@
   ],
   "vars": {
     "EXPECTED_ATTACHMENT_NAME": "Vehicle ETIC.xlsx",
+    // "*" = any sender can ingest ETIC email. Use comma-separated addresses in production.
     "ALLOWED_SENDERS": "*",
     "MAX_ATTACHMENT_BYTES": "20000000"
   }

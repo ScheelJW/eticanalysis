@@ -195,7 +195,8 @@ export async function extractMelRowsFromBinary(bytes: ArrayBuffer): Promise<MelR
 
 /** Insert one MEL snapshot for a date, replace existing snapshot for that
  *  date if any, update mel_state, and emit per-key changelog entries vs. the
- *  prior snapshot for that key. Idempotent. */
+ *  prior snapshot for that key (including same-day re-ingest vs the earlier
+ *  file for that date). Idempotent. */
 export async function ingestMelSnapshot(
   env: Env,
   dateKey: string,
@@ -213,12 +214,28 @@ export async function ingestMelSnapshot(
   const priorByKey = new Map<string, MelStateRow>();
   for (const p of prior.results ?? []) priorByKey.set(p.mel_key, p);
 
-  // Wipe this date's existing snapshot rows so we can re-insert cleanly.
+  // Same-day re-ingest: keep this date's changelog rows from the first pass,
+  // then diff the new workbook against the prior MEL snapshot rows we are
+  // about to replace (morning vs afternoon).
+  const priorSnap = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT * FROM mel_snapshot WHERE snapshot_date_key = ?`,
+  )
+    .bind(dateKey)
+    .all<MelHistoryPoint>();
+  const priorSnapByKey = new Map<string, MelHistoryPoint>();
+  for (const row of priorSnap.results ?? []) priorSnapByKey.set(row.mel_key, row);
+  const sameDayReingest = priorSnapByKey.size > 0;
+
+  if (!sameDayReingest) {
+    await env.ETIC_SNAPSHOTS.prepare(
+      `DELETE FROM mel_changelog WHERE snapshot_date_key = ?`,
+    )
+      .bind(dateKey)
+      .run();
+  }
+
   await env.ETIC_SNAPSHOTS.prepare(
     `DELETE FROM mel_snapshot WHERE snapshot_date_key = ?`,
-  ).bind(dateKey).run();
-  await env.ETIC_SNAPSHOTS.prepare(
-    `DELETE FROM mel_changelog WHERE snapshot_date_key = ?`,
   ).bind(dateKey).run();
 
   // Insert mel_snapshot rows in batches.
@@ -264,12 +281,25 @@ export async function ingestMelSnapshot(
   // snapshot is now idempotent instead of producing a duplicate row per field per
   // day. We also keep ON CONFLICT semantics simple — first observation wins.
   const insertChange = env.ETIC_SNAPSHOTS.prepare(
-    `INSERT OR IGNORE INTO mel_changelog
+    `INSERT OR REPLACE INTO mel_changelog
        (mel_key, snapshot_date_key, field, old_value, new_value, created_at_iso)
      VALUES (?,?,?,?,?,?)`,
   );
   let changes = 0;
   for (const r of rows) {
+    const snapPrior = priorSnapByKey.get(r.melKey);
+    if (snapPrior) {
+      for (const [pCol, rField, label] of tracked) {
+        const oldV = String((snapPrior as Record<string, unknown>)[pCol] ?? "");
+        const newV = String((r as Record<string, unknown>)[rField] ?? "");
+        if (oldV !== newV) {
+          changeStmts.push(insertChange.bind(r.melKey, dateKey, label, oldV, newV, nowIso));
+          changes += 1;
+        }
+      }
+      continue;
+    }
+
     const p = priorByKey.get(r.melKey);
     if (!p) {
       // First time we've seen this MEL key.
