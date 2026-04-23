@@ -150,18 +150,27 @@ async function getLatestSnapshotDateKey(env: Env): Promise<string> {
   } catch {
     // Fall through to D1-based fallback.
   }
-  const row = await env.ETIC_SNAPSHOTS.prepare(
+  let row = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT date_key FROM etic_snapshots WHERE deleted_at_iso IS NULL ORDER BY date_key DESC LIMIT 1`,
+  ).first<{ date_key: string }>();
+  if (!row?.date_key) {
+    try {
+      row = await env.ETIC_SNAPSHOTS.prepare(
+        `SELECT date_key FROM etic_snapshots ORDER BY date_key DESC LIMIT 1`,
+      ).first<{ date_key: string }>();
+    } catch {
+      row = null;
+    }
+  }
+  if (row?.date_key) return row.date_key;
+  const snap = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT snapshot_date_key
        FROM work_order_snapshot
       GROUP BY snapshot_date_key
       ORDER BY snapshot_date_key DESC
       LIMIT 1`,
   ).first<{ snapshot_date_key: string }>();
-  if (row?.snapshot_date_key) return row.snapshot_date_key;
-  const fallback = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT date_key FROM etic_snapshots ORDER BY date_key DESC LIMIT 1`,
-  ).first<{ date_key: string }>();
-  return fallback?.date_key ?? "";
+  return snap?.snapshot_date_key ?? "";
 }
 
 /**
@@ -755,7 +764,7 @@ export async function getRollingRoster(env: Env): Promise<RollingRoster> {
     ).all<{ asset_id: string; c: number }>(),
     env.ETIC_SNAPSHOTS.prepare(
       `SELECT date_key FROM etic_snapshots
-        WHERE date_key < ? ORDER BY date_key DESC LIMIT 1`,
+        WHERE deleted_at_iso IS NULL AND date_key < ? ORDER BY date_key DESC LIMIT 1`,
     ).bind(dateKey).first<{ date_key: string }>(),
     env.ETIC_SNAPSHOTS.prepare(
       `SELECT yc.asset_id AS asset_id, yc.location AS location

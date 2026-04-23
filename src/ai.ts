@@ -243,7 +243,7 @@ type SnapshotRow = {
 
 async function getLatestSnapshotDate(env: AiEnv): Promise<string | null> {
   const r = await env.ETIC_SNAPSHOTS.prepare(
-    "SELECT date_key FROM etic_snapshots ORDER BY date_key DESC LIMIT 1",
+    "SELECT date_key FROM etic_snapshots WHERE deleted_at_iso IS NULL ORDER BY date_key DESC LIMIT 1",
   ).first<{ date_key: string }>();
   return r?.date_key ?? null;
 }
@@ -253,6 +253,7 @@ async function tool_list_snapshots(env: AiEnv, args: { limit?: number }) {
   const r = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT date_key, mc_rate, fleet_total, fmc, nmc, surplus
      FROM etic_snapshots
+     WHERE deleted_at_iso IS NULL
      ORDER BY date_key DESC
      LIMIT ?`,
   ).bind(limit).all<{ date_key: string; mc_rate: number | null; fleet_total: number | null; fmc: number | null; nmc: number | null; surplus: number | null }>();
@@ -262,7 +263,7 @@ async function tool_list_snapshots(env: AiEnv, args: { limit?: number }) {
 async function tool_get_snapshot(env: AiEnv, args: { date: string }) {
   const r = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT date_key, mc_rate, fleet_total, fmc, nmc, surplus, mel_total, asset_manager_ok
-     FROM etic_snapshots WHERE date_key = ?`,
+     FROM etic_snapshots WHERE date_key = ? AND deleted_at_iso IS NULL`,
   ).bind(args.date).first();
   if (!r) return { error: `No snapshot found for ${args.date}.` };
   return r;
@@ -291,7 +292,7 @@ function parseBreakdown(json: string): Breakdown[] {
 
 async function tool_get_unit_breakdown(env: AiEnv, args: { date: string }) {
   const r = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT date_key, asset_manager_breakdown FROM etic_snapshots WHERE date_key = ?`,
+    `SELECT date_key, asset_manager_breakdown FROM etic_snapshots WHERE date_key = ? AND deleted_at_iso IS NULL`,
   ).bind(args.date).first<{ date_key: string; asset_manager_breakdown: string }>();
   if (!r) return { error: `No snapshot for ${args.date}.` };
   const rows = parseBreakdown(r.asset_manager_breakdown);
@@ -305,7 +306,7 @@ async function tool_get_unit_history(env: AiEnv, args: { unit: string; from?: st
   const r = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT date_key, asset_manager_breakdown
      FROM etic_snapshots
-     WHERE date_key BETWEEN ? AND ?
+     WHERE deleted_at_iso IS NULL AND date_key BETWEEN ? AND ?
      ORDER BY date_key ASC`,
   ).bind(from, to).all<{ date_key: string; asset_manager_breakdown: string }>();
   const wantNce = /^nce\b/i.test(args.unit.trim());
@@ -342,7 +343,7 @@ async function tool_get_unit_history(env: AiEnv, args: { unit: string; from?: st
 
 async function tool_compare_snapshots(env: AiEnv, args: { from: string; to: string }) {
   const both = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT date_key, mc_rate, fleet_total, fmc, nmc FROM etic_snapshots WHERE date_key IN (?, ?)`,
+    `SELECT date_key, mc_rate, fleet_total, fmc, nmc FROM etic_snapshots WHERE deleted_at_iso IS NULL AND date_key IN (?, ?)`,
   ).bind(args.from, args.to).all<{ date_key: string; mc_rate: number | null; fleet_total: number | null; fmc: number | null; nmc: number | null }>();
   const rows = both.results ?? [];
   const a = rows.find((x) => x.date_key === args.from);

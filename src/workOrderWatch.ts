@@ -139,11 +139,61 @@ type WoStateRow = {
   updated_at_iso: string;
 };
 
+function guessOwningUnitFromFleetRaw(raw: Record<string, string> | undefined): string {
+  if (!raw) return "";
+  for (const [k, v] of Object.entries(raw)) {
+    const kk = k.toLowerCase();
+    const t = (v ?? "").trim();
+    if (!t) continue;
+    if (/\bunit\b|owning|organization|org\b|squadron|flight|assigned/.test(kk)) return t;
+  }
+  return "";
+}
+
+function guessShopFromFleetRaw(raw: Record<string, string> | undefined, eticLocation: string): string {
+  const loc = (eticLocation ?? "").trim();
+  if (loc) return loc;
+  if (!raw) return "";
+  for (const [k, v] of Object.entries(raw)) {
+    const kk = k.toLowerCase();
+    const t = (v ?? "").trim();
+    if (!t) continue;
+    if (/shop|location|bay|hangar|eti\s*c|et\s*i\s*c/.test(kk)) return t;
+  }
+  return "";
+}
+
+function guessMelKeyFromFleetRaw(raw: Record<string, string> | undefined): string {
+  if (!raw) return "";
+  for (const [k, v] of Object.entries(raw)) {
+    const t = (v ?? "").trim();
+    if (!t) continue;
+    const kk = k.toLowerCase();
+    if (/mel\s*key|^mel\b/.test(kk)) return t;
+  }
+  return "";
+}
+
+function fleetRowFromFleetRecord(
+  rec: FleetRecord,
+  raw: Record<string, string> | undefined,
+): { owning_unit: string; shop: string; make_model: string; veh_nomen: string; mgmt_cd: string; mel_key: string } {
+  return {
+    owning_unit: guessOwningUnitFromFleetRaw(raw),
+    shop: guessShopFromFleetRaw(raw, rec.etiCLocation ?? ""),
+    make_model: (rec.makeModel ?? "").trim(),
+    veh_nomen: (rec.vehNomen ?? "").trim(),
+    mgmt_cd: (rec.mgmtCd ?? "").trim(),
+    mel_key: guessMelKeyFromFleetRaw(raw),
+  };
+}
+
 export async function ingestWorkOrderSnapshot(
   env: { ETIC_SNAPSHOTS: D1Database },
   dateKey: string,
   rows: RawWorkOrder[],
   updatedAtIso: string,
+  workbookBinary?: ArrayBuffer,
 ): Promise<void> {
   const cleaned = rows
     .map((wo) => ({
@@ -363,6 +413,73 @@ export async function ingestWorkOrderSnapshot(
   const BATCH = 50;
   for (let i = 0; i < statements.length; i += BATCH) {
     await env.ETIC_SNAPSHOTS.batch(statements.slice(i, i + BATCH));
+  }
+
+  // Rolling fleet roster: merge **entire** Fleet (P&A) sheet (all asset rows) with
+  // WO-derived rows so FMC-only assets still appear in pickers (abuse tracker, etc.).
+  const fleetByAsset = new Map<
+    string,
+    { owning_unit: string; shop: string; make_model: string; veh_nomen: string; mgmt_cd: string; mel_key: string }
+  >();
+  if (workbookBinary && workbookBinary.byteLength > 0) {
+    try {
+      const fleetMaps = await extractFleetMapsFromBinary(workbookBinary);
+      if (fleetMaps) {
+        for (const [aid, rec] of fleetMaps.byAsset) {
+          const id = (aid ?? "").trim();
+          if (!id) continue;
+          const raw = fleetMaps.rawByAsset.get(aid);
+          fleetByAsset.set(id, fleetRowFromFleetRecord(rec, raw));
+        }
+      }
+    } catch {
+      /* fleet parse optional — WO list still updates */
+    }
+  }
+  for (const c of workOrders) {
+    const aid = (c.assetId ?? "").trim();
+    if (!aid) continue;
+    fleetByAsset.set(aid, {
+      owning_unit: c.owningUnit,
+      shop: c.shop,
+      make_model: c.makeModel,
+      veh_nomen: c.vehNomen,
+      mgmt_cd: c.mgmtCd,
+      mel_key: c.melKey,
+    });
+  }
+  const fleetUpsert = env.ETIC_SNAPSHOTS.prepare(
+    `INSERT INTO fleet_asset_current (
+       asset_id, owning_unit, shop, make_model, veh_nomen, mgmt_cd, mel_key, last_seen_snapshot_date, updated_at_iso
+     ) VALUES (?,?,?,?,?,?,?,?,?)
+     ON CONFLICT(asset_id) DO UPDATE SET
+       owning_unit = excluded.owning_unit,
+       shop = excluded.shop,
+       make_model = excluded.make_model,
+       veh_nomen = excluded.veh_nomen,
+       mgmt_cd = excluded.mgmt_cd,
+       mel_key = excluded.mel_key,
+       last_seen_snapshot_date = excluded.last_seen_snapshot_date,
+       updated_at_iso = excluded.updated_at_iso`,
+  );
+  const fleetStmts: D1PreparedStatement[] = [];
+  for (const [aid, f] of fleetByAsset) {
+    fleetStmts.push(
+      fleetUpsert.bind(
+        aid,
+        f.owning_unit,
+        f.shop,
+        f.make_model,
+        f.veh_nomen,
+        f.mgmt_cd,
+        f.mel_key,
+        dateKey,
+        updatedAtIso,
+      ),
+    );
+  }
+  for (let i = 0; i < fleetStmts.length; i += BATCH) {
+    await env.ETIC_SNAPSHOTS.batch(fleetStmts.slice(i, i + BATCH));
   }
 
   // Verify any pending FM&A actions against the changes we just wrote.
@@ -898,7 +1015,7 @@ export async function getScheduleMxFleetForDate(
   const woCounts = await loadWoCountsPerAsset(env, dateKey);
 
   const snap = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT workbook_key FROM etic_snapshots WHERE date_key = ?`,
+    `SELECT workbook_key FROM etic_snapshots WHERE date_key = ? AND deleted_at_iso IS NULL`,
   )
     .bind(dateKey)
     .first<{ workbook_key: string | null }>();
