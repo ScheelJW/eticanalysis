@@ -39,6 +39,8 @@ export type WaiverPhotoRef = {
   id: number;
   /** GET path — `/api/waivers/photo/:id` for real rows; legacy single-photo uses `/api/waivers/:waiverId/photo`. */
   url: string;
+  /** MIME type helps clients decide image vs video rendering. */
+  contentType?: string;
 };
 
 export type Waiver = {
@@ -257,6 +259,9 @@ function extensionForContentType(ct: string): string {
   if (c.includes("webp")) return "webp";
   if (c.includes("heic") || c.includes("heif")) return "heic";
   if (c.includes("gif")) return "gif";
+  if (c.includes("webm")) return "webm";
+  if (c.includes("quicktime")) return "mov";
+  if (c.includes("mp4")) return "mp4";
   return "jpg";
 }
 
@@ -269,16 +274,16 @@ async function listWaiverPhotosForWaiverIds(
   if (!uniq.length) return out;
   const ph = uniq.map(() => "?").join(",");
   const r = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT id, waiver_id, sort_index
+    `SELECT id, waiver_id, sort_index, content_type
        FROM waiver_photo
       WHERE waiver_id IN (${ph})
       ORDER BY waiver_id, sort_index ASC, id ASC`,
   )
     .bind(...uniq)
-    .all<{ id: number; waiver_id: number; sort_index: number }>();
+    .all<{ id: number; waiver_id: number; sort_index: number; content_type: string | null }>();
   for (const row of r.results ?? []) {
     const list = out.get(row.waiver_id) ?? [];
-    list.push({ id: row.id, url: `/api/waivers/photo/${row.id}` });
+    list.push({ id: row.id, url: `/api/waivers/photo/${row.id}`, contentType: row.content_type ?? "" });
     out.set(row.waiver_id, list);
   }
   return out;
@@ -307,7 +312,7 @@ async function insertWaiverPhotos(
     )
       .bind(waiverId, r2Key, ct, idx, createdAtIso)
       .first<{ id: number }>();
-    if (row?.id) out.push({ id: row.id, url: `/api/waivers/photo/${row.id}` });
+    if (row?.id) out.push({ id: row.id, url: `/api/waivers/photo/${row.id}`, contentType: ct });
     idx++;
   }
   return out;

@@ -172,22 +172,26 @@ export async function ingestWorkOrderSnapshot(
     const stmt = env.ETIC_SNAPSHOTS.prepare(
       `SELECT work_order_id, asset_id, remarks, parts_status, etic_raw, etic_date, mel_tier,
               last_remark_change_date, etic_push_count, first_etic_date, last_etic_date, cumulative_etic_slip_days,
-              owning_unit, mel_key, shop, mgmt_cd, make_model, veh_nomen
-       FROM work_order_state WHERE work_order_id IN (${placeholders})`,
-    ).bind(...chunk.map((c) => c.wid));
+              owning_unit, mel_key, shop, mgmt_cd, make_model, veh_nomen,
+              snapshot_date_key AS last_snapshot_date
+       FROM work_order_snapshot
+       WHERE work_order_id IN (${placeholders})
+         AND snapshot_date_key < ?
+       ORDER BY work_order_id ASC, snapshot_date_key DESC`,
+    ).bind(...chunk.map((c) => c.wid), dateKey);
     const r = await stmt.all<WoStateRow>();
     for (const row of r.results ?? []) {
+      if (priorByWid.has(row.work_order_id)) continue;
       priorByWid.set(row.work_order_id, row);
     }
   }
 
-  // INSERT OR IGNORE pairs with the UNIQUE(work_order_id, snapshot_date_key, field)
-  // index added in migration 0017. Re-ingesting the same snapshot (rebuild history,
-  // replay, or a re-emailed workbook for the same day) is now a no-op for the
-  // changelog instead of doubling every change row, which was the root cause of the
-  // duplicated MEL TIER / PARTS entries showing up on the WO change timeline.
+  // INSERT OR REPLACE pairs with the UNIQUE(work_order_id, snapshot_date_key, field)
+  // index added in migration 0017. Re-ingesting the same snapshot now refreshes
+  // that date's change row (instead of leaving stale values), while still
+  // preventing duplicate timeline rows.
   const insertLog = env.ETIC_SNAPSHOTS.prepare(
-    `INSERT OR IGNORE INTO work_order_changelog (work_order_id, snapshot_date_key, changed_at_iso, field, old_value, new_value)
+    `INSERT OR REPLACE INTO work_order_changelog (work_order_id, snapshot_date_key, changed_at_iso, field, old_value, new_value)
      VALUES (?, ?, ?, ?, ?, ?)`,
   );
   const upsert = env.ETIC_SNAPSHOTS.prepare(
@@ -216,7 +220,8 @@ export async function ingestWorkOrderSnapshot(
       make_model = excluded.make_model,
       veh_nomen = excluded.veh_nomen,
       raw_row_json = excluded.raw_row_json,
-      updated_at_iso = excluded.updated_at_iso`,
+      updated_at_iso = excluded.updated_at_iso
+    WHERE excluded.last_snapshot_date >= work_order_state.last_snapshot_date`,
   );
   const snapUpsert = env.ETIC_SNAPSHOTS.prepare(
     `INSERT INTO work_order_snapshot (

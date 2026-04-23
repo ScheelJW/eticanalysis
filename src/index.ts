@@ -186,7 +186,7 @@ type HistoryIndex = {
 };
 
 export default {
-  async email(message: ForwardableEmailMessage, env: Env, _ctx: ExecutionContext): Promise<void> {
+  async email(message: ForwardableEmailMessage, env: Env, ctx: ExecutionContext): Promise<void> {
     if (!isAuthorizedSender(message.from, env)) {
       message.setReject("Unauthorized sender");
       return;
@@ -249,12 +249,6 @@ export default {
 
     await upsertSnapshotRow(env, analysis, workbookKey);
 
-    const rawWos = await extractRawWorkOrdersFromBinary(workbookBytes);
-    await ingestWorkOrderSnapshot(env, dateKey, rawWos, now.toISOString());
-
-    const melRows = await extractMelRowsFromBinary(workbookBytes);
-    await ingestMelSnapshot(env, dateKey, melRows, now.toISOString());
-
     const history = await loadHistory(env);
     const upsertedHistory = upsertHistoryEntry(history, analysis, workbookKey, analysisKey);
     await env.ETIC_BUCKET.put(
@@ -271,6 +265,37 @@ export default {
         httpMetadata: { contentType: "application/json; charset=utf-8" },
       },
     );
+
+    // Keep the email event fast enough to avoid CPU-limit drops by deferring
+    // workbook-heavy WO/MEL extraction to background work.
+    ctx.waitUntil((async () => {
+      try {
+        const rawWos = await extractRawWorkOrdersFromBinary(workbookBytes);
+        await ingestWorkOrderSnapshot(env, dateKey, rawWos, now.toISOString());
+      } catch (error) {
+        console.error(
+          JSON.stringify({
+            level: "error",
+            message: "Background WO ingest failed",
+            dateKey,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      }
+      try {
+        const melRows = await extractMelRowsFromBinary(workbookBytes);
+        await ingestMelSnapshot(env, dateKey, melRows, now.toISOString());
+      } catch (error) {
+        console.error(
+          JSON.stringify({
+            level: "error",
+            message: "Background MEL ingest failed",
+            dateKey,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      }
+    })());
   },
 
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -282,7 +307,8 @@ export default {
 
     if (url.pathname === "/api/history") {
       const history = await loadHistory(env);
-      return Response.json(history, { headers: cacheHeaders() });
+      const merged = await mergeHistoryWithActiveSnapshots(env, history);
+      return Response.json(merged, { headers: cacheHeaders() });
     }
 
     if (url.pathname === "/api/snapshots") {
@@ -577,6 +603,16 @@ export default {
           "Cache-Control": "private, no-store, no-cache, must-revalidate, max-age=0",
         },
       });
+    }
+    // Stable desktop deep link: always land on dashboard Waivers -> By vehicle.
+    if (url.pathname === "/desk/waivers/byvehicle") {
+      const target = new URL("/", url);
+      target.searchParams.set("desktop", "1");
+      target.searchParams.set("tab", "waivers");
+      target.searchParams.set("wv", "byvehicle");
+      const asset = (url.searchParams.get("asset") ?? "").trim();
+      if (asset) target.searchParams.set("asset", asset);
+      return Response.redirect(target.toString(), 302);
     }
 
     if (url.pathname === "/" || url.pathname === "/index.html") {
@@ -969,31 +1005,44 @@ async function handleRelabelSnapshot(env: Env, fromKey: string, toKey: string): 
   );
 }
 
-async function handleSnapshotsList(env: Env): Promise<Response> {
-  const result = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT date_key, workbook_key, workbook_file_name, received_at_iso,
+type EticSnapshotIndexRow = {
+  date_key: string;
+  workbook_key: string;
+  workbook_file_name: string;
+  received_at_iso: string;
+  mc_rate: number | null;
+  fleet_total: number | null;
+  fmc: number | null;
+  nmc: number | null;
+  surplus: number | null;
+  asset_manager_ok: number;
+  total_rows: number | null;
+  mel_total: number | null;
+  visible_sheets: number | null;
+  hidden_sheets: number | null;
+  updated_at_iso: string;
+};
+
+async function loadAllEticSnapshotIndexRows(env: Env): Promise<EticSnapshotIndexRow[]> {
+  const baseSelect = `SELECT date_key, workbook_key, workbook_file_name, received_at_iso,
             mc_rate, fleet_total, fmc, nmc, surplus, asset_manager_ok,
             total_rows, mel_total, visible_sheets, hidden_sheets, updated_at_iso
-     FROM etic_snapshots ORDER BY date_key DESC`,
-  ).all<{
-    date_key: string;
-    workbook_key: string;
-    workbook_file_name: string;
-    received_at_iso: string;
-    mc_rate: number | null;
-    fleet_total: number | null;
-    fmc: number | null;
-    nmc: number | null;
-    surplus: number | null;
-    asset_manager_ok: number;
-    total_rows: number | null;
-    mel_total: number | null;
-    visible_sheets: number | null;
-    hidden_sheets: number | null;
-    updated_at_iso: string;
-  }>();
+     FROM etic_snapshots`;
+  try {
+    const result = await env.ETIC_SNAPSHOTS.prepare(
+      `${baseSelect} WHERE deleted_at_iso IS NULL ORDER BY date_key DESC`,
+    ).all<EticSnapshotIndexRow>();
+    return result.results ?? [];
+  } catch {
+    const result = await env.ETIC_SNAPSHOTS.prepare(
+      `${baseSelect} ORDER BY date_key DESC`,
+    ).all<EticSnapshotIndexRow>();
+    return result.results ?? [];
+  }
+}
 
-  const rows: SnapshotListRow[] = (result.results ?? []).map((r) => ({
+function rowToSnapshotListRow(r: EticSnapshotIndexRow): SnapshotListRow {
+  return {
     dateKey: r.date_key,
     workbookKey: r.workbook_key,
     workbookFileName: r.workbook_file_name,
@@ -1009,8 +1058,46 @@ async function handleSnapshotsList(env: Env): Promise<Response> {
     visibleSheets: r.visible_sheets,
     hiddenSheets: r.hidden_sheets,
     updatedAtIso: r.updated_at_iso,
-  }));
+  };
+}
 
+async function mergeHistoryWithActiveSnapshots(env: Env, history: HistoryIndex): Promise<HistoryIndex> {
+  const d1Rows = await loadAllEticSnapshotIndexRows(env);
+  const byDate = new Map<string, HistoryEntry>();
+  for (const entry of history.entries ?? []) {
+    if (entry && entry.dateKey) byDate.set(entry.dateKey, entry);
+  }
+
+  for (const row of d1Rows) {
+    if (byDate.has(row.date_key)) continue;
+    byDate.set(row.date_key, {
+      dateKey: row.date_key,
+      receivedAtIso: row.received_at_iso ?? new Date().toISOString(),
+      workbookFileName: row.workbook_file_name || `etic-${row.date_key}.xlsx`,
+      workbookKey: row.workbook_key || `workbooks/${row.date_key}.xlsx`,
+      analysisKey: `analyses/${row.date_key}.json`,
+      totalVisibleSheets: row.visible_sheets ?? 0,
+      totalHiddenSheets: row.hidden_sheets ?? 0,
+      totalRowsAcrossSheets: row.total_rows ?? 0,
+      melMentionsTotal: row.mel_total ?? 0,
+      diff: {
+        previousDateKey: null,
+        deltaTotalRows: null,
+        deltaMelMentionsTotal: null,
+        deltaSheetsVisible: null,
+      },
+    });
+  }
+
+  const entries = Array.from(byDate.values()).sort((a, b) => a.dateKey.localeCompare(b.dateKey));
+  return {
+    updatedAtIso: new Date().toISOString(),
+    entries,
+  };
+}
+
+async function handleSnapshotsList(env: Env): Promise<Response> {
+  const rows: SnapshotListRow[] = (await loadAllEticSnapshotIndexRows(env)).map(rowToSnapshotListRow);
   return Response.json({ updatedAtIso: new Date().toISOString(), snapshots: rows }, { headers: cacheHeaders() });
 }
 
@@ -1876,6 +1963,7 @@ async function handleYardCheckApi(env: Env, request: Request): Promise<Response>
     status?: string;
     checkedBy?: string;
     sourceDateKey?: string;
+    fromFindUnlisted?: boolean;
   }>(request);
   if (!body?.assetId) {
     return Response.json({ error: "assetId is required" }, { status: 400, headers: cacheHeaders() });
@@ -1892,6 +1980,7 @@ async function handleYardCheckApi(env: Env, request: Request): Promise<Response>
       status: body.status as YardEntryStatus | undefined,
       checkedBy: checkedByTrim,
       sourceDateKey: body.sourceDateKey,
+      fromFindUnlisted: !!body.fromFindUnlisted,
     });
     return Response.json({ check }, { headers: cacheHeaders() });
   } catch (e) {
@@ -2188,6 +2277,12 @@ function renderWaiverAppHtml(): string {
       border-radius: 8px; border: 1px solid var(--border);
       background: #0a1a3a;
     }
+    .wcard-video {
+      display: block; width: calc(50% - 4px); max-width: 100%; min-width: 120px;
+      flex: 1 1 140px; max-height: 240px;
+      border-radius: 8px; border: 1px solid var(--border);
+      background: #0a1a3a;
+    }
     @media (max-width: 420px) {
       .wcard-photo { width: 100%; flex: 1 1 100%; max-height: 240px; }
     }
@@ -2197,6 +2292,11 @@ function renderWaiverAppHtml(): string {
     .sub-preview-grid .sub-thumb {
       width: 76px; height: 76px; object-fit: cover; border-radius: 8px;
       border: 1px solid var(--border); background: #0a1a3a;
+    }
+    .sub-preview-grid .sub-video {
+      width: 76px; height: 76px; border-radius: 8px;
+      border: 1px solid var(--border); background: #0a1a3a;
+      object-fit: cover;
     }
     .wcard-actions {
       display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 12px;
@@ -2304,14 +2404,16 @@ function renderWaiverAppHtml(): string {
     <div class="modal">
       <h2>Request a waiver</h2>
       <div class="h-sub" id="submit-asset-line"></div>
+      <label for="sub-name">Your name (required)</label>
+      <input id="sub-name" type="text" autocomplete="name" placeholder="First Last" />
       <label for="sub-title">Short title (what is the defect?)</label>
       <input id="sub-title" type="text" maxlength="120" placeholder="e.g. Driver-side mirror crack < 2&quot;" />
       <label for="sub-desc">Details (where it is, why it doesn't affect safety, etc.)</label>
       <textarea id="sub-desc" maxlength="2000"></textarea>
-      <label>Photos of the defect (one or more)</label>
+      <label>Photos/videos of the defect (optional)</label>
       <div class="file-row">
-        <label class="file-btn" for="sub-photo">📷 Take / choose photos</label>
-        <input id="sub-photo" type="file" accept="image/*" capture="environment" multiple />
+        <label class="file-btn" for="sub-photo">📎 Add media</label>
+        <input id="sub-photo" type="file" accept="image/*,video/*" multiple />
         <span id="sub-photo-name" style="font-size:0.85rem;color:var(--muted);"></span>
       </div>
       <div id="sub-preview-grid" class="sub-preview-grid" hidden></div>
@@ -2652,6 +2754,10 @@ function renderWaiverAppHtml(): string {
     var plist = (w.photos && w.photos.length) ? w.photos : (w.hasPhoto && w.photoUrl ? [{ url: w.photoUrl }] : []);
     var photo = plist.length
       ? ('<div class="wcard-photos">' + plist.map(function (p) {
+          var ct = String((p && p.contentType) || "").toLowerCase();
+          if (ct.indexOf("video/") === 0) {
+            return '<video class="wcard-video" src="' + esc(p.url) + '" controls preload="metadata"></video>';
+          }
           return '<img class="wcard-photo" src="' + esc(p.url) + '" alt="" loading="lazy" />';
         }).join("") + "</div>")
       : "";
@@ -2684,6 +2790,7 @@ function renderWaiverAppHtml(): string {
   function openSubmitModal() {
     if (!state.assetId) { showToast("Pick an asset first", true); return; }
     $("submit-asset-line").textContent = "For asset " + state.assetId;
+    $("sub-name").value = readName();
     $("sub-title").value = "";
     $("sub-desc").value = "";
     $("sub-photo").value = "";
@@ -2703,25 +2810,40 @@ function renderWaiverAppHtml(): string {
     grid.innerHTML = "";
     var files = inp.files ? Array.from(inp.files) : [];
     if (!files.length) { grid.hidden = true; $("sub-photo-name").textContent = ""; return; }
-    $("sub-photo-name").textContent = files.length + " photo" + (files.length === 1 ? "" : "s") + " selected";
+    var nPhotos = files.filter(function (f) { return (f.type || "").toLowerCase().indexOf("image/") === 0; }).length;
+    var nVideos = files.length - nPhotos;
+    var bits = [];
+    if (nPhotos) bits.push(nPhotos + " photo" + (nPhotos === 1 ? "" : "s"));
+    if (nVideos) bits.push(nVideos + " video" + (nVideos === 1 ? "" : "s"));
+    $("sub-photo-name").textContent = bits.join(" · ") || (files.length + " file(s) selected");
     grid.hidden = false;
     files.forEach(function (f) {
       var url = URL.createObjectURL(f);
-      var im = document.createElement("img");
-      im.className = "sub-thumb";
-      im.src = url;
-      im.alt = "";
-      grid.appendChild(im);
+      var isVideo = (f.type || "").toLowerCase().indexOf("video/") === 0;
+      if (isVideo) {
+        var vv = document.createElement("video");
+        vv.className = "sub-video";
+        vv.src = url;
+        vv.muted = true;
+        vv.playsInline = true;
+        vv.preload = "metadata";
+        grid.appendChild(vv);
+      } else {
+        var im = document.createElement("img");
+        im.className = "sub-thumb";
+        im.src = url;
+        im.alt = "";
+        grid.appendChild(im);
+      }
     });
   });
   $("sub-submit").addEventListener("click", async function () {
-    var name = readName();
-    if (!name) { $("sub-err").textContent = "Enter your name on the lookup screen first."; $("sub-err").hidden = false; return; }
+    var name = $("sub-name").value.trim();
+    if (!name) { $("sub-err").textContent = "Your name is required."; $("sub-err").hidden = false; return; }
     rememberName(name);
     var title = $("sub-title").value.trim();
     if (!title) { $("sub-err").textContent = "Title is required."; $("sub-err").hidden = false; return; }
     var files = $("sub-photo").files ? Array.from($("sub-photo").files) : [];
-    if (!files.length) { $("sub-err").textContent = "At least one photo is required for a waiver request."; $("sub-err").hidden = false; return; }
     var fd = new FormData();
     fd.append("assetId", state.assetId);
     fd.append("title", title);
@@ -3351,8 +3473,8 @@ async function handleWaiverCountsApi(env: Env): Promise<Response> {
 
 /**
  * POST /api/waivers — submit a new waiver request.
- * multipart/form-data: assetId, title, description?, submittedBy, and one or
- * more `photo` file fields (same name repeated). Up to 8 files, 10MB each.
+ * multipart/form-data: assetId, title, description?, submittedBy, and zero or
+ * more `photo` file fields (same name repeated). Up to 8 media files, 10MB each.
  */
 async function handleWaiverSubmitApi(env: Env, request: Request): Promise<Response> {
   if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
@@ -3386,7 +3508,7 @@ async function handleWaiverSubmitApi(env: Env, request: Request): Promise<Respon
   for (const entry of rawFiles) {
     if (!(entry instanceof File) || entry.size <= 0) continue;
     if (entry.size > MAX_BYTES) {
-      return Response.json({ error: "each photo must be 10MB or less" }, { status: 413, headers: cacheHeaders() });
+      return Response.json({ error: "each media file must be 10MB or less" }, { status: 413, headers: cacheHeaders() });
     }
     photos.push({ body: await entry.arrayBuffer(), contentType: entry.type || "image/jpeg" });
     if (photos.length >= MAX_FILES) break;
@@ -4640,7 +4762,7 @@ function readCellText(cell: ExcelJS.Cell): string {
  * - Sticky top header with current cadence stats.
  * - Sticky filter chips below the header.
  * - Tap an asset row → full-screen detail sheet with status, location,
- *   discrepancy chips, photos (camera capture), and a big "Mark checked".
+ *   discrepancy chips, photos (camera capture), and a single "Save check".
  * - Auto-saves the walker name to localStorage.
  * - Polls the roster every 30s so newly added ETIC assets appear.
  * - "Add to home screen" via /yard/manifest.webmanifest.
@@ -4876,6 +4998,30 @@ function renderYardAppHtml(): string {
       background: #0a1a3a; border: 1px solid var(--border);
     }
     .photo img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .photo .yard-photo-view {
+      display: block; width: 100%; height: 100%; padding: 0; margin: 0; border: 0; background: transparent;
+      cursor: zoom-in; border-radius: inherit;
+    }
+    .yard-photo-lb-overlay {
+      z-index: 80;
+    }
+    .yard-photo-lb-overlay .modal.yard-photo-lb-inner {
+      position: relative;
+      max-width: min(94vw, 960px);
+      width: auto;
+      max-height: 92vh;
+      padding: 10px;
+      box-shadow: 0 12px 40px rgba(15,30,60,0.2);
+    }
+    .yard-photo-lb-overlay .yard-photo-lb-x {
+      position: absolute; top: 8px; right: 8px; z-index: 2;
+      width: 38px; height: 38px; border-radius: 8px; border: 1px solid var(--border);
+      background: var(--bg1); font-size: 20px; cursor: pointer; line-height: 1;
+    }
+    .yard-photo-lb-overlay #yard-photo-lb-img-m {
+      display: block; max-width: 100%; max-height: 86vh; width: auto; height: auto; margin: 0 auto;
+      object-fit: contain; border-radius: 8px;
+    }
     .photo .meta { position: absolute; bottom: 0; left: 0; right: 0; padding: 4px 6px; font-size: 10px;
       color: white; background: linear-gradient(180deg, transparent, rgba(0,0,0,0.7)); }
     .photo .x {
@@ -4973,11 +5119,18 @@ function renderYardAppHtml(): string {
 
     .save-bar {
       position: fixed; left: 0; right: 0; bottom: 0;
-      padding: 12px 14px calc(var(--safe-bottom) + 12px);
+      padding: 10px 14px calc(var(--safe-bottom) + 12px);
       background: var(--bg1);
       border-top: 1px solid var(--border);
       box-shadow: 0 -4px 14px rgba(15,30,60,0.08);
       z-index: 65;
+    }
+    .save-bar-hint {
+      margin: 0 0 8px;
+      font-size: 12px;
+      line-height: 1.35;
+      color: var(--muted);
+      text-align: center;
     }
     .save-btn {
       width: 100%; padding: 16px; border-radius: 8px;
@@ -5340,7 +5493,7 @@ function renderYardAppHtml(): string {
 
     <nav class="chiprow" id="filters">
       <button type="button" class="chip yard-filter-btn active" data-filter="all">All <span class="count" data-yc="all">0</span></button>
-      <button type="button" class="chip yard-filter-btn" data-filter="needs_action">Needs action <span class="count" data-yc="needs_action">0</span></button>
+      <button type="button" class="chip yard-filter-btn" data-filter="needs_action">Due for check <span class="count" data-yc="needs_action">0</span></button>
       <button type="button" class="chip yard-filter-btn" data-filter="done">Done <span class="count" data-yc="done">0</span></button>
     </nav>
 
@@ -5369,14 +5522,14 @@ function renderYardAppHtml(): string {
         <span class="yard-desktop-filterbar-label">Show</span>
         <nav id="filters-desk" class="yard-desk-filters" aria-label="Fleet list filters">
           <button type="button" class="yard-filter-btn active" data-filter="all">All <span class="yard-ftab-n" data-yc="all">0</span></button>
-          <button type="button" class="yard-filter-btn" data-filter="needs_action">Needs action <span class="yard-ftab-n" data-yc="needs_action">0</span></button>
+          <button type="button" class="yard-filter-btn" data-filter="needs_action">Due for check <span class="yard-ftab-n" data-yc="needs_action">0</span></button>
           <button type="button" class="yard-filter-btn" data-filter="done">Done <span class="yard-ftab-n" data-yc="done">0</span></button>
         </nav>
       </div>
     </div>
 
     <div class="yard-desk" id="yard-desk">
-      <p class="yard-desk-hint">Search and pick a row for location, notes, and history. <span style="color:var(--muted)">Unlisted / NCE / Below MEL still appear as row tags when they apply.</span></p>
+      <p class="yard-desk-hint">Search and pick a row for location, notes, and history. <span style="color:var(--muted)">NCE and Below MEL tags are work-order context only. Unlisted is the only extra queue besides the check cadence.</span></p>
       <div class="yard-desk-split">
         <div class="yard-desk-table-wrap">
           <table class="yard-desk-table" aria-label="Yard vehicle lookup">
@@ -5429,7 +5582,8 @@ function renderYardAppHtml(): string {
     </div>
     <div class="sheet-body" id="sheet-body"></div>
     <div class="save-bar">
-      <button class="save-btn" id="save-btn">✓ Mark checked</button>
+      <p class="save-bar-hint">One save = one yard visit (set parking location first).</p>
+      <button class="save-btn" id="save-btn">Save check</button>
     </div>
   </div>
 
@@ -5459,6 +5613,13 @@ function renderYardAppHtml(): string {
         <button type="button" class="secondary" id="edit-check-cancel">Cancel</button>
         <button type="button" class="primary" id="edit-check-save">Save changes</button>
       </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay yard-photo-lb-overlay" id="yard-photo-lb-m" aria-hidden="true">
+    <div class="modal yard-photo-lb-inner" role="dialog" aria-modal="true" aria-label="Photo">
+      <button type="button" class="yard-photo-lb-x" id="yard-photo-lb-x-m" aria-label="Close">\u00D7</button>
+      <img id="yard-photo-lb-img-m" alt="Yard photo" />
     </div>
   </div>
 
@@ -5493,6 +5654,28 @@ function renderYardAppHtml(): string {
       "Windows down","Door unlocked","Flat tire","Fluid leak",
       "Lights on","Wrong spot","Damaged","Missing fuel cap",
       "Battery dead","Needs cleaning","No keys","Unsecured cargo"
+    ];
+    var BASIC_LOCATION_CHIPS = [
+      "AT INSIDE",
+      "AT OUTSIDE",
+      "CSC INSIDE",
+      "CSC OUTSIDE",
+      "FARM",
+      "FM&A OUTSIDE",
+      "FM&A PEN",
+      "GP INSIDE",
+      "GPL INSIDE",
+      "GP OUTSIDE",
+      "GPL OUTSIDE",
+      "GRAVEL LEFT",
+      "GRAVEL MIDDLE",
+      "GRAVEL RIGHT",
+      "MOS",
+      "RAILHEAD",
+      "READY LINE",
+      "SP INSIDE",
+      "SP OUTSIDE",
+      "TIRE SHOP"
     ];
     // Walker only ever logs what they actually see. "Not here" used to be a
     // button, but the walker has no way of knowing what *should* be parked in
@@ -5587,10 +5770,13 @@ function renderYardAppHtml(): string {
         .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
     }
+    function normLoc(s){
+      return String(s == null ? "" : s).trim().toUpperCase();
+    }
 
-    /** True when the asset should appear under "Needs action" (one bucket for walkers). */
-    function yardNeedsAction(a){
-      if (a.isUnlisted || a.isNce || a.isBelowMel) return true;
+    /** True for the "Due for check" filter: cadence bucket only, plus unlisted floor-to-book. NCE / below MEL stay as row badges only (WO context). */
+    function yardDueForCheck(a){
+      if (a.isUnlisted) return true;
       if (a.rollingState === "due" || a.rollingState === "overdue" || a.rollingState === "never") return true;
       return false;
     }
@@ -5599,7 +5785,7 @@ function renderYardAppHtml(): string {
       var q = state.search.trim().toLowerCase();
       var filt = state.filter;
       return state.assets.filter(function(a){
-        if (filt === "needs_action" && !yardNeedsAction(a)) return false;
+        if (filt === "needs_action" && !yardDueForCheck(a)) return false;
         if (filt === "done" && a.rollingState !== "fresh") return false;
         if (!q) return true;
         var hay = (a.assetId + " " + (a.vinSerial||"") + " " + (a.makeModel||"") + " " +
@@ -5618,7 +5804,7 @@ function renderYardAppHtml(): string {
         document.querySelectorAll("[data-yc='" + key + "']").forEach(function(el){ el.textContent = String(val); });
       }
       yc("all", state.assets.length);
-      yc("needs_action", state.assets.filter(yardNeedsAction).length);
+      yc("needs_action", state.assets.filter(yardDueForCheck).length);
       yc("done", state.assets.filter(function(a){ return a.rollingState === "fresh"; }).length);
     }
 
@@ -5945,6 +6131,13 @@ function renderYardAppHtml(): string {
         var on = chips.indexOf(c) !== -1;
         return '<button class="chip ' + (on ? "on" : "") + '" data-chip="' + escapeHtml(c) + '">' + escapeHtml(c) + '</button>';
       }).join("");
+      var curLocNorm = normLoc(state.draft.location);
+      var hasBasicLoc = BASIC_LOCATION_CHIPS.some(function(c){ return normLoc(c) === curLocNorm; });
+      var locChipHtml = BASIC_LOCATION_CHIPS.map(function(c){
+        var on = normLoc(c) === curLocNorm;
+        return '<button class="chip ' + (on ? "on" : "") + '" data-loc-chip="' + escapeHtml(c) + '">' + escapeHtml(c) + '</button>';
+      }).join("");
+      var customLoc = hasBasicLoc ? "" : (state.draft.location || "");
 
       // STATUS is single-button now ("Found it") and isn't rendered as its
       // own row anymore — the act of saving the sheet implies presence. We
@@ -5958,9 +6151,9 @@ function renderYardAppHtml(): string {
       for (var i = 0; i < photos.length; i++) {
         var p = photos[i];
         photoHtml += '<div class="photo" data-photo-id="' + p.id + '">' +
-          '<a href="' + p.url + '" target="_blank" rel="noopener">' +
-            '<img src="' + p.url + '" alt="" loading="lazy" />' +
-          '</a>' +
+          '<button type="button" class="yard-photo-view" data-yard-photo-url="' + escapeHtml(p.url) + '" aria-label="View full size">' +
+            '<img src="' + escapeHtml(p.url) + '" alt="" loading="lazy" />' +
+          '</button>' +
           '<button class="x" data-del-photo="' + p.id + '" aria-label="Delete">\u00D7</button>' +
           '<div class="meta">' + (p.uploadedBy ? escapeHtml(p.uploadedBy) + " \u00B7 " : "") + fmtRel(p.uploadedAtIso) + '</div>' +
         '</div>';
@@ -6084,7 +6277,8 @@ function renderYardAppHtml(): string {
         // confirming presence.
         '<div class="card">' +
           '<h4>Location</h4>' +
-          '<input id="loc-input" list="loc-options" placeholder="Where is it parked?" value="' + escapeHtml(state.draft.location) + '" />' +
+          '<div class="chip-pick" id="loc-pick">' + locChipHtml + '</div>' +
+          '<input id="loc-input-other" list="loc-options" placeholder="Other location (optional)" value="' + escapeHtml(customLoc) + '" style="margin-top:8px;" />' +
         '</div>' +
         '<div class="card">' +
           '<h4>Discrepancies</h4>' +
@@ -6311,8 +6505,15 @@ function renderYardAppHtml(): string {
         state.draft.discrepancies = parts.join("; ");
         renderSheet();
       });
-      var loc = $("loc-input");
-      if (loc) loc.addEventListener("input", function(){ state.draft.location = loc.value; });
+      var lp = $("loc-pick");
+      if (lp) lp.addEventListener("click", function(e){
+        var btn = e.target.closest("[data-loc-chip]");
+        if (!btn) return;
+        state.draft.location = btn.getAttribute("data-loc-chip") || "";
+        renderSheet();
+      });
+      var locOther = $("loc-input-other");
+      if (locOther) locOther.addEventListener("input", function(){ state.draft.location = locOther.value; });
       var disc = $("disc-input");
       if (disc) disc.addEventListener("input", function(){ state.draft.discrepancies = disc.value; });
       var pi = $("photo-input");
@@ -6322,6 +6523,13 @@ function renderYardAppHtml(): string {
       if (sb && !sb._yardDelEv) {
         sb._yardDelEv = true;
         sb.addEventListener("click", function(e){
+          var pv = e.target.closest("[data-yard-photo-url]");
+          if (pv) {
+            e.preventDefault();
+            var u = pv.getAttribute("data-yard-photo-url");
+            if (u) openYardPhotoLbMob(u);
+            return;
+          }
           var editB = e.target.closest("[data-edit-check]");
           if (editB) {
             e.preventDefault();
@@ -6393,13 +6601,13 @@ function renderYardAppHtml(): string {
       if (!requireWalkerName()) return;
       var loc = (state.draft.location || "").trim();
       if (!loc) {
-        showToast("Enter where the vehicle is parked before marking checked.", true);
+        showToast("Enter where the vehicle is parked, then save once.", true);
         return;
       }
       state.saving = true;
       var btn = $("save-btn");
       btn.classList.add("saving");
-      btn.textContent = "Saving…";
+      btn.textContent = "Saving\u2026";
       fetch("/api/yard/check", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -6416,7 +6624,7 @@ function renderYardAppHtml(): string {
           return r.json();
         })
         .then(function(){
-          showToast("\u2713 Marked checked");
+          showToast("Check saved");
           // Optimistic local update
           var a = state.assets.find(function(x){ return x.assetId === state.openId; });
           if (a) {
@@ -6444,11 +6652,29 @@ function renderYardAppHtml(): string {
         .finally(function(){
           state.saving = false;
           btn.classList.remove("saving");
-          btn.textContent = "\u2713 Mark checked";
+          btn.textContent = "Save check";
         });
     }
 
     /* ----- find / floor-to-book modal ----- */
+    function openYardPhotoLbMob(url) {
+      var m = $("yard-photo-lb-m");
+      var img = $("yard-photo-lb-img-m");
+      if (!m || !img || !url) return;
+      img.src = url;
+      m.classList.add("open");
+      m.setAttribute("aria-hidden", "false");
+    }
+    function closeYardPhotoLbMob() {
+      var m = $("yard-photo-lb-m");
+      var img = $("yard-photo-lb-img-m");
+      if (m) {
+        m.classList.remove("open");
+        m.setAttribute("aria-hidden", "true");
+      }
+      if (img) img.src = "";
+    }
+
     function openFindModal(){
       var m = $("find-modal");
       m.classList.add("open");
@@ -6483,7 +6709,8 @@ function renderYardAppHtml(): string {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           assetId: id, location: loc, discrepancies: notes,
-          status: "present", checkedBy: (state.walker || "").trim()
+          status: "present", checkedBy: (state.walker || "").trim(),
+          fromFindUnlisted: true
         })
       })
         .then(function(r){
@@ -6499,9 +6726,7 @@ function renderYardAppHtml(): string {
             showToast(msg);
             closeFindModal();
             if (photoInp) photoInp.value = "";
-            loadRoster().then(function(){
-              openSheet(id);
-            });
+            loadRoster();
           }
           if (!files.length) {
             doneUi("Logged " + id);
@@ -6581,6 +6806,14 @@ function renderYardAppHtml(): string {
     $("find-modal").addEventListener("click", function(e){
       if (e.target === e.currentTarget) closeFindModal();
     });
+    var yplbm = $("yard-photo-lb-m");
+    if (yplbm) {
+      yplbm.addEventListener("click", function (e) {
+        if (e.target === yplbm) closeYardPhotoLbMob();
+      });
+    }
+    var yplbx = $("yard-photo-lb-x-m");
+    if (yplbx) yplbx.addEventListener("click", function () { closeYardPhotoLbMob(); });
     $("edit-check-cancel").addEventListener("click", closeEditCheckModal);
     $("edit-check-delete").addEventListener("click", deleteEditCheck);
     $("edit-check-save").addEventListener("click", saveEditCheck);
@@ -6608,6 +6841,7 @@ function renderYardAppHtml(): string {
     // ESC key for desktop testing
     document.addEventListener("keydown", function(e){
       if (e.key === "Escape") {
+        if ($("yard-photo-lb-m") && $("yard-photo-lb-m").classList.contains("open")) { closeYardPhotoLbMob(); return; }
         if ($("edit-check-modal").classList.contains("open")) { closeEditCheckModal(); return; }
         if ($("find-modal").classList.contains("open")) { closeFindModal(); return; }
         if (state.openId) closeSheet();
@@ -9255,7 +9489,11 @@ function renderDashboardHtml(): string {
       border-radius: 999px; background: var(--bg2); color: var(--text);
       font-size: 12px; font-weight: 700; text-align: center;
     }
-    .yard-subtab.active .yard-subbadge { background: var(--accent); color: var(--accent-fg); }
+    .yard-subtab.active .yard-subbadge {
+      background: var(--accent);
+      color: #ffffff;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.25);
+    }
 
     /* FM&A finding chips */
     .yard-findings-chip {
@@ -9267,7 +9505,7 @@ function renderDashboardHtml(): string {
 
     /* Finding cards */
     .yard-finding {
-      display: grid; grid-template-columns: auto 1fr auto; gap: 12px 16px;
+      display: grid; grid-template-columns: auto 72px 1fr auto; gap: 12px 14px;
       padding: 14px 16px; border: 1px solid var(--border); border-radius: 12px;
       background: var(--bg1); margin-bottom: 8px;
     }
@@ -9282,7 +9520,38 @@ function renderDashboardHtml(): string {
     .yard-finding-icon.discrepancy { background: #e8eef8; color: #003a8c; border: 1px solid #9fbce0; }
     .yard-finding-icon.unknown { background: #eef1f5; color: #3d4a5c; border: 1px solid var(--border); }
     .yard-finding-body { min-width: 0; }
-    .yard-finding-id { font-weight: 700; font-size: 16px; }
+    .yard-finding-id { font-weight: 700; font-size: 16px; color: var(--text); }
+    .yard-finding-thumb {
+      width: 72px; height: 72px; border-radius: 10px; overflow: hidden; border: 1px solid var(--border);
+      background: var(--bg2); padding: 0; cursor: pointer; align-self: start;
+    }
+    .yard-finding-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .yard-finding-thumb.placeholder {
+      cursor: default; display: flex; align-items: center; justify-content: center;
+      font-size: 11px; color: var(--muted2); text-align: center; line-height: 1.2;
+    }
+    .yard-finding-fma {
+      margin-top: 8px; padding: 8px 10px; border-radius: 8px; background: var(--bg2);
+      border: 1px solid var(--border); font-size: 12px; color: var(--text-dim); line-height: 1.4;
+    }
+    .yard-finding-fma .lbl {
+      display: block; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+      color: var(--muted); margin-bottom: 4px;
+    }
+    .yard-finding-fma .txt { white-space: pre-wrap; word-break: break-word; color: var(--text); }
+    #yard-photo-lightbox-desk .yard-photo-lb-card {
+      position: relative; max-width: min(94vw, 960px); max-height: 92vh; padding: 12px;
+      border-radius: 12px; background: var(--bg1); border: 1px solid var(--border);
+    }
+    #yard-photo-lightbox-desk .yard-photo-lb-close {
+      position: absolute; top: 8px; right: 8px; z-index: 2;
+      width: 36px; height: 36px; border-radius: 8px; border: 1px solid var(--border);
+      background: var(--bg1); font-size: 18px; cursor: pointer; line-height: 1;
+    }
+    #yard-photo-lb-img-desk {
+      display: block; max-width: 100%; max-height: 86vh; width: auto; height: auto; margin: 0 auto;
+      object-fit: contain; border-radius: 8px;
+    }
     .yard-finding-meta { color: var(--muted); font-size: 13px; margin-top: 2px; }
     .yard-finding-disc {
       margin-top: 6px; font-size: 13px; color: var(--text);
@@ -9297,7 +9566,7 @@ function renderDashboardHtml(): string {
     .yard-finding-actions button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 600; }
     .yard-finding-actions button.ghost { background: transparent; }
     .yard-finding-action {
-      grid-column: 2 / -1; margin-top: 8px; padding-top: 8px;
+      grid-column: 1 / -1; margin-top: 8px; padding-top: 8px;
       border-top: 1px dashed var(--border);
       font-size: 12px; color: var(--muted);
     }
@@ -9577,7 +9846,8 @@ function renderDashboardHtml(): string {
       display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 0 0;
       border-top: 1px solid var(--border);
     }
-    .wv-photo-grid img.photo {
+    .wv-photo-grid img.photo,
+    .wv-photo-grid video.photo {
       display: block; width: auto; max-width: min(48%, 280px); max-height: 220px;
       object-fit: cover; border-radius: 8px; border: 1px solid var(--border); background: #0a1a3a;
     }
@@ -9628,6 +9898,30 @@ function renderDashboardHtml(): string {
       padding: 16px 16px 14px; background: var(--surface);
       border: 1px solid var(--border); border-radius: 14px;
     }
+    .wv-create-card {
+      padding: 14px 16px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .wv-create-card h4 { margin: 0; font-size: 1rem; }
+    .wv-create-card label { font-size: 0.76rem; color: var(--muted); margin-top: 2px; }
+    .wv-create-card input[type="text"], .wv-create-card textarea, .wv-create-card input[type="file"] {
+      width: 100%;
+      background: var(--bg0, var(--bg));
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 11px;
+      font-size: 0.9rem;
+      font-family: inherit;
+    }
+    .wv-create-card textarea { min-height: 76px; resize: vertical; }
+    .wv-create-actions { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
+    .wv-create-status { font-size: 0.8rem; color: var(--muted); min-height: 1em; }
     .wv-asset-browser-head {
       display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; margin-bottom: 12px;
     }
@@ -12236,7 +12530,7 @@ function renderDashboardHtml(): string {
 
               <div class="wo-timeline-head">
                 <h3 class="wo-section-title" id="wo-timeline-heading">Change timeline</h3>
-                <button type="button" class="linkish" id="watch-rebuild">Rebuild history</button>
+                <button type="button" class="linkish hidden" id="watch-rebuild" aria-hidden="true" tabindex="-1">Rebuild history</button>
               </div>
               <div class="wo-timeline" id="wo-timeline"><div class="wo-timeline-empty">Loading…</div></div>
               <p class="status" id="watch-rebuild-status"></p>
@@ -12738,6 +13032,13 @@ function renderDashboardHtml(): string {
             </div>
           </div>
         </div>
+
+        <div id="yard-photo-lightbox-desk" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-hidden="true">
+          <div class="yard-photo-lb-card">
+            <button type="button" class="yard-photo-lb-close" id="yard-photo-lb-close-desk" aria-label="Close">\u00D7</button>
+            <img id="yard-photo-lb-img-desk" alt="Yard photo preview" />
+          </div>
+        </div>
       </div>
 
       <!-- Waivers tab: management approval queue + per-vehicle lookup +
@@ -12779,6 +13080,24 @@ function renderDashboardHtml(): string {
                     <input type="text" id="wv-bv-input" placeholder="e.g. AF00C00488"
                            autocomplete="off" autocapitalize="characters" spellcheck="false" />
                     <button type="button" class="primary" id="wv-bv-go">Look up</button>
+                  </div>
+                </div>
+                <div class="wv-create-card">
+                  <h4>Add waiver request</h4>
+                  <label for="wv-create-asset">Selected asset (from lookup)</label>
+                  <input type="text" id="wv-create-asset" placeholder="Look up or select a vehicle first"
+                         autocomplete="off" spellcheck="false" readonly />
+                  <label for="wv-create-name">Your name (required)</label>
+                  <input type="text" id="wv-create-name" placeholder="First Last" autocomplete="name" />
+                  <label for="wv-create-title">Short title (required)</label>
+                  <input type="text" id="wv-create-title" maxlength="120" placeholder="e.g. Passenger mirror crack" />
+                  <label for="wv-create-desc">Details (optional)</label>
+                  <textarea id="wv-create-desc" maxlength="2000"></textarea>
+                  <label for="wv-create-media">Photos/videos (optional)</label>
+                  <input type="file" id="wv-create-media" accept="image/*,video/*" multiple />
+                  <div class="wv-create-actions">
+                    <button type="button" class="primary" id="wv-create-submit">Submit waiver</button>
+                    <span class="wv-create-status" id="wv-create-status"></span>
                   </div>
                 </div>
                 <div class="wv-asset-browser" id="wv-asset-browser">
@@ -13256,6 +13575,9 @@ function renderDashboardHtml(): string {
     }
 
     function readHashRoute() {
+      const qs = new URLSearchParams(location.search);
+      const qTab = String(qs.get("tab") || "").trim().toLowerCase();
+      if (qTab === "waivers") return { tab: "waivers", dateKey: null, workOrderId: null };
       const raw = (location.hash || "").replace(/^#/, "");
       if (!raw) return { tab: "snapshot", dateKey: null, workOrderId: null };
       if (raw.indexOf("wo=") === 0) {
@@ -15965,6 +16287,10 @@ function renderDashboardHtml(): string {
         await selectWo(r.workOrderId, false);
         return;
       }
+      if (r.tab === "waivers") {
+        setMainTab("waivers");
+        return;
+      }
       if (r.tab === "authz") {
         setMainTab("authz");
         return;
@@ -16881,7 +17207,8 @@ function renderDashboardHtml(): string {
         });
       }
 
-      document.getElementById("watch-rebuild").addEventListener("click", async function () {
+      const watchRebuildBtn = document.getElementById("watch-rebuild");
+      if (watchRebuildBtn) watchRebuildBtn.addEventListener("click", async function () {
         const st = document.getElementById("watch-rebuild-status");
         if (!confirm("Rebuild clears work order changelog and replays every ETIC in date order. Continue?")) return;
         st.textContent = "Starting rebuild…";
@@ -19148,7 +19475,8 @@ function renderDashboardHtml(): string {
 
     function onEnterYardTab() {
       yardFmWireOnce();
-      const sub = yardFmState.subTab || "findings";
+      yardPrefetchFindingsCounts();
+      const sub = yardFmState.subTab || "roster";
       yardActivateSub(sub);
     }
 
@@ -19165,6 +19493,23 @@ function renderDashboardHtml(): string {
       /** Sorted asset ids from last /api/waivers/counts (By vehicle list). */
       bvAssetKeys: [],
     };
+    let waiversDeepLinkApplied = false;
+
+    function applyWaiversDeepLinkFromUrl() {
+      if (waiversDeepLinkApplied) return;
+      const qs = new URLSearchParams(location.search);
+      const tab = String(qs.get("tab") || "").trim().toLowerCase();
+      const sub = String(qs.get("wv") || qs.get("waiverView") || "").trim().toLowerCase();
+      if (tab !== "waivers" && sub !== "byvehicle") return;
+      waiversDeepLinkApplied = true;
+      setMainTab("waivers");
+      if (sub === "byvehicle") {
+        waiversSetSubTab("byvehicle");
+        loadWaiverAssetBrowser();
+        const asset = String(qs.get("asset") || "").trim().toUpperCase();
+        if (asset) loadWaiverByVehicle(asset);
+      }
+    }
 
     function waiversSetSubTab(which) {
       waiversState.subTab = which;
@@ -19214,6 +19559,71 @@ function renderDashboardHtml(): string {
       });
       const wvAf = document.getElementById("wv-asset-filter");
       if (wvAf) wvAf.addEventListener("input", function () { renderWaiverAssetChipList(); });
+      const createName = document.getElementById("wv-create-name");
+      if (createName) createName.value = localStorage.getItem("waiver.reviewerName") || "";
+      const createAsset = document.getElementById("wv-create-asset");
+      if (createAsset) createAsset.value = ((waiversState.bv && waiversState.bv.assetId) || "").trim().toUpperCase();
+      const createBtn = document.getElementById("wv-create-submit");
+      if (createBtn) createBtn.addEventListener("click", submitDesktopWaiver);
+    }
+
+    async function submitDesktopWaiver() {
+      const assetEl = document.getElementById("wv-create-asset");
+      var assetId = ((waiversState.bv && waiversState.bv.assetId) || "").trim().toUpperCase();
+      const lookupEl = document.getElementById("wv-bv-input");
+      const typedLookupAsset = ((lookupEl && lookupEl.value) || "").trim().toUpperCase();
+      const status = document.getElementById("wv-create-status");
+      const setStatus = function (msg, danger) {
+        if (!status) return;
+        status.textContent = msg || "";
+        status.style.color = danger ? "var(--danger)" : "var(--muted)";
+      };
+      if (!assetId && typedLookupAsset) {
+        // Allow starting a brand-new waiver card from a typed asset id,
+        // even when no existing waiver rows exist for that vehicle yet.
+        assetId = typedLookupAsset;
+        await loadWaiverByVehicle(assetId);
+      }
+      if (!assetId) { setStatus("Look up/select an asset first.", true); return; }
+      const nameEl = document.getElementById("wv-create-name");
+      const titleEl = document.getElementById("wv-create-title");
+      const descEl = document.getElementById("wv-create-desc");
+      const mediaEl = document.getElementById("wv-create-media");
+      const submitEl = document.getElementById("wv-create-submit");
+      const submittedBy = ((nameEl && nameEl.value) || "").trim();
+      const title = ((titleEl && titleEl.value) || "").trim();
+      const description = ((descEl && descEl.value) || "").trim();
+      if (!submittedBy) { setStatus("Your name is required.", true); if (nameEl) nameEl.focus(); return; }
+      if (!title) { setStatus("Title is required.", true); if (titleEl) titleEl.focus(); return; }
+      var files = mediaEl && mediaEl.files ? Array.from(mediaEl.files) : [];
+      var fd = new FormData();
+      fd.append("assetId", assetId);
+      fd.append("title", title);
+      fd.append("description", description);
+      fd.append("submittedBy", submittedBy);
+      files.forEach(function (f) { fd.append("photo", f); });
+      if (submitEl) submitEl.disabled = true;
+      if (assetEl) assetEl.value = assetId;
+      setStatus("Submitting...", false);
+      try {
+        const r = await fetch("/api/waivers", { method: "POST", body: fd });
+        const j = await r.json().catch(function () { return {}; });
+        if (!r.ok) throw new Error((j && j.error) || ("HTTP " + r.status));
+        localStorage.setItem("waiver.reviewerName", submittedBy);
+        if (nameEl) nameEl.value = submittedBy;
+        if (assetEl) assetEl.value = assetId;
+        if (titleEl) titleEl.value = "";
+        if (descEl) descEl.value = "";
+        if (mediaEl) mediaEl.value = "";
+        setStatus("Submitted. Now pending review.", false);
+        await loadWaiverByVehicle(assetId);
+        await loadWaiverPending();
+        await loadWaiverCounts(true);
+      } catch (e) {
+        setStatus("Submit failed: " + ((e && e.message) ? e.message : e), true);
+      } finally {
+        if (submitEl) submitEl.disabled = false;
+      }
     }
 
     async function loadWaiverAssetBrowser() {
@@ -19295,6 +19705,7 @@ function renderDashboardHtml(): string {
     }
 
     function onEnterWaiversTab() {
+      applyWaiversDeepLinkFromUrl();
       waiversWireOnce();
       waiversSetSubTab(waiversState.subTab || "pending");
       // Always pull pending so the badge count on the subnav is current,
@@ -19305,6 +19716,8 @@ function renderDashboardHtml(): string {
         if (waiversState.bv.assetId) loadWaiverByVehicle(waiversState.bv.assetId);
       }
     }
+    // Support direct desktop links like /?tab=waivers&wv=byvehicle.
+    queueMicrotask(function () { applyWaiversDeepLinkFromUrl(); });
 
     async function loadWaiverPending() {
       const list = document.getElementById("wv-pending-list");
@@ -19340,6 +19753,10 @@ function renderDashboardHtml(): string {
         "<div class='wv-photo-grid'>" +
         list
           .map(function (p) {
+            var ct = String((p && p.contentType) || "").toLowerCase();
+            if (ct.indexOf("video/") === 0) {
+              return "<video class='photo' src='" + esc(p.url) + "' controls preload='metadata'></video>";
+            }
             return "<img class='photo' src='" + esc(p.url) + "' alt='' loading='lazy' />";
           })
           .join("") +
@@ -19419,6 +19836,8 @@ function renderDashboardHtml(): string {
 
     async function loadWaiverByVehicle(assetId) {
       waiversState.bv.assetId = assetId;
+      const createAsset = document.getElementById("wv-create-asset");
+      if (createAsset) createAsset.value = (assetId || "").toUpperCase();
       const wrap = document.getElementById("wv-bv-result");
       if (!wrap) return;
       wrap.innerHTML = "<div class='hint' style='color:var(--muted);padding:8px 0'>Loading waivers for " + esc(assetId) + "…</div>";
@@ -19685,6 +20104,25 @@ function renderDashboardHtml(): string {
       reassigned: "Reassigned",
     };
 
+    function yardOpenPhotoLightboxDesk(url) {
+      var m = document.getElementById("yard-photo-lightbox-desk");
+      var img = document.getElementById("yard-photo-lb-img-desk");
+      if (!m || !img || !url) return;
+      img.src = url;
+      img.alt = "Yard photo preview";
+      m.classList.remove("hidden");
+      m.setAttribute("aria-hidden", "false");
+    }
+    function yardClosePhotoLightboxDesk() {
+      var m = document.getElementById("yard-photo-lightbox-desk");
+      var img = document.getElementById("yard-photo-lb-img-desk");
+      if (m) {
+        m.classList.add("hidden");
+        m.setAttribute("aria-hidden", "true");
+      }
+      if (img) img.src = "";
+    }
+
     // NOTE: must NOT be named yardWireOnce — there is a leftover walker-app
     // yardWireOnce further down in this same script block (dead code that
     // targets IDs like yard-new-btn which only existed when the walker was
@@ -19719,6 +20157,13 @@ function renderDashboardHtml(): string {
 
       const list = document.getElementById("yard-findings-list");
       if (list) list.addEventListener("click", function (e) {
+        const ph = e.target.closest("[data-yard-finding-photo]");
+        if (ph) {
+          e.preventDefault();
+          var u = ph.getAttribute("data-yard-finding-photo");
+          if (u) yardOpenPhotoLightboxDesk(u);
+          return;
+        }
         const btn = e.target.closest("[data-fa]");
         if (!btn) return;
         const action = btn.getAttribute("data-fa");
@@ -19744,6 +20189,26 @@ function renderDashboardHtml(): string {
       if (cancel) cancel.addEventListener("click", closeModal);
       if (back) back.addEventListener("click", function(e){ if (e.target === back) closeModal(); });
       if (save) save.addEventListener("click", function(){ yardSubmitResolve().then(function(ok){ if (ok) closeModal(); }); });
+      var plb = document.getElementById("yard-photo-lightbox-desk");
+      var plbX = document.getElementById("yard-photo-lb-close-desk");
+      if (plb && plb.dataset.wiredLb !== "1") {
+        plb.dataset.wiredLb = "1";
+        plb.addEventListener("click", function (e) {
+          if (e.target === plb) yardClosePhotoLightboxDesk();
+        });
+      }
+      if (plbX && plbX.dataset.wiredLb !== "1") {
+        plbX.dataset.wiredLb = "1";
+        plbX.addEventListener("click", function () { yardClosePhotoLightboxDesk(); });
+      }
+      if (document.documentElement.dataset.yardPhotoEsc !== "1") {
+        document.documentElement.dataset.yardPhotoEsc = "1";
+        document.addEventListener("keydown", function (e) {
+          if (e.key !== "Escape") return;
+          var m = document.getElementById("yard-photo-lightbox-desk");
+          if (m && !m.classList.contains("hidden")) yardClosePhotoLightboxDesk();
+        });
+      }
     }
 
     function yardActivateSub(sub) {
@@ -19759,6 +20224,18 @@ function renderDashboardHtml(): string {
         const f = document.getElementById("yard-frame");
         if (f) f.src = "/yard?desktop=1&t=" + Date.now();
       } else if (sub === "activity") yardLoadActivity();
+    }
+
+    function yardPrefetchFindingsCounts() {
+      fetch("/api/yard/findings", { cache: "no-store" })
+        .then(function (r) { return r.json(); })
+        .then(function (j) {
+          yardFmState.findings = j.findings || [];
+          yardFmState.totals = j.totals || yardFmState.totals;
+          yardRenderFindingsCounts();
+          if (yardFmState.subTab === "findings") yardRenderFindings();
+        })
+        .catch(function () {});
     }
 
     function yardLoadFindings() {
@@ -19847,6 +20324,12 @@ function renderDashboardHtml(): string {
       if (a.isBelowMel) badges.push('<span class="badge below-mel">Below MEL</span>');
       if (f.photoCount > 0) badges.push('<span class="badge photos">\uD83D\uDCF7 ' + f.photoCount + '</span>');
       const disc = tc && tc.discrepancies ? '<div class="yard-finding-disc">\u201C' + escapeHtml(tc.discrepancies) + '\u201D</div>' : '';
+      const fmaHtml = f.fleetFmaNotes
+        ? '<div class="yard-finding-fma"><span class="lbl">FM&amp;A / fleet (P&amp;A) notes</span><div class="txt">' + escapeHtml(f.fleetFmaNotes) + '</div></div>'
+        : '';
+      const thumb = f.previewPhotoUrl
+        ? '<button type="button" class="yard-finding-thumb" data-yard-finding-photo="' + escapeHtml(f.previewPhotoUrl) + '" title="View photo"><img src="' + escapeHtml(f.previewPhotoUrl) + '" alt="" loading="lazy" decoding="async" /></button>'
+        : '<div class="yard-finding-thumb placeholder" aria-hidden="true">No\u00A0photo</div>';
       const lastActionBlock = f.lastAction ? yardRenderLastAction(f.lastAction, f.isAcknowledged) : '';
       const ackedClass = f.isAcknowledged ? ' acked' : '';
       const buttons = f.isAcknowledged
@@ -19854,6 +20337,7 @@ function renderDashboardHtml(): string {
         : '<button class="primary" data-fa="resolve">Record action</button>';
       return '<article class="yard-finding' + ackedClass + '" data-asset="' + escapeHtml(f.assetId) + '" data-kind="' + escapeHtml(f.kind) + '">' +
         '<div class="yard-finding-icon ' + escapeHtml(f.kind) + '">' + FINDING_ICONS[f.kind] + '</div>' +
+        thumb +
         '<div class="yard-finding-body">' +
           '<div class="yard-finding-id">' + escapeHtml(f.assetId) + ' ' +
             '<span class="badge" style="background:var(--bg2);color:var(--muted);border:1px solid var(--border);font-size:10px;font-weight:700;padding:2px 7px;border-radius:5px;text-transform:uppercase;letter-spacing:0.4px;margin-left:4px;">' + FINDING_LABELS[f.kind] + '</span> ' +
@@ -19861,6 +20345,7 @@ function renderDashboardHtml(): string {
           '</div>' +
           '<div class="yard-finding-meta">' + meta.join(" \u00B7 ") + '</div>' +
           disc +
+          fmaHtml +
         '</div>' +
         '<div class="yard-finding-actions">' + buttons + '</div>' +
         lastActionBlock +

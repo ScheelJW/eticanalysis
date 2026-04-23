@@ -123,11 +123,45 @@ export function normalizeEntryStatus(s: string | null | undefined): YardEntrySta
   return "present";
 }
 
+async function hasWorkOrderSnapshotRowsForDate(env: Env, dateKey: string): Promise<boolean> {
+  if (!dateKey) return false;
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT 1 AS ok FROM work_order_snapshot WHERE snapshot_date_key = ? LIMIT 1`,
+  )
+    .bind(dateKey)
+    .first<{ ok: number }>();
+  return !!r;
+}
+
+/**
+ * Yard should follow the newest successfully analyzed workbook date, even when
+ * etic_snapshots lags briefly behind due to background post-processing.
+ */
 async function getLatestSnapshotDateKey(env: Env): Promise<string> {
+  try {
+    const latestObj = await env.ETIC_BUCKET.get("analyses/latest.json");
+    if (latestObj) {
+      const latest = JSON.parse(await latestObj.text()) as { dateKey?: string };
+      const dateKey = String(latest?.dateKey ?? "").trim();
+      if (/^\d{4}-\d{2}-\d{2}$/.test(dateKey) && await hasWorkOrderSnapshotRowsForDate(env, dateKey)) {
+        return dateKey;
+      }
+    }
+  } catch {
+    // Fall through to D1-based fallback.
+  }
   const row = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT snapshot_date_key
+       FROM work_order_snapshot
+      GROUP BY snapshot_date_key
+      ORDER BY snapshot_date_key DESC
+      LIMIT 1`,
+  ).first<{ snapshot_date_key: string }>();
+  if (row?.snapshot_date_key) return row.snapshot_date_key;
+  const fallback = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT date_key FROM etic_snapshots ORDER BY date_key DESC LIMIT 1`,
   ).first<{ date_key: string }>();
-  return row?.date_key ?? "";
+  return fallback?.date_key ?? "";
 }
 
 /**
@@ -877,7 +911,20 @@ export type RecordCheckInput = {
   status?: YardEntryStatus;
   checkedBy?: string;
   sourceDateKey?: string;
+  /** When true (Find-unlisted flow only), reject if asset already on latest ETIC WO snapshot. */
+  fromFindUnlisted?: boolean;
 };
+
+async function assetOnWorkOrderSnapshot(env: Env, dateKey: string, assetId: string): Promise<boolean> {
+  if (!dateKey || !assetId) return false;
+  const row = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT 1 AS x FROM work_order_snapshot
+     WHERE snapshot_date_key = ? AND UPPER(TRIM(asset_id)) = UPPER(TRIM(?)) LIMIT 1`,
+  )
+    .bind(dateKey, assetId)
+    .first<{ x: number }>();
+  return !!row;
+}
 
 export async function recordCheck(env: Env, input: RecordCheckInput): Promise<YardCheckRow> {
   const assetId = input.assetId.trim();
@@ -887,6 +934,14 @@ export async function recordCheck(env: Env, input: RecordCheckInput): Promise<Ya
     throw new Error("Location is required when marking present (checked)");
   }
   const sourceDateKey = input.sourceDateKey || (await getLatestSnapshotDateKey(env));
+  if (input.fromFindUnlisted && sourceDateKey) {
+    const onWo = await assetOnWorkOrderSnapshot(env, sourceDateKey, assetId);
+    if (onWo) {
+      throw new Error(
+        "This asset already appears on the latest ETIC work order list (open WO). Use the fleet list to log a yard check, not Find.",
+      );
+    }
+  }
   const nowIso = new Date().toISOString();
   const r = await env.ETIC_SNAPSHOTS.prepare(
     `INSERT INTO yard_check
@@ -1455,6 +1510,10 @@ export type YardFinding = {
   asset: RollingAsset | null;
   /** Photo count for quick badge rendering. */
   photoCount: number;
+  /** Latest yard photo URL for list thumbnails (`/api/yard/photo/:id`), or null. */
+  previewPhotoUrl: string | null;
+  /** Fleet (P&A) merged columns on the WO row — FM&A / notes style headers when present. */
+  fleetFmaNotes: string;
 };
 
 type FindingActionRow = {
@@ -1468,6 +1527,114 @@ type FindingActionRow = {
   resolved_by: string | null;
   resolved_at_iso: string;
 };
+
+function normalizeFleetRawKey(k: string): string {
+  return k.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Pull FM&A / fleet notes from merged workbook JSON on a WO row (Fleet P&A columns).
+ */
+export function extractFleetFmaNotesFromRaw(raw: Record<string, unknown> | null | undefined): string {
+  if (!raw) return "";
+  const preferred = [
+    "fleet.fm&a notes",
+    "fleet.fma notes",
+    "fleet.fm and a notes",
+    "fleet.f&m notes",
+    "fleet.fma note",
+    "fm&a notes",
+    "fma notes",
+  ];
+  const byNorm = new Map<string, string>();
+  for (const [k, v] of Object.entries(raw)) {
+    const val = String(v ?? "").trim();
+    if (!val) continue;
+    byNorm.set(normalizeFleetRawKey(k), val);
+  }
+  for (const p of preferred) {
+    const hit = byNorm.get(normalizeFleetRawKey(p));
+    if (hit) return hit;
+  }
+  for (const [k, v] of Object.entries(raw)) {
+    const nk = normalizeFleetRawKey(k);
+    const val = String(v ?? "").trim();
+    if (!val) continue;
+    const hasFma = nk.includes("fm&a") || nk.includes("fma") || nk.includes("f&m");
+    if (hasFma && nk.includes("note")) return val;
+  }
+  return "";
+}
+
+async function enrichFindingsPreviewPhotos(
+  env: Env,
+  findings: YardFinding[],
+): Promise<void> {
+  const ids = [...new Set(findings.map((f) => f.assetId).filter(Boolean))];
+  if (!ids.length) return;
+  const byAsset = new Map<string, number>();
+  const chunk = 80;
+  for (let i = 0; i < ids.length; i += chunk) {
+    const slice = ids.slice(i, i + chunk);
+    const ph = slice.map(() => "?").join(",");
+    const r = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT id, asset_id FROM (
+         SELECT id, asset_id,
+           ROW_NUMBER() OVER (PARTITION BY asset_id ORDER BY uploaded_at_iso DESC, id DESC) AS rn
+         FROM yard_photo WHERE asset_id IN (${ph})
+       ) WHERE rn = 1`,
+    )
+      .bind(...slice)
+      .all<{ id: number; asset_id: string }>();
+    for (const row of r.results ?? []) {
+      if (row.asset_id) byAsset.set(row.asset_id.trim(), row.id);
+    }
+  }
+  for (const f of findings) {
+    const pid = byAsset.get(f.assetId);
+    f.previewPhotoUrl = pid != null ? photoUrlFor(pid) : null;
+  }
+}
+
+async function enrichFindingsFleetFmaNotes(
+  env: Env,
+  dateKey: string,
+  findings: YardFinding[],
+): Promise<void> {
+  if (!dateKey) return;
+  const ids = [...new Set(findings.map((f) => f.assetId).filter(Boolean))];
+  if (!ids.length) return;
+  const best = new Map<string, string>();
+  const chunk = 80;
+  for (let i = 0; i < ids.length; i += chunk) {
+    const slice = ids.slice(i, i + chunk);
+    const ph = slice.map(() => "?").join(",");
+    const r = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT asset_id, raw_row_json FROM work_order_snapshot
+       WHERE snapshot_date_key = ? AND asset_id IN (${ph})
+       ORDER BY asset_id, work_order_id`,
+    )
+      .bind(dateKey, ...slice)
+      .all<{ asset_id: string; raw_row_json: string | null }>();
+    for (const row of r.results ?? []) {
+      const aid = (row.asset_id ?? "").trim();
+      if (!aid) continue;
+      let raw: Record<string, unknown> = {};
+      try {
+        raw = JSON.parse(row.raw_row_json || "{}") as Record<string, unknown>;
+      } catch {
+        raw = {};
+      }
+      const note = extractFleetFmaNotesFromRaw(raw);
+      if (!note) continue;
+      const prev = best.get(aid) ?? "";
+      if (!prev || note.length > prev.length) best.set(aid, note);
+    }
+  }
+  for (const f of findings) {
+    f.fleetFmaNotes = best.get(f.assetId) ?? "";
+  }
+}
 
 const VALID_KINDS = new Set<FindingKind>(["missing", "unlisted", "discrepancy", "unknown"]);
 const VALID_RESOLUTIONS = new Set<FindingResolution>([
@@ -1602,6 +1769,8 @@ export async function listOpenFindings(env: Env): Promise<{
       isAcknowledged: acknowledged,
       asset,
       photoCount: asset?.photoCount ?? 0,
+      previewPhotoUrl: null,
+      fleetFmaNotes: "",
     });
     totals.total += 1;
     totals[kind] += 1;
@@ -1626,6 +1795,8 @@ export async function listOpenFindings(env: Env): Promise<{
     if (latest.status === "unknown") pushFinding(assetId, "unknown", latest);
   }
 
+  await Promise.all([enrichFindingsPreviewPhotos(env, findings), enrichFindingsFleetFmaNotes(env, dateKey, findings)]);
+
   // Sort: unacknowledged first, then by trigger check age (newest first, with
   // "never seen" sorting first within the missing kind), then assetId.
   findings.sort((a, b) => {
@@ -1636,8 +1807,6 @@ export async function listOpenFindings(env: Env): Promise<{
     return a.assetId.localeCompare(b.assetId, undefined, { numeric: true });
   });
 
-  // dateKey returned for convenience but not currently used by callers
-  void dateKey;
   return { findings, totals };
 }
 
