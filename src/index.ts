@@ -21,6 +21,7 @@ import {
   getWatchRowsLatest,
   getWorkOrderActions,
   getWorkOrderTimeline,
+  getFleetPaSnapshotForDate,
   ingestWorkOrderSnapshot,
   listFmaFollowUpActionsForReport,
   logWorkOrderAction,
@@ -280,20 +281,29 @@ export default {
 
     const now = new Date();
     const subject = parsed.subject ?? "";
+    const safeName = sanitizeFileName(workbookAttachment.filename ?? "vehicle-etic.xlsx");
     const dateKeyFromSubject = parseReportDateKeyFromSubject(subject);
-    const dateKey = dateKeyFromSubject ?? isoDateKey(now);
+    const dateKeyFromFile = parseReportDateKeyFromFileName(safeName);
+    const dateKey = dateKeyFromSubject ?? dateKeyFromFile ?? receiptDayDateKey(now, env);
+    const tz = (env.INGEST_TIMEZONE ?? "").trim();
     console.log(
       JSON.stringify({
         level: "info",
         message: "etic_workbook_email_received",
         dateKey,
-        dateKeySource: dateKeyFromSubject ? "subject" : "utc-receipt-day",
+        dateKeySource: dateKeyFromSubject
+          ? "subject"
+          : dateKeyFromFile
+            ? "filename"
+            : tz
+              ? "local-receipt-day"
+              : "utc-receipt-day",
+        ingestTimezone: tz || null,
         subjectLen: subject.length,
         from: message.from,
         to: message.to,
       }),
     );
-    const safeName = sanitizeFileName(workbookAttachment.filename ?? "vehicle-etic.xlsx");
     const workbookKey = `workbooks/${dateKey}/${safeName}`;
     const analysisKey = `analyses/${dateKey}.json`;
 
@@ -521,6 +531,23 @@ export default {
 
     if (url.pathname === "/api/work-order-timeline") {
       return handleWorkOrderTimelineApi(env, request);
+    }
+
+    if (url.pathname === "/api/fleet-pa") {
+      const d = url.searchParams.get("date");
+      if (!d || !/^\d{4}-\d{2}-\d{2}$/.test(d)) {
+        return Response.json({ error: "Query date=YYYY-MM-DD is required" }, { status: 400, headers: cacheHeaders() });
+      }
+      try {
+        const rows = await getFleetPaSnapshotForDate(env, d);
+        return Response.json(
+          { dateKey: d, count: rows.length, rows },
+          { headers: cacheHeaders() },
+        );
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return Response.json({ error: msg }, { status: 500, headers: cacheHeaders() });
+      }
     }
 
     if (url.pathname === "/api/wo-action") {
@@ -976,14 +1003,15 @@ async function upsertSnapshotRow(env: Env, analysis: AnalysisResult, workbookKey
     ? analysis.assetManagerBreakdown
     : [];
   const breakdownJson = breakdown.length ? JSON.stringify(breakdown) : "";
+  const analysisJson = JSON.stringify(analysis);
   const now = new Date().toISOString();
   await env.ETIC_SNAPSHOTS.prepare(
     `INSERT INTO etic_snapshots (
       date_key, workbook_key, workbook_file_name, received_at_iso,
       mc_rate, fleet_total, fmc, nmc, surplus, asset_manager_ok,
       total_rows, mel_total, visible_sheets, hidden_sheets, updated_at_iso,
-      asset_manager_breakdown
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      asset_manager_breakdown, analysis_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(date_key) DO UPDATE SET
       workbook_key = excluded.workbook_key,
       workbook_file_name = excluded.workbook_file_name,
@@ -1003,7 +1031,8 @@ async function upsertSnapshotRow(env: Env, analysis: AnalysisResult, workbookKey
       asset_manager_breakdown = CASE
         WHEN excluded.asset_manager_breakdown <> '' THEN excluded.asset_manager_breakdown
         ELSE etic_snapshots.asset_manager_breakdown
-      END`,
+      END,
+      analysis_json = excluded.analysis_json`,
   )
     .bind(
       analysis.dateKey,
@@ -1022,6 +1051,7 @@ async function upsertSnapshotRow(env: Env, analysis: AnalysisResult, workbookKey
       analysis.totalHiddenSheets,
       now,
       breakdownJson,
+      analysisJson,
     )
     .run();
 }
@@ -1149,6 +1179,9 @@ async function handleRelabelSnapshot(env: Env, fromKey: string, toKey: string): 
     ).bind(toKey, fromKey),
     env.ETIC_SNAPSHOTS.prepare(
       `UPDATE mel_state SET last_snapshot_date = ? WHERE last_snapshot_date = ?`,
+    ).bind(toKey, fromKey),
+    env.ETIC_SNAPSHOTS.prepare(
+      `UPDATE fleet_p_a_snapshot SET snapshot_date_key = ? WHERE snapshot_date_key = ?`,
     ).bind(toKey, fromKey),
   ]);
 
@@ -1730,29 +1763,93 @@ async function replayWorkOrderWatchForDate(env: Env, dateKey: string): Promise<n
   return lastRowCount;
 }
 
+type EticSnapshotRebuildRow = {
+  date_key: string;
+  workbook_key: string;
+  received_at_iso: string;
+};
+
 /**
- * Replays every stored workbook from R2 in order, repopulating work_order_changelog
- * and snapshots in D1 so each report day (and re-upload) is a persisted row, not
- * something computed on read.
+ * Every active row in the same D1 index the dashboard uses (etic_snapshots), oldest→newest.
+ * Each pass runs ingest against the **prior** work_order_snapshot rows in D1, so diffs and
+ * work_order_changelog rows use that snapshot’s `date_key` and `received_at_iso` (when the
+ * new state first appears in the sequence — i.e. the day that workbook is the report for).
+ */
+async function loadActiveEticSnapshotsForRebuild(env: Env): Promise<EticSnapshotRebuildRow[]> {
+  try {
+    const r = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT date_key, workbook_key, received_at_iso
+       FROM etic_snapshots
+       WHERE deleted_at_iso IS NULL
+       ORDER BY date_key ASC, received_at_iso ASC`,
+    ).all<EticSnapshotRebuildRow>();
+    return r.results ?? [];
+  } catch {
+    const r = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT date_key, workbook_key, received_at_iso
+       FROM etic_snapshots
+       ORDER BY date_key ASC, received_at_iso ASC`,
+    ).all<EticSnapshotRebuildRow>();
+    return r.results ?? [];
+  }
+}
+
+function ingestTimestampForSnapshotIndexRow(row: EticSnapshotRebuildRow): string {
+  const r = (row.received_at_iso ?? "").trim();
+  if (r && !Number.isNaN(Date.parse(r))) return r;
+  return `${row.date_key}T12:00:00.000Z`;
+}
+
+/**
+ * Wall clock used when *rebuilding* from stored workbooks. If `received_at_iso` in D1
+ * was bulk-updated to one day (e.g. every row shows the same import instant), the WO/MEL
+ * changelogs would all show that one timestamp. Prefer: when the receive date (UTC
+ * YYYY-MM-DD) matches the report `date_key`, keep the real instant; otherwise anchor
+ * each replay to a stable time on the **report** day so timelines stay on the right day.
+ */
+function ingestTimestampForSnapshotRebuild(row: EticSnapshotRebuildRow): string {
+  const dk = row.date_key;
+  const r = (row.received_at_iso ?? "").trim();
+  if (r && !Number.isNaN(Date.parse(r)) && r.slice(0, 10) === dk) {
+    return r;
+  }
+  return `${dk}T18:00:00.000Z`;
+}
+
+/**
+ * Replays one stored workbook per **active** `etic_snapshots` row, in `date_key` order.
+ * Changelog and `work_order_snapshot` are repopulated so each field change is stored under
+ * the snapshot it first appears in (compared to the prior snapshot in that order). Does not
+ * use `history/index.json` (that can drift); the D1 index is the list of workbooks to walk.
  */
 async function rebuildWorkOrderWatchFromHistory(env: Env): Promise<void> {
   await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM work_order_changelog`).run();
   await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM work_order_state`).run();
   await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM work_order_snapshot`).run();
+  await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM fleet_p_a_snapshot`).run();
   await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM mel_changelog`).run();
   await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM mel_state`).run();
   await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM mel_snapshot`).run();
-  const history = await loadHistory(env);
-  const sorted = sortHistoryEntriesChronologically(history.entries);
-  for (const entry of sorted) {
-    const obj = await env.ETIC_BUCKET.get(entry.workbookKey);
-    if (!obj) continue;
+  const snapshots = await loadActiveEticSnapshotsForRebuild(env);
+  for (const row of snapshots) {
+    const obj = await env.ETIC_BUCKET.get(row.workbook_key);
+    if (!obj) {
+      console.error(
+        JSON.stringify({
+          level: "error",
+          message: "rebuild: workbook missing in R2",
+          date_key: row.date_key,
+          workbook_key: row.workbook_key,
+        }),
+      );
+      continue;
+    }
     const bytes = await obj.arrayBuffer();
     const raw = await extractRawWorkOrdersFromBinary(bytes);
-    const ts = ingestTimestampForHistoryEntry(entry);
-    await ingestWorkOrderSnapshot(env, entry.dateKey, raw, ts, bytes);
+    const ts = ingestTimestampForSnapshotRebuild(row);
+    await ingestWorkOrderSnapshot(env, row.date_key, raw, ts, bytes);
     const melRows = await extractMelRowsFromBinary(bytes);
-    await ingestMelSnapshot(env, entry.dateKey, melRows, ts);
+    await ingestMelSnapshot(env, row.date_key, melRows, ts);
   }
 }
 
@@ -4461,7 +4558,7 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
         {
           ok: true,
           message:
-            "Work order watch is rebuilding from R2 in chronological order (clears prior changelog). Takes a few minutes for large history.",
+            "Work order watch is rebuilding: every active D1 etic_snapshots row (in date order), one workbook at a time, repopulating changelog. Takes a few minutes for large histories.",
         },
         { headers: cacheHeaders() },
       );
@@ -4779,6 +4876,58 @@ async function readJson<T>(env: Env, key: string): Promise<T | null> {
   }
 }
 
+/** Parsed analysis JSON stored on `etic_snapshots.analysis_json` (authoritative for reads). */
+async function tryReadAnalysisFromD1(env: Env, dateKey: string): Promise<AnalysisResult | null> {
+  try {
+    const r = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT analysis_json FROM etic_snapshots WHERE date_key = ? AND deleted_at_iso IS NULL`,
+    )
+      .bind(dateKey)
+      .first<{ analysis_json: string | null }>();
+    const raw = (r?.analysis_json ?? "").trim();
+    if (!raw) return null;
+    return JSON.parse(raw) as AnalysisResult;
+  } catch {
+    return null;
+  }
+}
+
+/** Prefer D1 `analysis_json`, then R2 `analyses/<date>.json`. */
+async function readAnalysisForDateKey(env: Env, dateKey: string): Promise<AnalysisResult | null> {
+  const fromDb = await tryReadAnalysisFromD1(env, dateKey);
+  if (fromDb) return fromDb;
+  return readJson<AnalysisResult>(env, `analyses/${dateKey}.json`);
+}
+
+/** Copy R2 analysis files into D1 for every active snapshot row missing `analysis_json`. */
+async function backfillAnalysisJsonFromR2(env: Env): Promise<{ ok: true; updated: number; missing: number }> {
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT date_key FROM etic_snapshots WHERE deleted_at_iso IS NULL ORDER BY date_key ASC`,
+  ).all<{ date_key: string }>();
+  const keys = (r.results ?? []).map((x) => x.date_key);
+  let updated = 0;
+  let missing = 0;
+  for (const dateKey of keys) {
+    const has = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT analysis_json FROM etic_snapshots WHERE date_key = ?`,
+    )
+      .bind(dateKey)
+      .first<{ analysis_json: string | null }>();
+    const existing = (has?.analysis_json ?? "").trim();
+    if (existing.length > 2) continue;
+    const analysis = await readJson<AnalysisResult>(env, `analyses/${dateKey}.json`);
+    if (!analysis) {
+      missing += 1;
+      continue;
+    }
+    await env.ETIC_SNAPSHOTS.prepare(`UPDATE etic_snapshots SET analysis_json = ? WHERE date_key = ?`)
+      .bind(JSON.stringify(analysis), dateKey)
+      .run();
+    updated += 1;
+  }
+  return { ok: true, updated, missing };
+}
+
 async function loadHistory(env: Env): Promise<HistoryIndex> {
   const existing = await readJson<HistoryIndex>(env, "history/index.json");
   if (existing && Array.isArray(existing.entries)) {
@@ -5012,6 +5161,34 @@ function isoDateKey(date: Date): string {
   return `${date.getUTCFullYear()}-${p(date.getUTCMonth() + 1)}-${p(date.getUTCDate())}`;
 }
 
+/** Calendar YYYY-MM-DD in IANA tz (e.g. Minot); falls back to UTC if invalid. */
+function calendarDateKeyInTimeZone(date: Date, timeZone: string): string {
+  const tz = timeZone.trim();
+  if (!tz) return isoDateKey(date);
+  try {
+    const fmt = new Intl.DateTimeFormat("en-CA", {
+      timeZone: tz,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    });
+    const parts = fmt.formatToParts(date);
+    const y = parts.find((p) => p.type === "year")?.value;
+    const m = parts.find((p) => p.type === "month")?.value;
+    const d = parts.find((p) => p.type === "day")?.value;
+    if (y && m && d) return `${y}-${m}-${d}`;
+  } catch {
+    /* invalid tz */
+  }
+  return isoDateKey(date);
+}
+
+function receiptDayDateKey(now: Date, env: { INGEST_TIMEZONE?: string }): string {
+  const raw = (env.INGEST_TIMEZONE ?? "").trim();
+  if (raw) return calendarDateKeyInTimeZone(now, raw);
+  return isoDateKey(now);
+}
+
 const MONTH_TOKEN: Record<string, number> = {
   jan: 1,
   feb: 2,
@@ -5059,14 +5236,18 @@ function buildReportDateKey(day: number, month: number, yRaw: string): string | 
 
 type SubjectDateHit = { index: number; key: string };
 
-/** Collect DD-MMM-YY, DD MMM YY / DD April YYYY, and ISO dates; return the last hit in the subject (thread-safe). */
-function parseReportDateKeyFromSubject(subject: string): string | null {
-  const s = subject.trim();
+/**
+ * Collect DD-MMM-YY, DD MMM YY, ISO dates. Returns the **first** date in reading order.
+ * Used for email subject and attachment file name (many clients send a generic subject;
+ * the file is often named `Vehicle ETIC 2026-04-15.xlsx`).
+ */
+function extractReportDateKeyFromText(s: string): string | null {
+  const s1 = s.trim();
   const hits: SubjectDateHit[] = [];
 
   const dashRe = /\b(\d{1,2})-([A-Za-z]{3})\.?-(\d{2,4})\b/g;
   let dm: RegExpExecArray | null;
-  while ((dm = dashRe.exec(s)) !== null) {
+  while ((dm = dashRe.exec(s1)) !== null) {
     const day = Number.parseInt(dm[1] ?? "", 10);
     const month = monthFromToken(dm[2] ?? "");
     const key = buildReportDateKey(day, month ?? 0, dm[3] ?? "");
@@ -5074,15 +5255,17 @@ function parseReportDateKeyFromSubject(subject: string): string | null {
   }
 
   const spaceRe = /\b(\d{1,2})\s+([A-Za-z]{3,9})\.?,?\s+(\d{2,4})\b/g;
-  while ((dm = spaceRe.exec(s)) !== null) {
+  while ((dm = spaceRe.exec(s1)) !== null) {
     const day = Number.parseInt(dm[1] ?? "", 10);
     const month = monthFromToken(dm[2] ?? "");
     const key = buildReportDateKey(day, month ?? 0, dm[3] ?? "");
     if (key) hits.push({ index: dm.index, key });
   }
 
-  const isoRe = /\b(20\d{2})-(\d{2})-(\d{2})\b/g;
-  while ((dm = isoRe.exec(s)) !== null) {
+  // Allow ISO after punctuation/underscore (filenames: Vehicle_ETIC_2026-04-20.xlsx) —
+  // `\b` before 20\ fails because `_` and `2` are both "word" characters in JS.
+  const isoRe = /(?:^|[^0-9A-Za-z])(20\d{2})-(\d{2})-(\d{2})/g;
+  while ((dm = isoRe.exec(s1)) !== null) {
     const y = Number.parseInt(dm[1] ?? "", 10);
     const m = Number.parseInt(dm[2] ?? "", 10);
     const d = Number.parseInt(dm[3] ?? "", 10);
@@ -5094,12 +5277,30 @@ function parseReportDateKeyFromSubject(subject: string): string | null {
 
   if (!hits.length) return null;
   hits.sort((a, b) => a.index - b.index);
-  return hits[hits.length - 1]?.key ?? null;
+  return hits[0]?.key ?? null;
 }
 
-/** Prefer report date from subject (forwarded ETICs); else UTC day of receipt. */
-function resolveAnalysisDateKey(subject: string, receivedAt: Date): string {
-  return parseReportDateKeyFromSubject(subject) ?? isoDateKey(receivedAt);
+function parseReportDateKeyFromSubject(subject: string): string | null {
+  return extractReportDateKeyFromText(subject);
+}
+
+/** When the subject has no date (thread title, Fwd), infer from the attachment name. */
+function parseReportDateKeyFromFileName(fileName: string): string | null {
+  return extractReportDateKeyFromText(fileName);
+}
+
+/** Prefer report date from subject; else local receipt day (see INGEST_TIMEZONE) or UTC. */
+function resolveAnalysisDateKey(
+  subject: string,
+  receivedAt: Date,
+  env: { INGEST_TIMEZONE?: string } = {},
+  fileName = "",
+): string {
+  return (
+    parseReportDateKeyFromSubject(subject) ??
+    parseReportDateKeyFromFileName(fileName) ??
+    receiptDayDateKey(receivedAt, env)
+  );
 }
 
 async function analyzeWorkbook(input: {
@@ -6530,6 +6731,19 @@ function renderYardAppHtml(): string {
         .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
     }
+    var YM = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
+    function fmtYardSnapshotKey(k){
+      if (k == null || k === "") return "";
+      var m = String(k).match(/^(\d{4})-(\d{2})-(\d{2})/);
+      if (!m) return String(k);
+      var d = new Date(Date.UTC(parseInt(m[1], 10), parseInt(m[2], 10) - 1, parseInt(m[3], 10)));
+      if (isNaN(d.getTime())) return String(k);
+      var dd = String(d.getUTCDate()).padStart(2, "0");
+      return dd + " " + YM[d.getUTCMonth()] + " " + String(d.getUTCFullYear()).slice(-2);
+    }
+    function normYardAsset(s){
+      return String(s == null ? "" : s).trim().toUpperCase();
+    }
     function normLoc(s){
       return String(s == null ? "" : s).trim().toUpperCase();
     }
@@ -6731,14 +6945,35 @@ function renderYardAppHtml(): string {
         return;
       }
       var c = state.deskHistChecks[idx];
-      var when = fmtRel(c.checkedAtIso) + (c.checkedBy ? " \u00B7 " + c.checkedBy : "");
+      var when = fmtRel(c.checkedAtIso) + (c.checkedBy ? " \u00B7 " + escapeHtml(c.checkedBy) : "");
       var loc = (c.location || "").trim() || "\u2014";
       var disc = (c.discrepancies || "").trim();
       var chg = changelogBlockForCheck(c.id, state.deskHistEdits);
+      var wob2 = {};
+      if (state.deskSelectedId && state.deskDetailById && state.deskDetailById[state.deskSelectedId]) {
+        wob2 = state.deskDetailById[state.deskSelectedId].workOrdersByCheckSourceDate || {};
+      }
+      var sk0 = (c.sourceDateKey || "").trim();
+      var eticBlock2 = "";
+      if (sk0) {
+        var wAt0 = wob2[sk0] || [];
+        if (wAt0.length) {
+          var lines0 = wAt0.map(function(w){
+            var rmk = (w.remarks || "").trim();
+            return "<div class=\\"wo-mini\\"><strong>WO " + escapeHtml(String(w.workOrderId)) + "</strong>" +
+              (w.shop ? " \u00B7 " + escapeHtml(w.shop) : "") +
+              (rmk ? "<div class=\\"wo-rmk\\">" + escapeHtml(rmk) + "</div>" : "") + "</div>";
+          }).join("");
+          eticBlock2 = "<div style=\\"margin-top:10px\\"><strong>ETIC book (when checked)</strong> " + escapeHtml(fmtYardSnapshotKey(sk0)) + "</div>" + lines0;
+        } else {
+          eticBlock2 = "<div style=\\"margin-top:10px;color:var(--muted);\\">ETIC snapshot " + escapeHtml(fmtYardSnapshotKey(sk0)) + " had no open work orders for this asset in the book.</div>";
+        }
+      }
       box.innerHTML =
         "<div class=\\"h-when\\">" + escapeHtml(when) + "</div>" +
         "<div><strong>Location:</strong> " + escapeHtml(loc) + "</div>" +
         (disc ? "<div style=\\"margin-top:8px;white-space:pre-wrap\\"><strong>Notes:</strong> " + escapeHtml(disc) + "</div>" : "") +
+        eticBlock2 +
         (chg || "");
       if (deskEdit) {
         deskEdit.disabled = false;
@@ -6846,11 +7081,12 @@ function renderYardAppHtml(): string {
     function openSheet(assetId){
       hideYardUploadProgress("sheet");
       state.openId = assetId;
-      var asset = state.assets.find(function(a){ return a.assetId === assetId; });
+      var n = normYardAsset(assetId);
+      var asset = state.assets.find(function(a){ return normYardAsset(a.assetId) === n; });
       // Do not reuse photoCache for a different asset: stale thumbnails from
       // the previous vehicle showed until the network fetch completed.
       if (state.photoCache && state.photoCache[assetId]) delete state.photoCache[assetId];
-      state.detail = { asset: asset, photos: [], checks: [], checkEdits: [], openWorkOrders: [] };
+      state.detail = { asset: asset, photos: [], checks: [], checkEdits: [], openWorkOrders: [], workOrdersByCheckSourceDate: {} };
       state.draft = {
         status: "present",
         location: (asset && asset.lastLocation) || "",
@@ -6994,6 +7230,7 @@ function renderYardAppHtml(): string {
       var allEdits = d.checkEdits || [];
       var historyHtml = "";
       if (checks.length) {
+        var wob = d.workOrdersByCheckSourceDate || {};
         historyHtml = '<ul class="history">';
         for (var j = 0; j < Math.min(checks.length, 8); j++) {
           var c = checks[j];
@@ -7001,10 +7238,23 @@ function renderYardAppHtml(): string {
           if (c.location) det.push("\uD83D\uDCCD " + escapeHtml(c.location));
           if (c.status && c.status !== "present") det.push(escapeHtml(c.status));
           if (c.discrepancies) det.push(escapeHtml(c.discrepancies));
+          var sk = (c.sourceDateKey || "").trim();
+          if (sk) {
+            var wAt = wob[sk];
+            if (wAt && wAt.length) {
+              var wparts = wAt.map(function(w){
+                var rmk = (w.remarks || "").trim();
+                return "WO " + w.workOrderId + (w.shop ? " (" + w.shop + ")" : "") + (rmk ? " — " + escapeHtml(rmk.length > 120 ? rmk.slice(0, 120) + "\u2026" : rmk) : "");
+              });
+              det.push("<span class=\"history-etic\">Book " + escapeHtml(fmtYardSnapshotKey(sk)) + ":</span> " + wparts.join("; "));
+            } else {
+              det.push("<span class=\"history-etic\">ETIC " + escapeHtml(fmtYardSnapshotKey(sk)) + " — no open WOs on that snapshot for this ID.</span>");
+            }
+          }
           var chg = changelogBlockForCheck(c.id, allEdits);
           historyHtml += '<li><b>' + fmtRel(c.checkedAtIso) + '</b>' +
             (c.checkedBy ? " by " + escapeHtml(c.checkedBy) : "") +
-            (det.length ? "<br/>" + det.join(" \u00B7 ") : "") +
+            (det.length ? "<br/>" + det.join(" <br/> ") : "") +
             (chg || "") +
             '<div class="history-actions"><button type="button" data-edit-check="' + c.id + '">Edit</button></div>' +
           '</li>';
@@ -15870,7 +16120,8 @@ function renderDashboardHtml(): string {
       const axis = "rgba(15,30,60,0.12)";
       const colFmc = "#157f3a";
       const colNmc = "#b00020";
-      const rows = (points || []).filter(function (p) {
+      const full = points || [];
+      const rows = full.filter(function (p) {
         const f = p.fmc != null ? Number(p.fmc) : 0;
         const n = p.nmc != null ? Number(p.nmc) : 0;
         return f + n > 0;
@@ -15881,7 +16132,10 @@ function renderDashboardHtml(): string {
         ctx.fillText("No FMC/NMC data in this range.", 16, 40);
         ctx.fillText("Try another series or chart type.", 16, 62);
         if (status) {
-          status.textContent = "Stacked view needs FMC and NMC counts for each snapshot.";
+          status.textContent =
+            full.length > 0
+              ? "0 of " + full.length + " day(s) with FMC+NMC for this filter — x-axis = calendar."
+              : "Stacked view needs FMC and NMC counts for each snapshot.";
         }
         return;
       }
@@ -15914,17 +16168,25 @@ function renderDashboardHtml(): string {
         ctx.fillText(String(Math.round(val)), padL - 6, y + 4);
       }
 
-      function xAt(i) {
-        return padL + (plotW * i) / Math.max(1, rows.length - 1);
+      function xIndexFor(dk) {
+        const j = full.findIndex(function (p) {
+          return p && p.dateKey === dk;
+        });
+        return j >= 0 ? j : 0;
+      }
+      function xAtIndex(idx) {
+        const n = full.length;
+        if (n <= 1) return padL + plotW / 2;
+        return padL + (plotW * idx) / (n - 1);
       }
       function yCount(c) {
         return padT + plotH * (1 - c / span);
       }
-      const bw = Math.min(32, (plotW / rows.length) * 0.72);
-      rows.forEach(function (p, i) {
+      const bw = Math.min(32, (plotW / full.length) * 0.72);
+      rows.forEach(function (p) {
         const f = Number(p.fmc) || 0;
         const n = Number(p.nmc) || 0;
-        const xc = xAt(i);
+        const xc = xAtIndex(xIndexFor(p.dateKey));
         const x0 = xc - bw / 2;
         const y0 = yCount(n);
         const y1 = yCount(n + f);
@@ -15949,19 +16211,26 @@ function renderDashboardHtml(): string {
       ctx.fillStyle = "#2c3a55";
       ctx.font = "10px system-ui, sans-serif";
       ctx.textAlign = "center";
-      const step = Math.max(1, Math.ceil(rows.length / 10));
-      for (let i = 0; i < rows.length; i += step) {
+      const sstep = Math.max(1, Math.ceil(full.length / 10));
+      for (let i = 0; i < full.length; i += sstep) {
         ctx.save();
-        ctx.translate(xAt(i), H - 10);
+        ctx.translate(xAtIndex(i), H - 10);
         ctx.rotate(-0.4);
-        ctx.fillText(fmtKeyShort(rows[i].dateKey), 0, 0);
+        ctx.fillText(fmtKeyShort(full[i].dateKey), 0, 0);
         ctx.restore();
       }
       drawMcChartAxisLeft(ctx, padT, plotH, "Total assets");
       drawMcChartAxisBottom(ctx, H, padL, plotW, "ETIC snapshot date");
       if (status) {
+        const miss = full.length - rows.length;
         status.textContent =
-          rows.length + " bar(s) · max stack " + maxT + " assets";
+          rows.length +
+          " of " +
+          full.length +
+          " day(s) with stacks · max " +
+          maxT +
+          " assets" +
+          (miss > 0 ? " (" + miss + " day(s) with no FMC+NMC for this filter)" : "");
       }
     }
 
@@ -16013,14 +16282,20 @@ function renderDashboardHtml(): string {
       const muted = "#5b6675";
       const axis = "rgba(15,30,60,0.12)";
       const lineCol = "#003a8c";
-      const data = (points || []).filter(function (p) {
+      const full = points || [];
+      const data = full.filter(function (p) {
         return p.mc != null && !isNaN(Number(p.mc));
       });
       if (!data.length) {
         ctx.fillStyle = muted;
         ctx.font = "14px system-ui, sans-serif";
         ctx.fillText("No MC% data in this range for the selected filter.", 16, 40);
-        if (status) status.textContent = "No points to plot.";
+        if (status) {
+          status.textContent =
+            full.length > 0
+              ? "0 of " + full.length + " day(s) with MC% — try Fleet or another slicer value."
+              : "No days in this date range.";
+        }
         updateMcChartLegend();
         return;
       }
@@ -16062,8 +16337,16 @@ function renderDashboardHtml(): string {
         ctx.fillText(val.toFixed(0) + "%", padL - 6, y + 4);
       }
 
-      function xAt(i) {
-        return padL + (plotW * i) / Math.max(1, data.length - 1);
+      function xIndexFor(dk) {
+        const j = full.findIndex(function (p) {
+          return p && p.dateKey === dk;
+        });
+        return j >= 0 ? j : 0;
+      }
+      function xAtIndex(idx) {
+        const n = full.length;
+        if (n <= 1) return padL + plotW / 2;
+        return padL + (plotW * idx) / (n - 1);
       }
       function yAt(v) {
         return padT + plotH * (1 - (v - minY) / span);
@@ -16071,9 +16354,9 @@ function renderDashboardHtml(): string {
       const baseY = padT + plotH;
 
       if (viz === "column") {
-        const bw = Math.min(28, (plotW / data.length) * 0.75);
-        data.forEach(function (p, i) {
-          const xc = xAt(i);
+        const bw = Math.min(28, (plotW / full.length) * 0.75);
+        data.forEach(function (p) {
+          const xc = xAtIndex(xIndexFor(p.dateKey));
           const x0 = xc - bw / 2;
           const yt = yAt(Number(p.mc));
           ctx.fillStyle = "rgba(0, 58, 140, 0.88)";
@@ -16082,43 +16365,44 @@ function renderDashboardHtml(): string {
       } else if (viz === "area") {
         ctx.fillStyle = "rgba(0, 58, 140, 0.2)";
         ctx.beginPath();
-        ctx.moveTo(xAt(0), baseY);
-        data.forEach(function (p, i) {
-          ctx.lineTo(xAt(i), yAt(Number(p.mc)));
+        ctx.moveTo(xAtIndex(xIndexFor(data[0].dateKey)), baseY);
+        data.forEach(function (p) {
+          ctx.lineTo(xAtIndex(xIndexFor(p.dateKey)), yAt(Number(p.mc)));
         });
-        ctx.lineTo(xAt(data.length - 1), baseY);
+        ctx.lineTo(xAtIndex(xIndexFor(data[data.length - 1].dateKey)), baseY);
         ctx.closePath();
         ctx.fill();
         ctx.strokeStyle = lineCol;
         ctx.lineWidth = 2.5;
         ctx.beginPath();
         data.forEach(function (p, i) {
-          const x = xAt(i);
+          const x = xAtIndex(xIndexFor(p.dateKey));
           const y = yAt(Number(p.mc));
           if (i === 0) ctx.moveTo(x, y);
           else ctx.lineTo(x, y);
         });
         ctx.stroke();
         ctx.fillStyle = lineCol;
-        data.forEach(function (p, i) {
+        data.forEach(function (p) {
           ctx.beginPath();
-          ctx.arc(xAt(i), yAt(Number(p.mc)), 3, 0, Math.PI * 2);
+          ctx.arc(xAtIndex(xIndexFor(p.dateKey)), yAt(Number(p.mc)), 3, 0, Math.PI * 2);
           ctx.fill();
         });
       } else if (viz === "step") {
         ctx.strokeStyle = lineCol;
         ctx.lineWidth = 2.5;
         ctx.beginPath();
-        ctx.moveTo(xAt(0), yAt(Number(data[0].mc)));
+        ctx.moveTo(xAtIndex(xIndexFor(data[0].dateKey)), yAt(Number(data[0].mc)));
         for (let i = 1; i < data.length; i++) {
-          ctx.lineTo(xAt(i), yAt(Number(data[i - 1].mc)));
-          ctx.lineTo(xAt(i), yAt(Number(data[i].mc)));
+          const xi = xAtIndex(xIndexFor(data[i].dateKey));
+          ctx.lineTo(xi, yAt(Number(data[i - 1].mc)));
+          ctx.lineTo(xi, yAt(Number(data[i].mc)));
         }
         ctx.stroke();
         ctx.fillStyle = lineCol;
-        data.forEach(function (p, i) {
+        data.forEach(function (p) {
           ctx.beginPath();
-          ctx.arc(xAt(i), yAt(Number(p.mc)), 3.5, 0, Math.PI * 2);
+          ctx.arc(xAtIndex(xIndexFor(p.dateKey)), yAt(Number(p.mc)), 3.5, 0, Math.PI * 2);
           ctx.fill();
         });
       } else {
@@ -16126,16 +16410,16 @@ function renderDashboardHtml(): string {
         ctx.lineWidth = 2.5;
         ctx.beginPath();
         data.forEach(function (p, i) {
-          const x = xAt(i);
+          const x = xAtIndex(xIndexFor(p.dateKey));
           const y = yAt(Number(p.mc));
           if (i === 0) ctx.moveTo(x, y);
           else ctx.lineTo(x, y);
         });
         ctx.stroke();
         ctx.fillStyle = lineCol;
-        data.forEach(function (p, i) {
+        data.forEach(function (p) {
           ctx.beginPath();
-          ctx.arc(xAt(i), yAt(Number(p.mc)), 3.5, 0, Math.PI * 2);
+          ctx.arc(xAtIndex(xIndexFor(p.dateKey)), yAt(Number(p.mc)), 3.5, 0, Math.PI * 2);
           ctx.fill();
         });
       }
@@ -16143,23 +16427,29 @@ function renderDashboardHtml(): string {
       ctx.fillStyle = "#2c3a55";
       ctx.font = "10px system-ui, sans-serif";
       ctx.textAlign = "center";
-      const step = Math.max(1, Math.ceil(data.length / 10));
-      for (let i = 0; i < data.length; i += step) {
+      const labelStep = Math.max(1, Math.ceil(full.length / 10));
+      for (let i = 0; i < full.length; i += labelStep) {
         ctx.save();
-        ctx.translate(xAt(i), H - 10);
+        ctx.translate(xAtIndex(i), H - 10);
         ctx.rotate(-0.4);
-        ctx.fillText(fmtKeyShort(data[i].dateKey), 0, 0);
+        ctx.fillText(fmtKeyShort(full[i].dateKey), 0, 0);
         ctx.restore();
       }
       drawMcChartAxisLeft(ctx, padT, plotH, "Mission capable %");
       drawMcChartAxisBottom(ctx, H, padL, plotW, "ETIC snapshot date");
       if (status) {
+        const omit = full.length - data.length;
+        const omitTxt =
+          omit > 0 ? " · " + omit + " day(s) without MC% for this filter (x-axis = calendar)" : "";
         status.textContent =
           data.length +
-          " point(s) · MC% " +
+          " of " +
+          full.length +
+          " day(s) plotted · MC% " +
           minY.toFixed(1) +
           " – " +
           maxY.toFixed(1) +
+          omitTxt +
           (viz === "column" ? " · columns" : viz === "area" ? " · area" : viz === "step" ? " · step" : " · line");
       }
       updateMcChartLegend();
@@ -16292,11 +16582,20 @@ function renderDashboardHtml(): string {
         if (!res.ok) throw new Error((j && j.error) || "Request failed");
         mcChartLastApiResponse = j;
         drawMcChartSeries(j.points || []);
-        const n = (j.points || []).filter(function (p) {
+        const pts = j.points || [];
+        const n = pts.filter(function (p) {
           return p.mc != null;
         }).length;
         const label = j.mode === "fleet" ? "Fleet" : j.key || j.mode || "—";
-        if (st) st.textContent = label + " · " + n + " snapshot(s) with data";
+        if (st) {
+          st.textContent =
+            label +
+            " · " +
+            n +
+            " of " +
+            pts.length +
+            " day(s) with MC% in range (chart x-axis is the full calendar span)";
+        }
       } catch (e) {
         mcChartLastApiResponse = null;
         if (st) st.textContent = String(e && e.message ? e.message : e);
@@ -25394,6 +25693,7 @@ export {
   extractAssetManagerKpis,
   isoDateKey,
   parseMaxAttachmentBytes,
+  parseReportDateKeyFromFileName,
   parseReportDateKeyFromSubject,
   pickWorkbookAttachment,
   readCellText,

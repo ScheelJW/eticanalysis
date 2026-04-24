@@ -417,10 +417,12 @@ export async function ingestWorkOrderSnapshot(
 
   // Rolling fleet roster: merge **entire** Fleet (P&A) sheet (all asset rows) with
   // WO-derived rows so FMC-only assets still appear in pickers (abuse tracker, etc.).
+  // rawByAsset: full merged Fleet sheet cells per asset (for D1 `fleet_p_a_snapshot`).
   const fleetByAsset = new Map<
     string,
     { owning_unit: string; shop: string; make_model: string; veh_nomen: string; mgmt_cd: string; mel_key: string }
   >();
+  const fleetRawByAsset = new Map<string, Record<string, string>>();
   if (workbookBinary && workbookBinary.byteLength > 0) {
     try {
       const fleetMaps = await extractFleetMapsFromBinary(workbookBinary);
@@ -429,6 +431,7 @@ export async function ingestWorkOrderSnapshot(
           const id = (aid ?? "").trim();
           if (!id) continue;
           const raw = fleetMaps.rawByAsset.get(aid);
+          if (raw) fleetRawByAsset.set(id, raw);
           fleetByAsset.set(id, fleetRowFromFleetRecord(rec, raw));
         }
       }
@@ -482,6 +485,43 @@ export async function ingestWorkOrderSnapshot(
     await env.ETIC_SNAPSHOTS.batch(fleetStmts.slice(i, i + BATCH));
   }
 
+  // Per-report-day Fleet (P&A) fact table — build dashboards off this, not R2.
+  const fleetPaSnap = env.ETIC_SNAPSHOTS.prepare(
+    `INSERT INTO fleet_p_a_snapshot (
+       snapshot_date_key, asset_id, owning_unit, shop, make_model, veh_nomen, mgmt_cd, mel_key, raw_row_json, updated_at_iso
+     ) VALUES (?,?,?,?,?,?,?,?,?,?)
+     ON CONFLICT(snapshot_date_key, asset_id) DO UPDATE SET
+       owning_unit = excluded.owning_unit,
+       shop = excluded.shop,
+       make_model = excluded.make_model,
+       veh_nomen = excluded.veh_nomen,
+       mgmt_cd = excluded.mgmt_cd,
+       mel_key = excluded.mel_key,
+       raw_row_json = excluded.raw_row_json,
+       updated_at_iso = excluded.updated_at_iso`,
+  );
+  const fleetPaStmts: D1PreparedStatement[] = [];
+  for (const [aid, f] of fleetByAsset) {
+    const rawJson = JSON.stringify(fleetRawByAsset.get(aid) ?? {});
+    fleetPaStmts.push(
+      fleetPaSnap.bind(
+        dateKey,
+        aid,
+        f.owning_unit,
+        f.shop,
+        f.make_model,
+        f.veh_nomen,
+        f.mgmt_cd,
+        f.mel_key,
+        rawJson,
+        updatedAtIso,
+      ),
+    );
+  }
+  for (let i = 0; i < fleetPaStmts.length; i += BATCH) {
+    await env.ETIC_SNAPSHOTS.batch(fleetPaStmts.slice(i, i + BATCH));
+  }
+
   // Verify any pending FM&A actions against the changes we just wrote.
   // Soft-fails so a verifier bug never blocks an ingest.
   try {
@@ -489,6 +529,57 @@ export async function ingestWorkOrderSnapshot(
   } catch (err) {
     console.error("verifyWorkOrderActionsForSnapshot failed", err);
   }
+}
+
+/** One asset row from the Fleet (P&A) sheet for a given report `snapshot_date_key`. */
+export type FleetPaSnapshotRow = {
+  snapshotDateKey: string;
+  assetId: string;
+  owningUnit: string;
+  shop: string;
+  makeModel: string;
+  vehNomen: string;
+  mgmtCd: string;
+  melKey: string;
+  /** JSON: merged `fleet.*` raw cells from the workbook for that asset. */
+  rawRowJson: string;
+  updatedAtIso: string;
+};
+
+/** All Fleet (P&A) rows stored for one ETIC day (D1 fact table). */
+export async function getFleetPaSnapshotForDate(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  dateKey: string,
+): Promise<FleetPaSnapshotRow[]> {
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT snapshot_date_key, asset_id, owning_unit, shop, make_model, veh_nomen, mgmt_cd, mel_key, raw_row_json, updated_at_iso
+     FROM fleet_p_a_snapshot WHERE snapshot_date_key = ? ORDER BY asset_id ASC`,
+  )
+    .bind(dateKey)
+    .all<{
+      snapshot_date_key: string;
+      asset_id: string;
+      owning_unit: string;
+      shop: string;
+      make_model: string;
+      veh_nomen: string;
+      mgmt_cd: string;
+      mel_key: string;
+      raw_row_json: string;
+      updated_at_iso: string;
+    }>();
+  return (r.results ?? []).map((row) => ({
+    snapshotDateKey: row.snapshot_date_key,
+    assetId: row.asset_id,
+    owningUnit: row.owning_unit,
+    shop: row.shop,
+    makeModel: row.make_model,
+    vehNomen: row.veh_nomen,
+    mgmtCd: row.mgmt_cd,
+    melKey: row.mel_key,
+    rawRowJson: row.raw_row_json,
+    updatedAtIso: row.updated_at_iso,
+  }));
 }
 
 /** Schedule maintenance (Fleet P&A Schedule Mx / due columns). */
@@ -1384,9 +1475,10 @@ export async function getChangelogFromSnapshots(
 }
 
 /**
- * Changelog for the work-order screen: `work_order_changelog` in D1 (populated on every
- * ingest and by POST /api/watch?rebuild=1) first; if empty, derive from
- * `work_order_snapshot` rows (still D1).
+ * Work-order change timeline: **read** persisted rows only. Each `ingestWorkOrderSnapshot` (email
+ * or `POST /api/watch?rebuild=1` replay) writes `work_order_changelog` for that report’s
+ * `snapshot_date_key` (e.g. 21 Apr) — it does not change on later reads. If the table is empty, we
+ * derive from `work_order_snapshot` (still D1, same as consecutive snapshot diffs).
  */
 export async function getChangelogForDisplay(
   env: { ETIC_SNAPSHOTS: D1Database },

@@ -34,6 +34,9 @@
     "EXPECTED_ATTACHMENT_NAME": "Vehicle ETIC.xlsx",
     // "*" = any sender can ingest ETIC email. Use comma-separated addresses in production.
     "ALLOWED_SENDERS": "*",
-    "MAX_ATTACHMENT_BYTES": "20000000"
+    "MAX_ATTACHMENT_BYTES": "20000000",
+    // When the email subject has no parseable report date, bucket the file by **local** calendar
+    // day here (not UTC) so evening Minot sends don’t land on “tomorrow” in UTC.
+    "INGEST_TIMEZONE": "America/Chicago"
   }
 }

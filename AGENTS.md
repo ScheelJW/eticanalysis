@@ -87,13 +87,13 @@ explicitly asked to skip deployment or you cannot (no network, deploy failure
 that needs human account action). Typos-only or doc-only edits don’t require
 a deploy unless they asked for it.
 
-**Rebuild WO/MEL watch from R2 (materialize `work_order_changelog` in D1 per report):**
-After deploy, `POST /api/watch?rebuild=1` replays every workbook in `history/index.json`
-in **chronological order** (report `dateKey`, then `receivedAtIso`, then `workbookKey` for
-ties). Each ingested report writes/updates D1’s `work_order_changelog` and snapshots;
-`changed_at_iso` comes from that entry’s `receivedAtIso` (not one wall-clock for the
-whole run). Runs in the background (`waitUntil`); large histories take several minutes.
-The dashboard reads changelog from D1, not on-the-fly R2.
+**Rebuild WO/MEL watch (materialize `work_order_changelog` in D1 per snapshot):**
+`POST /api/watch?rebuild=1` walks **every active row in D1 `etic_snapshots`** (same list the
+dashboard uses), **oldest `date_key` first**. For each row it loads `workbook_key` from R2 and
+runs ingest: diffs are against the prior snapshot in that order, and each change is stored
+under that row’s `date_key` with `changed_at_iso` from `received_at_iso`. Soft-deleted
+`etic_snapshots` rows are skipped. Runs in the background (`waitUntil`). The timeline API
+reads changelog from D1 only.
 
 ---
 

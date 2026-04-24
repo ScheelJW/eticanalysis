@@ -123,6 +123,33 @@ export function normalizeEntryStatus(s: string | null | undefined): YardEntrySta
   return "present";
 }
 
+/**
+ * Yard checks and ETIC rows may disagree on casing / leading spaces; use this
+ * when matching a walker's asset_id to `work_order_snapshot` (same idea as
+ * `UPPER(TRIM(...))` in SQL, but for in-memory maps and JS keys).
+ */
+export function canonicalYardAssetKey(assetId: string): string {
+  return assetId.trim().toUpperCase();
+}
+
+type YardCheckMergeRow = { id: number; asset_id: string; checked_at_iso: string };
+
+function mergeYardCheckRowsByCanonical<T extends YardCheckMergeRow>(rows: T[]): T[] {
+  const by = new Map<string, T>();
+  for (const row of rows) {
+    if (!row.asset_id) continue;
+    const c = canonicalYardAssetKey(row.asset_id);
+    const existing = by.get(c);
+    if (!existing) {
+      by.set(c, row);
+      continue;
+    }
+    if (row.checked_at_iso > existing.checked_at_iso) by.set(c, row);
+    else if (row.checked_at_iso === existing.checked_at_iso && row.id > existing.id) by.set(c, row);
+  }
+  return [...by.values()];
+}
+
 async function hasWorkOrderSnapshotRowsForDate(env: Env, dateKey: string): Promise<boolean> {
   if (!dateKey) return false;
   const r = await env.ETIC_SNAPSHOTS.prepare(
@@ -324,7 +351,8 @@ export async function getYardRosterForDate(env: Env, dateKey: string): Promise<Y
   for (const row of r.results ?? []) {
     const id = (row.asset_id ?? "").trim();
     if (!id) continue;
-    const existing = grouped.get(id);
+    const canon = canonicalYardAssetKey(id);
+    const existing = grouped.get(canon);
     let prevLoc = "";
     let vin = "";
     let nce = false;
@@ -347,7 +375,7 @@ export async function getYardRosterForDate(env: Env, dateKey: string): Promise<Y
       }
     }
     if (!existing) {
-      grouped.set(id, {
+      grouped.set(canon, {
         assetId: id,
         owningUnit: row.owning_unit ?? "",
         shop: row.shop ?? "",
@@ -661,8 +689,9 @@ export type RollingRoster = {
   };
 };
 
-/** One row per asset: latest yard_check by time (ties broken by id). */
+/** One row per exact asset_id: latest yard_check (ties broken by id). Merged by canonical in JS. */
 type LatestCheckFullRow = {
+  id: number;
   asset_id: string;
   checked_at_iso: string;
   checked_by: string | null;
@@ -748,9 +777,10 @@ export async function getRollingRoster(env: Env): Promise<RollingRoster> {
   const [roster, latestChecks, photoCounts, priorAssets, latestLocs, belowMelRows] = await Promise.all([
     getYardRosterForDate(env, dateKey),
     env.ETIC_SNAPSHOTS.prepare(
-      `SELECT asset_id, checked_at_iso, checked_by, discrepancies
+      `SELECT id, asset_id, checked_at_iso, checked_by, discrepancies
        FROM (
          SELECT
+           id,
            asset_id,
            checked_at_iso,
            checked_by,
@@ -781,27 +811,37 @@ export async function getRollingRoster(env: Env): Promise<RollingRoster> {
     ).bind(dateKey).all<{ asset_id: string }>(),
   ]);
 
-  const lastByAsset = new Map<string, { at: string; by: string; notes: string }>();
-  for (const row of latestChecks.results ?? []) {
+  const latestMerged = mergeYardCheckRowsByCanonical(latestChecks.results ?? []);
+  const lastByAsset = new Map<string, { at: string; by: string; notes: string; displayId: string }>();
+  for (const row of latestMerged) {
+    if (!row.asset_id) continue;
+    const c = canonicalYardAssetKey(row.asset_id);
+    lastByAsset.set(c, {
+      at: row.checked_at_iso,
+      by: row.checked_by ?? "",
+      notes: (row.discrepancies ?? "").trim(),
+      displayId: row.asset_id.trim(),
+    });
+  }
+  const photoByCanon = new Map<string, number>();
+  for (const row of photoCounts.results ?? []) {
     if (row.asset_id) {
-      lastByAsset.set(row.asset_id, {
-        at: row.checked_at_iso,
-        by: row.checked_by ?? "",
-        notes: (row.discrepancies ?? "").trim(),
-      });
+      const c = canonicalYardAssetKey(row.asset_id);
+      photoByCanon.set(c, (photoByCanon.get(c) ?? 0) + (row.c ?? 0));
     }
   }
-  const photoByAsset = new Map<string, number>();
-  for (const row of photoCounts.results ?? []) {
-    if (row.asset_id) photoByAsset.set(row.asset_id, row.c ?? 0);
-  }
-  const lastLocByAsset = new Map<string, string>();
+  const lastLocByCanon = new Map<string, string>();
   for (const row of latestLocs.results ?? []) {
-    if (row.asset_id && row.location) lastLocByAsset.set(row.asset_id, row.location);
+    if (row.asset_id && row.location) {
+      const c = canonicalYardAssetKey(row.asset_id);
+      const loc = row.location;
+      const prev = lastLocByCanon.get(c);
+      if (!prev || loc.length > prev.length) lastLocByCanon.set(c, loc);
+    }
   }
   const belowMelAssets = new Set<string>();
   for (const row of belowMelRows.results ?? []) {
-    if (row.asset_id) belowMelAssets.add(row.asset_id);
+    if (row.asset_id) belowMelAssets.add(canonicalYardAssetKey(row.asset_id));
   }
 
   let priorAssetIds = new Set<string>();
@@ -809,7 +849,16 @@ export async function getRollingRoster(env: Env): Promise<RollingRoster> {
     const r = await env.ETIC_SNAPSHOTS.prepare(
       `SELECT DISTINCT asset_id FROM work_order_snapshot WHERE snapshot_date_key = ?`,
     ).bind(priorAssets.date_key).all<{ asset_id: string }>();
-    priorAssetIds = new Set((r.results ?? []).map((x) => x.asset_id).filter(Boolean));
+    priorAssetIds = new Set(
+      (r.results ?? [])
+        .map((x) => (x.asset_id ? canonicalYardAssetKey(x.asset_id) : ""))
+        .filter(Boolean),
+    );
+  }
+
+  const rosterByCanon = new Map<string, YardAsset>();
+  for (const a of roster.assets) {
+    rosterByCanon.set(canonicalYardAssetKey(a.assetId), a);
   }
 
   const nowIso = new Date().toISOString();
@@ -818,11 +867,12 @@ export async function getRollingRoster(env: Env): Promise<RollingRoster> {
   const out: RollingAsset[] = [];
   const inLatestSnapshot = new Set<string>();
   for (const a of roster.assets) {
-    inLatestSnapshot.add(a.assetId);
-    const last = lastByAsset.get(a.assetId) ?? null;
+    const c = canonicalYardAssetKey(a.assetId);
+    inLatestSnapshot.add(c);
+    const last = lastByAsset.get(c) ?? null;
     const days = last ? daysBetween(last.at, nowIso) : null;
     const state = bucketState(days, intervalDays);
-    const isNew = priorAssetIds.size > 0 && !priorAssetIds.has(a.assetId);
+    const isNew = priorAssetIds.size > 0 && !priorAssetIds.has(c);
     out.push({
       ...a,
       lastCheckedAtIso: last?.at ?? null,
@@ -832,10 +882,10 @@ export async function getRollingRoster(env: Env): Promise<RollingRoster> {
       isNeverChecked: !last,
       isNewAsset: isNew,
       isUnlisted: false,
-      photoCount: photoByAsset.get(a.assetId) ?? 0,
-      lastLocation: lastLocByAsset.get(a.assetId) || a.previousLocation,
+      photoCount: photoByCanon.get(c) ?? 0,
+      lastLocation: lastLocByCanon.get(c) || a.previousLocation,
       lastNotes: last?.notes ?? "",
-      isBelowMel: belowMelAssets.has(a.assetId),
+      isBelowMel: belowMelAssets.has(c),
     });
     totals.total += 1;
     if (state === "fresh") totals.fresh += 1;
@@ -849,12 +899,13 @@ export async function getRollingRoster(env: Env): Promise<RollingRoster> {
   // Floor-to-book: any asset_id we have on record (yard_check) but isn't on
   // the latest ETIC snapshot. Walkers found it; we surface it so a fleet
   // manager can reconcile (open a WO, retire the asset, etc.).
-  for (const [assetId, last] of lastByAsset) {
-    if (inLatestSnapshot.has(assetId)) continue;
+  for (const [c, last] of lastByAsset) {
+    if (inLatestSnapshot.has(c)) continue;
+    const displayId = rosterByCanon.get(c)?.assetId ?? last.displayId;
     const days = daysBetween(last.at, nowIso);
     const state = bucketState(days, intervalDays);
     out.push({
-      assetId,
+      assetId: displayId,
       owningUnit: "",
       shop: "",
       mgmtCd: "",
@@ -873,8 +924,8 @@ export async function getRollingRoster(env: Env): Promise<RollingRoster> {
       isNeverChecked: false,
       isNewAsset: false,
       isUnlisted: true,
-      photoCount: photoByAsset.get(assetId) ?? 0,
-      lastLocation: lastLocByAsset.get(assetId) || "",
+      photoCount: photoByCanon.get(c) ?? 0,
+      lastLocation: lastLocByCanon.get(c) || "",
       lastNotes: last.notes ?? "",
       isBelowMel: false,
     });
@@ -1085,7 +1136,9 @@ export async function getCheckEditsForAsset(env: Env, assetId: string): Promise<
   if (!id) return [];
   const r = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT id, check_id, edited_at_iso, edited_by, before_json, after_json
-     FROM yard_check_edit WHERE asset_id = ? ORDER BY edited_at_iso DESC`,
+     FROM yard_check_edit
+     WHERE UPPER(TRIM(asset_id)) = UPPER(TRIM(?))
+     ORDER BY edited_at_iso DESC`,
   )
     .bind(id)
     .all<EditReadRow>();
@@ -1106,7 +1159,8 @@ export async function getChecksForAsset(
 ): Promise<YardCheckRow[]> {
   const r = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key
-     FROM yard_check WHERE asset_id = ?
+     FROM yard_check
+     WHERE UPPER(TRIM(asset_id)) = UPPER(TRIM(?))
      ORDER BY checked_at_iso DESC LIMIT ?`,
   )
     .bind(assetId, limit)
@@ -1307,7 +1361,8 @@ export async function addPhoto(env: Env, input: AddPhotoInput): Promise<YardPhot
 export async function listPhotosForAsset(env: Env, assetId: string): Promise<YardPhotoRow[]> {
   const r = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT id, asset_id, check_id, r2_key, content_type, size_bytes, uploaded_by, uploaded_at_iso, caption
-     FROM yard_photo WHERE asset_id = ?
+     FROM yard_photo
+     WHERE UPPER(TRIM(asset_id)) = UPPER(TRIM(?))
      ORDER BY uploaded_at_iso DESC`,
   )
     .bind(assetId)
@@ -1395,6 +1450,12 @@ export type AssetDetail = {
   photos: YardPhotoRow[];
   /** Open work orders against this asset on the latest snapshot, with remarks. */
   openWorkOrders: AssetWorkOrder[];
+  /**
+   * Open WOs for this asset keyed by the ETIC snapshot date that was "current"
+   * when each check was saved (`yard_check.source_date_key`) — the book state
+   * at the time the walker saw the unit.
+   */
+  workOrdersByCheckSourceDate: Record<string, AssetWorkOrder[]>;
   /** True if the asset_id has yard_check rows but isn't in the latest snapshot. */
   isUnlisted: boolean;
   /** FM&A actions taken on this asset, most recent first. */
@@ -1436,7 +1497,7 @@ async function getOpenWorkOrdersForAsset(
     `SELECT work_order_id, shop, remarks, parts_status, etic_date, etic_raw,
             mel_tier, last_remark_change_date, etic_push_count
      FROM work_order_snapshot
-     WHERE snapshot_date_key = ? AND asset_id = ?
+     WHERE snapshot_date_key = ? AND UPPER(TRIM(asset_id)) = UPPER(TRIM(?))
      ORDER BY last_remark_change_date DESC, work_order_id ASC`,
   )
     .bind(dateKey, assetId)
@@ -1456,6 +1517,7 @@ async function getOpenWorkOrdersForAsset(
 
 export async function getAssetDetail(env: Env, assetId: string): Promise<AssetDetail> {
   const id = assetId.trim();
+  const idCanon = canonicalYardAssetKey(id);
   const [roster, checks, checkEdits, photos, actions] = await Promise.all([
     getRollingRoster(env),
     getChecksForAsset(env, id),
@@ -1463,18 +1525,26 @@ export async function getAssetDetail(env: Env, assetId: string): Promise<AssetDe
     listPhotosForAsset(env, id),
     listFindingActionsForAsset(env, id),
   ]);
-  const inRoster = roster.assets.find((a) => a.assetId === id) ?? null;
+  const inRoster = roster.assets.find((a) => canonicalYardAssetKey(a.assetId) === idCanon) ?? null;
   let asset: RollingAsset | null = inRoster;
   if (!asset && checks.length > 0) {
     asset = rollingAssetSyntheticUnlisted(id, checks, photos, roster.intervalDays);
   }
   const openWorkOrders = await getOpenWorkOrdersForAsset(env, roster.dateKey, id);
+  const sourceDateKeys = [...new Set(checks.map((c) => c.sourceDateKey).filter(Boolean))] as string[];
+  const workOrdersByCheckSourceDate: Record<string, AssetWorkOrder[]> = {};
+  await Promise.all(
+    sourceDateKeys.map(async (dk) => {
+      workOrdersByCheckSourceDate[dk] = await getOpenWorkOrdersForAsset(env, dk, id);
+    }),
+  );
   return {
     asset,
     checks,
     checkEdits,
     photos,
     openWorkOrders,
+    workOrdersByCheckSourceDate,
     isUnlisted: inRoster ? inRoster.isUnlisted : checks.length > 0,
     actions,
   };
@@ -1606,22 +1676,23 @@ async function enrichFindingsPreviewPhotos(
   const chunk = 80;
   for (let i = 0; i < ids.length; i += chunk) {
     const slice = ids.slice(i, i + chunk);
-    const ph = slice.map(() => "?").join(",");
+    const u = slice.map((s) => canonicalYardAssetKey(s));
+    const ph2 = u.map(() => "?").join(",");
     const r = await env.ETIC_SNAPSHOTS.prepare(
       `SELECT id, asset_id FROM (
          SELECT id, asset_id,
-           ROW_NUMBER() OVER (PARTITION BY asset_id ORDER BY uploaded_at_iso DESC, id DESC) AS rn
-         FROM yard_photo WHERE asset_id IN (${ph})
+           ROW_NUMBER() OVER (PARTITION BY UPPER(TRIM(asset_id)) ORDER BY uploaded_at_iso DESC, id DESC) AS rn
+         FROM yard_photo WHERE UPPER(TRIM(asset_id)) IN (${ph2})
        ) WHERE rn = 1`,
     )
-      .bind(...slice)
+      .bind(...u)
       .all<{ id: number; asset_id: string }>();
     for (const row of r.results ?? []) {
-      if (row.asset_id) byAsset.set(row.asset_id.trim(), row.id);
+      if (row.asset_id) byAsset.set(canonicalYardAssetKey(row.asset_id), row.id);
     }
   }
   for (const f of findings) {
-    const pid = byAsset.get(f.assetId);
+    const pid = byAsset.get(canonicalYardAssetKey(f.assetId));
     f.previewPhotoUrl = pid != null ? photoUrlFor(pid) : null;
   }
 }
@@ -1638,16 +1709,17 @@ async function enrichFindingsFleetFmaNotes(
   const chunk = 80;
   for (let i = 0; i < ids.length; i += chunk) {
     const slice = ids.slice(i, i + chunk);
-    const ph = slice.map(() => "?").join(",");
+    const u = slice.map((s) => canonicalYardAssetKey(s));
+    const ph2 = u.map(() => "?").join(",");
     const r = await env.ETIC_SNAPSHOTS.prepare(
       `SELECT asset_id, raw_row_json FROM work_order_snapshot
-       WHERE snapshot_date_key = ? AND asset_id IN (${ph})
+       WHERE snapshot_date_key = ? AND UPPER(TRIM(asset_id)) IN (${ph2})
        ORDER BY asset_id, work_order_id`,
     )
-      .bind(dateKey, ...slice)
+      .bind(dateKey, ...u)
       .all<{ asset_id: string; raw_row_json: string | null }>();
     for (const row of r.results ?? []) {
-      const aid = (row.asset_id ?? "").trim();
+      const aid = canonicalYardAssetKey(row.asset_id ?? "");
       if (!aid) continue;
       let raw: Record<string, unknown> = {};
       try {
@@ -1662,7 +1734,7 @@ async function enrichFindingsFleetFmaNotes(
     }
   }
   for (const f of findings) {
-    f.fleetFmaNotes = best.get(f.assetId) ?? "";
+    f.fleetFmaNotes = best.get(canonicalYardAssetKey(f.assetId)) ?? "";
   }
 }
 
@@ -1701,7 +1773,9 @@ export async function listFindingActionsForAsset(
   if (!assetId) return [];
   const r = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT id, asset_id, kind, check_id, resolution, wo_opened, note, resolved_by, resolved_at_iso
-     FROM yard_finding_action WHERE asset_id = ? ORDER BY resolved_at_iso DESC`,
+     FROM yard_finding_action
+     WHERE UPPER(TRIM(asset_id)) = UPPER(TRIM(?))
+     ORDER BY resolved_at_iso DESC`,
   )
     .bind(assetId)
     .all<FindingActionRow>();
@@ -1741,20 +1815,27 @@ export async function listOpenFindings(env: Env): Promise<{
     ).all<FindingActionRow>(),
   ]);
 
+  const rosterByCanon = new Map<string, RollingAsset>();
+  for (const a of roster.assets) {
+    rosterByCanon.set(canonicalYardAssetKey(a.assetId), a);
+  }
+
   const latestAnyByAsset = new Map<string, YardCheckRow>();
-  for (const row of latestAnyRows.results ?? []) {
-    if (row.asset_id) latestAnyByAsset.set(row.asset_id, rowToCheck(row));
+  for (const row of mergeYardCheckRowsByCanonical(latestAnyRows.results ?? [])) {
+    if (!row.asset_id) continue;
+    const c = canonicalYardAssetKey(row.asset_id);
+    const displayId = rosterByCanon.get(c)?.assetId ?? row.asset_id.trim();
+    latestAnyByAsset.set(displayId, rowToCheck({ ...row, asset_id: displayId }));
   }
 
   const actionByKey = new Map<string, YardFindingAction>();
   for (const row of latestActionRows.results ?? []) {
     if (!row.asset_id) continue;
     const action = rowToAction(row);
-    actionByKey.set(action.assetId + "|" + action.kind, action);
+    actionByKey.set(canonicalYardAssetKey(action.assetId) + "|" + action.kind, action);
   }
 
-  const assetByKey = new Map<string, RollingAsset>();
-  for (const a of roster.assets) assetByKey.set(a.assetId, a);
+  const assetByKey = rosterByCanon;
 
   const findings: YardFinding[] = [];
   const totals: Record<FindingKind | "total" | "acknowledged", number> = {
@@ -1767,8 +1848,9 @@ export async function listOpenFindings(env: Env): Promise<{
   };
 
   function pushFinding(assetId: string, kind: FindingKind, triggerCheck: YardCheckRow | null) {
-    const asset = assetByKey.get(assetId) ?? null;
-    const lastAction = actionByKey.get(assetId + "|" + kind) ?? null;
+    const c = canonicalYardAssetKey(assetId);
+    const asset = assetByKey.get(c) ?? null;
+    const lastAction = actionByKey.get(c + "|" + kind) ?? null;
     // Acknowledgment rules per kind:
     //   - discrepancy / unknown:  action.check_id matches the triggering check
     //   - unlisted:               any action newer than the most-recent check
@@ -1814,7 +1896,8 @@ export async function listOpenFindings(env: Env): Promise<{
   // ---- UNLISTED + DISCREPANCY (and legacy UNKNOWN) ------------------------
   // Walk every asset that has any check history.
   for (const [assetId, latest] of latestAnyByAsset) {
-    const inLatest = assetByKey.has(assetId) && !assetByKey.get(assetId)!.isUnlisted;
+    const ra = assetByKey.get(canonicalYardAssetKey(assetId));
+    const inLatest = !!ra && !ra.isUnlisted;
     if (!inLatest) pushFinding(assetId, "unlisted", latest);
     if (latest.discrepancies && latest.discrepancies.trim()) {
       pushFinding(assetId, "discrepancy", latest);

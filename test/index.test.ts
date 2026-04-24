@@ -4,6 +4,7 @@ import {
   analyzeWorkbook,
   isoDateKey,
   parseMaxAttachmentBytes,
+  parseReportDateKeyFromFileName,
   parseReportDateKeyFromSubject,
   pickWorkbookAttachment,
   resolveAnalysisDateKey,
@@ -12,9 +13,9 @@ import {
 } from "../src/index";
 
 describe("ETIC email subject → report date (ingest path only)", () => {
-  it("uses last DD-MMM-YY token in subject as report date key", () => {
+  it("uses the first date token in subject (reading order), not a later 'Report' line", () => {
     const subject = "RE: Daily — 01-JAN-25 snapshot — MC Rate: 80% — Report: 14-FEB-26";
-    expect(parseReportDateKeyFromSubject(subject)).toBe("2026-02-14");
+    expect(parseReportDateKeyFromSubject(subject)).toBe("2025-01-01");
   });
 
   it("parses space-separated DD MMM YY (common in forwarded subjects)", () => {
@@ -22,9 +23,9 @@ describe("ETIC email subject → report date (ingest path only)", () => {
     expect(parseReportDateKeyFromSubject("Vehicle MC Rate — 3 April 2026")).toBe("2026-04-03");
   });
 
-  it("parses last ISO date in subject when present", () => {
+  it("parses the first ISO date in subject when present", () => {
     const subject = "notes for 2026-04-01 then file for 2026-04-17";
-    expect(parseReportDateKeyFromSubject(subject)).toBe("2026-04-17");
+    expect(parseReportDateKeyFromSubject(subject)).toBe("2026-04-01");
   });
 
   it("resolveAnalysisDateKey prefers parsed report date over receipt day", () => {
@@ -33,9 +34,27 @@ describe("ETIC email subject → report date (ingest path only)", () => {
     expect(resolveAnalysisDateKey(subject, received)).toBe("2026-04-15");
   });
 
-  it("falls back to UTC receipt day when subject has no date token", () => {
+  it("falls back to UTC receipt day when subject has no date token and no INGEST_TIMEZONE", () => {
     const received = new Date("2026-04-18T12:00:00.000Z");
-    expect(resolveAnalysisDateKey("Vehicle ETIC attached", received)).toBe("2026-04-18");
+    expect(resolveAnalysisDateKey("Vehicle ETIC attached", received, {})).toBe("2026-04-18");
+  });
+
+  it("uses ISO date in attachment file name when subject has no report date", () => {
+    const received = new Date("2026-04-18T12:00:00.000Z");
+    expect(
+      resolveAnalysisDateKey("Vehicle ETIC", received, {}, "Vehicle_MC_Rate_2026-04-20_report.xlsx"),
+    ).toBe("2026-04-20");
+  });
+
+  it("parseReportDateKeyFromFileName finds embedded ISO in sanitized-style names", () => {
+    expect(parseReportDateKeyFromFileName("Vehicle_ETIC_2026-04-20.xlsx")).toBe("2026-04-20");
+  });
+
+  it("falls back to local receipt day in INGEST_TIMEZONE (not UTC) when subject has no date", () => {
+    const received = new Date("2026-04-19T04:00:00.000Z");
+    expect(
+      resolveAnalysisDateKey("Vehicle ETIC attached", received, { INGEST_TIMEZONE: "America/Chicago" }),
+    ).toBe("2026-04-18");
   });
 });
 
