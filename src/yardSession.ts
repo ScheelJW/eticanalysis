@@ -2,11 +2,9 @@
 // taps each vehicle's actual location plus any new discrepancies. Backed by
 // D1 tables created in migrations/0014_yard_check.sql.
 //
-// The "asset roster" for a session is derived from the latest snapshot's
-// work_order_state rows (one entry per asset_id). We snapshot the asset list
-// at session-create time only conceptually — in practice we always re-derive
-// from the latest snapshot referenced by the session's source_date_key so the
-// list stays correct even if a new xlsx lands mid-walk.
+// The "asset roster" comes from a specific ETIC snapshot date. Rolling checks
+// also persist the active asset row JSON so later ingests cannot change what
+// the walker saw when they marked that vehicle present.
 
 type Env = { ETIC_SNAPSHOTS: D1Database; ETIC_BUCKET: R2Bucket };
 
@@ -606,6 +604,7 @@ export type YardCheckRow = {
   checkedBy: string;
   checkedAtIso: string;
   sourceDateKey: string;
+  assetSnapshotJson: string;
 };
 
 /** One correction applied to an existing `yard_check` row (see migrations/0022). */
@@ -707,6 +706,7 @@ type CheckReadRow = {
   checked_by: string | null;
   checked_at_iso: string;
   source_date_key: string | null;
+  asset_snapshot_json?: string | null;
 };
 
 function rowToCheck(r: CheckReadRow): YardCheckRow {
@@ -719,6 +719,7 @@ function rowToCheck(r: CheckReadRow): YardCheckRow {
     checkedBy: r.checked_by ?? "",
     checkedAtIso: r.checked_at_iso,
     sourceDateKey: r.source_date_key ?? "",
+    assetSnapshotJson: r.asset_snapshot_json ?? "",
   };
 }
 
@@ -986,6 +987,19 @@ async function assetOnWorkOrderSnapshot(env: Env, dateKey: string, assetId: stri
   return !!row;
 }
 
+async function assetSnapshotJsonForCheck(env: Env, dateKey: string, assetId: string): Promise<string> {
+  if (!dateKey || !assetId) return "";
+  const roster = await getYardRosterForDate(env, dateKey);
+  const canon = canonicalYardAssetKey(assetId);
+  const asset = roster.assets.find((a) => canonicalYardAssetKey(a.assetId) === canon);
+  if (!asset) return "";
+  return JSON.stringify({ sourceDateKey: dateKey, asset });
+}
+
+function isMissingColumnError(err: unknown, column: string): boolean {
+  return String(err instanceof Error ? err.message : err).toLowerCase().includes(column.toLowerCase());
+}
+
 export async function recordCheck(env: Env, input: RecordCheckInput): Promise<YardCheckRow> {
   const assetId = input.assetId.trim();
   if (!assetId) throw new Error("assetId required");
@@ -1002,23 +1016,39 @@ export async function recordCheck(env: Env, input: RecordCheckInput): Promise<Ya
       );
     }
   }
+  const assetSnapshotJson = await assetSnapshotJsonForCheck(env, sourceDateKey, assetId);
   const nowIso = new Date().toISOString();
-  const r = await env.ETIC_SNAPSHOTS.prepare(
-    `INSERT INTO yard_check
-       (asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
-     RETURNING id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key`,
-  )
-    .bind(
-      assetId,
-      (input.location ?? "").trim(),
-      (input.discrepancies ?? "").trim(),
-      status,
-      (input.checkedBy ?? "").trim(),
-      nowIso,
-      sourceDateKey,
+  const values = [
+    assetId,
+    (input.location ?? "").trim(),
+    (input.discrepancies ?? "").trim(),
+    status,
+    (input.checkedBy ?? "").trim(),
+    nowIso,
+    sourceDateKey,
+  ] as const;
+  let r: CheckReadRow | null = null;
+  try {
+    r = await env.ETIC_SNAPSHOTS.prepare(
+      `INSERT INTO yard_check
+         (asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, asset_snapshot_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       RETURNING id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, asset_snapshot_json`,
     )
-    .first<CheckReadRow>();
+      .bind(...values, assetSnapshotJson)
+      .first<CheckReadRow>();
+  } catch (err) {
+    if (!isMissingColumnError(err, "asset_snapshot_json")) throw err;
+    r = await env.ETIC_SNAPSHOTS.prepare(
+      `INSERT INTO yard_check
+         (asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       RETURNING id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key`,
+    )
+      .bind(...values)
+      .first<CheckReadRow>();
+    if (r) r.asset_snapshot_json = assetSnapshotJson;
+  }
   if (!r) throw new Error("failed to record check");
   return rowToCheck(r);
 }
@@ -1050,7 +1080,7 @@ export async function updateYardCheck(env: Env, input: UpdateYardCheckInput): Pr
   if (!Number.isFinite(checkId) || checkId <= 0) throw new Error("checkId required");
 
   const r0 = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key
+    `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, asset_snapshot_json
      FROM yard_check WHERE id = ?`,
   )
     .bind(checkId)
@@ -1100,7 +1130,7 @@ export async function updateYardCheck(env: Env, input: UpdateYardCheckInput): Pr
     .run();
 
   const r1 = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key
+    `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, asset_snapshot_json
      FROM yard_check WHERE id = ?`,
   )
     .bind(checkId)
@@ -1158,7 +1188,7 @@ export async function getChecksForAsset(
   limit = 50,
 ): Promise<YardCheckRow[]> {
   const r = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key
+    `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, asset_snapshot_json
      FROM yard_check
      WHERE UPPER(TRIM(asset_id)) = UPPER(TRIM(?))
      ORDER BY checked_at_iso DESC LIMIT ?`,
@@ -1170,7 +1200,7 @@ export async function getChecksForAsset(
 
 export async function getRecentChecks(env: Env, limit = 100): Promise<YardCheckRow[]> {
   const r = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key
+    `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, asset_snapshot_json
      FROM yard_check ORDER BY checked_at_iso DESC LIMIT ?`,
   )
     .bind(limit)
@@ -1995,7 +2025,7 @@ export type YardActivityItem =
 export async function getRecentActivity(env: Env, limit = 100): Promise<YardActivityItem[]> {
   const [checks, actions] = await Promise.all([
     env.ETIC_SNAPSHOTS.prepare(
-      `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key
+      `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, asset_snapshot_json
        FROM yard_check ORDER BY checked_at_iso DESC LIMIT ?`,
     ).bind(limit).all<CheckReadRow>(),
     env.ETIC_SNAPSHOTS.prepare(

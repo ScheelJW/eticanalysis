@@ -347,7 +347,7 @@ export default {
 
       await upsertSnapshotRow(env, analysis, workbookKey);
 
-      const history = await loadHistory(env);
+      const history = await loadMergedHistory(env);
       const upsertedHistory = upsertHistoryEntry(history, analysis, workbookKey, analysisKey);
       await env.ETIC_BUCKET.put(
         "history/index.json",
@@ -368,30 +368,46 @@ export default {
       // workbook-heavy WO/MEL extraction to background work.
       ctx.waitUntil((async () => {
         try {
-          const rawWos = await extractRawWorkOrdersFromBinary(workbookBytes);
-          await ingestWorkOrderSnapshot(env, dateKey, rawWos, now.toISOString(), workbookBytes);
+          const summary = await refreshWorkOrderWatchAfterEmailIngest(
+            env,
+            dateKey,
+            workbookBytes,
+            now.toISOString(),
+          );
+          console.log(
+            JSON.stringify({
+              level: "info",
+              message: "Background WO/MEL ingest complete",
+              dateKey,
+              mode: summary.mode,
+              processed: summary.processed,
+              total: summary.total,
+            }),
+          );
         } catch (error) {
           console.error(
             JSON.stringify({
               level: "error",
-              message: "Background WO ingest failed",
+              message: "Background WO/MEL replay failed; falling back to current workbook only",
               dateKey,
               error: error instanceof Error ? error.message : String(error),
             }),
           );
-        }
-        try {
-          const melRows = await extractMelRowsFromBinary(workbookBytes);
-          await ingestMelSnapshot(env, dateKey, melRows, now.toISOString());
-        } catch (error) {
-          console.error(
-            JSON.stringify({
-              level: "error",
-              message: "Background MEL ingest failed",
-              dateKey,
-              error: error instanceof Error ? error.message : String(error),
-            }),
-          );
+          try {
+            const rawWos = await extractRawWorkOrdersFromBinary(workbookBytes);
+            await ingestWorkOrderSnapshot(env, dateKey, rawWos, now.toISOString(), workbookBytes);
+            const melRows = await extractMelRowsFromBinary(workbookBytes);
+            await ingestMelSnapshot(env, dateKey, melRows, now.toISOString());
+          } catch (fallbackError) {
+            console.error(
+              JSON.stringify({
+                level: "error",
+                message: "Background current-workbook fallback ingest failed",
+                dateKey,
+                error: fallbackError instanceof Error ? fallbackError.message : String(fallbackError),
+              }),
+            );
+          }
         }
       })());
     } catch (err) {
@@ -433,9 +449,7 @@ export default {
     }
 
     if (url.pathname === "/api/history") {
-      const history = await loadHistory(env);
-      const merged = await mergeHistoryWithActiveSnapshots(env, history);
-      return Response.json(merged, { headers: cacheHeaders() });
+      return Response.json(await loadMergedHistory(env), { headers: cacheHeaders() });
     }
 
     if (url.pathname === "/api/snapshot/delete" && request.method === "POST") {
@@ -492,7 +506,8 @@ export default {
     }
 
     if (url.pathname === "/api/latest") {
-      let analysis = await readJson<AnalysisResult>(env, "analyses/latest.json");
+      let analysis = await getLatestActiveAnalysisFromD1(env);
+      if (!analysis) analysis = await readJson<AnalysisResult>(env, "analyses/latest.json");
       if (!analysis) return new Response("Not Found", { status: 404 });
       analysis = await enrichAnalysisAssetManagerFromR2(env, analysis);
       return Response.json(analysis, { headers: cacheHeaders() });
@@ -503,7 +518,7 @@ export default {
       if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) {
         return new Response("Invalid date key", { status: 400 });
       }
-      let analysis = await readJson<AnalysisResult>(env, `analyses/${dateKey}.json`);
+      let analysis = await readAnalysisForDateKey(env, dateKey);
       if (!analysis) return new Response("Not Found", { status: 404 });
       analysis = await enrichAnalysisAssetManagerFromR2(env, analysis);
       return Response.json(analysis, { headers: cacheHeaders() });
@@ -857,7 +872,7 @@ async function resolveYardCheckWorkbook(
   | { ok: true; workbookKey: string; sourceFileName: string; sourceDateKey: string }
   | { ok: false; error: string }
 > {
-  const history = await mergeHistoryWithActiveSnapshots(env, await loadHistory(env));
+  const history = await loadMergedHistory(env);
   const latest = await readJson<AnalysisResult>(env, "analyses/latest.json");
 
   if (dateKey) {
@@ -1093,7 +1108,7 @@ async function handleRelabelSnapshot(env: Env, fromKey: string, toKey: string): 
     return Response.json({ error: "from and to are identical" }, { status: 400, headers: cacheHeaders() });
   }
 
-  const history = await loadHistory(env);
+  const history = await loadMergedHistory(env);
   const fromEntry = history.entries.find((e) => e.dateKey === fromKey);
   if (!fromEntry) {
     return Response.json({ error: `No snapshot found for ${fromKey}` }, { status: 404, headers: cacheHeaders() });
@@ -1238,7 +1253,7 @@ async function handleDeleteSnapshotApi(env: Env, request: Request, ctx: Executio
     return Response.json({ error: "confirmDateKey must exactly match dateKey" }, { status: 400, headers: cacheHeaders() });
   }
 
-  const history = await loadHistory(env);
+  const history = await loadMergedHistory(env);
   const entry = history.entries.find((e) => e.dateKey === dateKey);
   if (!entry) {
     return Response.json({ error: `No snapshot in history for ${dateKey}` }, { status: 404, headers: cacheHeaders() });
@@ -1695,7 +1710,7 @@ async function enrichAnalysisAssetManagerFromR2(env: Env, analysis: AnalysisResu
 
   // If the DB doesn't have it yet (or KPI sheet is missing), re-parse from R2.
   if (!am.sheetFound || !breakdown.length) {
-    const history = await loadHistory(env);
+    const history = await loadMergedHistory(env);
     const entry = history.entries.find((e) => e.dateKey === analysis.dateKey);
     if (entry) {
       const obj = await env.ETIC_BUCKET.get(entry.workbookKey);
@@ -1722,7 +1737,7 @@ async function enrichAnalysisAssetManagerFromR2(env: Env, analysis: AnalysisResu
 }
 
 async function backfillSnapshotsFromHistory(env: Env): Promise<void> {
-  const history = await loadHistory(env);
+  const history = await loadMergedHistory(env);
   for (const entry of history.entries) {
     let analysis = await readJson<AnalysisResult>(env, entry.analysisKey);
     if (!analysis) continue;
@@ -1744,7 +1759,7 @@ function ingestTimestampForHistoryEntry(entry: HistoryEntry): string {
 
 /** Replay one report day into the watch tables (all workbooks for that day, in ingest order). */
 async function replayWorkOrderWatchForDate(env: Env, dateKey: string): Promise<number> {
-  const history = await loadHistory(env);
+  const history = await loadMergedHistory(env);
   const forDay = history.entries.filter((e) => e.dateKey === dateKey);
   if (forDay.length === 0) return 0;
   const sorted = sortHistoryEntriesChronologically(forDay);
@@ -1763,10 +1778,16 @@ async function replayWorkOrderWatchForDate(env: Env, dateKey: string): Promise<n
   return lastRowCount;
 }
 
-type EticSnapshotRebuildRow = {
+export type EticSnapshotRebuildRow = {
   date_key: string;
   workbook_key: string;
   received_at_iso: string;
+};
+
+export type RebuildWorkOrderWatchSummary = {
+  total: number;
+  processed: number;
+  missing: EticSnapshotRebuildRow[];
 };
 
 /**
@@ -1775,7 +1796,7 @@ type EticSnapshotRebuildRow = {
  * work_order_changelog rows use that snapshot’s `date_key` and `received_at_iso` (when the
  * new state first appears in the sequence — i.e. the day that workbook is the report for).
  */
-async function loadActiveEticSnapshotsForRebuild(env: Env): Promise<EticSnapshotRebuildRow[]> {
+export async function loadActiveEticSnapshotsForRebuild(env: Env): Promise<EticSnapshotRebuildRow[]> {
   try {
     const r = await env.ETIC_SNAPSHOTS.prepare(
       `SELECT date_key, workbook_key, received_at_iso
@@ -1794,12 +1815,6 @@ async function loadActiveEticSnapshotsForRebuild(env: Env): Promise<EticSnapshot
   }
 }
 
-function ingestTimestampForSnapshotIndexRow(row: EticSnapshotRebuildRow): string {
-  const r = (row.received_at_iso ?? "").trim();
-  if (r && !Number.isNaN(Date.parse(r))) return r;
-  return `${row.date_key}T12:00:00.000Z`;
-}
-
 /**
  * Wall clock used when *rebuilding* from stored workbooks. If `received_at_iso` in D1
  * was bulk-updated to one day (e.g. every row shows the same import instant), the WO/MEL
@@ -1807,7 +1822,7 @@ function ingestTimestampForSnapshotIndexRow(row: EticSnapshotRebuildRow): string
  * YYYY-MM-DD) matches the report `date_key`, keep the real instant; otherwise anchor
  * each replay to a stable time on the **report** day so timelines stay on the right day.
  */
-function ingestTimestampForSnapshotRebuild(row: EticSnapshotRebuildRow): string {
+export function ingestTimestampForSnapshotRebuild(row: EticSnapshotRebuildRow): string {
   const dk = row.date_key;
   const r = (row.received_at_iso ?? "").trim();
   if (r && !Number.isNaN(Date.parse(r)) && r.slice(0, 10) === dk) {
@@ -1822,7 +1837,32 @@ function ingestTimestampForSnapshotRebuild(row: EticSnapshotRebuildRow): string 
  * the snapshot it first appears in (compared to the prior snapshot in that order). Does not
  * use `history/index.json` (that can drift); the D1 index is the list of workbooks to walk.
  */
-async function rebuildWorkOrderWatchFromHistory(env: Env): Promise<void> {
+export async function rebuildWorkOrderWatchFromHistory(env: Env): Promise<RebuildWorkOrderWatchSummary> {
+  const snapshots = await loadActiveEticSnapshotsForRebuild(env);
+  const loaded: Array<{ row: EticSnapshotRebuildRow; bytes: ArrayBuffer }> = [];
+  const missing: EticSnapshotRebuildRow[] = [];
+  for (const row of snapshots) {
+    const obj = await env.ETIC_BUCKET.get(row.workbook_key);
+    if (!obj) {
+      missing.push(row);
+      continue;
+    }
+    loaded.push({ row, bytes: await obj.arrayBuffer() });
+  }
+  if (missing.length > 0) {
+    for (const row of missing) {
+      console.error(
+        JSON.stringify({
+          level: "error",
+          message: "rebuild: workbook missing in R2; preserving existing watch tables",
+          date_key: row.date_key,
+          workbook_key: row.workbook_key,
+        }),
+      );
+    }
+    throw new Error(`Cannot rebuild WO/MEL watch: ${missing.length} active D1 snapshot workbook(s) missing from R2`);
+  }
+
   await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM work_order_changelog`).run();
   await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM work_order_state`).run();
   await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM work_order_snapshot`).run();
@@ -1830,27 +1870,37 @@ async function rebuildWorkOrderWatchFromHistory(env: Env): Promise<void> {
   await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM mel_changelog`).run();
   await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM mel_state`).run();
   await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM mel_snapshot`).run();
-  const snapshots = await loadActiveEticSnapshotsForRebuild(env);
-  for (const row of snapshots) {
-    const obj = await env.ETIC_BUCKET.get(row.workbook_key);
-    if (!obj) {
-      console.error(
-        JSON.stringify({
-          level: "error",
-          message: "rebuild: workbook missing in R2",
-          date_key: row.date_key,
-          workbook_key: row.workbook_key,
-        }),
-      );
-      continue;
-    }
-    const bytes = await obj.arrayBuffer();
+  for (const { row, bytes } of loaded) {
     const raw = await extractRawWorkOrdersFromBinary(bytes);
     const ts = ingestTimestampForSnapshotRebuild(row);
     await ingestWorkOrderSnapshot(env, row.date_key, raw, ts, bytes);
     const melRows = await extractMelRowsFromBinary(bytes);
     await ingestMelSnapshot(env, row.date_key, melRows, ts);
   }
+  return { total: snapshots.length, processed: loaded.length, missing };
+}
+
+type EmailIngestWatchRefreshSummary = RebuildWorkOrderWatchSummary & {
+  mode: "rebuild" | "current";
+};
+
+async function refreshWorkOrderWatchAfterEmailIngest(
+  env: Env,
+  dateKey: string,
+  workbookBytes: ArrayBuffer,
+  updatedAtIso: string,
+): Promise<EmailIngestWatchRefreshSummary> {
+  const snapshots = await loadActiveEticSnapshotsForRebuild(env);
+  const latest = snapshots[snapshots.length - 1];
+  const canReplayFullIndex = snapshots.length > 1 && latest?.date_key === dateKey;
+  if (!canReplayFullIndex) {
+    const raw = await extractRawWorkOrdersFromBinary(workbookBytes);
+    await ingestWorkOrderSnapshot(env, dateKey, raw, updatedAtIso, workbookBytes);
+    const melRows = await extractMelRowsFromBinary(workbookBytes);
+    await ingestMelSnapshot(env, dateKey, melRows, updatedAtIso);
+    return { mode: "current", total: 1, processed: 1, missing: [] };
+  }
+  return { mode: "rebuild", ...(await rebuildWorkOrderWatchFromHistory(env)) };
 }
 
 async function handleDebugWatchCounts(env: Env): Promise<Response> {
@@ -1884,7 +1934,7 @@ async function handleDebugWatchCounts(env: Env): Promise<Response> {
 async function handleDebugScrape(env: Env, request: Request): Promise<Response> {
   const url = new URL(request.url);
   const dateParam = url.searchParams.get("date");
-  const history = await loadHistory(env);
+  const history = await loadMergedHistory(env);
   const entries = [...history.entries].sort((a, b) => b.dateKey.localeCompare(a.dateKey));
   const entry = dateParam
     ? entries.find((e) => e.dateKey === dateParam)
@@ -1920,7 +1970,7 @@ async function handleDebugScrape(env: Env, request: Request): Promise<Response> 
  *  confirm exact column names before writing the parser. */
 async function handleDebugMelHeaders(env: Env, url: URL): Promise<Response> {
   const dateParam = url.searchParams.get("date");
-  const history = await loadHistory(env);
+  const history = await loadMergedHistory(env);
   const entries = [...history.entries].sort((a, b) => b.dateKey.localeCompare(a.dateKey));
   const entry = dateParam ? entries.find((e) => e.dateKey === dateParam) : entries[0];
   if (!entry) {
@@ -4553,12 +4603,35 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
       return Response.json({ ok: true, dateKey: replayDate, rowsIngested: count }, { headers: cacheHeaders() });
     }
     if (url.searchParams.get("rebuild") === "1") {
+      const wait = url.searchParams.get("wait") === "1";
+      if (wait) {
+        try {
+          const summary = await rebuildWorkOrderWatchFromHistory(env);
+          return Response.json(
+            {
+              ok: true,
+              message: "Work order watch rebuilt from every active D1 snapshot row.",
+              ...summary,
+            },
+            { headers: cacheHeaders() },
+          );
+        } catch (error) {
+          return Response.json(
+            {
+              ok: false,
+              error: error instanceof Error ? error.message : String(error),
+              message: "Rebuild did not clear existing watch tables because at least one active snapshot workbook could not be loaded.",
+            },
+            { status: 409, headers: cacheHeaders() },
+          );
+        }
+      }
       ctx.waitUntil(rebuildWorkOrderWatchFromHistory(env));
       return Response.json(
         {
           ok: true,
           message:
-            "Work order watch is rebuilding: every active D1 etic_snapshots row (in date order), one workbook at a time, repopulating changelog. Takes a few minutes for large histories.",
+            "Work order watch is rebuilding from every active D1 etic_snapshots row, oldest to newest. Use wait=1 to block until completion.",
         },
         { headers: cacheHeaders() },
       );
@@ -5021,6 +5094,10 @@ async function mergeHistoryWithActiveSnapshots(env: Env, history: HistoryIndex):
   };
 }
 
+async function loadMergedHistory(env: Env): Promise<HistoryIndex> {
+  return mergeHistoryWithActiveSnapshots(env, await loadHistory(env));
+}
+
 async function setSnapshotSoftDeleted(
   env: Env,
   dateKey: string,
@@ -5046,7 +5123,7 @@ async function getLatestActiveAnalysisFromD1(env: Env): Promise<AnalysisResult |
     `SELECT date_key FROM etic_snapshots WHERE deleted_at_iso IS NULL ORDER BY date_key DESC LIMIT 1`,
   ).first<{ date_key: string }>();
   if (!row?.date_key) return null;
-  return readJson<AnalysisResult>(env, `analyses/${row.date_key}.json`);
+  return readAnalysisForDateKey(env, row.date_key);
 }
 
 /** Keep R2 analyses/latest.json aligned with the newest non-deleted D1 snapshot. */
