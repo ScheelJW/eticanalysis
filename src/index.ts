@@ -10952,6 +10952,9 @@ function renderDashboardHtml(): string {
       color: var(--accent-strong); font-weight: 600; text-decoration: none; cursor: pointer; border: 0; background: none; padding: 0; font: inherit;
     }
     .yard-wo-history-table .wo-link:hover { text-decoration: underline; }
+    .yard-wo-history-table .fma-cell {
+      max-width: 14rem; white-space: pre-wrap; word-break: break-word; font-size: 10px; line-height: 1.35; color: var(--text-dim);
+    }
     .yard-wo-history-empty { color: var(--muted); padding: 8px 4px; font-size: 12px; }
     .yard-finding-actions { display: flex; flex-direction: column; gap: 6px; align-items: flex-end; }
     .yard-finding-actions button {
@@ -22716,7 +22719,7 @@ function renderDashboardHtml(): string {
         return '<div class="yard-wo-history-empty">No work order rows in any stored ETIC snapshot for this asset id.</div>';
       }
       var head = '<div class="yard-wo-history-table-wrap"><table class="yard-wo-history-table"><thead><tr>' +
-        '<th>Snapshot</th><th>WO</th><th>MEL</th><th>Shop</th><th>ETIC</th><th>Parts</th>' +
+        '<th>Snapshot</th><th>WO</th><th>MEL</th><th>Shop</th><th>ETIC</th><th>Parts</th><th>FM&amp;A (Fleet P&amp;A)</th>' +
         '</tr></thead><tbody>';
       var body = rows.map(function (r) {
         var snap = esc(r.snapshotDateKey || "");
@@ -22725,8 +22728,14 @@ function renderDashboardHtml(): string {
         var shop = esc(r.shop || "");
         var etic = esc(r.eticDate || r.eticRaw || "");
         var parts = esc((r.partsStatus || "").slice(0, 96));
+        var fmaFull = (r.fleetFmaNotes || "").trim();
+        var fmaShow = fmaFull.replace(/\\s+/g, " ");
+        if (fmaShow.length > 160) fmaShow = fmaShow.slice(0, 157) + "\u2026";
+        var fmaCell = fmaFull
+          ? '<td class="fma-cell" title="' + esc(fmaFull) + '">' + esc(fmaShow) + "</td>"
+          : "<td class=\"fma-cell\">\u2014</td>";
         var woCell = '<button type="button" class="wo-link" data-yard-open-wo="' + esc(wo) + '">' + esc(wo) + '</button>';
-        return "<tr><td>" + snap + "</td><td>" + woCell + "</td><td>" + tier + "</td><td>" + shop + "</td><td>" + etic + "</td><td>" + parts + "</td></tr>";
+        return "<tr><td>" + snap + "</td><td>" + woCell + "</td><td>" + tier + "</td><td>" + shop + "</td><td>" + etic + "</td><td>" + parts + "</td>" + fmaCell + "</tr>";
       }).join("");
       return head + body + "</tbody></table></div>";
     }

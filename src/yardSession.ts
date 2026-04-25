@@ -1618,6 +1618,8 @@ export type WorkOrderSnapshotHistoryRow = {
   remarks: string;
   partsStatus: string;
   lastRemarkChangeDate: string;
+  /** Fleet P&A FM&A notes column from raw_row_json for that snapshot row. */
+  fleetFmaNotes: string;
 };
 
 /**
@@ -1634,7 +1636,7 @@ export async function listWorkOrderSnapshotsForAsset(
   if (!id) return [];
   const r = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT snapshot_date_key, work_order_id, asset_id, mel_tier, shop,
-            etic_date, etic_raw, remarks, parts_status, last_remark_change_date
+            etic_date, etic_raw, remarks, parts_status, last_remark_change_date, raw_row_json
      FROM work_order_snapshot
      WHERE UPPER(TRIM(asset_id)) = UPPER(TRIM(?))
      ORDER BY snapshot_date_key DESC, work_order_id ASC
@@ -1652,19 +1654,29 @@ export async function listWorkOrderSnapshotsForAsset(
       remarks: string | null;
       parts_status: string | null;
       last_remark_change_date: string | null;
+      raw_row_json: string | null;
     }>();
-  return (r.results ?? []).map((row) => ({
-    snapshotDateKey: row.snapshot_date_key,
-    workOrderId: row.work_order_id,
-    assetId: row.asset_id ?? "",
-    melTier: row.mel_tier ?? "",
-    shop: row.shop ?? "",
-    eticDate: row.etic_date ?? "",
-    eticRaw: row.etic_raw ?? "",
-    remarks: row.remarks ?? "",
-    partsStatus: row.parts_status ?? "",
-    lastRemarkChangeDate: row.last_remark_change_date ?? "",
-  }));
+  return (r.results ?? []).map((row) => {
+    let raw: Record<string, unknown> = {};
+    try {
+      raw = JSON.parse(row.raw_row_json || "{}") as Record<string, unknown>;
+    } catch {
+      raw = {};
+    }
+    return {
+      snapshotDateKey: row.snapshot_date_key,
+      workOrderId: row.work_order_id,
+      assetId: row.asset_id ?? "",
+      melTier: row.mel_tier ?? "",
+      shop: row.shop ?? "",
+      eticDate: row.etic_date ?? "",
+      eticRaw: row.etic_raw ?? "",
+      remarks: row.remarks ?? "",
+      partsStatus: row.parts_status ?? "",
+      lastRemarkChangeDate: row.last_remark_change_date ?? "",
+      fleetFmaNotes: extractFleetFmaNotesFromRaw(raw),
+    };
+  });
 }
 
 type WoReadRow = {
