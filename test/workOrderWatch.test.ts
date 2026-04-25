@@ -3,10 +3,13 @@ import type { RawWorkOrder } from "../src/yardCheck";
 import {
   calendarDaysBetween,
   classifyMelTier,
+  computeMelRecallHintForRow,
   getChangelogForDisplay,
   ingestWorkOrderSnapshot,
+  melMgmtCodesMatch,
   parseEticDate,
 } from "../src/workOrderWatch";
+import type { WatchRow } from "../src/workOrderWatch";
 
 describe("classifyMelTier", () => {
   it("detects below / at / above from phrases", () => {
@@ -36,6 +39,140 @@ describe("parseEticDate", () => {
 describe("calendarDaysBetween", () => {
   it("counts whole days", () => {
     expect(calendarDaysBetween("2026-04-01", "2026-04-04")).toBe(3);
+  });
+});
+
+describe("melMgmtCodesMatch", () => {
+  it("matches B216 style codes inside longer auth strings", () => {
+    expect(melMgmtCodesMatch("Auth B216 / foo", "B216")).toBe(true);
+    expect(melMgmtCodesMatch("b216", "B216")).toBe(true);
+  });
+  it("returns false when either side empty", () => {
+    expect(melMgmtCodesMatch("", "B216")).toBe(false);
+    expect(melMgmtCodesMatch("B216", "")).toBe(false);
+  });
+});
+
+function minimalWatchRow(overrides: Partial<WatchRow>): WatchRow {
+  return {
+    workOrderId: "WO-1",
+    assetId: "AF1",
+    melTier: "above",
+    partsStatus: "",
+    eticRaw: "",
+    eticDate: null,
+    remarks: "",
+    lastRemarkChangeDate: "2026-04-01",
+    daysSinceRemarkChange: 0,
+    requiredIntervalDays: 5,
+    remarkStale: false,
+    eticPushCount: 0,
+    cumulativeEticSlipDays: 0,
+    firstEticDate: null,
+    lastEticDate: null,
+    lastSnapshotDate: "2026-04-01",
+    owningUnit: "",
+    melKey: "MEL-A",
+    shop: "",
+    mgmtCd: "B216",
+    makeModel: "",
+    vehNomen: "",
+    firstSeenDate: "",
+    historyBounded: false,
+    establishedDate: "",
+    establishedDateIso: null,
+    woReason: "",
+    nce: false,
+    nceStatus: "",
+    scheduleMxStatus: "",
+    scheduleMxDueIso: null,
+    scheduleMxDaysUntil: null,
+    scheduleMxOverdueByDays: null,
+    scheduleMxBucket: "ok",
+    scheduleMxNeedsEntry: false,
+    daysDown: null,
+    ...overrides,
+  };
+}
+
+describe("computeMelRecallHintForRow", () => {
+  it("returns a hint when another above-MEL line matches asset mgmt and donor has FMC cushion", () => {
+    const melRows = [
+      {
+        mel_key: "MEL-A",
+        unit: "U1",
+        mgmt_code_name: "X100",
+        fmc_count: 10,
+        nmc_count: 2,
+        mel_required: 6,
+        mel_status: "above",
+      },
+      {
+        mel_key: "MEL-B",
+        unit: "U2",
+        mgmt_code_name: "Auth B216",
+        fmc_count: 8,
+        nmc_count: 1,
+        mel_required: 5,
+        mel_status: "above",
+      },
+    ];
+    const row = minimalWatchRow({ melKey: "MEL-A", mgmtCd: "B216", melTier: "above" });
+    const hint = computeMelRecallHintForRow(melRows, row);
+    expect(hint).not.toBeNull();
+    expect(hint?.donorMelKey).toBe("MEL-A");
+    expect(hint?.supporterMelKey).toBe("MEL-B");
+    expect(hint?.otherNmcOnDonorMel).toBe(1);
+  });
+
+  it("returns null when WO is not above MEL tier", () => {
+    const melRows = [
+      {
+        mel_key: "MEL-A",
+        unit: "U1",
+        mgmt_code_name: "X",
+        fmc_count: 10,
+        nmc_count: 2,
+        mel_required: 6,
+        mel_status: "above",
+      },
+      {
+        mel_key: "MEL-B",
+        unit: "U2",
+        mgmt_code_name: "B216",
+        fmc_count: 8,
+        nmc_count: 1,
+        mel_required: 5,
+        mel_status: "above",
+      },
+    ];
+    const row = minimalWatchRow({ melTier: "at" });
+    expect(computeMelRecallHintForRow(melRows, row)).toBeNull();
+  });
+
+  it("returns null when donor FMC cushion is too thin", () => {
+    const melRows = [
+      {
+        mel_key: "MEL-A",
+        unit: "U1",
+        mgmt_code_name: "X",
+        fmc_count: 7,
+        nmc_count: 1,
+        mel_required: 6,
+        mel_status: "above",
+      },
+      {
+        mel_key: "MEL-B",
+        unit: "U2",
+        mgmt_code_name: "B216",
+        fmc_count: 8,
+        nmc_count: 1,
+        mel_required: 5,
+        mel_status: "above",
+      },
+    ];
+    const row = minimalWatchRow({ melKey: "MEL-A" });
+    expect(computeMelRecallHintForRow(melRows, row)).toBeNull();
   });
 });
 
