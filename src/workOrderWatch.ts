@@ -30,6 +30,22 @@ function resolveStaleness(thresholds?: Record<string, number>): Record<MelTier, 
   };
 }
 
+/**
+ * Normalize remarks for day-over-day equality only. Excel / export churn often
+ * swaps line endings, inserts NBSP, or changes which Unicode space character
+ * is used — that must not create a fake "remarks changed" changelog row or
+ * bump last_remark_change_date. Stored text in D1 stays the ingest-time trim;
+ * this is for compare + synthetic timeline diff only.
+ */
+export function normalizeRemarksForCompare(raw: string | null | undefined): string {
+  let s = String(raw ?? "");
+  s = s.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  s = s.replace(/[\u00A0\u2007\u202F\uFEFF]/g, " ");
+  s = s.replace(/[\u1680\u2000-\u200A\u205F\u3000]/g, " ");
+  s = s.replace(/\s+/g, " ").trim();
+  return s;
+}
+
 export function classifyMelTier(raw: string): MelTier {
   const s = raw.replace(/\s+/g, " ").trim().toLowerCase();
   if (!s) return "unknown";
@@ -322,7 +338,7 @@ export async function ingestWorkOrderSnapshot(
 
     if (prev) {
       lastRemarkChange = prev.last_remark_change_date;
-      if (remarks !== (prev.remarks ?? "")) {
+      if (normalizeRemarksForCompare(remarks) !== normalizeRemarksForCompare(prev.remarks ?? "")) {
         lastRemarkChange = dateKey;
         statements.push(insertLog.bind(wid, dateKey, updatedAtIso, "remarks", prev.remarks ?? "", remarks));
       }
@@ -1552,7 +1568,7 @@ export async function getChangelogFromSnapshots(
     }
     const prev = rows[i - 1]!;
     const k = cur.snapshot_date_key;
-    if (cur.remarks !== (prev.remarks ?? "")) {
+    if (normalizeRemarksForCompare(cur.remarks) !== normalizeRemarksForCompare(prev.remarks ?? "")) {
       out.push({
         id: ++id,
         snapshot_date_key: k,
