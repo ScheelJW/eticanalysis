@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { calendarDaysBetween, classifyMelTier, parseEticDate } from "../src/workOrderWatch";
+import type { RawWorkOrder } from "../src/yardCheck";
+import {
+  calendarDaysBetween,
+  classifyMelTier,
+  getChangelogForDisplay,
+  ingestWorkOrderSnapshot,
+  parseEticDate,
+} from "../src/workOrderWatch";
 
 describe("classifyMelTier", () => {
   it("detects below / at / above from phrases", () => {
@@ -29,5 +36,202 @@ describe("parseEticDate", () => {
 describe("calendarDaysBetween", () => {
   it("counts whole days", () => {
     expect(calendarDaysBetween("2026-04-01", "2026-04-04")).toBe(3);
+  });
+});
+
+type MockRunResult = { meta: { changes: number } };
+
+class MockD1PreparedStatement {
+  constructor(
+    private readonly db: MockD1Database,
+    private readonly sql: string,
+    private readonly params: unknown[] = [],
+  ) {}
+
+  bind(...params: unknown[]): MockD1PreparedStatement {
+    return new MockD1PreparedStatement(this.db, this.sql, params);
+  }
+
+  async all<T>(): Promise<{ results: T[] }> {
+    return { results: this.db.all<T>(this.sql, this.params) };
+  }
+
+  async run(): Promise<MockRunResult> {
+    return { meta: { changes: this.db.run(this.sql, this.params) } };
+  }
+}
+
+class MockD1Database {
+  readonly snapshots: Map<string, Map<string, Record<string, unknown>>> = new Map();
+  readonly changelog: Array<Record<string, unknown>> = [];
+  readonly state: Map<string, Record<string, unknown>> = new Map();
+
+  prepare(sql: string): MockD1PreparedStatement {
+    return new MockD1PreparedStatement(this, sql);
+  }
+
+  async batch(statements: MockD1PreparedStatement[]): Promise<MockRunResult[]> {
+    return Promise.all(statements.map((s) => s.run()));
+  }
+
+  all<T>(sql: string, params: unknown[]): T[] {
+    if (sql.includes("FROM work_order_snapshot") && sql.includes("WHERE work_order_id = ?")) {
+      const workOrderId = String(params[0]);
+      const rows: Record<string, unknown>[] = [];
+      for (const [snapshotDate, byWo] of this.snapshots) {
+        const row = byWo.get(workOrderId);
+        if (row) rows.push({ ...row, snapshot_date_key: snapshotDate });
+      }
+      rows.sort((a, b) => String(a.snapshot_date_key).localeCompare(String(b.snapshot_date_key)));
+      return rows as T[];
+    }
+    if (sql.includes("FROM work_order_snapshot") && sql.includes("WHERE work_order_id IN")) {
+      const dateKey = String(params[params.length - 1]);
+      const workOrderIds = new Set(params.slice(0, -1).map(String));
+      const rows: Record<string, unknown>[] = [];
+      for (const [snapshotDate, byWo] of this.snapshots) {
+        if (snapshotDate > dateKey) continue;
+        for (const [wid, row] of byWo) {
+          if (!workOrderIds.has(wid)) continue;
+          rows.push({ ...row, last_snapshot_date: snapshotDate });
+        }
+      }
+      rows.sort((a, b) => {
+        const wid = String(a.work_order_id).localeCompare(String(b.work_order_id));
+        if (wid !== 0) return wid;
+        return String(b.last_snapshot_date).localeCompare(String(a.last_snapshot_date));
+      });
+      return rows as T[];
+    }
+    return [];
+  }
+
+  run(sql: string, params: unknown[]): number {
+    if (sql.includes("INSERT OR REPLACE INTO work_order_changelog")) {
+      const [work_order_id, snapshot_date_key, changed_at_iso, field, old_value, new_value] = params;
+      const existing = this.changelog.findIndex(
+        (row) =>
+          row.work_order_id === work_order_id &&
+          row.snapshot_date_key === snapshot_date_key &&
+          row.field === field,
+      );
+      const row = { work_order_id, snapshot_date_key, changed_at_iso, field, old_value, new_value };
+      if (existing >= 0) this.changelog[existing] = row;
+      else this.changelog.push(row);
+      return 1;
+    }
+    if (sql.includes("INSERT INTO work_order_snapshot")) {
+      const row = this.workOrderRowFromParams(params);
+      const dateKey = String(params[0]);
+      const wid = String(params[1]);
+      if (!this.snapshots.has(dateKey)) this.snapshots.set(dateKey, new Map());
+      this.snapshots.get(dateKey)?.set(wid, row);
+      return 1;
+    }
+    if (sql.includes("INSERT INTO work_order_state")) {
+      const row = this.workOrderRowFromParams(params.slice(1));
+      const wid = String(params[0]);
+      const prev = this.state.get(wid);
+      if (!prev || String(row.last_snapshot_date) >= String(prev.last_snapshot_date)) this.state.set(wid, row);
+      return 1;
+    }
+    return 0;
+  }
+
+  private workOrderRowFromParams(params: unknown[]): Record<string, unknown> {
+    return {
+      snapshot_date_key: params[0],
+      work_order_id: params[1],
+      asset_id: params[2],
+      remarks: params[3],
+      parts_status: params[4],
+      etic_raw: params[5],
+      etic_date: params[6],
+      mel_tier: params[7],
+      last_remark_change_date: params[8],
+      etic_push_count: params[9],
+      first_etic_date: params[10],
+      last_etic_date: params[11],
+      cumulative_etic_slip_days: params[12],
+      owning_unit: params[13],
+      mel_key: params[14],
+      shop: params[15],
+      mgmt_cd: params[16],
+      make_model: params[17],
+      veh_nomen: params[18],
+      raw_row_json: params[19],
+      last_snapshot_date: params[0],
+    };
+  }
+}
+
+function wo(overrides: Partial<RawWorkOrder>): RawWorkOrder {
+  return {
+    assetId: "",
+    workOrderId: "",
+    remarks: "",
+    shop: "",
+    shop2: "",
+    etiCLocation: "",
+    makeModel: "",
+    partsStatus: "",
+    eticDue: "",
+    currentMel: "",
+    owningUnit: "",
+    melKey: "",
+    mgmtCd: "",
+    vehNomen: "",
+    rawColumns: {},
+    ...overrides,
+  };
+}
+
+describe("ingestWorkOrderSnapshot", () => {
+  it("builds date-by-date changelog rows from each sequential ingest", async () => {
+    const db = new MockD1Database();
+    const env = { ETIC_SNAPSHOTS: db as unknown as D1Database };
+
+    await ingestWorkOrderSnapshot(env, "2026-04-01", [
+      wo({ workOrderId: "WO-1", assetId: "AF1", remarks: "Initial", eticDue: "4/5/2026", currentMel: "Below MEL" }),
+    ], "2026-04-01T18:00:00.000Z");
+    await ingestWorkOrderSnapshot(env, "2026-04-02", [
+      wo({ workOrderId: "WO-1", assetId: "AF1", remarks: "Parts ordered", eticDue: "4/5/2026", currentMel: "Below MEL" }),
+    ], "2026-04-02T18:00:00.000Z");
+    await ingestWorkOrderSnapshot(env, "2026-04-03", [
+      wo({ workOrderId: "WO-1", assetId: "AF1", remarks: "Parts ordered", eticDue: "4/7/2026", currentMel: "Below MEL" }),
+    ], "2026-04-03T18:00:00.000Z");
+
+    expect([...db.snapshots.keys()]).toEqual(["2026-04-01", "2026-04-02", "2026-04-03"]);
+    expect(db.changelog.map((row) => [row.snapshot_date_key, row.field, row.old_value, row.new_value])).toEqual([
+      ["2026-04-01", "initial", "", "first_seen"],
+      ["2026-04-02", "remarks", "Initial", "Parts ordered"],
+      ["2026-04-03", "etic", "4/5/2026", "4/7/2026"],
+      ["2026-04-03", "etic_date_slip", "2026-04-05", "2026-04-07"],
+    ]);
+  });
+
+  it("derives display changelog from snapshots when persisted changelog has stale duplicate initial rows", async () => {
+    const db = new MockD1Database();
+    const env = { ETIC_SNAPSHOTS: db as unknown as D1Database };
+
+    await ingestWorkOrderSnapshot(env, "2026-02-26", [
+      wo({ workOrderId: "WO-1", assetId: "AF1", remarks: "Initial", currentMel: "Below MEL" }),
+    ], "2026-02-26T18:00:00.000Z");
+    await ingestWorkOrderSnapshot(env, "2026-04-16", [
+      wo({ workOrderId: "WO-1", assetId: "AF1", remarks: "Initial", currentMel: "Below MEL" }),
+    ], "2026-04-16T18:00:00.000Z");
+
+    db.changelog.push({
+      work_order_id: "WO-1",
+      snapshot_date_key: "2026-04-16",
+      changed_at_iso: "2026-04-16T18:00:00.000Z",
+      field: "initial",
+      old_value: "",
+      new_value: "first_seen",
+    });
+
+    const display = await getChangelogForDisplay(env, "WO-1");
+
+    expect(display.filter((row) => row.field === "initial").map((row) => row.snapshot_date_key)).toEqual(["2026-02-26"]);
   });
 });

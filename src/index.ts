@@ -347,7 +347,7 @@ export default {
 
       await upsertSnapshotRow(env, analysis, workbookKey);
 
-      const history = await loadHistory(env);
+      const history = await loadMergedHistory(env);
       const upsertedHistory = upsertHistoryEntry(history, analysis, workbookKey, analysisKey);
       await env.ETIC_BUCKET.put(
         "history/index.json",
@@ -368,26 +368,21 @@ export default {
       // workbook-heavy WO/MEL extraction to background work.
       ctx.waitUntil((async () => {
         try {
-          const rawWos = await extractRawWorkOrdersFromBinary(workbookBytes);
-          await ingestWorkOrderSnapshot(env, dateKey, rawWos, now.toISOString(), workbookBytes);
-        } catch (error) {
-          console.error(
+          const summary = await ingestCurrentWorkbookIntoD1(env, dateKey, workbookBytes, now.toISOString());
+          console.log(
             JSON.stringify({
-              level: "error",
-              message: "Background WO ingest failed",
+              level: "info",
+              message: "Background WO/MEL ingest complete",
               dateKey,
-              error: error instanceof Error ? error.message : String(error),
+              processed: summary.processed,
+              total: summary.total,
             }),
           );
-        }
-        try {
-          const melRows = await extractMelRowsFromBinary(workbookBytes);
-          await ingestMelSnapshot(env, dateKey, melRows, now.toISOString());
         } catch (error) {
           console.error(
             JSON.stringify({
               level: "error",
-              message: "Background MEL ingest failed",
+              message: "Background WO/MEL D1 ingest failed",
               dateKey,
               error: error instanceof Error ? error.message : String(error),
             }),
@@ -433,9 +428,7 @@ export default {
     }
 
     if (url.pathname === "/api/history") {
-      const history = await loadHistory(env);
-      const merged = await mergeHistoryWithActiveSnapshots(env, history);
-      return Response.json(merged, { headers: cacheHeaders() });
+      return Response.json(await loadMergedHistory(env), { headers: cacheHeaders() });
     }
 
     if (url.pathname === "/api/snapshot/delete" && request.method === "POST") {
@@ -492,7 +485,8 @@ export default {
     }
 
     if (url.pathname === "/api/latest") {
-      let analysis = await readJson<AnalysisResult>(env, "analyses/latest.json");
+      let analysis = await getLatestActiveAnalysisFromD1(env);
+      if (!analysis) analysis = await readJson<AnalysisResult>(env, "analyses/latest.json");
       if (!analysis) return new Response("Not Found", { status: 404 });
       analysis = await enrichAnalysisAssetManagerFromR2(env, analysis);
       return Response.json(analysis, { headers: cacheHeaders() });
@@ -503,7 +497,7 @@ export default {
       if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) {
         return new Response("Invalid date key", { status: 400 });
       }
-      let analysis = await readJson<AnalysisResult>(env, `analyses/${dateKey}.json`);
+      let analysis = await readAnalysisForDateKey(env, dateKey);
       if (!analysis) return new Response("Not Found", { status: 404 });
       analysis = await enrichAnalysisAssetManagerFromR2(env, analysis);
       return Response.json(analysis, { headers: cacheHeaders() });
@@ -857,7 +851,7 @@ async function resolveYardCheckWorkbook(
   | { ok: true; workbookKey: string; sourceFileName: string; sourceDateKey: string }
   | { ok: false; error: string }
 > {
-  const history = await mergeHistoryWithActiveSnapshots(env, await loadHistory(env));
+  const history = await loadMergedHistory(env);
   const latest = await readJson<AnalysisResult>(env, "analyses/latest.json");
 
   if (dateKey) {
@@ -1093,7 +1087,7 @@ async function handleRelabelSnapshot(env: Env, fromKey: string, toKey: string): 
     return Response.json({ error: "from and to are identical" }, { status: 400, headers: cacheHeaders() });
   }
 
-  const history = await loadHistory(env);
+  const history = await loadMergedHistory(env);
   const fromEntry = history.entries.find((e) => e.dateKey === fromKey);
   if (!fromEntry) {
     return Response.json({ error: `No snapshot found for ${fromKey}` }, { status: 404, headers: cacheHeaders() });
@@ -1238,7 +1232,7 @@ async function handleDeleteSnapshotApi(env: Env, request: Request, ctx: Executio
     return Response.json({ error: "confirmDateKey must exactly match dateKey" }, { status: 400, headers: cacheHeaders() });
   }
 
-  const history = await loadHistory(env);
+  const history = await loadMergedHistory(env);
   const entry = history.entries.find((e) => e.dateKey === dateKey);
   if (!entry) {
     return Response.json({ error: `No snapshot in history for ${dateKey}` }, { status: 404, headers: cacheHeaders() });
@@ -1695,7 +1689,7 @@ async function enrichAnalysisAssetManagerFromR2(env: Env, analysis: AnalysisResu
 
   // If the DB doesn't have it yet (or KPI sheet is missing), re-parse from R2.
   if (!am.sheetFound || !breakdown.length) {
-    const history = await loadHistory(env);
+    const history = await loadMergedHistory(env);
     const entry = history.entries.find((e) => e.dateKey === analysis.dateKey);
     if (entry) {
       const obj = await env.ETIC_BUCKET.get(entry.workbookKey);
@@ -1722,7 +1716,7 @@ async function enrichAnalysisAssetManagerFromR2(env: Env, analysis: AnalysisResu
 }
 
 async function backfillSnapshotsFromHistory(env: Env): Promise<void> {
-  const history = await loadHistory(env);
+  const history = await loadMergedHistory(env);
   for (const entry of history.entries) {
     let analysis = await readJson<AnalysisResult>(env, entry.analysisKey);
     if (!analysis) continue;
@@ -1744,7 +1738,7 @@ function ingestTimestampForHistoryEntry(entry: HistoryEntry): string {
 
 /** Replay one report day into the watch tables (all workbooks for that day, in ingest order). */
 async function replayWorkOrderWatchForDate(env: Env, dateKey: string): Promise<number> {
-  const history = await loadHistory(env);
+  const history = await loadMergedHistory(env);
   const forDay = history.entries.filter((e) => e.dateKey === dateKey);
   if (forDay.length === 0) return 0;
   const sorted = sortHistoryEntriesChronologically(forDay);
@@ -1763,10 +1757,16 @@ async function replayWorkOrderWatchForDate(env: Env, dateKey: string): Promise<n
   return lastRowCount;
 }
 
-type EticSnapshotRebuildRow = {
+export type EticSnapshotRebuildRow = {
   date_key: string;
   workbook_key: string;
   received_at_iso: string;
+};
+
+export type RebuildWorkOrderWatchSummary = {
+  total: number;
+  processed: number;
+  missing: EticSnapshotRebuildRow[];
 };
 
 /**
@@ -1775,7 +1775,7 @@ type EticSnapshotRebuildRow = {
  * work_order_changelog rows use that snapshot’s `date_key` and `received_at_iso` (when the
  * new state first appears in the sequence — i.e. the day that workbook is the report for).
  */
-async function loadActiveEticSnapshotsForRebuild(env: Env): Promise<EticSnapshotRebuildRow[]> {
+export async function loadActiveEticSnapshotsForRebuild(env: Env): Promise<EticSnapshotRebuildRow[]> {
   try {
     const r = await env.ETIC_SNAPSHOTS.prepare(
       `SELECT date_key, workbook_key, received_at_iso
@@ -1794,12 +1794,6 @@ async function loadActiveEticSnapshotsForRebuild(env: Env): Promise<EticSnapshot
   }
 }
 
-function ingestTimestampForSnapshotIndexRow(row: EticSnapshotRebuildRow): string {
-  const r = (row.received_at_iso ?? "").trim();
-  if (r && !Number.isNaN(Date.parse(r))) return r;
-  return `${row.date_key}T12:00:00.000Z`;
-}
-
 /**
  * Wall clock used when *rebuilding* from stored workbooks. If `received_at_iso` in D1
  * was bulk-updated to one day (e.g. every row shows the same import instant), the WO/MEL
@@ -1807,7 +1801,7 @@ function ingestTimestampForSnapshotIndexRow(row: EticSnapshotRebuildRow): string
  * YYYY-MM-DD) matches the report `date_key`, keep the real instant; otherwise anchor
  * each replay to a stable time on the **report** day so timelines stay on the right day.
  */
-function ingestTimestampForSnapshotRebuild(row: EticSnapshotRebuildRow): string {
+export function ingestTimestampForSnapshotRebuild(row: EticSnapshotRebuildRow): string {
   const dk = row.date_key;
   const r = (row.received_at_iso ?? "").trim();
   if (r && !Number.isNaN(Date.parse(r)) && r.slice(0, 10) === dk) {
@@ -1822,7 +1816,32 @@ function ingestTimestampForSnapshotRebuild(row: EticSnapshotRebuildRow): string 
  * the snapshot it first appears in (compared to the prior snapshot in that order). Does not
  * use `history/index.json` (that can drift); the D1 index is the list of workbooks to walk.
  */
-async function rebuildWorkOrderWatchFromHistory(env: Env): Promise<void> {
+export async function rebuildWorkOrderWatchFromHistory(env: Env): Promise<RebuildWorkOrderWatchSummary> {
+  const snapshots = await loadActiveEticSnapshotsForRebuild(env);
+  const loaded: Array<{ row: EticSnapshotRebuildRow; bytes: ArrayBuffer }> = [];
+  const missing: EticSnapshotRebuildRow[] = [];
+  for (const row of snapshots) {
+    const obj = await env.ETIC_BUCKET.get(row.workbook_key);
+    if (!obj) {
+      missing.push(row);
+      continue;
+    }
+    loaded.push({ row, bytes: await obj.arrayBuffer() });
+  }
+  if (missing.length > 0) {
+    for (const row of missing) {
+      console.error(
+        JSON.stringify({
+          level: "error",
+          message: "rebuild: workbook missing in R2; preserving existing watch tables",
+          date_key: row.date_key,
+          workbook_key: row.workbook_key,
+        }),
+      );
+    }
+    throw new Error(`Cannot rebuild WO/MEL watch: ${missing.length} active D1 snapshot workbook(s) missing from R2`);
+  }
+
   await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM work_order_changelog`).run();
   await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM work_order_state`).run();
   await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM work_order_snapshot`).run();
@@ -1830,27 +1849,34 @@ async function rebuildWorkOrderWatchFromHistory(env: Env): Promise<void> {
   await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM mel_changelog`).run();
   await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM mel_state`).run();
   await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM mel_snapshot`).run();
-  const snapshots = await loadActiveEticSnapshotsForRebuild(env);
-  for (const row of snapshots) {
-    const obj = await env.ETIC_BUCKET.get(row.workbook_key);
-    if (!obj) {
-      console.error(
-        JSON.stringify({
-          level: "error",
-          message: "rebuild: workbook missing in R2",
-          date_key: row.date_key,
-          workbook_key: row.workbook_key,
-        }),
-      );
-      continue;
-    }
-    const bytes = await obj.arrayBuffer();
+  for (const { row, bytes } of loaded) {
     const raw = await extractRawWorkOrdersFromBinary(bytes);
     const ts = ingestTimestampForSnapshotRebuild(row);
     await ingestWorkOrderSnapshot(env, row.date_key, raw, ts, bytes);
     const melRows = await extractMelRowsFromBinary(bytes);
     await ingestMelSnapshot(env, row.date_key, melRows, ts);
   }
+  return { total: snapshots.length, processed: loaded.length, missing };
+}
+
+type EmailIngestWatchRefreshSummary = {
+  mode: "current";
+  total: number;
+  processed: number;
+  missing: EticSnapshotRebuildRow[];
+};
+
+async function ingestCurrentWorkbookIntoD1(
+  env: Env,
+  dateKey: string,
+  workbookBytes: ArrayBuffer,
+  updatedAtIso: string,
+): Promise<EmailIngestWatchRefreshSummary> {
+  const raw = await extractRawWorkOrdersFromBinary(workbookBytes);
+  await ingestWorkOrderSnapshot(env, dateKey, raw, updatedAtIso, workbookBytes);
+  const melRows = await extractMelRowsFromBinary(workbookBytes);
+  await ingestMelSnapshot(env, dateKey, melRows, updatedAtIso);
+  return { mode: "current", total: 1, processed: 1, missing: [] };
 }
 
 async function handleDebugWatchCounts(env: Env): Promise<Response> {
@@ -1884,7 +1910,7 @@ async function handleDebugWatchCounts(env: Env): Promise<Response> {
 async function handleDebugScrape(env: Env, request: Request): Promise<Response> {
   const url = new URL(request.url);
   const dateParam = url.searchParams.get("date");
-  const history = await loadHistory(env);
+  const history = await loadMergedHistory(env);
   const entries = [...history.entries].sort((a, b) => b.dateKey.localeCompare(a.dateKey));
   const entry = dateParam
     ? entries.find((e) => e.dateKey === dateParam)
@@ -1920,7 +1946,7 @@ async function handleDebugScrape(env: Env, request: Request): Promise<Response> 
  *  confirm exact column names before writing the parser. */
 async function handleDebugMelHeaders(env: Env, url: URL): Promise<Response> {
   const dateParam = url.searchParams.get("date");
-  const history = await loadHistory(env);
+  const history = await loadMergedHistory(env);
   const entries = [...history.entries].sort((a, b) => b.dateKey.localeCompare(a.dateKey));
   const entry = dateParam ? entries.find((e) => e.dateKey === dateParam) : entries[0];
   if (!entry) {
@@ -2270,10 +2296,60 @@ async function handleYardFindingReopenApi(env: Env, request: Request): Promise<R
   }
 }
 
-/** GET — interleaved feed of recent checks + actions. */
+function parseOptionalDateParam(url: URL, name: string): string {
+  const v = (url.searchParams.get(name) ?? "").trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : "";
+}
+
+function dateKeyToStartIso(dateKey: string): string {
+  return dateKey ? `${dateKey}T00:00:00.000Z` : "";
+}
+
+function dateKeyToNextStartIso(dateKey: string): string {
+  if (!dateKey) return "";
+  const [y, m, d] = dateKey.split("-").map((x) => Number.parseInt(x, 10));
+  const dt = new Date(Date.UTC(y, (m || 1) - 1, d || 1, 0, 0, 0));
+  if (Number.isNaN(dt.getTime())) return "";
+  dt.setUTCDate(dt.getUTCDate() + 1);
+  return dt.toISOString();
+}
+
+function csvEscape(v: unknown): string {
+  return '"' + String(v ?? "").replace(/"/g, '""') + '"';
+}
+
+/** GET — interleaved feed of checks + actions, optionally date-bounded. */
 async function handleYardActivityApi(env: Env, url: URL): Promise<Response> {
   const limit = Math.min(500, Math.max(1, Number.parseInt(url.searchParams.get("limit") ?? "100", 10)));
-  const items = await getYardRecentActivity(env, limit);
+  const from = parseOptionalDateParam(url, "from");
+  const to = parseOptionalDateParam(url, "to");
+  const format = (url.searchParams.get("format") ?? "").trim().toLowerCase();
+  const items = await getYardRecentActivity(env, limit, {
+    fromIso: dateKeyToStartIso(from),
+    toIso: dateKeyToNextStartIso(to),
+  });
+  if (format === "csv") {
+    const rows = [
+      ["type", "at", "asset_id", "who", "location", "status_or_resolution", "issue", "wo_opened", "note"],
+      ...items.map((it) => {
+        if (it.kind === "check") {
+          const c = it.check;
+          return ["check", it.at, c.assetId, c.checkedBy, c.location, c.status, c.discrepancies, "", ""];
+        }
+        const a = it.action;
+        return ["action", it.at, a.assetId, a.resolvedBy, "", a.resolution, a.kind, a.woOpened, a.note];
+      }),
+    ];
+    const csv = rows.map((r) => r.map(csvEscape).join(",")).join("\n") + "\n";
+    const suffix = from || to ? `_${from || "start"}_${to || "today"}` : "";
+    return new Response(csv, {
+      headers: {
+        "Content-Type": "text/csv; charset=utf-8",
+        "Content-Disposition": `attachment; filename="yard-needs-fix-report${suffix}.csv"`,
+        ...cacheHeaders(),
+      },
+    });
+  }
   return Response.json({ items }, { headers: cacheHeaders() });
 }
 
@@ -3567,7 +3643,7 @@ function renderMobileAppPickerHtml(): string {
       <span class="choice-icon" aria-hidden="true">📍</span>
       <span class="choice-text">
         <span class="choice-title">Yard check</span>
-        <span class="choice-sub">Walk the yard — confirm assets, photos, and findings.</span>
+        <span class="choice-sub">Walk the yard — confirm assets, photos, and needs-fix items.</span>
       </span>
       <span class="choice-go" aria-hidden="true">→</span>
     </a>
@@ -4553,12 +4629,35 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
       return Response.json({ ok: true, dateKey: replayDate, rowsIngested: count }, { headers: cacheHeaders() });
     }
     if (url.searchParams.get("rebuild") === "1") {
+      const wait = url.searchParams.get("wait") === "1";
+      if (wait) {
+        try {
+          const summary = await rebuildWorkOrderWatchFromHistory(env);
+          return Response.json(
+            {
+              ok: true,
+              message: "Work order watch rebuilt from every active D1 snapshot row.",
+              ...summary,
+            },
+            { headers: cacheHeaders() },
+          );
+        } catch (error) {
+          return Response.json(
+            {
+              ok: false,
+              error: error instanceof Error ? error.message : String(error),
+              message: "Rebuild did not clear existing watch tables because at least one active snapshot workbook could not be loaded.",
+            },
+            { status: 409, headers: cacheHeaders() },
+          );
+        }
+      }
       ctx.waitUntil(rebuildWorkOrderWatchFromHistory(env));
       return Response.json(
         {
           ok: true,
           message:
-            "Work order watch is rebuilding: every active D1 etic_snapshots row (in date order), one workbook at a time, repopulating changelog. Takes a few minutes for large histories.",
+            "Work order watch is rebuilding from every active D1 etic_snapshots row, oldest to newest. Use wait=1 to block until completion.",
         },
         { headers: cacheHeaders() },
       );
@@ -5021,6 +5120,10 @@ async function mergeHistoryWithActiveSnapshots(env: Env, history: HistoryIndex):
   };
 }
 
+async function loadMergedHistory(env: Env): Promise<HistoryIndex> {
+  return mergeHistoryWithActiveSnapshots(env, await loadHistory(env));
+}
+
 async function setSnapshotSoftDeleted(
   env: Env,
   dateKey: string,
@@ -5046,7 +5149,7 @@ async function getLatestActiveAnalysisFromD1(env: Env): Promise<AnalysisResult |
     `SELECT date_key FROM etic_snapshots WHERE deleted_at_iso IS NULL ORDER BY date_key DESC LIMIT 1`,
   ).first<{ date_key: string }>();
   if (!row?.date_key) return null;
-  return readJson<AnalysisResult>(env, `analyses/${row.date_key}.json`);
+  return readAnalysisForDateKey(env, row.date_key);
 }
 
 /** Keep R2 analyses/latest.json aligned with the newest non-deleted D1 snapshot. */
@@ -6224,7 +6327,10 @@ function renderYardAppHtml(): string {
         font-size: 12px;
         justify-self: end;
         max-width: 200px;
+        color: var(--muted);
       }
+      .yard-desktop-walker b { color: var(--text); }
+      .yard-desktop-walker a { color: var(--accent); font-weight: 700; }
       .yard-desktop-walker.walker-row.input { max-width: 200px; }
       .yard-desktop-walker.walker-row.input input {
         height: 32px;
@@ -6439,7 +6545,7 @@ function renderYardAppHtml(): string {
       </div>
       <div class="search-row">
         <input id="search" type="search" inputmode="search" placeholder="Search asset, VIN, shop, location…" autocomplete="off" />
-        <button class="find-btn" id="find-btn" aria-label="Found unlisted asset">+ Find</button>
+        <button class="find-btn" id="find-btn" aria-label="Found asset with no open work order">+ Find</button>
       </div>
       <div id="walker" class="walker-row"></div>
     </header>
@@ -6463,7 +6569,7 @@ function renderYardAppHtml(): string {
         </div>
         <div class="yard-desktop-search">
           <input id="search-desk" type="search" inputmode="search" placeholder="Search asset, VIN, shop, location…" autocomplete="off" />
-          <button type="button" class="yard-desktop-find" id="find-btn-desk">Find unlisted…</button>
+          <button type="button" class="yard-desktop-find" id="find-btn-desk">Found, no WO…</button>
         </div>
         <div class="yard-desktop-stats" aria-live="polite">
           <b data-stat="t-due">0</b> due · <b data-stat="t-today">0</b> today
@@ -6482,7 +6588,7 @@ function renderYardAppHtml(): string {
     </div>
 
     <div class="yard-desk" id="yard-desk">
-      <p class="yard-desk-hint">Search and pick a row for location, notes, and history. <span style="color:var(--muted)">NCE and Below MEL tags are work-order context only. Unlisted is the only extra queue besides the check cadence.</span></p>
+      <p class="yard-desk-hint">Search and pick a row for location, notes, and history. <span style="color:var(--muted)">NCE and Below MEL tags are work-order context only. Items marked Found, no open WO need a work-order or records fix.</span></p>
       <div class="yard-desk-split">
         <div class="yard-desk-table-wrap">
           <table class="yard-desk-table" aria-label="Yard vehicle lookup">
@@ -6582,8 +6688,8 @@ function renderYardAppHtml(): string {
 
   <div class="modal-overlay" id="find-modal" aria-hidden="true">
     <div class="modal" role="dialog" aria-labelledby="find-title">
-      <h3 id="find-title">Found unlisted asset</h3>
-      <p class="hint">Floor-to-book: log a vehicle you found in the yard that doesn't show up in the latest ETIC. It'll show as "Unlisted" until a fleet manager reconciles it.</p>
+      <h3 id="find-title">Found, no open WO</h3>
+      <p class="hint">Log a vehicle you found in the yard that does not have an open work order in the latest ETIC. It will show in Needs Fix until a fleet manager opens a WO or corrects the record.</p>
       <label>Asset / tail / bumper number
         <input id="find-asset-id" type="text" inputmode="text" autocapitalize="characters" placeholder="e.g. L-3157" />
       </label>
@@ -6748,13 +6854,12 @@ function renderYardAppHtml(): string {
       return String(s == null ? "" : s).trim().toUpperCase();
     }
 
-    /** True for the "Due for check" filter: check cadence only (never / due / overdue / fresh+never path).
-     *  Floor-to-book unlisted assets (isUnlisted) are a separate FM&A / Findings queue — not "due for another walk"
-     *  because they are not on the latest ETIC roster. NCE / below MEL stay as row badges only. */
+    /** Due means latest-ingest open WO plus no present check inside the yard interval. */
     function yardDueForCheck(a){
       if (a.isUnlisted) return false;
-      if (a.rollingState === "due" || a.rollingState === "overdue" || a.rollingState === "never") return true;
-      return false;
+      if (!(Number(a.openWoCount) > 0)) return false;
+      if (!a.lastCheckedAtIso) return true;
+      return Number(a.daysSinceLastCheck) >= Number((state.roster && state.roster.intervalDays) || 7);
     }
 
     function applyFilter(){
@@ -6803,7 +6908,7 @@ function renderYardAppHtml(): string {
         // Badges = orthogonal flags only. The colored age line below already
         // conveys never/due/overdue/done, so we don't repeat it here.
         var badges = "";
-        if (a.isUnlisted) badges += '<span class="badge unlisted">Unlisted</span>';
+        if (a.isUnlisted) badges += '<span class="badge unlisted">Found, no WO</span>';
         if (a.isNewAsset) badges += '<span class="badge new">NEW</span>';
         if (a.isNce) badges += '<span class="badge nce">NCE</span>';
         if (a.isBelowMel) badges += '<span class="badge below-mel">Below MEL</span>';
@@ -6870,7 +6975,7 @@ function renderYardAppHtml(): string {
     function formatLastParkedMeta(a){
       if (!a) return "";
       if (a.isNeverChecked) {
-        return "Location from ETIC only — no yard check recorded yet.";
+        return "No yard check location recorded yet.";
       }
       var iso = a.lastCheckedAtIso;
       var by = (a.lastCheckedBy || "").trim();
@@ -7246,9 +7351,9 @@ function renderYardAppHtml(): string {
                 var rmk = (w.remarks || "").trim();
                 return "WO " + w.workOrderId + (w.shop ? " (" + w.shop + ")" : "") + (rmk ? " — " + escapeHtml(rmk.length > 120 ? rmk.slice(0, 120) + "\u2026" : rmk) : "");
               });
-              det.push("<span class=\"history-etic\">Book " + escapeHtml(fmtYardSnapshotKey(sk)) + ":</span> " + wparts.join("; "));
+              det.push('<span class="history-etic">Book ' + escapeHtml(fmtYardSnapshotKey(sk)) + ':</span> ' + wparts.join("; "));
             } else {
-              det.push("<span class=\"history-etic\">ETIC " + escapeHtml(fmtYardSnapshotKey(sk)) + " — no open WOs on that snapshot for this ID.</span>");
+              det.push('<span class="history-etic">ETIC ' + escapeHtml(fmtYardSnapshotKey(sk)) + ' — no open WOs on that snapshot for this ID.</span>');
             }
           }
           var chg = changelogBlockForCheck(c.id, allEdits);
@@ -7298,9 +7403,9 @@ function renderYardAppHtml(): string {
 
       var unlistedBanner = a.isUnlisted
         ? '<div class="unlisted-banner">' +
-            '<b>Unlisted in latest ETIC</b>' +
-            'A walker logged this asset, but it doesn\u2019t appear in the most recent xlsx. ' +
-            'Have a fleet manager open a WO or retire the record.' +
+            '<b>Found, no open WO</b>' +
+            'A walker logged this asset, but it does not have an open work order in the latest ETIC. ' +
+            'Have a fleet manager open a WO or correct the record.' +
           '</div>'
         : '';
 
@@ -7315,7 +7420,7 @@ function renderYardAppHtml(): string {
           resolved: "Resolved", in_progress: "In progress", dismissed: "Dismissed",
           wo_opened: "WO opened", retired: "Retired", reassigned: "Reassigned"
         };
-        var kindLabels = { missing: "Missing", unlisted: "Unlisted", discrepancy: "Discrepancy", unknown: "Unknown" };
+        var kindLabels = { missing: "Missing", unlisted: "Found, no open WO", discrepancy: "Discrepancy", unknown: "Unknown" };
         var label = resLabels[act.resolution] || act.resolution;
         var kindLbl = kindLabels[act.kind] || act.kind;
         var woTxt = act.woOpened ? " (WO #" + escapeHtml(act.woOpened) + ")" : "";
@@ -7726,7 +7831,7 @@ function renderYardAppHtml(): string {
         });
     }
 
-    /* ----- find / floor-to-book modal ----- */
+    /* ----- find / needs-fix modal ----- */
     function openYardPhotoLbMob(url) {
       var m = $("yard-photo-lb-m");
       var img = $("yard-photo-lb-img-m");
@@ -10647,17 +10752,24 @@ function renderDashboardHtml(): string {
 
     /* FM&A finding chips */
     .yard-findings-chip {
-      background: var(--bg2); border: 1px solid var(--border); color: var(--text);
-      padding: 6px 12px; border-radius: 999px; font-size: 13px; cursor: pointer;
+      background: #ffffff; border: 1px solid var(--border); color: var(--text-dim);
+      padding: 7px 13px; border-radius: 999px; font-size: 13px; cursor: pointer;
+      box-shadow: 0 1px 2px rgba(15,30,60,0.04);
     }
-    .yard-findings-chip.active { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 600; }
-    .yard-findings-chip .count { opacity: 0.7; margin-left: 6px; font-size: 12px; }
+    .yard-findings-chip:hover { border-color: rgba(0,58,140,0.25); color: var(--accent); }
+    .yard-findings-chip.active {
+      background: var(--accent); color: #ffffff; border-color: var(--accent);
+      font-weight: 700; box-shadow: 0 3px 10px rgba(0,58,140,0.18);
+    }
+    .yard-findings-chip .count { opacity: 0.78; margin-left: 6px; font-size: 12px; }
+    .yard-findings-chip.active .count { opacity: 0.96; }
 
     /* Finding cards */
     .yard-finding {
       display: grid; grid-template-columns: auto 72px 1fr auto; gap: 12px 14px;
-      padding: 14px 16px; border: 1px solid var(--border); border-radius: 12px;
-      background: var(--bg1); margin-bottom: 8px;
+      padding: 14px 16px; border: 1px solid rgba(15,30,60,0.10); border-radius: 14px;
+      background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+      margin-bottom: 10px; box-shadow: 0 1px 2px rgba(15,30,60,0.04);
     }
     .yard-finding.acked { opacity: 0.55; }
     .yard-finding-icon {
@@ -10666,7 +10778,7 @@ function renderDashboardHtml(): string {
       font-size: 18px; font-weight: 700; box-sizing: border-box;
     }
     .yard-finding-icon.missing { background: #fde8eb; color: var(--danger); border: 1px solid #f1a3ab; }
-    .yard-finding-icon.unlisted { background: #fff8e6; color: #8a5a00; border: 1px solid #e7c779; }
+    .yard-finding-icon.unlisted { background: #fff4d6; color: #8a5a00; border: 1px solid #e7c779; }
     .yard-finding-icon.discrepancy { background: #e8eef8; color: #003a8c; border: 1px solid #9fbce0; }
     .yard-finding-icon.unknown { background: #eef1f5; color: #3d4a5c; border: 1px solid var(--border); }
     .yard-finding-body { min-width: 0; }
@@ -10703,6 +10815,14 @@ function renderDashboardHtml(): string {
       object-fit: contain; border-radius: 8px;
     }
     .yard-finding-meta { color: var(--muted); font-size: 13px; margin-top: 2px; }
+    .yard-finding-kind {
+      display: inline-flex; align-items: center; vertical-align: middle;
+      background: #fff4d6; color: #7a4d00; border: 1px solid #e7c779;
+      font-size: 10px; font-weight: 800; padding: 2px 7px; border-radius: 5px;
+      text-transform: uppercase; letter-spacing: 0.04em; margin-left: 4px;
+    }
+    .yard-finding-kind.discrepancy { background: #e8eef8; color: #003a8c; border-color: #9fbce0; }
+    .yard-finding-kind.unknown { background: #eef1f5; color: #3d4a5c; border-color: var(--border); }
     .yard-finding-disc {
       margin-top: 6px; font-size: 13px; color: var(--text);
       white-space: pre-wrap; word-break: break-word;
@@ -10713,7 +10833,11 @@ function renderDashboardHtml(): string {
       border: 1px solid var(--border); background: var(--bg2); color: var(--text);
       white-space: nowrap;
     }
-    .yard-finding-actions button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 600; }
+    .yard-finding-actions button.primary {
+      background: var(--accent); color: #ffffff; border-color: var(--accent);
+      font-weight: 700; box-shadow: 0 2px 8px rgba(0,58,140,0.18);
+    }
+    .yard-finding-actions button.primary:hover { background: var(--accent-strong); border-color: var(--accent-strong); }
     .yard-finding-actions button.ghost { background: transparent; }
     .yard-finding-action {
       grid-column: 1 / -1; margin-top: 8px; padding-top: 8px;
@@ -14380,7 +14504,7 @@ function renderDashboardHtml(): string {
           <nav class="yard-subnav" id="yard-subnav" style="padding:0 20px;display:flex;gap:6px;border-bottom:1px solid var(--border);">
             <button type="button" class="yard-subtab active" data-yard-sub="roster">Fleet list</button>
             <button type="button" class="yard-subtab" data-yard-sub="findings">
-              Findings <span class="yard-subbadge" id="yard-sub-findings-count">0</span>
+              Needs Fix <span class="yard-subbadge" id="yard-sub-findings-count">0</span>
             </button>
             <button type="button" class="yard-subtab" data-yard-sub="activity">Recent activity</button>
           </nav>
@@ -14389,7 +14513,7 @@ function renderDashboardHtml(): string {
             <div class="yard-findings-controls" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px;">
               <div class="yard-findings-chips" id="yard-findings-chips" style="display:flex;gap:6px;flex-wrap:wrap;">
                 <button type="button" class="yard-findings-chip active" data-finding-kind="all">All <span class="count" id="ff-all">0</span></button>
-                <button type="button" class="yard-findings-chip" data-finding-kind="unlisted">Unlisted <span class="count" id="ff-unlisted">0</span></button>
+                <button type="button" class="yard-findings-chip" data-finding-kind="unlisted">Found, no open WO <span class="count" id="ff-unlisted">0</span></button>
                 <button type="button" class="yard-findings-chip" data-finding-kind="discrepancy">Discrepancies <span class="count" id="ff-discrepancy">0</span></button>
               </div>
               <label style="margin-left:auto;display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted);cursor:pointer;"
@@ -14408,6 +14532,19 @@ function renderDashboardHtml(): string {
           </div>
 
           <div id="yard-sub-activity" class="yard-subpanel hidden" style="padding:16px 20px;">
+            <div class="yard-findings-controls" style="display:flex;gap:8px;align-items:end;flex-wrap:wrap;margin-bottom:12px;">
+              <label class="field" style="max-width:170px;">
+                <span class="label">From</span>
+                <input type="date" id="yard-report-from" />
+              </label>
+              <label class="field" style="max-width:170px;">
+                <span class="label">To</span>
+                <input type="date" id="yard-report-to" />
+              </label>
+              <button type="button" class="ghost" id="yard-report-apply" style="padding:8px 14px;">Run report</button>
+              <a class="ghost" id="yard-report-csv" href="/api/yard/activity?format=csv" style="padding:8px 14px;text-decoration:none;">Export CSV</a>
+              <span class="hint" style="margin-left:auto;">Checks and Needs Fix actions in the selected date range.</span>
+            </div>
             <div id="yard-activity-list" class="yard-activity-list">Loading\u2026</div>
           </div>
         </section>
@@ -14419,7 +14556,7 @@ function renderDashboardHtml(): string {
               <h3 style="margin:0;" id="yard-resolve-title">Resolve finding</h3>
               <button type="button" class="ghost" id="yard-resolve-close" aria-label="Close" style="font-size:20px;line-height:1;padding:4px 10px;">\u00D7</button>
             </header>
-            <p class="hint" id="yard-resolve-sub" style="margin:0 0 12px;"></p>
+            <div class="hint" id="yard-resolve-sub" style="margin:0 0 12px;"></div>
             <div class="settings-grid">
               <label class="field">
                 <span class="label">What did you do?</span>
@@ -15332,6 +15469,12 @@ function renderDashboardHtml(): string {
       const qs = new URLSearchParams(location.search);
       const qTab = String(qs.get("tab") || "").trim().toLowerCase();
       if (qTab === "waivers") return { tab: "waivers", dateKey: null, workOrderId: null };
+      if (qTab === "yard") {
+        let yv = String(qs.get("yard") || qs.get("yv") || "").trim().toLowerCase();
+        if (yv === "needs-fix" || yv === "needsfix") yv = "findings";
+        return { tab: "yard", dateKey: null, workOrderId: null, abuseCaseId: null, yardSub: yv || null };
+      }
+      if (qTab) return { tab: qTab, dateKey: null, workOrderId: null, abuseCaseId: null };
       const raw = (location.hash || "").replace(/^#/, "");
       if (!raw) return { tab: "snapshot", dateKey: null, workOrderId: null, abuseCaseId: null };
       if (raw.indexOf("wo=") === 0) {
@@ -15355,6 +15498,22 @@ function renderDashboardHtml(): string {
         return { tab: "snapshot", dateKey: raw, workOrderId: null, abuseCaseId: null };
       }
       return { tab: "snapshot", dateKey: null, workOrderId: null, abuseCaseId: null };
+    }
+
+    function syncDashboardQuery(tab, extras) {
+      try {
+        const u = new URL(location.href);
+        u.hash = "";
+        u.searchParams.set("tab", tab);
+        ["yard", "yv", "wv", "waiverView"].forEach(function (k) { u.searchParams.delete(k); });
+        Object.entries(extras || {}).forEach(function ([k, v]) {
+          if (v == null || v === "") u.searchParams.delete(k);
+          else u.searchParams.set(k, String(v));
+        });
+        history.replaceState(null, "", u.pathname + u.search + u.hash);
+      } catch {
+        // URL state is convenience only.
+      }
     }
 
     let historyEntries = [];
@@ -18228,6 +18387,11 @@ function renderDashboardHtml(): string {
         setMainTab("waivers");
         return;
       }
+      if (r.tab === "yard") {
+        yardFmState.subTab = r.yardSub || "roster";
+        setMainTab("yard");
+        return;
+      }
       if (r.tab === "authz") {
         setMainTab("authz");
         return;
@@ -18971,7 +19135,7 @@ function renderDashboardHtml(): string {
         if (selectedWoId) setHashWorkOrder(selectedWoId);
       });
       const smxTabBtn = document.getElementById("tab-schedule-mx");
-      if (smxTabBtn) smxTabBtn.addEventListener("click", function () { setMainTab("smx"); });
+      if (smxTabBtn) smxTabBtn.addEventListener("click", function () { setMainTab("smx"); syncDashboardQuery("smx"); });
       const authzTabBtn = document.getElementById("tab-authz");
       if (authzTabBtn) {
         authzTabBtn.addEventListener("click", function () {
@@ -18996,19 +19160,19 @@ function renderDashboardHtml(): string {
       const smxQ = document.getElementById("smx-query");
       if (smxQ) smxQ.addEventListener("input", function () { renderScheduleMxTable(); });
       const melTabBtn = document.getElementById("tab-mel");
-      if (melTabBtn) melTabBtn.addEventListener("click", function () { setMainTab("mel"); });
+      if (melTabBtn) melTabBtn.addEventListener("click", function () { setMainTab("mel"); syncDashboardQuery("mel"); });
       const meetTabBtn = document.getElementById("tab-meeting");
-      if (meetTabBtn) meetTabBtn.addEventListener("click", function () { setMainTab("meeting"); });
+      if (meetTabBtn) meetTabBtn.addEventListener("click", function () { setMainTab("meeting"); syncDashboardQuery("meeting"); });
       const yardTabBtn = document.getElementById("tab-yard");
-      if (yardTabBtn) yardTabBtn.addEventListener("click", function () { setMainTab("yard"); });
+      if (yardTabBtn) yardTabBtn.addEventListener("click", function () { setMainTab("yard"); syncDashboardQuery("yard", { yard: yardFmState.subTab || "roster" }); });
       const wvTabBtn = document.getElementById("tab-waivers");
-      if (wvTabBtn) wvTabBtn.addEventListener("click", function () { setMainTab("waivers"); });
+      if (wvTabBtn) wvTabBtn.addEventListener("click", function () { setMainTab("waivers"); syncDashboardQuery("waivers"); });
       const abuseTabBtn = document.getElementById("tab-abuse-tracker");
-      if (abuseTabBtn) abuseTabBtn.addEventListener("click", function () { setMainTab("abuse-tracker"); });
+      if (abuseTabBtn) abuseTabBtn.addEventListener("click", function () { setMainTab("abuse-tracker"); syncDashboardQuery("abuse-tracker"); });
       const askTabBtn = document.getElementById("tab-ask");
-      if (askTabBtn) askTabBtn.addEventListener("click", function () { setMainTab("ask"); });
+      if (askTabBtn) askTabBtn.addEventListener("click", function () { setMainTab("ask"); syncDashboardQuery("ask"); });
       const setTabBtn = document.getElementById("tab-settings");
-      if (setTabBtn) setTabBtn.addEventListener("click", function () { setMainTab("settings"); });
+      if (setTabBtn) setTabBtn.addEventListener("click", function () { setMainTab("settings"); syncDashboardQuery("settings"); });
 
       askInit();
 
@@ -22091,8 +22255,8 @@ function renderDashboardHtml(): string {
        ====================================================================== */
     const yardFmState = {
       wired: false,
-      // Default to Fleet list — embedded walker app. Findings triages
-      // unlisted/discrepancies only (not "not checked"; that's on the list).
+      // Default to Fleet list — embedded walker app. Needs Fix triages
+      // found-with-no-WO/discrepancies only (not "not checked"; that's on the list).
       subTab: "roster",
       findings: [],
       totals: { total: 0, missing: 0, unlisted: 0, discrepancy: 0, unknown: 0, acknowledged: 0 },
@@ -22101,11 +22265,11 @@ function renderDashboardHtml(): string {
       activity: [],
       resolveTarget: null, // { assetId, kind, checkId, asset }
     };
-    // Kinds: unlisted / discrepancy / unknown (legacy). Absence-derived
-    // "missing" is no longer listed in the queue — see Fleet list instead.
+    // Internal kinds are stable API values; labels below are what users see.
+    // Absence-derived "missing" is no longer listed in the queue — see Fleet list instead.
     const FINDING_LABELS = {
       missing: "Not seen",
-      unlisted: "Unlisted",
+      unlisted: "Found, no open WO",
       discrepancy: "Discrepancy",
       unknown: "Unknown",
     };
@@ -22232,7 +22396,10 @@ function renderDashboardHtml(): string {
     }
 
     function yardActivateSub(sub) {
+      if (sub === "needs-fix" || sub === "needsfix") sub = "findings";
+      sub = (sub === "findings" || sub === "activity" || sub === "roster") ? sub : "roster";
       yardFmState.subTab = sub;
+      syncDashboardQuery("yard", { yard: sub === "findings" ? "needs-fix" : sub });
       ["findings", "roster", "activity"].forEach(function (s) {
         const tabEl = document.querySelector('[data-yard-sub="' + s + '"]');
         const panelEl = document.getElementById("yard-sub-" + s);
@@ -22303,9 +22470,9 @@ function renderDashboardHtml(): string {
           list.innerHTML =
             '<div class="hint" style="padding:32px 16px;text-align:center;max-width:640px;margin:0 auto;">' +
               '<div style="font-size:18px;color:var(--text);font-weight:600;margin-bottom:8px;">No yard checks yet</div>' +
-              '<p style="margin:0 0 12px;">Walkers tag what they actually see. Findings appear here automatically. Each one is:</p>' +
+              '<p style="margin:0 0 12px;">Walkers tag what they actually see. Needs Fix items appear here automatically. Each one is:</p>' +
               '<ul style="text-align:left;display:inline-block;line-height:1.7;">' +
-                '<li><b>Unlisted</b> \u2014 walker logged an asset that isn\u2019t on the latest ETIC (floor-to-book reconciliation).</li>' +
+                '<li><b>Found, no open WO</b> \u2014 walker logged an asset that has no open WO in the latest ingest.</li>' +
                 '<li><b>Discrepancy</b> \u2014 walker noted something (flat tire, windows down, etc.).</li>' +
               '</ul>' +
               '<p style="margin:12px 0 0;font-size:13px;color:var(--muted);">Vehicles waiting for a yard walk (due / never checked) appear on the <b>Fleet list</b> tab, not here.</p>' +
@@ -22314,7 +22481,7 @@ function renderDashboardHtml(): string {
             '</div>';
         } else {
           list.innerHTML = '<div class="hint" style="padding:24px;text-align:center;">' +
-            (showAck ? "Nothing matches that filter." : "All open findings cleared. \uD83C\uDF89 (Toggle \u201CShow resolved\u201D to see history.)") +
+            (showAck ? "Nothing matches that filter." : "All Needs Fix items cleared. \uD83C\uDF89 (Toggle \u201CShow resolved\u201D to see history.)") +
             '</div>';
         }
         return;
@@ -22410,11 +22577,20 @@ function renderDashboardHtml(): string {
       title.textContent = FINDING_LABELS[kind] + " \u2014 " + assetId;
       const a = finding.asset || {};
       const ctx = [];
-      if (a.shop) ctx.push("Shop " + a.shop);
-      if (a.owningUnit) ctx.push("Unit " + a.owningUnit);
-      if (a.makeModel) ctx.push(a.makeModel);
-      if (finding.triggerCheck && finding.triggerCheck.discrepancies) {
-        ctx.push('"' + finding.triggerCheck.discrepancies + '"');
+      [
+        a.owningUnit ? "Unit " + a.owningUnit : "",
+        a.makeModel || "",
+        a.shop ? "Shop " + a.shop : "",
+        a.lastLocation ? "Parked " + a.lastLocation : "",
+        Number.isFinite(Number(a.openWoCount)) ? (Number(a.openWoCount) || 0) + " open WO" : "",
+      ].forEach(function (x) { if (String(x || "").trim()) ctx.push(x); });
+      if (finding.triggerCheck) {
+        ctx.push("Seen " + fmtRelTs(finding.triggerCheck.checkedAtIso) + (finding.triggerCheck.checkedBy ? " by " + finding.triggerCheck.checkedBy : ""));
+        if (finding.triggerCheck.sourceDateKey) ctx.push("Book " + finding.triggerCheck.sourceDateKey);
+        if (finding.triggerCheck.discrepancies) ctx.push('"' + finding.triggerCheck.discrepancies + '"');
+      }
+      if (finding.fleetFmaNotes) {
+        ctx.push("Fleet notes: " + finding.fleetFmaNotes);
       }
       sub.textContent = ctx.join(" \u00B7 ");
       // Pre-fill last-known values
@@ -22457,6 +22633,16 @@ function renderDashboardHtml(): string {
         });
         const j = await r.json();
         if (!r.ok) throw new Error(j.error || "save failed");
+        const key = t.assetId + "|" + t.kind;
+        yardFmState.findings = (yardFmState.findings || []).map(function (f) {
+          if ((f.assetId + "|" + f.kind) !== key) return f;
+          f.isAcknowledged = true;
+          f.lastAction = j.action || f.lastAction;
+          return f;
+        });
+        if (yardFmState.totals) yardFmState.totals.acknowledged = (yardFmState.totals.acknowledged || 0) + 1;
+        yardRenderFindingsCounts();
+        yardRenderFindings();
         yardLoadFindings();
         return true;
       } catch (e) {

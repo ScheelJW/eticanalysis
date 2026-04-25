@@ -2,11 +2,9 @@
 // taps each vehicle's actual location plus any new discrepancies. Backed by
 // D1 tables created in migrations/0014_yard_check.sql.
 //
-// The "asset roster" for a session is derived from the latest snapshot's
-// work_order_state rows (one entry per asset_id). We snapshot the asset list
-// at session-create time only conceptually — in practice we always re-derive
-// from the latest snapshot referenced by the session's source_date_key so the
-// list stays correct even if a new xlsx lands mid-walk.
+// The "asset roster" comes from a specific ETIC snapshot date. Rolling checks
+// also persist the active asset row JSON so later ingests cannot change what
+// the walker saw when they marked that vehicle present.
 
 type Env = { ETIC_SNAPSHOTS: D1Database; ETIC_BUCKET: R2Bucket };
 
@@ -160,24 +158,60 @@ async function hasWorkOrderSnapshotRowsForDate(env: Env, dateKey: string): Promi
   return !!r;
 }
 
+async function hasFleetSnapshotRowsForDate(env: Env, dateKey: string): Promise<boolean> {
+  if (!dateKey) return false;
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT 1 AS ok FROM fleet_p_a_snapshot WHERE snapshot_date_key = ? LIMIT 1`,
+  )
+    .bind(dateKey)
+    .first<{ ok: number }>();
+  return !!r;
+}
+
+async function hasYardRosterRowsForDate(env: Env, dateKey: string): Promise<boolean> {
+  return await hasFleetSnapshotRowsForDate(env, dateKey) || await hasWorkOrderSnapshotRowsForDate(env, dateKey);
+}
+
 /**
- * Yard should follow the newest successfully analyzed workbook date, even when
- * etic_snapshots lags briefly behind due to background post-processing.
+ * Yard follows the newest D1 snapshot that has extracted roster rows. R2 latest
+ * can lag after rebuilds, but the walker needs the latest queryable D1 roster.
  */
 async function getLatestSnapshotDateKey(env: Env): Promise<string> {
+  let row = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT e.date_key
+       FROM etic_snapshots e
+      WHERE e.deleted_at_iso IS NULL
+        AND (
+          EXISTS (SELECT 1 FROM fleet_p_a_snapshot f WHERE f.snapshot_date_key = e.date_key)
+          OR EXISTS (SELECT 1 FROM work_order_snapshot w WHERE w.snapshot_date_key = e.date_key)
+        )
+      ORDER BY e.date_key DESC
+      LIMIT 1`,
+  ).first<{ date_key: string }>();
+  if (row?.date_key) return row.date_key;
+
+  row = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT snapshot_date_key AS date_key
+       FROM fleet_p_a_snapshot
+      GROUP BY snapshot_date_key
+      ORDER BY snapshot_date_key DESC
+      LIMIT 1`,
+  ).first<{ date_key: string }>();
+  if (row?.date_key) return row.date_key;
+
   try {
     const latestObj = await env.ETIC_BUCKET.get("analyses/latest.json");
     if (latestObj) {
       const latest = JSON.parse(await latestObj.text()) as { dateKey?: string };
       const dateKey = String(latest?.dateKey ?? "").trim();
-      if (/^\d{4}-\d{2}-\d{2}$/.test(dateKey) && await hasWorkOrderSnapshotRowsForDate(env, dateKey)) {
+      if (/^\d{4}-\d{2}-\d{2}$/.test(dateKey) && await hasYardRosterRowsForDate(env, dateKey)) {
         return dateKey;
       }
     }
   } catch {
     // Fall through to D1-based fallback.
   }
-  let row = await env.ETIC_SNAPSHOTS.prepare(
+  row = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT date_key FROM etic_snapshots WHERE deleted_at_iso IS NULL ORDER BY date_key DESC LIMIT 1`,
   ).first<{ date_key: string }>();
   if (!row?.date_key) {
@@ -322,58 +356,103 @@ function detectNce(raw: Record<string, unknown>): boolean {
   return false;
 }
 
+type YardRosterSourceRow = {
+  asset_id: string;
+  owning_unit: string | null;
+  shop: string | null;
+  mgmt_cd: string | null;
+  make_model: string | null;
+  veh_nomen: string | null;
+  mel_key: string | null;
+  mel_tier?: string | null;
+  raw_row_json: string | null;
+};
+
+function readYardAssetRow(row: YardRosterSourceRow): { prevLoc: string; vin: string; nce: boolean } {
+  let prevLoc = "";
+  let vin = "";
+  let nce = false;
+  if (row.raw_row_json) {
+    try {
+      const raw = JSON.parse(row.raw_row_json) as Record<string, unknown>;
+      prevLoc = extractLocation(raw);
+      vin = extractVinSerial(raw);
+      nce = detectNce(raw);
+    } catch {
+      // ignore JSON parse failures
+    }
+  }
+  return { prevLoc, vin, nce };
+}
+
+function collectLocationValues(row: YardRosterSourceRow, allLocations: Set<string>): void {
+  if (!row.raw_row_json) return;
+  try {
+    const raw = JSON.parse(row.raw_row_json) as Record<string, unknown>;
+    for (const [k, v] of Object.entries(raw)) {
+      const key = k.toLowerCase();
+      const val = String(v ?? "").trim();
+      if (val && key.includes("location")) allLocations.add(val);
+    }
+  } catch {
+    // ignore JSON parse failures
+  }
+}
+
 /**
- * Build the asset roster for a yard check from the work_order_snapshot rows
- * of a given snapshot. Aggregates per-asset across multiple open WOs and
- * collects every distinct location for the location dropdown.
+ * Build the yard-check roster from the full Fleet P&A snapshot, then overlay
+ * open-WO context from the same ETIC day. Checked assets outside Fleet P&A are
+ * added later by getRollingRoster as unlisted/floor-to-book finds.
  */
 export async function getYardRosterForDate(env: Env, dateKey: string): Promise<YardRoster> {
   if (!dateKey) return { assets: [], locations: [] };
-  const r = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT asset_id, owning_unit, shop, mgmt_cd, make_model, veh_nomen, mel_key, mel_tier, raw_row_json
-     FROM work_order_snapshot
-     WHERE snapshot_date_key = ? AND asset_id != ''`,
-  )
-    .bind(dateKey)
-    .all<{
-      asset_id: string;
-      owning_unit: string | null;
-      shop: string | null;
-      mgmt_cd: string | null;
-      make_model: string | null;
-      veh_nomen: string | null;
-      mel_key: string | null;
-      mel_tier: string | null;
-      raw_row_json: string | null;
-    }>();
+  const [fleetRows, woRows] = await Promise.all([
+    env.ETIC_SNAPSHOTS.prepare(
+      `SELECT asset_id, owning_unit, shop, mgmt_cd, make_model, veh_nomen, mel_key, raw_row_json
+       FROM fleet_p_a_snapshot
+       WHERE snapshot_date_key = ? AND asset_id != ''`,
+    )
+      .bind(dateKey)
+      .all<YardRosterSourceRow>(),
+    env.ETIC_SNAPSHOTS.prepare(
+      `SELECT asset_id, owning_unit, shop, mgmt_cd, make_model, veh_nomen, mel_key, mel_tier, raw_row_json
+       FROM work_order_snapshot
+       WHERE snapshot_date_key = ? AND asset_id != ''`,
+    )
+      .bind(dateKey)
+      .all<YardRosterSourceRow>(),
+  ]);
   const grouped = new Map<string, YardAsset>();
   const allLocations = new Set<string>();
-  for (const row of r.results ?? []) {
+
+  for (const row of fleetRows.results ?? []) {
     const id = (row.asset_id ?? "").trim();
     if (!id) continue;
+    collectLocationValues(row, allLocations);
+    const { prevLoc, vin, nce } = readYardAssetRow(row);
+    grouped.set(canonicalYardAssetKey(id), {
+      assetId: id,
+      owningUnit: row.owning_unit ?? "",
+      shop: row.shop ?? "",
+      mgmtCd: row.mgmt_cd ?? "",
+      makeModel: row.make_model ?? "",
+      vehNomen: row.veh_nomen ?? "",
+      melKey: row.mel_key ?? "",
+      melTier: "",
+      vinSerial: vin,
+      previousLocation: prevLoc,
+      openWoCount: 0,
+      isNce: nce,
+    });
+  }
+
+  for (const row of woRows.results ?? []) {
+    const id = (row.asset_id ?? "").trim();
+    if (!id) continue;
+    collectLocationValues(row, allLocations);
     const canon = canonicalYardAssetKey(id);
+    const { prevLoc, vin, nce } = readYardAssetRow(row);
     const existing = grouped.get(canon);
-    let prevLoc = "";
-    let vin = "";
-    let nce = false;
-    if (row.raw_row_json) {
-      try {
-        const raw = JSON.parse(row.raw_row_json) as Record<string, unknown>;
-        // Walk the row once for everything we need (location, VIN, NCE) AND
-        // collect every location-shaped value into the global dropdown set.
-        for (const [k, v] of Object.entries(raw)) {
-          const key = k.toLowerCase();
-          const val = String(v ?? "").trim();
-          if (!val) continue;
-          if (key.includes("location")) allLocations.add(val);
-        }
-        prevLoc = extractLocation(raw);
-        vin = extractVinSerial(raw);
-        nce = detectNce(raw);
-      } catch {
-        // ignore JSON parse failures
-      }
-    }
     if (!existing) {
       grouped.set(canon, {
         assetId: id,
@@ -389,20 +468,21 @@ export async function getYardRosterForDate(env: Env, dateKey: string): Promise<Y
         openWoCount: 1,
         isNce: nce,
       });
-    } else {
-      existing.openWoCount += 1;
-      if (!existing.previousLocation && prevLoc) existing.previousLocation = prevLoc;
-      if (!existing.vinSerial && vin) existing.vinSerial = vin;
-      if (!existing.owningUnit && row.owning_unit) existing.owningUnit = row.owning_unit;
-      if (!existing.shop && row.shop) existing.shop = row.shop;
-      if (!existing.mgmtCd && row.mgmt_cd) existing.mgmtCd = row.mgmt_cd;
-      if (!existing.makeModel && row.make_model) existing.makeModel = row.make_model;
-      if (!existing.vehNomen && row.veh_nomen) existing.vehNomen = row.veh_nomen;
-      if (!existing.melKey && row.mel_key) existing.melKey = row.mel_key;
-      if (!existing.melTier && row.mel_tier) existing.melTier = row.mel_tier;
-      if (nce) existing.isNce = true;
+      continue;
     }
+    existing.openWoCount += 1;
+    if (row.owning_unit) existing.owningUnit = row.owning_unit;
+    if (row.shop) existing.shop = row.shop;
+    if (row.mgmt_cd) existing.mgmtCd = row.mgmt_cd;
+    if (row.make_model) existing.makeModel = row.make_model;
+    if (row.veh_nomen) existing.vehNomen = row.veh_nomen;
+    if (row.mel_key) existing.melKey = row.mel_key;
+    if (row.mel_tier) existing.melTier = row.mel_tier;
+    if (prevLoc) existing.previousLocation = prevLoc;
+    if (vin) existing.vinSerial = vin;
+    if (nce) existing.isNce = true;
   }
+
   const assets = [...grouped.values()];
   assets.sort((a, b) => a.assetId.localeCompare(b.assetId, undefined, { numeric: true }));
   const locations = [...allLocations].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
@@ -589,9 +669,9 @@ export async function deleteSession(env: Env, sessionId: number): Promise<boolea
 
 /* =============================================================================
    ROLLING YARD CHECK MODEL
-   Each "check" is a row in yard_check (no session). An asset is "due" if its
-   most-recent check is older than the configured cadence (default 7 days),
-   or if no check has been recorded yet.
+   Each "check" is a row in yard_check (no session). The searchable roster is the
+   current fleet, but the "due" queue is intentionally narrower: assets with an
+   open WO on the latest ingest and no present check inside the cadence.
    ========================================================================== */
 
 /** How many days a check is fresh for. Override via app_config["yardCheckIntervalDays"]. */
@@ -606,6 +686,7 @@ export type YardCheckRow = {
   checkedBy: string;
   checkedAtIso: string;
   sourceDateKey: string;
+  assetSnapshotJson: string;
 };
 
 /** One correction applied to an existing `yard_check` row (see migrations/0022). */
@@ -707,6 +788,8 @@ type CheckReadRow = {
   checked_by: string | null;
   checked_at_iso: string;
   source_date_key: string | null;
+  snapshot_asset_json?: string | null;
+  asset_snapshot_json?: string | null;
 };
 
 function rowToCheck(r: CheckReadRow): YardCheckRow {
@@ -719,6 +802,7 @@ function rowToCheck(r: CheckReadRow): YardCheckRow {
     checkedBy: r.checked_by ?? "",
     checkedAtIso: r.checked_at_iso,
     sourceDateKey: r.source_date_key ?? "",
+    assetSnapshotJson: r.snapshot_asset_json ?? r.asset_snapshot_json ?? "",
   };
 }
 
@@ -752,6 +836,10 @@ function bucketState(daysSince: number | null, intervalDays: number): RollingAss
   if (daysSince >= intervalDays * 2) return "overdue";
   if (daysSince >= intervalDays) return "due";
   return "fresh";
+}
+
+function isOpenWoDue(openWoCount: number, daysSince: number | null, intervalDays: number): boolean {
+  return openWoCount > 0 && (daysSince === null || daysSince >= intervalDays);
 }
 
 /**
@@ -883,70 +971,38 @@ export async function getRollingRoster(env: Env): Promise<RollingRoster> {
       isNewAsset: isNew,
       isUnlisted: false,
       photoCount: photoByCanon.get(c) ?? 0,
-      lastLocation: lastLocByCanon.get(c) || a.previousLocation,
+      lastLocation: lastLocByCanon.get(c) || "",
       lastNotes: last?.notes ?? "",
       isBelowMel: belowMelAssets.has(c),
     });
     totals.total += 1;
-    if (state === "fresh") totals.fresh += 1;
-    else if (state === "due") totals.due += 1;
-    else if (state === "overdue") totals.overdue += 1;
-    else totals.never += 1;
+    if (isOpenWoDue(a.openWoCount, days, intervalDays)) {
+      if (state === "overdue" || state === "never") totals.overdue += 1;
+      else totals.due += 1;
+    } else {
+      totals.fresh += 1;
+    }
     if (last && last.at.slice(0, 10) === todayPrefix) totals.checkedToday += 1;
     if (last && days !== null && days < 7) totals.checkedThisWeek += 1;
   }
 
-  // Floor-to-book: any asset_id we have on record (yard_check) but isn't on
-  // the latest ETIC snapshot. Walkers found it; we surface it so a fleet
-  // manager can reconcile (open a WO, retire the asset, etc.).
+  // Do not append true floor-to-book IDs here. The Fleet list is strictly the
+  // current Excel Fleet P&A roster (plus WO overlay). Found IDs that are not in
+  // the workbook still surface in Needs Fix via listOpenFindings.
   for (const [c, last] of lastByAsset) {
     if (inLatestSnapshot.has(c)) continue;
-    const displayId = rosterByCanon.get(c)?.assetId ?? last.displayId;
-    const days = daysBetween(last.at, nowIso);
-    const state = bucketState(days, intervalDays);
-    out.push({
-      assetId: displayId,
-      owningUnit: "",
-      shop: "",
-      mgmtCd: "",
-      makeModel: "",
-      vehNomen: "",
-      melKey: "",
-      melTier: "",
-      vinSerial: "",
-      previousLocation: "",
-      openWoCount: 0,
-      isNce: false,
-      lastCheckedAtIso: last.at,
-      lastCheckedBy: last.by,
-      daysSinceLastCheck: days,
-      rollingState: state,
-      isNeverChecked: false,
-      isNewAsset: false,
-      isUnlisted: true,
-      photoCount: photoByCanon.get(c) ?? 0,
-      lastLocation: lastLocByCanon.get(c) || "",
-      lastNotes: last.notes ?? "",
-      isBelowMel: false,
-    });
-    totals.total += 1;
-    // Unlisted = not on latest ETIC roster (finding / floor-to-book). Do not
-    // fold into walk cadence due/overdue/fresh — those are for the fleet list
-    // only. Findings are tracked in the Findings UI instead.
     if (last.at.slice(0, 10) === todayPrefix) totals.checkedToday += 1;
+    const days = daysBetween(last.at, nowIso);
     if (days < 7) totals.checkedThisWeek += 1;
   }
 
   // Sort: never-checked first, then overdue, then due, then fresh; within
   // each bucket, oldest check first so the walker tackles the worst.
-  // Unlisted assets bubble to the top *within* their bucket as a hint to
-  // reconcile, but we don't override the cadence ordering itself.
   const order: Record<RollingAssetState, number> = { never: 0, overdue: 1, due: 2, fresh: 3 };
   out.sort((a, b) => {
     const oa = order[a.rollingState];
     const ob = order[b.rollingState];
     if (oa !== ob) return oa - ob;
-    if (a.isUnlisted !== b.isUnlisted) return a.isUnlisted ? -1 : 1;
     const da = a.daysSinceLastCheck ?? 1e9;
     const db = b.daysSinceLastCheck ?? 1e9;
     if (db !== da) return db - da;
@@ -986,6 +1042,19 @@ async function assetOnWorkOrderSnapshot(env: Env, dateKey: string, assetId: stri
   return !!row;
 }
 
+async function assetSnapshotJsonForCheck(env: Env, dateKey: string, assetId: string): Promise<string> {
+  if (!dateKey || !assetId) return "";
+  const roster = await getYardRosterForDate(env, dateKey);
+  const canon = canonicalYardAssetKey(assetId);
+  const asset = roster.assets.find((a) => canonicalYardAssetKey(a.assetId) === canon);
+  if (!asset) return "";
+  return JSON.stringify({ sourceDateKey: dateKey, asset });
+}
+
+function isMissingColumnError(err: unknown, column: string): boolean {
+  return String(err instanceof Error ? err.message : err).toLowerCase().includes(column.toLowerCase());
+}
+
 export async function recordCheck(env: Env, input: RecordCheckInput): Promise<YardCheckRow> {
   const assetId = input.assetId.trim();
   if (!assetId) throw new Error("assetId required");
@@ -1002,23 +1071,39 @@ export async function recordCheck(env: Env, input: RecordCheckInput): Promise<Ya
       );
     }
   }
+  const assetSnapshotJson = await assetSnapshotJsonForCheck(env, sourceDateKey, assetId);
   const nowIso = new Date().toISOString();
-  const r = await env.ETIC_SNAPSHOTS.prepare(
-    `INSERT INTO yard_check
-       (asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
-     RETURNING id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key`,
-  )
-    .bind(
-      assetId,
-      (input.location ?? "").trim(),
-      (input.discrepancies ?? "").trim(),
-      status,
-      (input.checkedBy ?? "").trim(),
-      nowIso,
-      sourceDateKey,
+  const values = [
+    assetId,
+    (input.location ?? "").trim(),
+    (input.discrepancies ?? "").trim(),
+    status,
+    (input.checkedBy ?? "").trim(),
+    nowIso,
+    sourceDateKey,
+  ] as const;
+  let r: CheckReadRow | null = null;
+  try {
+    r = await env.ETIC_SNAPSHOTS.prepare(
+      `INSERT INTO yard_check
+         (asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, snapshot_asset_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       RETURNING id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, snapshot_asset_json`,
     )
-    .first<CheckReadRow>();
+      .bind(...values, assetSnapshotJson)
+      .first<CheckReadRow>();
+  } catch (err) {
+    if (!isMissingColumnError(err, "snapshot_asset_json")) throw err;
+    r = await env.ETIC_SNAPSHOTS.prepare(
+      `INSERT INTO yard_check
+         (asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       RETURNING id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key`,
+    )
+      .bind(...values)
+      .first<CheckReadRow>();
+    if (r) r.snapshot_asset_json = assetSnapshotJson;
+  }
   if (!r) throw new Error("failed to record check");
   return rowToCheck(r);
 }
@@ -1050,7 +1135,7 @@ export async function updateYardCheck(env: Env, input: UpdateYardCheckInput): Pr
   if (!Number.isFinite(checkId) || checkId <= 0) throw new Error("checkId required");
 
   const r0 = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key
+    `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, snapshot_asset_json
      FROM yard_check WHERE id = ?`,
   )
     .bind(checkId)
@@ -1100,7 +1185,7 @@ export async function updateYardCheck(env: Env, input: UpdateYardCheckInput): Pr
     .run();
 
   const r1 = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key
+    `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, snapshot_asset_json
      FROM yard_check WHERE id = ?`,
   )
     .bind(checkId)
@@ -1158,7 +1243,7 @@ export async function getChecksForAsset(
   limit = 50,
 ): Promise<YardCheckRow[]> {
   const r = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key
+    `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, snapshot_asset_json
      FROM yard_check
      WHERE UPPER(TRIM(asset_id)) = UPPER(TRIM(?))
      ORDER BY checked_at_iso DESC LIMIT ?`,
@@ -1170,7 +1255,7 @@ export async function getChecksForAsset(
 
 export async function getRecentChecks(env: Env, limit = 100): Promise<YardCheckRow[]> {
   const r = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key
+    `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, snapshot_asset_json
      FROM yard_check ORDER BY checked_at_iso DESC LIMIT ?`,
   )
     .bind(limit)
@@ -1556,7 +1641,7 @@ export async function getAssetDetail(env: Env, assetId: string): Promise<AssetDe
    `listOpenFindings` returns only kinds that need explicit FM&A follow-up on
    walker-tagged evidence:
 
-     - UNLISTED — asset has yard_check history but not on latest ETIC snapshot
+     - UNLISTED — walker found/logged an asset with no open WO on latest ETIC
      - DISCREPANCY — latest check has non-empty discrepancy text
      - UNKNOWN — legacy rows only
 
@@ -1897,8 +1982,8 @@ export async function listOpenFindings(env: Env): Promise<{
   // Walk every asset that has any check history.
   for (const [assetId, latest] of latestAnyByAsset) {
     const ra = assetByKey.get(canonicalYardAssetKey(assetId));
-    const inLatest = !!ra && !ra.isUnlisted;
-    if (!inLatest) pushFinding(assetId, "unlisted", latest);
+    const hasCurrentOpenWo = !!ra && !ra.isUnlisted && (ra.openWoCount ?? 0) > 0;
+    if (!hasCurrentOpenWo) pushFinding(assetId, "unlisted", latest);
     if (latest.discrepancies && latest.discrepancies.trim()) {
       pushFinding(assetId, "discrepancy", latest);
     }
@@ -1992,16 +2077,42 @@ export type YardActivityItem =
   | { kind: "check"; at: string; check: YardCheckRow }
   | { kind: "action"; at: string; action: YardFindingAction };
 
-export async function getRecentActivity(env: Env, limit = 100): Promise<YardActivityItem[]> {
+export async function getRecentActivity(
+  env: Env,
+  limit = 100,
+  range?: { fromIso?: string; toIso?: string },
+): Promise<YardActivityItem[]> {
+  const fromIso = (range?.fromIso ?? "").trim();
+  const toIso = (range?.toIso ?? "").trim();
+  const checkWhere: string[] = [];
+  const actionWhere: string[] = [];
+  const checkParams: string[] = [];
+  const actionParams: string[] = [];
+  if (fromIso) {
+    checkWhere.push("checked_at_iso >= ?");
+    actionWhere.push("resolved_at_iso >= ?");
+    checkParams.push(fromIso);
+    actionParams.push(fromIso);
+  }
+  if (toIso) {
+    checkWhere.push("checked_at_iso < ?");
+    actionWhere.push("resolved_at_iso < ?");
+    checkParams.push(toIso);
+    actionParams.push(toIso);
+  }
+  const checkSql =
+    `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, snapshot_asset_json
+       FROM yard_check` +
+    (checkWhere.length ? ` WHERE ${checkWhere.join(" AND ")}` : "") +
+    ` ORDER BY checked_at_iso DESC LIMIT ?`;
+  const actionSql =
+    `SELECT id, asset_id, kind, check_id, resolution, wo_opened, note, resolved_by, resolved_at_iso
+       FROM yard_finding_action` +
+    (actionWhere.length ? ` WHERE ${actionWhere.join(" AND ")}` : "") +
+    ` ORDER BY resolved_at_iso DESC LIMIT ?`;
   const [checks, actions] = await Promise.all([
-    env.ETIC_SNAPSHOTS.prepare(
-      `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key
-       FROM yard_check ORDER BY checked_at_iso DESC LIMIT ?`,
-    ).bind(limit).all<CheckReadRow>(),
-    env.ETIC_SNAPSHOTS.prepare(
-      `SELECT id, asset_id, kind, check_id, resolution, wo_opened, note, resolved_by, resolved_at_iso
-       FROM yard_finding_action ORDER BY resolved_at_iso DESC LIMIT ?`,
-    ).bind(limit).all<FindingActionRow>(),
+    env.ETIC_SNAPSHOTS.prepare(checkSql).bind(...checkParams, limit).all<CheckReadRow>(),
+    env.ETIC_SNAPSHOTS.prepare(actionSql).bind(...actionParams, limit).all<FindingActionRow>(),
   ]);
   const items: YardActivityItem[] = [
     ...(checks.results ?? []).map((r) => ({ kind: "check" as const, at: r.checked_at_iso, check: rowToCheck(r) })),
