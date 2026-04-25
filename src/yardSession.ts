@@ -986,57 +986,23 @@ export async function getRollingRoster(env: Env): Promise<RollingRoster> {
     if (last && days !== null && days < 7) totals.checkedThisWeek += 1;
   }
 
-  // Floor-to-book: any asset_id we have on record (yard_check) but isn't on
-  // the latest ETIC snapshot. Walkers found it; we surface it so a fleet
-  // manager can reconcile (open a WO, retire the asset, etc.).
+  // Do not append true floor-to-book IDs here. The Fleet list is strictly the
+  // current Excel Fleet P&A roster (plus WO overlay). Found IDs that are not in
+  // the workbook still surface in Needs Fix via listOpenFindings.
   for (const [c, last] of lastByAsset) {
     if (inLatestSnapshot.has(c)) continue;
-    const displayId = rosterByCanon.get(c)?.assetId ?? last.displayId;
-    const days = daysBetween(last.at, nowIso);
-    const state = bucketState(days, intervalDays);
-    out.push({
-      assetId: displayId,
-      owningUnit: "",
-      shop: "",
-      mgmtCd: "",
-      makeModel: "",
-      vehNomen: "",
-      melKey: "",
-      melTier: "",
-      vinSerial: "",
-      previousLocation: "",
-      openWoCount: 0,
-      isNce: false,
-      lastCheckedAtIso: last.at,
-      lastCheckedBy: last.by,
-      daysSinceLastCheck: days,
-      rollingState: state,
-      isNeverChecked: false,
-      isNewAsset: false,
-      isUnlisted: true,
-      photoCount: photoByCanon.get(c) ?? 0,
-      lastLocation: lastLocByCanon.get(c) || "",
-      lastNotes: last.notes ?? "",
-      isBelowMel: false,
-    });
-    totals.total += 1;
-    // Unlisted = not on latest ETIC roster (finding / floor-to-book). Do not
-    // fold into walk cadence due/overdue/fresh — those are for the fleet list
-    // only. Findings are tracked in the Findings UI instead.
     if (last.at.slice(0, 10) === todayPrefix) totals.checkedToday += 1;
+    const days = daysBetween(last.at, nowIso);
     if (days < 7) totals.checkedThisWeek += 1;
   }
 
   // Sort: never-checked first, then overdue, then due, then fresh; within
   // each bucket, oldest check first so the walker tackles the worst.
-  // Unlisted assets bubble to the top *within* their bucket as a hint to
-  // reconcile, but we don't override the cadence ordering itself.
   const order: Record<RollingAssetState, number> = { never: 0, overdue: 1, due: 2, fresh: 3 };
   out.sort((a, b) => {
     const oa = order[a.rollingState];
     const ob = order[b.rollingState];
     if (oa !== ob) return oa - ob;
-    if (a.isUnlisted !== b.isUnlisted) return a.isUnlisted ? -1 : 1;
     const da = a.daysSinceLastCheck ?? 1e9;
     const db = b.daysSinceLastCheck ?? 1e9;
     if (db !== da) return db - da;

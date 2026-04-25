@@ -159,17 +159,15 @@ describe("Yard roster", () => {
     expect(fleetOnlyAsset?.previousLocation).toBe("Hangar 2");
   });
 
-  it("keeps checked non-fleet assets searchable as unlisted with latest yard location", async () => {
+  it("keeps checked non-fleet assets out of the Fleet list", async () => {
     const db = new MemoryD1();
     const env = { ETIC_SNAPSHOTS: db, ETIC_BUCKET: {} };
     await recordCheck(env as never, { assetId: "AF-GHOST", location: "Lot Z", checkedBy: "Walker" });
 
     const roster = await getRollingRoster(env as never);
-    const ghost = roster.assets.find((asset) => asset.assetId === "AF-GHOST");
 
-    expect(roster.assets.length).toBe(3);
-    expect(ghost?.isUnlisted).toBe(true);
-    expect(ghost?.lastLocation).toBe("Lot Z");
+    expect(roster.assets.map((asset) => asset.assetId)).toEqual(["AF123", "AF999"]);
+    expect(roster.assets.some((asset) => asset.assetId === "AF-GHOST")).toBe(false);
   });
 
   it("counts due checks only for latest open-WO assets older than the interval", async () => {
