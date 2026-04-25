@@ -116,6 +116,20 @@ export function calendarDaysBetween(aKey: string, bKey: string): number {
   return Math.floor((b - a) / (86400 * 1000));
 }
 
+/**
+ * Normalize workbook cell text before equality checks so Excel export noise
+ * (CRLF vs LF, NBSP, odd spaces) does not look like a "change" on the next
+ * report date. Real edits still land on the ingest dateKey for that workbook.
+ */
+export function normalizeWorkbookTextForCompare(raw: string | null | undefined): string {
+  let s = String(raw ?? "");
+  s = s.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  s = s.replace(/[\u00A0\u2007\u202F\uFEFF]/g, " ");
+  s = s.replace(/[\u1680\u2000-\u200A\u205F\u3000]/g, " ");
+  s = s.replace(/\s+/g, " ").trim();
+  return s;
+}
+
 type WoStateRow = {
   work_order_id: string;
   asset_id: string;
@@ -322,20 +336,20 @@ export async function ingestWorkOrderSnapshot(
 
     if (prev) {
       lastRemarkChange = prev.last_remark_change_date;
-      if (remarks !== (prev.remarks ?? "")) {
+      if (normalizeWorkbookTextForCompare(remarks) !== normalizeWorkbookTextForCompare(prev.remarks ?? "")) {
         lastRemarkChange = dateKey;
         statements.push(insertLog.bind(wid, dateKey, updatedAtIso, "remarks", prev.remarks ?? "", remarks));
       }
-      if (partsStatus !== (prev.parts_status ?? "")) {
+      if (normalizeWorkbookTextForCompare(partsStatus) !== normalizeWorkbookTextForCompare(prev.parts_status ?? "")) {
         statements.push(insertLog.bind(wid, dateKey, updatedAtIso, "parts_status", prev.parts_status ?? "", partsStatus));
       }
-      if (eticRaw !== (prev.etic_raw ?? "")) {
+      if (normalizeWorkbookTextForCompare(eticRaw) !== normalizeWorkbookTextForCompare(prev.etic_raw ?? "")) {
         statements.push(insertLog.bind(wid, dateKey, updatedAtIso, "etic", prev.etic_raw ?? "", eticRaw));
       }
       if (melTier !== (prev.mel_tier as MelTier)) {
         statements.push(insertLog.bind(wid, dateKey, updatedAtIso, "mel_tier", prev.mel_tier ?? "", melTier));
       }
-      if (shop !== (prev.shop ?? "")) {
+      if (normalizeWorkbookTextForCompare(shop) !== normalizeWorkbookTextForCompare(prev.shop ?? "")) {
         statements.push(insertLog.bind(wid, dateKey, updatedAtIso, "shop", prev.shop ?? "", shop));
       }
       pushCount = prev.etic_push_count ?? 0;
@@ -1552,7 +1566,7 @@ export async function getChangelogFromSnapshots(
     }
     const prev = rows[i - 1]!;
     const k = cur.snapshot_date_key;
-    if (cur.remarks !== (prev.remarks ?? "")) {
+    if (normalizeWorkbookTextForCompare(cur.remarks) !== normalizeWorkbookTextForCompare(prev.remarks ?? "")) {
       out.push({
         id: ++id,
         snapshot_date_key: k,
@@ -1562,7 +1576,7 @@ export async function getChangelogFromSnapshots(
         new_value: cur.remarks,
       });
     }
-    if (cur.parts_status !== (prev.parts_status ?? "")) {
+    if (normalizeWorkbookTextForCompare(cur.parts_status) !== normalizeWorkbookTextForCompare(prev.parts_status ?? "")) {
       out.push({
         id: ++id,
         snapshot_date_key: k,
@@ -1572,7 +1586,7 @@ export async function getChangelogFromSnapshots(
         new_value: cur.parts_status,
       });
     }
-    if (cur.etic_raw !== (prev.etic_raw ?? "")) {
+    if (normalizeWorkbookTextForCompare(cur.etic_raw) !== normalizeWorkbookTextForCompare(prev.etic_raw ?? "")) {
       out.push({
         id: ++id,
         snapshot_date_key: k,
@@ -1592,7 +1606,7 @@ export async function getChangelogFromSnapshots(
         new_value: cur.mel_tier,
       });
     }
-    if ((cur.shop ?? "") !== (prev.shop ?? "")) {
+    if (normalizeWorkbookTextForCompare(cur.shop ?? "") !== normalizeWorkbookTextForCompare(prev.shop ?? "")) {
       out.push({
         id: ++id,
         snapshot_date_key: k,
