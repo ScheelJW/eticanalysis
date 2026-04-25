@@ -806,7 +806,7 @@ function rowToCheck(r: CheckReadRow): YardCheckRow {
   };
 }
 
-/** openWoCount from recordCheck snapshot JSON; null if missing or legacy empty. */
+/** openWoCount from recordCheck snapshot JSON; null if missing or not parseable. */
 function openWoCountFromCheckSnapshot(check: YardCheckRow | null): number | null {
   if (!check?.assetSnapshotJson?.trim()) return null;
   try {
@@ -817,6 +817,38 @@ function openWoCountFromCheckSnapshot(check: YardCheckRow | null): number | null
     /* ignore */
   }
   return null;
+}
+
+async function countWorkOrdersOnSnapshotForAsset(
+  env: Env,
+  snapshotDateKey: string,
+  assetId: string,
+): Promise<number> {
+  const dk = snapshotDateKey.trim();
+  if (!dk || !assetId.trim()) return 0;
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT COUNT(*) AS c FROM work_order_snapshot
+     WHERE snapshot_date_key = ? AND UPPER(TRIM(asset_id)) = UPPER(TRIM(?))`,
+  )
+    .bind(dk, assetId)
+    .first<{ c: number }>();
+  return r?.c ?? 0;
+}
+
+/**
+ * True if the yard_check was logged against a book day that showed ≥1 WO row
+ * for this asset (same rule as openWoCount on the roster). Uses frozen JSON
+ * when present; otherwise COUNT on work_order_snapshot for source_date_key
+ * (covers legacy rows with empty snapshot_asset_json).
+ */
+async function hadOpenWoAtYardCheckTime(env: Env, check: YardCheckRow | null): Promise<boolean> {
+  if (!check) return false;
+  const fromJson = openWoCountFromCheckSnapshot(check);
+  if (fromJson !== null) return fromJson > 0;
+  const dk = (check.sourceDateKey ?? "").trim();
+  if (!dk) return false;
+  const n = await countWorkOrdersOnSnapshotForAsset(env, dk, check.assetId);
+  return n > 0;
 }
 
 async function getYardCheckIntervalDays(env: Env): Promise<number> {
@@ -2057,12 +2089,9 @@ export async function listOpenFindings(env: Env): Promise<{
   for (const [assetId, latest] of latestAnyByAsset) {
     const ra = assetByKey.get(canonicalYardAssetKey(assetId));
     const hasCurrentOpenWo = !!ra && !ra.isUnlisted && (ra.openWoCount ?? 0) > 0;
-    // Book state at check time (recordCheck stores roster + openWoCount in snapshot_asset_json).
-    // Without this, a newer ingest can close the WO and incorrectly resurrect "Found, no open WO"
-    // for a sighting that was logged while the asset still had an open WO on the book.
-    const openWoAtCheck = openWoCountFromCheckSnapshot(latest);
-    const hadOpenWoWhenWalkerSawIt =
-      openWoAtCheck !== null ? openWoAtCheck > 0 : false;
+    // Book state at check time: snapshot_asset_json when present, else COUNT
+    // on work_order_snapshot for source_date_key (legacy empty JSON).
+    const hadOpenWoWhenWalkerSawIt = await hadOpenWoAtYardCheckTime(env, latest);
     if (!hasCurrentOpenWo && !hadOpenWoWhenWalkerSawIt) {
       pushFinding(assetId, "unlisted", latest);
     }

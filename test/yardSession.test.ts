@@ -84,6 +84,11 @@ class MemoryD1 {
       return this.fleetRows;
     }
     if (sql.includes("FROM work_order_snapshot") && sql.includes("snapshot_date_key = ?")) {
+      if (sql.includes("COUNT(*)")) {
+        const aid = String(binds[1] ?? "").trim().toUpperCase();
+        const n = this.workOrderRows.filter((row) => String(row.asset_id ?? "").trim().toUpperCase() === aid).length;
+        return [{ c: n }];
+      }
       if (sql.includes("mel_tier = 'below'")) return [{ asset_id: "AF123" }];
       if (sql.includes("SELECT DISTINCT asset_id")) return this.workOrderRows.map((row) => ({ asset_id: row.asset_id }));
       return this.workOrderRows;
@@ -234,6 +239,26 @@ describe("Yard roster", () => {
           sourceDateKey: "2026-04-02",
           asset: { assetId: "AF123", openWoCount: 1, melTier: "below" },
         }),
+      },
+    ];
+    const env = { ETIC_SNAPSHOTS: db, ETIC_BUCKET: {} };
+    const result = await listOpenFindings(env as never);
+    expect(result.findings.some((f) => f.kind === "unlisted" && f.assetId === "AF123")).toBe(false);
+  });
+
+  it("does not flag unlisted when snapshot JSON is empty but source_date_key WO count > 0", async () => {
+    const db = new MemoryD1();
+    db.checks = [
+      {
+        id: 1,
+        asset_id: "AF123",
+        location: "Lot C",
+        discrepancies: "",
+        status: "present",
+        checked_by: "Walker",
+        checked_at_iso: "2026-04-10T12:00:00.000Z",
+        source_date_key: "2026-04-02",
+        asset_snapshot_json: "",
       },
     ];
     const env = { ETIC_SNAPSHOTS: db, ETIC_BUCKET: {} };
