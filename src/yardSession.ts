@@ -687,6 +687,8 @@ export type YardCheckRow = {
   checkedAtIso: string;
   sourceDateKey: string;
   assetSnapshotJson: string;
+  /** Populated on asset detail: photo URLs from this same yard visit (check_id), newest first. */
+  checkPhotoUrls?: string[];
 };
 
 /** One correction applied to an existing `yard_check` row (see migrations/0022). */
@@ -817,6 +819,138 @@ function openWoCountFromCheckSnapshot(check: YardCheckRow | null): number | null
     /* ignore */
   }
   return null;
+}
+
+/** Fleet P&A row captured on the check (when the walker saved). Used when the ID is off-roster today. */
+function yardAssetFromCheckSnapshotJson(json: string | null | undefined): YardAsset | null {
+  if (!json?.trim()) return null;
+  try {
+    const parsed = JSON.parse(json) as { asset?: YardAsset };
+    const a = parsed?.asset;
+    if (!a || typeof a !== "object") return null;
+    if (typeof a.assetId !== "string" || !a.assetId.trim()) return null;
+    return a;
+  } catch {
+    return null;
+  }
+}
+
+function rollingAssetFromTriggerCheck(
+  check: YardCheckRow,
+  photos: YardPhotoRow[],
+  intervalDays: number,
+): RollingAsset {
+  const snap = yardAssetFromCheckSnapshotJson(check.assetSnapshotJson);
+  const base: YardAsset = snap ?? {
+    assetId: check.assetId,
+    owningUnit: "",
+    shop: "",
+    mgmtCd: "",
+    makeModel: "",
+    vehNomen: "",
+    melKey: "",
+    melTier: "",
+    vinSerial: "",
+    previousLocation: "",
+    openWoCount: 0,
+    isNce: false,
+  };
+  const nowIso = new Date().toISOString();
+  const days = daysBetween(check.checkedAtIso, nowIso);
+  const rollingState = bucketState(days, intervalDays);
+  return {
+    ...base,
+    assetId: check.assetId.trim() || base.assetId,
+    lastCheckedAtIso: check.checkedAtIso,
+    lastCheckedBy: check.checkedBy,
+    daysSinceLastCheck: days,
+    rollingState,
+    isNeverChecked: false,
+    isNewAsset: false,
+    isUnlisted: true,
+    photoCount: photos.length,
+    lastLocation: (check.location ?? "").trim() || base.previousLocation || "",
+    lastNotes: (check.discrepancies ?? "").trim(),
+    isBelowMel: false,
+  };
+}
+
+function mergeRollingAssetFromSnapshotJson(asset: RollingAsset, snap: YardAsset): RollingAsset {
+  const pick = <K extends keyof YardAsset>(k: K) => {
+    const cur = asset[k];
+    const v = snap[k];
+    if ((cur === "" || cur == null) && v != null && String(v).trim()) (asset as YardAsset)[k] = v;
+  };
+  pick("owningUnit");
+  pick("shop");
+  pick("mgmtCd");
+  pick("makeModel");
+  pick("vehNomen");
+  pick("melKey");
+  pick("melTier");
+  pick("vinSerial");
+  pick("previousLocation");
+  if (!asset.lastLocation?.trim() && snap.previousLocation?.trim()) {
+    asset.lastLocation = snap.previousLocation.trim();
+  }
+  if (
+    asset.isUnlisted &&
+    typeof snap.openWoCount === "number" &&
+    Number.isFinite(snap.openWoCount) &&
+    snap.openWoCount >= 0
+  ) {
+    asset.openWoCount = Math.floor(snap.openWoCount);
+  }
+  if (snap.isNce) asset.isNce = true;
+  return asset;
+}
+
+function hydrateFindingRollingAsset(
+  f: YardFinding,
+  intervalDays_fallback: number,
+  photoByCanon: Map<string, number>,
+): void {
+  if (!f.triggerCheck) return;
+  if (f.asset) {
+    const snap = yardAssetFromCheckSnapshotJson(f.triggerCheck.assetSnapshotJson);
+    if (snap) mergeRollingAssetFromSnapshotJson(f.asset, snap);
+    const c = canonicalYardAssetKey(f.assetId);
+    const pc = photoByCanon.get(c);
+    if (pc != null && pc > f.photoCount) f.photoCount = pc;
+    return;
+  }
+  const c = canonicalYardAssetKey(f.assetId);
+  const stubPhotos: YardPhotoRow[] = [];
+  f.asset = rollingAssetFromTriggerCheck(
+    f.triggerCheck,
+    stubPhotos,
+    intervalDays_fallback > 0 ? intervalDays_fallback : DEFAULT_YARD_CHECK_INTERVAL_DAYS,
+  );
+  const snap = yardAssetFromCheckSnapshotJson(f.triggerCheck.assetSnapshotJson);
+  if (snap) mergeRollingAssetFromSnapshotJson(f.asset, snap);
+  const pc = photoByCanon.get(c);
+  if (pc != null) f.photoCount = pc;
+}
+
+async function batchPhotoCountsForCanonicalAssets(env: Env, canonSet: Set<string>): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  const ids = [...canonSet].filter(Boolean);
+  if (!ids.length) return out;
+  const chunk = 80;
+  for (let i = 0; i < ids.length; i += chunk) {
+    const slice = ids.slice(i, i + chunk);
+    const ph2 = slice.map(() => "?").join(",");
+    const r = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT UPPER(TRIM(asset_id)) AS aid, COUNT(*) AS c FROM yard_photo
+       WHERE UPPER(TRIM(asset_id)) IN (${ph2}) GROUP BY UPPER(TRIM(asset_id))`,
+    )
+      .bind(...slice)
+      .all<{ aid: string; c: number }>();
+    for (const row of r.results ?? []) {
+      if (row.aid) out.set(row.aid.toUpperCase(), Math.floor(row.c ?? 0));
+    }
+  }
+  return out;
 }
 
 /**
@@ -1419,6 +1553,37 @@ function rowToPhoto(r: PhotoReadRow): YardPhotoRow {
   };
 }
 
+async function attachCheckPhotoUrlsToChecks(env: Env, checks: YardCheckRow[]): Promise<void> {
+  const ids = checks.map((c) => c.id).filter((id) => Number.isFinite(id));
+  if (!ids.length) return;
+  const byCheck = new Map<number, string[]>();
+  const chunk = 80;
+  for (let i = 0; i < ids.length; i += chunk) {
+    const slice = ids.slice(i, i + chunk);
+    const ph = slice.map(() => "?").join(",");
+    const r = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT id, check_id FROM yard_photo
+       WHERE check_id IN (${ph})
+       ORDER BY check_id, uploaded_at_iso DESC, id DESC`,
+    )
+      .bind(...slice)
+      .all<{ id: number; check_id: number | null }>();
+    for (const row of r.results ?? []) {
+      const cid = row.check_id;
+      if (!cid) continue;
+      let arr = byCheck.get(cid);
+      if (!arr) {
+        arr = [];
+        byCheck.set(cid, arr);
+      }
+      arr.push(photoUrlFor(row.id));
+    }
+  }
+  for (const c of checks) {
+    c.checkPhotoUrls = byCheck.get(c.id) ?? [];
+  }
+}
+
 type PhotoReadRow = {
   id: number;
   asset_id: string;
@@ -1743,6 +1908,7 @@ export async function getAssetDetail(env: Env, assetId: string): Promise<AssetDe
       workOrdersByCheckSourceDate[dk] = await getOpenWorkOrdersForAsset(env, dk, id);
     }),
   );
+  await attachCheckPhotoUrlsToChecks(env, checks);
   return {
     asset,
     checks,
@@ -1907,39 +2073,74 @@ async function enrichFindingsFleetFmaNotes(
   dateKey: string,
   findings: YardFinding[],
 ): Promise<void> {
-  if (!dateKey) return;
-  const ids = [...new Set(findings.map((f) => f.assetId).filter(Boolean))];
-  if (!ids.length) return;
+  if (!findings.length) return;
+  /** snapshot date key -> canonical asset ids to read FM&A columns for */
+  const bySnapshot = new Map<string, Set<string>>();
+  for (const f of findings) {
+    const canon = canonicalYardAssetKey(f.assetId);
+    if (!canon) continue;
+    let dk = (dateKey || "").trim();
+    if (!f.asset || f.asset.isUnlisted) {
+      dk = (f.triggerCheck?.sourceDateKey ?? "").trim() || dk;
+    }
+    if (!dk) continue;
+    let s = bySnapshot.get(dk);
+    if (!s) {
+      s = new Set();
+      bySnapshot.set(dk, s);
+    }
+    s.add(canon);
+  }
   const best = new Map<string, string>();
   const chunk = 80;
-  for (let i = 0; i < ids.length; i += chunk) {
-    const slice = ids.slice(i, i + chunk);
-    const u = slice.map((s) => canonicalYardAssetKey(s));
-    const ph2 = u.map(() => "?").join(",");
-    const r = await env.ETIC_SNAPSHOTS.prepare(
-      `SELECT asset_id, raw_row_json FROM work_order_snapshot
-       WHERE snapshot_date_key = ? AND UPPER(TRIM(asset_id)) IN (${ph2})
-       ORDER BY asset_id, work_order_id`,
-    )
-      .bind(dateKey, ...u)
-      .all<{ asset_id: string; raw_row_json: string | null }>();
-    for (const row of r.results ?? []) {
-      const aid = canonicalYardAssetKey(row.asset_id ?? "");
-      if (!aid) continue;
-      let raw: Record<string, unknown> = {};
-      try {
-        raw = JSON.parse(row.raw_row_json || "{}") as Record<string, unknown>;
-      } catch {
-        raw = {};
+  for (const [dk, idSet] of bySnapshot) {
+    const ids = [...idSet];
+    for (let i = 0; i < ids.length; i += chunk) {
+      const slice = ids.slice(i, i + chunk);
+      const ph2 = slice.map(() => "?").join(",");
+      const r = await env.ETIC_SNAPSHOTS.prepare(
+        `SELECT asset_id, raw_row_json FROM work_order_snapshot
+         WHERE snapshot_date_key = ? AND UPPER(TRIM(asset_id)) IN (${ph2})
+         ORDER BY asset_id, work_order_id`,
+      )
+        .bind(dk, ...slice)
+        .all<{ asset_id: string; raw_row_json: string | null }>();
+      for (const row of r.results ?? []) {
+        const aid = canonicalYardAssetKey(row.asset_id ?? "");
+        if (!aid) continue;
+        let raw: Record<string, unknown> = {};
+        try {
+          raw = JSON.parse(row.raw_row_json || "{}") as Record<string, unknown>;
+        } catch {
+          raw = {};
+        }
+        const note = extractFleetFmaNotesFromRaw(raw);
+        if (!note) continue;
+        const prev = best.get(aid) ?? "";
+        if (!prev || note.length > prev.length) best.set(aid, note);
       }
-      const note = extractFleetFmaNotesFromRaw(raw);
-      if (!note) continue;
-      const prev = best.get(aid) ?? "";
-      if (!prev || note.length > prev.length) best.set(aid, note);
     }
   }
   for (const f of findings) {
     f.fleetFmaNotes = best.get(canonicalYardAssetKey(f.assetId)) ?? "";
+  }
+}
+
+async function hydrateFindingRollingAssetsBatch(
+  env: Env,
+  findings: YardFinding[],
+  intervalDays: number,
+): Promise<void> {
+  const need = new Set<string>();
+  for (const f of findings) {
+    if (!f.triggerCheck) continue;
+    const c = canonicalYardAssetKey(f.assetId);
+    if (c) need.add(c);
+  }
+  const photoByCanon = await batchPhotoCountsForCanonicalAssets(env, need);
+  const iv = intervalDays > 0 ? intervalDays : DEFAULT_YARD_CHECK_INTERVAL_DAYS;
+  for (const f of findings) {
+    hydrateFindingRollingAsset(f, iv, photoByCanon);
   }
 }
 
@@ -2140,6 +2341,7 @@ export async function listOpenFindings(env: Env): Promise<{
     if (latest.status === "unknown") pushFinding(assetId, "unknown", latest);
   }
 
+  await hydrateFindingRollingAssetsBatch(env, findings, roster.intervalDays);
   await Promise.all([enrichFindingsPreviewPhotos(env, findings), enrichFindingsFleetFmaNotes(env, dateKey, findings)]);
 
   // Sort: unacknowledged first, then by trigger check age (newest first, with

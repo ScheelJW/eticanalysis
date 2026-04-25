@@ -6557,6 +6557,14 @@ function renderYardAppHtml(): string {
       .yard-desk-hist-lbl select { padding: 10px 12px; font-size: 0.86rem; }
       .yard-hist-detail { margin-top: 10px; font-size: 0.84rem; color: var(--text-dim); line-height: 1.45; }
       .yard-hist-detail .h-when { font-size: 0.78rem; color: var(--muted); margin-bottom: 6px; }
+      .yard-desk-check-photos {
+        display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px;
+      }
+      .yard-desk-check-photo {
+        padding: 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+        background: var(--bg2); cursor: pointer; width: 96px; height: 72px;
+      }
+      .yard-desk-check-photo img { width: 100%; height: 100%; object-fit: cover; display: block; }
       .yard-hist-actions { margin-top: 10px; }
       .yard-desk-open-full {
         margin-top: 16px; width: 100%; padding: 12px; border-radius: 10px;
@@ -7135,6 +7143,26 @@ function renderYardAppHtml(): string {
       var when = fmtRel(c.checkedAtIso) + (c.checkedBy ? " \u00B7 " + escapeHtml(c.checkedBy) : "");
       var loc = (c.location || "").trim() || "\u2014";
       var disc = (c.discrepancies || "").trim();
+      var purls = c.checkPhotoUrls && c.checkPhotoUrls.length ? c.checkPhotoUrls : [];
+      var photoBlock = "";
+      if (purls.length) {
+        photoBlock =
+          '<div style="margin-top:10px"><strong>Photos from this check</strong></div>' +
+          '<div class="yard-desk-check-photos">' +
+          purls
+            .map(function (u) {
+              return (
+                '<button type="button" class="yard-desk-check-photo" data-yard-photo-url="' +
+                escapeHtml(u) +
+                '" aria-label="View full size photo">' +
+                '<img src="' +
+                escapeHtml(u) +
+                '" alt="" loading="lazy" decoding="async" /></button>'
+              );
+            })
+            .join("") +
+          "</div>";
+      }
       var chg = changelogBlockForCheck(c.id, state.deskHistEdits);
       var wob2 = {};
       if (state.deskSelectedId && state.deskDetailById && state.deskDetailById[state.deskSelectedId]) {
@@ -7160,6 +7188,7 @@ function renderYardAppHtml(): string {
         "<div class=\\"h-when\\">" + escapeHtml(when) + "</div>" +
         "<div><strong>Location:</strong> " + escapeHtml(loc) + "</div>" +
         (disc ? "<div style=\\"margin-top:8px;white-space:pre-wrap\\"><strong>Notes:</strong> " + escapeHtml(disc) + "</div>" : "") +
+        photoBlock +
         eticBlock2 +
         (chg || "");
       if (deskEdit) {
@@ -7222,6 +7251,17 @@ function renderYardAppHtml(): string {
       if (hsel && !hsel._yardDesk) {
         hsel._yardDesk = true;
         hsel.addEventListener("change", function(){ renderDeskHistDetail(); });
+      }
+      var hdet = document.getElementById("yard-hist-detail");
+      if (hdet && !hdet._yardDeskPhoto) {
+        hdet._yardDeskPhoto = true;
+        hdet.addEventListener("click", function (e) {
+          var pv = e.target.closest("[data-yard-photo-url]");
+          if (!pv) return;
+          e.preventDefault();
+          var u = pv.getAttribute("data-yard-photo-url");
+          if (u) openYardPhotoLbMob(u);
+        });
       }
     }
 
