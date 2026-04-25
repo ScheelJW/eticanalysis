@@ -368,18 +368,12 @@ export default {
       // workbook-heavy WO/MEL extraction to background work.
       ctx.waitUntil((async () => {
         try {
-          const summary = await refreshWorkOrderWatchAfterEmailIngest(
-            env,
-            dateKey,
-            workbookBytes,
-            now.toISOString(),
-          );
+          const summary = await ingestCurrentWorkbookIntoD1(env, dateKey, workbookBytes, now.toISOString());
           console.log(
             JSON.stringify({
               level: "info",
               message: "Background WO/MEL ingest complete",
               dateKey,
-              mode: summary.mode,
               processed: summary.processed,
               total: summary.total,
             }),
@@ -388,26 +382,11 @@ export default {
           console.error(
             JSON.stringify({
               level: "error",
-              message: "Background WO/MEL replay failed; falling back to current workbook only",
+              message: "Background WO/MEL D1 ingest failed",
               dateKey,
               error: error instanceof Error ? error.message : String(error),
             }),
           );
-          try {
-            const rawWos = await extractRawWorkOrdersFromBinary(workbookBytes);
-            await ingestWorkOrderSnapshot(env, dateKey, rawWos, now.toISOString(), workbookBytes);
-            const melRows = await extractMelRowsFromBinary(workbookBytes);
-            await ingestMelSnapshot(env, dateKey, melRows, now.toISOString());
-          } catch (fallbackError) {
-            console.error(
-              JSON.stringify({
-                level: "error",
-                message: "Background current-workbook fallback ingest failed",
-                dateKey,
-                error: fallbackError instanceof Error ? fallbackError.message : String(fallbackError),
-              }),
-            );
-          }
         }
       })());
     } catch (err) {
@@ -1880,27 +1859,24 @@ export async function rebuildWorkOrderWatchFromHistory(env: Env): Promise<Rebuil
   return { total: snapshots.length, processed: loaded.length, missing };
 }
 
-type EmailIngestWatchRefreshSummary = RebuildWorkOrderWatchSummary & {
-  mode: "rebuild" | "current";
+type EmailIngestWatchRefreshSummary = {
+  mode: "current";
+  total: number;
+  processed: number;
+  missing: EticSnapshotRebuildRow[];
 };
 
-async function refreshWorkOrderWatchAfterEmailIngest(
+async function ingestCurrentWorkbookIntoD1(
   env: Env,
   dateKey: string,
   workbookBytes: ArrayBuffer,
   updatedAtIso: string,
 ): Promise<EmailIngestWatchRefreshSummary> {
-  const snapshots = await loadActiveEticSnapshotsForRebuild(env);
-  const latest = snapshots[snapshots.length - 1];
-  const canReplayFullIndex = snapshots.length > 1 && latest?.date_key === dateKey;
-  if (!canReplayFullIndex) {
-    const raw = await extractRawWorkOrdersFromBinary(workbookBytes);
-    await ingestWorkOrderSnapshot(env, dateKey, raw, updatedAtIso, workbookBytes);
-    const melRows = await extractMelRowsFromBinary(workbookBytes);
-    await ingestMelSnapshot(env, dateKey, melRows, updatedAtIso);
-    return { mode: "current", total: 1, processed: 1, missing: [] };
-  }
-  return { mode: "rebuild", ...(await rebuildWorkOrderWatchFromHistory(env)) };
+  const raw = await extractRawWorkOrdersFromBinary(workbookBytes);
+  await ingestWorkOrderSnapshot(env, dateKey, raw, updatedAtIso, workbookBytes);
+  const melRows = await extractMelRowsFromBinary(workbookBytes);
+  await ingestMelSnapshot(env, dateKey, melRows, updatedAtIso);
+  return { mode: "current", total: 1, processed: 1, missing: [] };
 }
 
 async function handleDebugWatchCounts(env: Env): Promise<Response> {
