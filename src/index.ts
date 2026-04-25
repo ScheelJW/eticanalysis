@@ -22422,11 +22422,13 @@ function renderDashboardHtml(): string {
         chips.querySelectorAll(".yard-findings-chip").forEach(function (c) { c.classList.remove("active"); });
         t.classList.add("active");
         yardFmState.kindFilter = t.getAttribute("data-finding-kind") || "all";
+        yardRenderFindingsCounts();
         yardRenderFindings();
       });
       const ackToggle = document.getElementById("yard-findings-show-ack");
       if (ackToggle) ackToggle.addEventListener("change", function () {
         yardFmState.showAck = ackToggle.checked;
+        yardRenderFindingsCounts();
         yardRenderFindings();
       });
       const refresh = document.getElementById("yard-findings-refresh");
@@ -22534,14 +22536,39 @@ function renderDashboardHtml(): string {
         });
     }
 
+    /** Findings visible in the list for the current "Show resolved" toggle. */
+    function yardFindingsForListView() {
+      const showAck = yardFmState.showAck;
+      return (yardFmState.findings || []).filter(function (f) {
+        if (!showAck && f.isAcknowledged) return false;
+        return true;
+      });
+    }
+
     function yardRenderFindingsCounts() {
       const t = yardFmState.totals || {};
       const set = function(id, v) { const el = document.getElementById(id); if (el) el.textContent = String(v ?? 0); };
-      set("ff-all", t.total);
-      set("ff-unlisted", t.unlisted);
-      set("ff-discrepancy", t.discrepancy);
-      set("ff-unknown", t.unknown);
-      const open = (t.total || 0) - (t.acknowledged || 0);
+      const visible = yardFindingsForListView();
+      const byKind = { unlisted: 0, discrepancy: 0, unknown: 0, missing: 0 };
+      for (var i = 0; i < visible.length; i++) {
+        var k = visible[i].kind;
+        if (byKind[k] != null) byKind[k]++;
+      }
+      if (yardFmState.showAck) {
+        set("ff-all", t.total);
+        set("ff-unlisted", t.unlisted);
+        set("ff-discrepancy", t.discrepancy);
+        set("ff-unknown", t.unknown);
+      } else {
+        set("ff-all", visible.length);
+        set("ff-unlisted", byKind.unlisted);
+        set("ff-discrepancy", byKind.discrepancy);
+        set("ff-unknown", byKind.unknown);
+      }
+      var open = 0;
+      for (var j = 0; j < (yardFmState.findings || []).length; j++) {
+        if (!(yardFmState.findings[j].isAcknowledged)) open++;
+      }
       set("yard-sub-findings-count", open);
     }
 
@@ -22550,9 +22577,8 @@ function renderDashboardHtml(): string {
       if (!list) return;
       const kind = yardFmState.kindFilter;
       const showAck = yardFmState.showAck;
-      const rows = (yardFmState.findings || []).filter(function (f) {
+      const rows = yardFindingsForListView().filter(function (f) {
         if (kind !== "all" && f.kind !== kind) return false;
-        if (!showAck && f.isAcknowledged) return false;
         return true;
       });
       if (!rows.length) {
