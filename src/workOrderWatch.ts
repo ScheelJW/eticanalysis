@@ -8,6 +8,7 @@ import {
 } from "./yardCheck";
 import { getStalenessThresholds } from "./melWatch";
 import { buildLineCompletions } from "./meeting";
+import { extractFleetFmaNotesFromRaw } from "./yardSession";
 
 export type MelTier = "below" | "at" | "above" | "unknown";
 
@@ -114,6 +115,21 @@ export function calendarDaysBetween(aKey: string, bKey: string): number {
   const a = dateKeyToUtcNoon(aKey).getTime();
   const b = dateKeyToUtcNoon(bKey).getTime();
   return Math.floor((b - a) / (86400 * 1000));
+}
+
+/**
+ * Normalize workbook cell text before equality checks so Excel export noise
+ * (CRLF vs LF, NBSP, odd spaces) does not advance last_remark_change_date on
+ * every ingest. Real edits still stamp on the report dateKey where the new
+ * text first appears.
+ */
+export function normalizeWorkbookTextForCompare(raw: string | null | undefined): string {
+  let s = String(raw ?? "");
+  s = s.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  s = s.replace(/[\u00A0\u2007\u202F\uFEFF]/g, " ");
+  s = s.replace(/[\u1680\u2000-\u200A\u205F\u3000]/g, " ");
+  s = s.replace(/\s+/g, " ").trim();
+  return s;
 }
 
 type WoStateRow = {
@@ -322,20 +338,20 @@ export async function ingestWorkOrderSnapshot(
 
     if (prev) {
       lastRemarkChange = prev.last_remark_change_date;
-      if (remarks !== (prev.remarks ?? "")) {
+      if (normalizeWorkbookTextForCompare(remarks) !== normalizeWorkbookTextForCompare(prev.remarks ?? "")) {
         lastRemarkChange = dateKey;
         statements.push(insertLog.bind(wid, dateKey, updatedAtIso, "remarks", prev.remarks ?? "", remarks));
       }
-      if (partsStatus !== (prev.parts_status ?? "")) {
+      if (normalizeWorkbookTextForCompare(partsStatus) !== normalizeWorkbookTextForCompare(prev.parts_status ?? "")) {
         statements.push(insertLog.bind(wid, dateKey, updatedAtIso, "parts_status", prev.parts_status ?? "", partsStatus));
       }
-      if (eticRaw !== (prev.etic_raw ?? "")) {
+      if (normalizeWorkbookTextForCompare(eticRaw) !== normalizeWorkbookTextForCompare(prev.etic_raw ?? "")) {
         statements.push(insertLog.bind(wid, dateKey, updatedAtIso, "etic", prev.etic_raw ?? "", eticRaw));
       }
       if (melTier !== (prev.mel_tier as MelTier)) {
         statements.push(insertLog.bind(wid, dateKey, updatedAtIso, "mel_tier", prev.mel_tier ?? "", melTier));
       }
-      if (shop !== (prev.shop ?? "")) {
+      if (normalizeWorkbookTextForCompare(shop) !== normalizeWorkbookTextForCompare(prev.shop ?? "")) {
         statements.push(insertLog.bind(wid, dateKey, updatedAtIso, "shop", prev.shop ?? "", shop));
       }
       pushCount = prev.etic_push_count ?? 0;
@@ -580,6 +596,31 @@ export async function getFleetPaSnapshotForDate(
     rawRowJson: row.raw_row_json,
     updatedAtIso: row.updated_at_iso,
   }));
+}
+
+/** FM&A notes cell from Fleet (P&A) sheet for this asset on the given report date (D1 fact table). */
+export async function getFleetPaFmaNotesForAsset(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  dateKey: string,
+  assetId: string,
+): Promise<string> {
+  const aid = (assetId ?? "").trim();
+  const dk = (dateKey ?? "").trim();
+  if (!aid || !dk || !/^\d{4}-\d{2}-\d{2}$/.test(dk)) return "";
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT raw_row_json FROM fleet_p_a_snapshot
+      WHERE snapshot_date_key = ? AND UPPER(TRIM(asset_id)) = UPPER(TRIM(?))`,
+  )
+    .bind(dk, aid)
+    .first<{ raw_row_json: string | null }>();
+  if (!r?.raw_row_json) return "";
+  let raw: Record<string, unknown> = {};
+  try {
+    raw = JSON.parse(r.raw_row_json) as Record<string, unknown>;
+  } catch {
+    return "";
+  }
+  return extractFleetFmaNotesFromRaw(raw);
 }
 
 /** Schedule maintenance (Fleet P&A Schedule Mx / due columns). */
@@ -1414,6 +1455,68 @@ export async function getWatchRowsForDate(
   return out;
 }
 
+/** For timeline UX: detect gaps where the fleet had other snapshot dates but this WO has no row. */
+export type WorkOrderSnapshotCoverage = {
+  workOrderId: string;
+  woSnapshotDateKeysAsc: string[];
+  distinctFleetSnapshotCount: number;
+  /** Fleet report dates between this WO's first and last snapshot that have no row for this WO. */
+  missingFleetSnapshotDatesBetweenFirstAndLast: number;
+  maxCalendarGapDaysBetweenWoSnapshots: number;
+};
+
+export async function getWorkOrderSnapshotCoverage(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  workOrderId: string,
+): Promise<WorkOrderSnapshotCoverage> {
+  const woDatesR = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT DISTINCT snapshot_date_key FROM work_order_snapshot WHERE work_order_id = ? ORDER BY snapshot_date_key ASC`,
+  )
+    .bind(workOrderId)
+    .all<{ snapshot_date_key: string }>();
+  const woSnapshotDateKeysAsc = (woDatesR.results ?? []).map((x) => x.snapshot_date_key).filter(Boolean);
+
+  const fleetR = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT COUNT(DISTINCT snapshot_date_key) AS c FROM work_order_snapshot`,
+  ).first<{ c: number }>();
+  const distinctFleetSnapshotCount = Number(fleetR?.c ?? 0);
+
+  let maxCalendarGapDaysBetweenWoSnapshots = 0;
+  for (let i = 1; i < woSnapshotDateKeysAsc.length; i++) {
+    const a = woSnapshotDateKeysAsc[i - 1]!;
+    const b = woSnapshotDateKeysAsc[i]!;
+    maxCalendarGapDaysBetweenWoSnapshots = Math.max(
+      maxCalendarGapDaysBetweenWoSnapshots,
+      calendarDaysBetween(a, b),
+    );
+  }
+
+  let missingFleetSnapshotDatesBetweenFirstAndLast = 0;
+  if (woSnapshotDateKeysAsc.length >= 2) {
+    const first = woSnapshotDateKeysAsc[0]!;
+    const last = woSnapshotDateKeysAsc[woSnapshotDateKeysAsc.length - 1]!;
+    const rangeR = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT DISTINCT snapshot_date_key AS d
+         FROM work_order_snapshot
+        WHERE snapshot_date_key >= ? AND snapshot_date_key <= ?`,
+    )
+      .bind(first, last)
+      .all<{ d: string }>();
+    const woSet = new Set(woSnapshotDateKeysAsc);
+    for (const row of rangeR.results ?? []) {
+      if (!woSet.has(row.d)) missingFleetSnapshotDatesBetweenFirstAndLast += 1;
+    }
+  }
+
+  return {
+    workOrderId,
+    woSnapshotDateKeysAsc,
+    distinctFleetSnapshotCount,
+    missingFleetSnapshotDatesBetweenFirstAndLast,
+    maxCalendarGapDaysBetweenWoSnapshots,
+  };
+}
+
 /** Entire timeline of a single WO across every snapshot it appeared in. */
 export async function getWorkOrderTimeline(
   env: { ETIC_SNAPSHOTS: D1Database },
@@ -1552,7 +1655,7 @@ export async function getChangelogFromSnapshots(
     }
     const prev = rows[i - 1]!;
     const k = cur.snapshot_date_key;
-    if (cur.remarks !== (prev.remarks ?? "")) {
+    if (normalizeWorkbookTextForCompare(cur.remarks) !== normalizeWorkbookTextForCompare(prev.remarks ?? "")) {
       out.push({
         id: ++id,
         snapshot_date_key: k,
@@ -1562,7 +1665,7 @@ export async function getChangelogFromSnapshots(
         new_value: cur.remarks,
       });
     }
-    if (cur.parts_status !== (prev.parts_status ?? "")) {
+    if (normalizeWorkbookTextForCompare(cur.parts_status) !== normalizeWorkbookTextForCompare(prev.parts_status ?? "")) {
       out.push({
         id: ++id,
         snapshot_date_key: k,
@@ -1572,7 +1675,7 @@ export async function getChangelogFromSnapshots(
         new_value: cur.parts_status,
       });
     }
-    if (cur.etic_raw !== (prev.etic_raw ?? "")) {
+    if (normalizeWorkbookTextForCompare(cur.etic_raw) !== normalizeWorkbookTextForCompare(prev.etic_raw ?? "")) {
       out.push({
         id: ++id,
         snapshot_date_key: k,
@@ -1592,7 +1695,7 @@ export async function getChangelogFromSnapshots(
         new_value: cur.mel_tier,
       });
     }
-    if ((cur.shop ?? "") !== (prev.shop ?? "")) {
+    if (normalizeWorkbookTextForCompare(cur.shop ?? "") !== normalizeWorkbookTextForCompare(prev.shop ?? "")) {
       out.push({
         id: ++id,
         snapshot_date_key: k,
@@ -1617,6 +1720,105 @@ export async function getChangelogFromSnapshots(
   }
   if (out.length <= limit) return out;
   return out.slice(-limit);
+}
+
+export type RepairRemarkDatesSummary = {
+  snapshotDatesWalked: number;
+  stateRowsUpdated: number;
+  snapshotCellsUpdated: number;
+};
+
+/**
+ * Recompute last_remark_change_date by walking work_order_snapshot in calendar
+ * order and comparing normalized remarks day-to-day. Fixes D1 rows poisoned by
+ * raw-string churn without re-reading R2. Idempotent when data already matches.
+ */
+export async function repairLastRemarkChangeDatesFromSnapshots(
+  env: { ETIC_SNAPSHOTS: D1Database },
+): Promise<RepairRemarkDatesSummary> {
+  const datesR = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT DISTINCT snapshot_date_key FROM work_order_snapshot ORDER BY snapshot_date_key ASC`,
+  ).all<{ snapshot_date_key: string }>();
+  const dates = (datesR.results ?? []).map((x) => x.snapshot_date_key).filter(Boolean);
+  if (dates.length === 0) {
+    return { snapshotDatesWalked: 0, stateRowsUpdated: 0, snapshotCellsUpdated: 0 };
+  }
+
+  const prevNormByWid = new Map<string, string>();
+  const lastRemarkDateByWid = new Map<string, string>();
+
+  const stateStmt = env.ETIC_SNAPSHOTS.prepare(
+    `UPDATE work_order_state SET last_remark_change_date = ? WHERE work_order_id = ?`,
+  );
+  const snapStmt = env.ETIC_SNAPSHOTS.prepare(
+    `UPDATE work_order_snapshot SET last_remark_change_date = ? WHERE snapshot_date_key = ? AND work_order_id = ?`,
+  );
+
+  let stateRowsUpdated = 0;
+  let snapshotCellsUpdated = 0;
+  const BATCH = 80;
+
+  for (const dateKey of dates) {
+    const rowsR = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT work_order_id, remarks, last_remark_change_date
+         FROM work_order_snapshot
+        WHERE snapshot_date_key = ?`,
+    )
+      .bind(dateKey)
+      .all<{ work_order_id: string; remarks: string | null; last_remark_change_date: string | null }>();
+    const dayRows = rowsR.results ?? [];
+
+    const snapBatch: D1PreparedStatement[] = [];
+
+    for (const row of dayRows) {
+      const wid = (row.work_order_id ?? "").trim();
+      if (!wid) continue;
+      const n = normalizeWorkbookTextForCompare(row.remarks ?? "");
+      if (!prevNormByWid.has(wid)) {
+        prevNormByWid.set(wid, n);
+        lastRemarkDateByWid.set(wid, dateKey);
+      } else if (n !== prevNormByWid.get(wid)) {
+        prevNormByWid.set(wid, n);
+        lastRemarkDateByWid.set(wid, dateKey);
+      }
+      const lr = lastRemarkDateByWid.get(wid) ?? dateKey;
+      if ((row.last_remark_change_date ?? "") !== lr) {
+        snapBatch.push(snapStmt.bind(lr, dateKey, wid));
+      }
+    }
+
+    for (let i = 0; i < snapBatch.length; i += BATCH) {
+      const slice = snapBatch.slice(i, i + BATCH);
+      await env.ETIC_SNAPSHOTS.batch(slice);
+      snapshotCellsUpdated += slice.length;
+    }
+  }
+
+  const stateRowsR = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT work_order_id, last_remark_change_date FROM work_order_state`,
+  ).all<{ work_order_id: string; last_remark_change_date: string | null }>();
+
+  const stateBatch: D1PreparedStatement[] = [];
+  for (const row of stateRowsR.results ?? []) {
+    const wid = (row.work_order_id ?? "").trim();
+    if (!wid) continue;
+    const want = lastRemarkDateByWid.get(wid);
+    if (!want) continue;
+    if ((row.last_remark_change_date ?? "") !== want) {
+      stateBatch.push(stateStmt.bind(want, wid));
+    }
+  }
+  for (let i = 0; i < stateBatch.length; i += BATCH) {
+    const slice = stateBatch.slice(i, i + BATCH);
+    await env.ETIC_SNAPSHOTS.batch(slice);
+    stateRowsUpdated += slice.length;
+  }
+
+  return {
+    snapshotDatesWalked: dates.length,
+    stateRowsUpdated,
+    snapshotCellsUpdated,
+  };
 }
 
 /**

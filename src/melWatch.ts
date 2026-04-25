@@ -419,12 +419,26 @@ export async function getMelChangelogForKey(
   return r.results ?? [];
 }
 
-/** Distinct snapshot dates we have MEL data for, newest first. */
+/**
+ * Distinct ETIC report dates (same index as the Snapshot tab), newest first.
+ * Uses etic_snapshots so the MEL trend chart and date picker stay aligned when
+ * mel_snapshot is missing days between ingests.
+ */
 export async function getMelSnapshotDates(env: Env): Promise<string[]> {
-  const r = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT DISTINCT snapshot_date_key FROM mel_snapshot ORDER BY snapshot_date_key DESC`,
-  ).all<{ snapshot_date_key: string }>();
-  return (r.results ?? []).map((x) => x.snapshot_date_key);
+  try {
+    const r = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT date_key
+         FROM etic_snapshots
+        WHERE deleted_at_iso IS NULL OR trim(deleted_at_iso) = ''
+        ORDER BY date_key DESC`,
+    ).all<{ date_key: string }>();
+    return (r.results ?? []).map((x) => x.date_key).filter(Boolean);
+  } catch {
+    const r = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT date_key FROM etic_snapshots ORDER BY date_key DESC`,
+    ).all<{ date_key: string }>();
+    return (r.results ?? []).map((x) => x.date_key).filter(Boolean);
+  }
 }
 
 /* -------------------- mel_config (editable per-key UI metadata) -------------------- */
@@ -642,20 +656,52 @@ export type MelRollupRow = {
   total_recall: number;
 };
 export async function getMelRollup(env: Env): Promise<MelRollupRow[]> {
-  const r = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT snapshot_date_key,
-            COUNT(*) AS total_keys,
-            SUM(CASE WHEN mel_status='below' THEN 1 ELSE 0 END) AS below,
-            SUM(CASE WHEN mel_status='at'    THEN 1 ELSE 0 END) AS at,
-            SUM(CASE WHEN mel_status='above' THEN 1 ELSE 0 END) AS above,
-            SUM(nmc_count) AS total_nmc,
-            SUM(fmc_count) AS total_fmc,
-            SUM(recall_delta) AS total_recall
-       FROM mel_snapshot
-       GROUP BY snapshot_date_key
-       ORDER BY snapshot_date_key ASC`,
-  ).all<MelRollupRow>();
-  return r.results ?? [];
+  try {
+    const r = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT es.date_key AS snapshot_date_key,
+              COUNT(ms.mel_key) AS total_keys,
+              COALESCE(SUM(CASE WHEN ms.mel_status='below' THEN 1 ELSE 0 END), 0) AS below,
+              COALESCE(SUM(CASE WHEN ms.mel_status='at'    THEN 1 ELSE 0 END), 0) AS at,
+              COALESCE(SUM(CASE WHEN ms.mel_status='above' THEN 1 ELSE 0 END), 0) AS above,
+              CASE WHEN COUNT(ms.mel_key) > 0
+                THEN COALESCE(SUM(ms.nmc_count), 0)
+                ELSE COALESCE(es.nmc, 0)
+              END AS total_nmc,
+              CASE WHEN COUNT(ms.mel_key) > 0
+                THEN COALESCE(SUM(ms.fmc_count), 0)
+                ELSE COALESCE(es.fmc, 0)
+              END AS total_fmc,
+              COALESCE(SUM(ms.recall_delta), 0) AS total_recall
+         FROM etic_snapshots es
+         LEFT JOIN mel_snapshot ms ON ms.snapshot_date_key = es.date_key
+        WHERE es.deleted_at_iso IS NULL OR trim(es.deleted_at_iso) = ''
+        GROUP BY es.date_key, es.fmc, es.nmc
+        ORDER BY es.date_key ASC`,
+    ).all<MelRollupRow>();
+    return r.results ?? [];
+  } catch {
+    const r = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT es.date_key AS snapshot_date_key,
+              COUNT(ms.mel_key) AS total_keys,
+              COALESCE(SUM(CASE WHEN ms.mel_status='below' THEN 1 ELSE 0 END), 0) AS below,
+              COALESCE(SUM(CASE WHEN ms.mel_status='at'    THEN 1 ELSE 0 END), 0) AS at,
+              COALESCE(SUM(CASE WHEN ms.mel_status='above' THEN 1 ELSE 0 END), 0) AS above,
+              CASE WHEN COUNT(ms.mel_key) > 0
+                THEN COALESCE(SUM(ms.nmc_count), 0)
+                ELSE COALESCE(es.nmc, 0)
+              END AS total_nmc,
+              CASE WHEN COUNT(ms.mel_key) > 0
+                THEN COALESCE(SUM(ms.fmc_count), 0)
+                ELSE COALESCE(es.fmc, 0)
+              END AS total_fmc,
+              COALESCE(SUM(ms.recall_delta), 0) AS total_recall
+         FROM etic_snapshots es
+         LEFT JOIN mel_snapshot ms ON ms.snapshot_date_key = es.date_key
+        GROUP BY es.date_key, es.fmc, es.nmc
+        ORDER BY es.date_key ASC`,
+    ).all<MelRollupRow>();
+    return r.results ?? [];
+  }
 }
 
 /** Authorization manager: latest MEL Calculator rows + unit / detail-doc move log (not work orders). */
