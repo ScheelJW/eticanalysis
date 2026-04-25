@@ -22829,7 +22829,10 @@ function renderDashboardHtml(): string {
         var noteShow = noteFull.replace(/\\s+/g, " ");
         if (noteShow.length > 220) noteShow = noteShow.slice(0, 217) + "\u2026";
         var woCell = '<button type="button" class="wo-link" data-yard-open-wo="' + esc(wo) + '">' + esc(wo) + "</button>";
-        return "<tr><td>" + snap + "</td><td>" + woCell + "</td><td class=\"fleet-fma-hist-cell\" title=\"" + esc(noteFull) + "\">" + esc(noteShow) + "</td></tr>";
+        var fmaOnlyTd = noteFull
+          ? '<td class="fleet-fma-hist-cell" title="' + esc(noteFull) + '">' + esc(noteShow) + "</td>"
+          : '<td class="fleet-fma-hist-cell">\u2014</td>';
+        return "<tr><td>" + snap + "</td><td>" + woCell + "</td>" + fmaOnlyTd + "</tr>";
       }).join("");
       return head + body + "</tbody></table></div>";
     }
