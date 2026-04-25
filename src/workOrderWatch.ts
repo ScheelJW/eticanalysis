@@ -1475,19 +1475,18 @@ export async function getChangelogFromSnapshots(
 }
 
 /**
- * Work-order change timeline: **read** persisted rows only. Each `ingestWorkOrderSnapshot` (email
- * or `POST /api/watch?rebuild=1` replay) writes `work_order_changelog` for that report’s
- * `snapshot_date_key` (e.g. 21 Apr) — it does not change on later reads. If the table is empty, we
- * derive from `work_order_snapshot` (still D1, same as consecutive snapshot diffs).
+ * Work-order change timeline for display. Derive from consecutive snapshot rows
+ * first so stale persisted changelog rows cannot invent a later tracking start.
+ * Fall back to work_order_changelog only when snapshot history is unavailable.
  */
 export async function getChangelogForDisplay(
   env: { ETIC_SNAPSHOTS: D1Database },
   workOrderId: string,
   limit = 500,
 ): Promise<WorkOrderChangelogEntry[]> {
-  const fromTable = await getChangelog(env, workOrderId, limit);
-  if (fromTable.length > 0) return fromTable;
-  return getChangelogFromSnapshots(env, workOrderId, limit);
+  const fromSnapshots = await getChangelogFromSnapshots(env, workOrderId, limit);
+  if (fromSnapshots.length > 0) return fromSnapshots;
+  return getChangelog(env, workOrderId, limit);
 }
 
 /** ETIC meeting rows for this WO (notes / due-outs) for the work-order timeline. */

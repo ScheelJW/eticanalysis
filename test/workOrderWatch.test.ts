@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { RawWorkOrder } from "../src/yardCheck";
-import { calendarDaysBetween, classifyMelTier, ingestWorkOrderSnapshot, parseEticDate } from "../src/workOrderWatch";
+import {
+  calendarDaysBetween,
+  classifyMelTier,
+  getChangelogForDisplay,
+  ingestWorkOrderSnapshot,
+  parseEticDate,
+} from "../src/workOrderWatch";
 
 describe("classifyMelTier", () => {
   it("detects below / at / above from phrases", () => {
@@ -69,6 +75,16 @@ class MockD1Database {
   }
 
   all<T>(sql: string, params: unknown[]): T[] {
+    if (sql.includes("FROM work_order_snapshot") && sql.includes("WHERE work_order_id = ?")) {
+      const workOrderId = String(params[0]);
+      const rows: Record<string, unknown>[] = [];
+      for (const [snapshotDate, byWo] of this.snapshots) {
+        const row = byWo.get(workOrderId);
+        if (row) rows.push({ ...row, snapshot_date_key: snapshotDate });
+      }
+      rows.sort((a, b) => String(a.snapshot_date_key).localeCompare(String(b.snapshot_date_key)));
+      return rows as T[];
+    }
     if (sql.includes("FROM work_order_snapshot") && sql.includes("WHERE work_order_id IN")) {
       const dateKey = String(params[params.length - 1]);
       const workOrderIds = new Set(params.slice(0, -1).map(String));
@@ -192,5 +208,30 @@ describe("ingestWorkOrderSnapshot", () => {
       ["2026-04-03", "etic", "4/5/2026", "4/7/2026"],
       ["2026-04-03", "etic_date_slip", "2026-04-05", "2026-04-07"],
     ]);
+  });
+
+  it("derives display changelog from snapshots when persisted changelog has stale duplicate initial rows", async () => {
+    const db = new MockD1Database();
+    const env = { ETIC_SNAPSHOTS: db as unknown as D1Database };
+
+    await ingestWorkOrderSnapshot(env, "2026-02-26", [
+      wo({ workOrderId: "WO-1", assetId: "AF1", remarks: "Initial", currentMel: "Below MEL" }),
+    ], "2026-02-26T18:00:00.000Z");
+    await ingestWorkOrderSnapshot(env, "2026-04-16", [
+      wo({ workOrderId: "WO-1", assetId: "AF1", remarks: "Initial", currentMel: "Below MEL" }),
+    ], "2026-04-16T18:00:00.000Z");
+
+    db.changelog.push({
+      work_order_id: "WO-1",
+      snapshot_date_key: "2026-04-16",
+      changed_at_iso: "2026-04-16T18:00:00.000Z",
+      field: "initial",
+      old_value: "",
+      new_value: "first_seen",
+    });
+
+    const display = await getChangelogForDisplay(env, "WO-1");
+
+    expect(display.filter((row) => row.field === "initial").map((row) => row.snapshot_date_key)).toEqual(["2026-02-26"]);
   });
 });
