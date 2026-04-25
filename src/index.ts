@@ -15627,6 +15627,17 @@ function renderDashboardHtml(): string {
     let woShop = "";
     let woMgmtCd = "";
     let woSort = "default";
+    var woListInputDebounce = null;
+    var WO_LIST_INPUT_DEBOUNCE_MS = 140;
+    function scheduleWoListRerender() {
+      if (woListInputDebounce) clearTimeout(woListInputDebounce);
+      woListInputDebounce = setTimeout(function () {
+        woListInputDebounce = null;
+        var asOf = woAsOfDate();
+        var rows = (asOf && watchCacheByDate.get(asOf)) || [];
+        renderWoList(rows);
+      }, WO_LIST_INPUT_DEBOUNCE_MS);
+    }
     // Snapshot screen: compare-2-dates state + per-Unit/NCE breakdown filter.
     const compareState = { from: "", to: "" };
     let breakdownFilter = "units"; // "units" | "nce" | "all"
@@ -15688,13 +15699,6 @@ function renderDashboardHtml(): string {
     async function loadWatchForDate(dateKey, opts) {
       if (!dateKey) return [];
       const force = !!(opts && opts.force);
-      // Always kick off a sightings + waiver-counts refresh in parallel —
-      // every place watch rows render also wants the asset's last-sighting
-      // and waiver-card badges. Both caches have their own TTL so these
-      // are no-ops when warm.
-      loadSightings(force);
-      loadWaiverCounts(force);
-      loadYardPhotoLatest(force);
       if (!force && watchCacheByDate.has(dateKey)) return watchCacheByDate.get(dateKey);
       // Use scope=snapshot (default) so the list shows ONLY the work orders
       // that were actually present in the .xlsx for this date. scope=all would
@@ -17122,7 +17126,17 @@ function renderDashboardHtml(): string {
         : "Fleet readiness at a glance.";
       if (isWo) {
         const asOf = woAsOfDate();
-        if (asOf) loadAndRenderWoList(asOf, { force: true });
+        if (asOf) {
+          const cached = watchCacheByDate.get(asOf);
+          if (cached && cached.length) {
+            renderWoList(cached);
+            loadSightings(false);
+            loadWaiverCounts(false);
+            loadYardPhotoLatest(false);
+          } else {
+            loadAndRenderWoList(asOf, {});
+          }
+        }
       } else if (isSmx) {
         loadScheduleMxTab();
       } else if (isAuthz) {
@@ -17504,13 +17518,20 @@ function renderDashboardHtml(): string {
     }
 
     function renderWoListCounts(rows) {
-      function count(f) {
-        return rows.filter(function (r) { return woMatchesFilter(r, f) && woMatchesRefine(r) && woMatchesQuery(r, woQuery); }).length;
+      var cAll = 0, cBelow = 0, cStale = 0, cPushed = 0, cSlipped = 0;
+      for (var i = 0; i < rows.length; i++) {
+        var r = rows[i];
+        if (!woMatchesRefine(r) || !woMatchesQuery(r, woQuery)) continue;
+        cAll += 1;
+        if (r.melTier === "below") cBelow += 1;
+        if (r.remarkStale) cStale += 1;
+        if ((r.eticPushCount || 0) >= 1) cPushed += 1;
+        if ((r.cumulativeEticSlipDays || 0) >= 1) cSlipped += 1;
       }
-      const map = { all: count("all"), below: count("below"), stale: count("stale"), pushed: count("pushed"), slipped: count("slipped") };
+      const map = { all: cAll, below: cBelow, stale: cStale, pushed: cPushed, slipped: cSlipped };
       document.querySelectorAll("#wo-filters .count").forEach(function (el) {
         const k = el.getAttribute("data-count");
-        if (k && map[k] !== undefined) el.textContent = map[k];
+        if (k && map[k] !== undefined) el.textContent = String(map[k]);
       });
     }
 
@@ -17647,7 +17668,7 @@ function renderDashboardHtml(): string {
           ((openedLine || r.assetId) ? (
             "<div class='wo-meta-line'>" +
               (openedLine || "") +
-              renderSightingBadge(r.assetId) +
+              renderSightingBadge(r.assetId, { compact: true }) +
               renderWaiverBadge(r.assetId) +
               renderYardPhotoThumb(r.assetId) +
             "</div>"
@@ -17676,16 +17697,17 @@ function renderDashboardHtml(): string {
       const meta = document.getElementById("wo-list-meta");
       meta.textContent = "Loading…";
       try {
-        // Pull WO rows + last-yard-sighting map + waiver counts in parallel
-        // so every asset-id badge (location + waiver card) renders together
-        // on first paint instead of popping in a tick later.
-        const [rows] = await Promise.all([
-          loadWatchForDate(dateKey, opts),
-          loadSightings(!!(opts && opts.force)),
-          loadWaiverCounts(!!(opts && opts.force)),
-          loadYardPhotoLatest(!!(opts && opts.force)),
-        ]);
+        const rows = await loadWatchForDate(dateKey, opts);
         renderWoList(rows);
+        const force = !!(opts && opts.force);
+        Promise.all([
+          loadSightings(force),
+          loadWaiverCounts(force),
+          loadYardPhotoLatest(force),
+        ]).then(function () {
+          if (woAsOfDate() !== dateKey) return;
+          renderWoList(rows);
+        });
       } catch (e) {
         meta.textContent = "Could not load work orders.";
       }
@@ -19287,9 +19309,7 @@ function renderDashboardHtml(): string {
       const woInput = document.getElementById("wo-id-input");
       woInput.addEventListener("input", function () {
         woQuery = (woInput.value || "").trim();
-        const asOf = woAsOfDate();
-        const rows = (asOf && watchCacheByDate.get(asOf)) || [];
-        renderWoList(rows);
+        scheduleWoListRerender();
       });
       woInput.addEventListener("keydown", function (ev) {
         if (ev.key === "Enter") {
