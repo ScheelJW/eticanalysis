@@ -7,6 +7,7 @@ import {
   getChangelogForDisplay,
   ingestWorkOrderSnapshot,
   melMgmtCodesMatch,
+  normalizeWorkbookTextForCompare,
   parseEticDate,
 } from "../src/workOrderWatch";
 import type { WatchRow } from "../src/workOrderWatch";
@@ -39,6 +40,13 @@ describe("parseEticDate", () => {
 describe("calendarDaysBetween", () => {
   it("counts whole days", () => {
     expect(calendarDaysBetween("2026-04-01", "2026-04-04")).toBe(3);
+  });
+});
+
+describe("normalizeWorkbookTextForCompare", () => {
+  it("treats line-ending and NBSP churn as unchanged", () => {
+    expect(normalizeWorkbookTextForCompare("A\r\nB")).toBe(normalizeWorkbookTextForCompare("A\nB"));
+    expect(normalizeWorkbookTextForCompare("wait\u00A0on\u202Fparts")).toBe(normalizeWorkbookTextForCompare("wait on parts"));
   });
 });
 
@@ -345,6 +353,22 @@ describe("ingestWorkOrderSnapshot", () => {
       ["2026-04-03", "etic", "4/5/2026", "4/7/2026"],
       ["2026-04-03", "etic_date_slip", "2026-04-05", "2026-04-07"],
     ]);
+  });
+
+  it("does not log remarks change when only workbook whitespace / line endings differ", async () => {
+    const db = new MockD1Database();
+    const env = { ETIC_SNAPSHOTS: db as unknown as D1Database };
+
+    await ingestWorkOrderSnapshot(env, "2026-03-02", [
+      wo({ workOrderId: "WO-1", assetId: "AF1", remarks: "Same text", currentMel: "Below MEL" }),
+    ], "2026-03-02T18:00:00.000Z");
+    await ingestWorkOrderSnapshot(env, "2026-03-03", [
+      wo({ workOrderId: "WO-1", assetId: "AF1", remarks: "Same text\r\n", currentMel: "Below MEL" }),
+    ], "2026-03-03T18:00:00.000Z");
+
+    expect(db.changelog.filter((row) => row.field === "remarks")).toEqual([]);
+    const snapMar3 = db.snapshots.get("2026-03-03")?.get("WO-1");
+    expect(snapMar3?.last_remark_change_date).toBe("2026-03-02");
   });
 
   it("derives display changelog from snapshots when persisted changelog has stale duplicate initial rows", async () => {

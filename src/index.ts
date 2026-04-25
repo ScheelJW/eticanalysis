@@ -25,6 +25,7 @@ import {
   ingestWorkOrderSnapshot,
   listFmaFollowUpActionsForReport,
   logWorkOrderAction,
+  repairLastRemarkChangeDatesFromSnapshots,
   setWorkOrderActionFollowupDone,
   type WorkOrderActionType,
 } from "./workOrderWatch";
@@ -4684,6 +4685,26 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
         { headers: cacheHeaders() },
       );
     }
+    if (url.searchParams.get("repair_remark_dates") === "1") {
+      const wait = url.searchParams.get("wait") === "1";
+      const runRepair = () => repairLastRemarkChangeDatesFromSnapshots(env);
+      if (wait) {
+        const summary = await runRepair();
+        return Response.json(
+          { ok: true, message: "Recomputed last_remark_change_date from snapshot history (normalized).", ...summary },
+          { headers: cacheHeaders() },
+        );
+      }
+      ctx.waitUntil(runRepair());
+      return Response.json(
+        {
+          ok: true,
+          message:
+            "Repairing last_remark_change_date in background (walk work_order_snapshot oldest to newest). Use repair_remark_dates=1&wait=1 to block.",
+        },
+        { headers: cacheHeaders() },
+      );
+    }
     if (url.searchParams.get("backfill-from-json") === "1") {
       const overwrite = url.searchParams.get("overwrite") === "1";
       const tableParam = (url.searchParams.get("table") ?? "both").toLowerCase();
@@ -4697,7 +4718,10 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
       }
       return Response.json({ ok: true, overwrite, reports }, { headers: cacheHeaders() });
     }
-    return new Response("Use POST /api/watch?rebuild=1 | ?replay=YYYY-MM-DD | ?reset=1 | ?backfill-from-json=1[&overwrite=1][&table=state|snapshot|both]", { status: 400 });
+    return new Response(
+      "Use POST /api/watch?rebuild=1 | ?repair_remark_dates=1[&wait=1] | ?replay=YYYY-MM-DD | ?reset=1 | ?backfill-from-json=1[&overwrite=1][&table=state|snapshot|both]",
+      { status: 400 },
+    );
   }
 
   const url = new URL(request.url);
