@@ -3593,7 +3593,7 @@ function renderMobileAppPickerHtml(): string {
       <span class="choice-icon" aria-hidden="true">📍</span>
       <span class="choice-text">
         <span class="choice-title">Yard check</span>
-        <span class="choice-sub">Walk the yard — confirm assets, photos, and findings.</span>
+        <span class="choice-sub">Walk the yard — confirm assets, photos, and needs-fix items.</span>
       </span>
       <span class="choice-go" aria-hidden="true">→</span>
     </a>
@@ -6492,7 +6492,7 @@ function renderYardAppHtml(): string {
       </div>
       <div class="search-row">
         <input id="search" type="search" inputmode="search" placeholder="Search asset, VIN, shop, location…" autocomplete="off" />
-        <button class="find-btn" id="find-btn" aria-label="Found unlisted asset">+ Find</button>
+        <button class="find-btn" id="find-btn" aria-label="Found asset with no open work order">+ Find</button>
       </div>
       <div id="walker" class="walker-row"></div>
     </header>
@@ -6516,7 +6516,7 @@ function renderYardAppHtml(): string {
         </div>
         <div class="yard-desktop-search">
           <input id="search-desk" type="search" inputmode="search" placeholder="Search asset, VIN, shop, location…" autocomplete="off" />
-          <button type="button" class="yard-desktop-find" id="find-btn-desk">Find unlisted…</button>
+          <button type="button" class="yard-desktop-find" id="find-btn-desk">Found, no WO…</button>
         </div>
         <div class="yard-desktop-stats" aria-live="polite">
           <b data-stat="t-due">0</b> due · <b data-stat="t-today">0</b> today
@@ -6535,7 +6535,7 @@ function renderYardAppHtml(): string {
     </div>
 
     <div class="yard-desk" id="yard-desk">
-      <p class="yard-desk-hint">Search and pick a row for location, notes, and history. <span style="color:var(--muted)">NCE and Below MEL tags are work-order context only. Unlisted is the only extra queue besides the check cadence.</span></p>
+      <p class="yard-desk-hint">Search and pick a row for location, notes, and history. <span style="color:var(--muted)">NCE and Below MEL tags are work-order context only. Items marked Found, no open WO need a work-order or records fix.</span></p>
       <div class="yard-desk-split">
         <div class="yard-desk-table-wrap">
           <table class="yard-desk-table" aria-label="Yard vehicle lookup">
@@ -6635,8 +6635,8 @@ function renderYardAppHtml(): string {
 
   <div class="modal-overlay" id="find-modal" aria-hidden="true">
     <div class="modal" role="dialog" aria-labelledby="find-title">
-      <h3 id="find-title">Found unlisted asset</h3>
-      <p class="hint">Floor-to-book: log a vehicle you found in the yard that doesn't show up in the latest ETIC. It'll show as "Unlisted" until a fleet manager reconciles it.</p>
+      <h3 id="find-title">Found, no open WO</h3>
+      <p class="hint">Log a vehicle you found in the yard that does not have an open work order in the latest ETIC. It will show in Needs Fix until a fleet manager opens a WO or corrects the record.</p>
       <label>Asset / tail / bumper number
         <input id="find-asset-id" type="text" inputmode="text" autocapitalize="characters" placeholder="e.g. L-3157" />
       </label>
@@ -6855,7 +6855,7 @@ function renderYardAppHtml(): string {
         // Badges = orthogonal flags only. The colored age line below already
         // conveys never/due/overdue/done, so we don't repeat it here.
         var badges = "";
-        if (a.isUnlisted) badges += '<span class="badge unlisted">Unlisted</span>';
+        if (a.isUnlisted) badges += '<span class="badge unlisted">Found, no WO</span>';
         if (a.isNewAsset) badges += '<span class="badge new">NEW</span>';
         if (a.isNce) badges += '<span class="badge nce">NCE</span>';
         if (a.isBelowMel) badges += '<span class="badge below-mel">Below MEL</span>';
@@ -7350,9 +7350,9 @@ function renderYardAppHtml(): string {
 
       var unlistedBanner = a.isUnlisted
         ? '<div class="unlisted-banner">' +
-            '<b>Unlisted in latest ETIC</b>' +
-            'A walker logged this asset, but it doesn\u2019t appear in the most recent xlsx. ' +
-            'Have a fleet manager open a WO or retire the record.' +
+            '<b>Found, no open WO</b>' +
+            'A walker logged this asset, but it does not have an open work order in the latest ETIC. ' +
+            'Have a fleet manager open a WO or correct the record.' +
           '</div>'
         : '';
 
@@ -7367,7 +7367,7 @@ function renderYardAppHtml(): string {
           resolved: "Resolved", in_progress: "In progress", dismissed: "Dismissed",
           wo_opened: "WO opened", retired: "Retired", reassigned: "Reassigned"
         };
-        var kindLabels = { missing: "Missing", unlisted: "Unlisted", discrepancy: "Discrepancy", unknown: "Unknown" };
+        var kindLabels = { missing: "Missing", unlisted: "Found, no open WO", discrepancy: "Discrepancy", unknown: "Unknown" };
         var label = resLabels[act.resolution] || act.resolution;
         var kindLbl = kindLabels[act.kind] || act.kind;
         var woTxt = act.woOpened ? " (WO #" + escapeHtml(act.woOpened) + ")" : "";
@@ -7778,7 +7778,7 @@ function renderYardAppHtml(): string {
         });
     }
 
-    /* ----- find / floor-to-book modal ----- */
+    /* ----- find / needs-fix modal ----- */
     function openYardPhotoLbMob(url) {
       var m = $("yard-photo-lb-m");
       var img = $("yard-photo-lb-img-m");
@@ -14432,7 +14432,7 @@ function renderDashboardHtml(): string {
           <nav class="yard-subnav" id="yard-subnav" style="padding:0 20px;display:flex;gap:6px;border-bottom:1px solid var(--border);">
             <button type="button" class="yard-subtab active" data-yard-sub="roster">Fleet list</button>
             <button type="button" class="yard-subtab" data-yard-sub="findings">
-              Findings <span class="yard-subbadge" id="yard-sub-findings-count">0</span>
+              Needs Fix <span class="yard-subbadge" id="yard-sub-findings-count">0</span>
             </button>
             <button type="button" class="yard-subtab" data-yard-sub="activity">Recent activity</button>
           </nav>
@@ -14441,7 +14441,7 @@ function renderDashboardHtml(): string {
             <div class="yard-findings-controls" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px;">
               <div class="yard-findings-chips" id="yard-findings-chips" style="display:flex;gap:6px;flex-wrap:wrap;">
                 <button type="button" class="yard-findings-chip active" data-finding-kind="all">All <span class="count" id="ff-all">0</span></button>
-                <button type="button" class="yard-findings-chip" data-finding-kind="unlisted">Unlisted <span class="count" id="ff-unlisted">0</span></button>
+                <button type="button" class="yard-findings-chip" data-finding-kind="unlisted">Found, no open WO <span class="count" id="ff-unlisted">0</span></button>
                 <button type="button" class="yard-findings-chip" data-finding-kind="discrepancy">Discrepancies <span class="count" id="ff-discrepancy">0</span></button>
               </div>
               <label style="margin-left:auto;display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted);cursor:pointer;"
@@ -22143,8 +22143,8 @@ function renderDashboardHtml(): string {
        ====================================================================== */
     const yardFmState = {
       wired: false,
-      // Default to Fleet list — embedded walker app. Findings triages
-      // unlisted/discrepancies only (not "not checked"; that's on the list).
+      // Default to Fleet list — embedded walker app. Needs Fix triages
+      // found-with-no-WO/discrepancies only (not "not checked"; that's on the list).
       subTab: "roster",
       findings: [],
       totals: { total: 0, missing: 0, unlisted: 0, discrepancy: 0, unknown: 0, acknowledged: 0 },
@@ -22153,11 +22153,11 @@ function renderDashboardHtml(): string {
       activity: [],
       resolveTarget: null, // { assetId, kind, checkId, asset }
     };
-    // Kinds: unlisted / discrepancy / unknown (legacy). Absence-derived
-    // "missing" is no longer listed in the queue — see Fleet list instead.
+    // Internal kinds are stable API values; labels below are what users see.
+    // Absence-derived "missing" is no longer listed in the queue — see Fleet list instead.
     const FINDING_LABELS = {
       missing: "Not seen",
-      unlisted: "Unlisted",
+      unlisted: "Found, no open WO",
       discrepancy: "Discrepancy",
       unknown: "Unknown",
     };
@@ -22355,9 +22355,9 @@ function renderDashboardHtml(): string {
           list.innerHTML =
             '<div class="hint" style="padding:32px 16px;text-align:center;max-width:640px;margin:0 auto;">' +
               '<div style="font-size:18px;color:var(--text);font-weight:600;margin-bottom:8px;">No yard checks yet</div>' +
-              '<p style="margin:0 0 12px;">Walkers tag what they actually see. Findings appear here automatically. Each one is:</p>' +
+              '<p style="margin:0 0 12px;">Walkers tag what they actually see. Needs Fix items appear here automatically. Each one is:</p>' +
               '<ul style="text-align:left;display:inline-block;line-height:1.7;">' +
-                '<li><b>Unlisted</b> \u2014 walker logged an asset that has no open WO in the latest ingest (floor-to-book reconciliation).</li>' +
+                '<li><b>Found, no open WO</b> \u2014 walker logged an asset that has no open WO in the latest ingest.</li>' +
                 '<li><b>Discrepancy</b> \u2014 walker noted something (flat tire, windows down, etc.).</li>' +
               '</ul>' +
               '<p style="margin:12px 0 0;font-size:13px;color:var(--muted);">Vehicles waiting for a yard walk (due / never checked) appear on the <b>Fleet list</b> tab, not here.</p>' +
@@ -22366,7 +22366,7 @@ function renderDashboardHtml(): string {
             '</div>';
         } else {
           list.innerHTML = '<div class="hint" style="padding:24px;text-align:center;">' +
-            (showAck ? "Nothing matches that filter." : "All open findings cleared. \uD83C\uDF89 (Toggle \u201CShow resolved\u201D to see history.)") +
+            (showAck ? "Nothing matches that filter." : "All Needs Fix items cleared. \uD83C\uDF89 (Toggle \u201CShow resolved\u201D to see history.)") +
             '</div>';
         }
         return;
