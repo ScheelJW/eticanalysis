@@ -22357,7 +22357,7 @@ function renderDashboardHtml(): string {
               '<div style="font-size:18px;color:var(--text);font-weight:600;margin-bottom:8px;">No yard checks yet</div>' +
               '<p style="margin:0 0 12px;">Walkers tag what they actually see. Findings appear here automatically. Each one is:</p>' +
               '<ul style="text-align:left;display:inline-block;line-height:1.7;">' +
-                '<li><b>Unlisted</b> \u2014 walker logged an asset that isn\u2019t on the latest ETIC (floor-to-book reconciliation).</li>' +
+                '<li><b>Unlisted</b> \u2014 walker logged an asset that has no open WO in the latest ingest (floor-to-book reconciliation).</li>' +
                 '<li><b>Discrepancy</b> \u2014 walker noted something (flat tire, windows down, etc.).</li>' +
               '</ul>' +
               '<p style="margin:12px 0 0;font-size:13px;color:var(--muted);">Vehicles waiting for a yard walk (due / never checked) appear on the <b>Fleet list</b> tab, not here.</p>' +

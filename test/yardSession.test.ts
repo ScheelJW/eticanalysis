@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { getRollingRoster, getYardRosterForDate, recordCheck } from "../src/yardSession";
+import { getRollingRoster, getYardRosterForDate, listOpenFindings, recordCheck } from "../src/yardSession";
 
 type Row = Record<string, unknown>;
 
@@ -91,6 +91,10 @@ class MemoryD1 {
     if (sql.includes("FROM yard_check") && sql.includes("ROW_NUMBER() OVER")) {
       return this.checks;
     }
+    if (sql.includes("SELECT yc.* FROM yard_check yc")) {
+      return this.checks;
+    }
+    if (sql.includes("FROM yard_finding_action")) return [];
     if (sql.includes("FROM yard_check yc") && sql.includes("COALESCE(location")) {
       return this.checks.filter((row) => String(row.location ?? "").trim()).map((row) => ({
         asset_id: row.asset_id,
@@ -183,5 +187,21 @@ describe("Yard roster", () => {
     expect(fleetOnly?.rollingState).toBe("fresh");
     expect(roster.totals.never + roster.totals.due + roster.totals.overdue).toBe(1);
     expect(roster.totals.fresh).toBe(1);
+  });
+
+  it("flags checked assets without latest open WOs as unlisted findings", async () => {
+    const db = new MemoryD1();
+    const env = { ETIC_SNAPSHOTS: db, ETIC_BUCKET: {} };
+    await recordCheck(env as never, { assetId: "AF999", location: "Hangar 2", checkedBy: "Walker" });
+    await recordCheck(env as never, { assetId: "AF-GHOST", location: "Lot Z", checkedBy: "Walker" });
+
+    const result = await listOpenFindings(env as never);
+    const unlistedIds = result.findings
+      .filter((finding) => finding.kind === "unlisted")
+      .map((finding) => finding.assetId)
+      .sort();
+
+    expect(unlistedIds).toEqual(["AF-GHOST", "AF999"]);
+    expect(result.totals.unlisted).toBe(2);
   });
 });

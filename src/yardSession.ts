@@ -1675,7 +1675,7 @@ export async function getAssetDetail(env: Env, assetId: string): Promise<AssetDe
    `listOpenFindings` returns only kinds that need explicit FM&A follow-up on
    walker-tagged evidence:
 
-     - UNLISTED — asset has yard_check history but not on latest ETIC snapshot
+     - UNLISTED — walker found/logged an asset with no open WO on latest ETIC
      - DISCREPANCY — latest check has non-empty discrepancy text
      - UNKNOWN — legacy rows only
 
@@ -2016,8 +2016,8 @@ export async function listOpenFindings(env: Env): Promise<{
   // Walk every asset that has any check history.
   for (const [assetId, latest] of latestAnyByAsset) {
     const ra = assetByKey.get(canonicalYardAssetKey(assetId));
-    const inLatest = !!ra && !ra.isUnlisted;
-    if (!inLatest) pushFinding(assetId, "unlisted", latest);
+    const hasCurrentOpenWo = !!ra && !ra.isUnlisted && (ra.openWoCount ?? 0) > 0;
+    if (!hasCurrentOpenWo) pushFinding(assetId, "unlisted", latest);
     if (latest.discrepancies && latest.discrepancies.trim()) {
       pushFinding(assetId, "discrepancy", latest);
     }
