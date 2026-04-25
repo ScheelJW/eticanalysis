@@ -10952,7 +10952,7 @@ function renderDashboardHtml(): string {
       color: var(--accent-strong); font-weight: 600; text-decoration: none; cursor: pointer; border: 0; background: none; padding: 0; font: inherit;
     }
     .yard-wo-history-table .wo-link:hover { text-decoration: underline; }
-    .yard-wo-history-table .fma-cell {
+    .yard-wo-history-table .fleet-fma-hist-cell {
       max-width: 14rem; white-space: pre-wrap; word-break: break-word; font-size: 10px; line-height: 1.35; color: var(--text-dim);
     }
     .yard-wo-history-empty { color: var(--muted); padding: 8px 4px; font-size: 12px; }
@@ -22728,14 +22728,14 @@ function renderDashboardHtml(): string {
         var shop = esc(r.shop || "");
         var etic = esc(r.eticDate || r.eticRaw || "");
         var parts = esc((r.partsStatus || "").slice(0, 96));
-        var fmaFull = (r.fleetFmaNotes || "").trim();
-        var fmaShow = fmaFull.replace(/\\s+/g, " ");
-        if (fmaShow.length > 160) fmaShow = fmaShow.slice(0, 157) + "\u2026";
-        var fmaCell = fmaFull
-          ? '<td class="fma-cell" title="' + esc(fmaFull) + '">' + esc(fmaShow) + "</td>"
-          : "<td class=\"fma-cell\">\u2014</td>";
+        var fleetNoteFull = (r.fleetFmaNotes || "").trim();
+        var fleetNoteShow = fleetNoteFull.replace(/\\s+/g, " ");
+        if (fleetNoteShow.length > 160) fleetNoteShow = fleetNoteShow.slice(0, 157) + "\u2026";
+        var fleetNoteTd = fleetNoteFull
+          ? '<td class="fleet-fma-hist-cell" title="' + esc(fleetNoteFull) + '">' + esc(fleetNoteShow) + "</td>"
+          : '<td class="fleet-fma-hist-cell">\u2014</td>';
         var woCell = '<button type="button" class="wo-link" data-yard-open-wo="' + esc(wo) + '">' + esc(wo) + '</button>';
-        return "<tr><td>" + snap + "</td><td>" + woCell + "</td><td>" + tier + "</td><td>" + shop + "</td><td>" + etic + "</td><td>" + parts + "</td>" + fmaCell + "</tr>";
+        return "<tr><td>" + snap + "</td><td>" + woCell + "</td><td>" + tier + "</td><td>" + shop + "</td><td>" + etic + "</td><td>" + parts + "</td>" + fleetNoteTd + "</tr>";
       }).join("");
       return head + body + "</tbody></table></div>";
     }
