@@ -230,6 +230,34 @@ Reading the whole file is expensive. Use `Grep` with line numbers + small
 
 (Line numbers drift as edits land — use `Grep` to confirm before assuming.)
 
+### Trap #5 — `\\"` vs `\"` in `renderDashboardHtml()` (breaks the live page, not the bundler)
+
+The desktop HTML is one TypeScript **outer** template literal: `` return `<!doctype html>…` ``.
+Everything inside it (including the huge `<script>` block) is a **string** from TypeScript’s
+point of view. Two quoting mistakes show up constantly:
+
+1. **You want a double quote inside the JavaScript that the browser will run** (e.g.
+   `return "<div class=\"foo\">";`). If you write **`\"`** inside the outer template, TypeScript
+   emits a **real** `"` character into the HTML/JS payload. That **closes** the JS string early in
+   the browser. The parser then sees garbage — classically **`Uncaught SyntaxError: Unexpected identifier`**
+   where the “identifier” is the first word of an HTML attribute (e.g. `fleet` from
+   `fleet-fma-hist-cell`). **`tsc` and `wrangler deploy` still succeed** because the TS file is valid.
+
+2. **Correct ways to get a double quote into the emitted inline script:**
+   - Prefer **single-quoted** JS strings for HTML snippets so you can use `"` inside freely:
+     `return '<td class="fleet-fma-hist-cell">';`
+   - Or emit a **backslash** before the quote in the served source by writing **`\\"`** in the TS
+     file (see the yard desk table code that builds `"<span class=\\"…\\">"` — the browser receives
+     `\"` inside a double-quoted JS string, which is valid).
+
+**Rule:** When pasting or writing new `return "…"` / template concatenation inside the dashboard
+`<script>` section, grep the surrounding file for existing patterns (`class=\\"` vs `class="`) and
+match them. After a risky edit, smoke-test **`/`** in the browser (hard refresh) and watch the
+console — don’t rely on `tsc` alone.
+
+**Sanity check:** You can extract the dashboard `<script>…</script>` body to a temp file and run
+`node --check` on it; that parses the same JS the browser runs.
+
 ---
 
 ## 5. Data model — D1 tables
@@ -465,6 +493,10 @@ before `npm run deploy`. The deploy itself does not block on type errors.
 - ❌ Don't count non-`present` `yard_check` rows as "sightings."
 - ❌ Don't have the walker UI mark assets as "missing." Missing is
   absence-derived from the roster (see §7).
+- ❌ Don't paste C-style **`\"`** inside the **desktop** dashboard `<script>` when you mean
+  “escape a quote for the browser.” Inside `renderDashboardHtml()` that often becomes a **real**
+  `"` in the served page and **silently breaks** inline JS (see Trap #5). Use single-quoted JS
+  strings or **`\\"`** in the TS source so the browser sees `\"`.
 
 ---
 
@@ -481,3 +513,6 @@ before `npm run deploy`. The deploy itself does not block on type errors.
 5. If `wrangler deploy` blows up with a TS parse error on a line that looks
    syntactically fine in your editor, it's almost certainly trap #1 or
    trap #2.
+6. If **`wrangler deploy` / `tsc` pass** but the **browser** shows
+   `Uncaught SyntaxError` on `(index)` for the dashboard, suspect **Trap #5**
+   (bad quoting inside the emitted `<script>`) — not a Cloudflare or esbuild failure.
