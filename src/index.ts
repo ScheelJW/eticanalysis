@@ -15467,7 +15467,8 @@ function renderDashboardHtml(): string {
       const qTab = String(qs.get("tab") || "").trim().toLowerCase();
       if (qTab === "waivers") return { tab: "waivers", dateKey: null, workOrderId: null };
       if (qTab === "yard") {
-        const yv = String(qs.get("yard") || qs.get("yv") || "").trim().toLowerCase();
+        let yv = String(qs.get("yard") || qs.get("yv") || "").trim().toLowerCase();
+        if (yv === "needs-fix" || yv === "needsfix") yv = "findings";
         return { tab: "yard", dateKey: null, workOrderId: null, abuseCaseId: null, yardSub: yv || null };
       }
       if (qTab) return { tab: qTab, dateKey: null, workOrderId: null, abuseCaseId: null };
@@ -22392,6 +22393,7 @@ function renderDashboardHtml(): string {
     }
 
     function yardActivateSub(sub) {
+      if (sub === "needs-fix" || sub === "needsfix") sub = "findings";
       sub = (sub === "findings" || sub === "activity" || sub === "roster") ? sub : "roster";
       yardFmState.subTab = sub;
       syncDashboardQuery("yard", { yard: sub === "findings" ? "needs-fix" : sub });
@@ -22572,11 +22574,13 @@ function renderDashboardHtml(): string {
       title.textContent = FINDING_LABELS[kind] + " \u2014 " + assetId;
       const a = finding.asset || {};
       const ctx = [];
-      if (a.shop) ctx.push("Shop " + a.shop);
-      if (a.owningUnit) ctx.push("Unit " + a.owningUnit);
-      if (a.makeModel) ctx.push(a.makeModel);
-      if (a.lastLocation) ctx.push("Parked " + a.lastLocation);
-      if (a.openWoCount != null) ctx.push((a.openWoCount || 0) + " open WO");
+      [
+        a.owningUnit ? "Unit " + a.owningUnit : "",
+        a.makeModel || "",
+        a.shop ? "Shop " + a.shop : "",
+        a.lastLocation ? "Parked " + a.lastLocation : "",
+        Number.isFinite(Number(a.openWoCount)) ? (Number(a.openWoCount) || 0) + " open WO" : "",
+      ].forEach(function (x) { if (String(x || "").trim()) ctx.push(x); });
       if (finding.triggerCheck) {
         ctx.push("Seen " + fmtRelTs(finding.triggerCheck.checkedAtIso) + (finding.triggerCheck.checkedBy ? " by " + finding.triggerCheck.checkedBy : ""));
         if (finding.triggerCheck.sourceDateKey) ctx.push("Book " + finding.triggerCheck.sourceDateKey);
