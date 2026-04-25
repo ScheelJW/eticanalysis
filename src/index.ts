@@ -7299,9 +7299,9 @@ function renderYardAppHtml(): string {
                 var rmk = (w.remarks || "").trim();
                 return "WO " + w.workOrderId + (w.shop ? " (" + w.shop + ")" : "") + (rmk ? " — " + escapeHtml(rmk.length > 120 ? rmk.slice(0, 120) + "\u2026" : rmk) : "");
               });
-              det.push("<span class=\"history-etic\">Book " + escapeHtml(fmtYardSnapshotKey(sk)) + ":</span> " + wparts.join("; "));
+              det.push('<span class="history-etic">Book ' + escapeHtml(fmtYardSnapshotKey(sk)) + ':</span> ' + wparts.join("; "));
             } else {
-              det.push("<span class=\"history-etic\">ETIC " + escapeHtml(fmtYardSnapshotKey(sk)) + " — no open WOs on that snapshot for this ID.</span>");
+              det.push('<span class="history-etic">ETIC ' + escapeHtml(fmtYardSnapshotKey(sk)) + ' — no open WOs on that snapshot for this ID.</span>');
             }
           }
           var chg = changelogBlockForCheck(c.id, allEdits);
