@@ -18766,10 +18766,12 @@ function renderDashboardHtml(): string {
 
     async function applyHashRoute() {
       const r = readHashRoute();
-      if (r.tab === "wo" && r.workOrderId) {
+      // Keep in sync with readHashRoute() query ?tab= values — anything not
+      // handled here incorrectly falls through to snapshot (see bug: ?tab=mel).
+      if (r.tab === "wo") {
         setMainTab("wo");
         if (selectedDate) await loadAndRenderWoList(selectedDate);
-        await selectWo(r.workOrderId, false);
+        if (r.workOrderId) await selectWo(r.workOrderId, false);
         return;
       }
       if (r.tab === "waivers") {
@@ -18783,6 +18785,26 @@ function renderDashboardHtml(): string {
       }
       if (r.tab === "authz") {
         setMainTab("authz");
+        return;
+      }
+      if (r.tab === "mel") {
+        setMainTab("mel");
+        return;
+      }
+      if (r.tab === "smx") {
+        setMainTab("smx");
+        return;
+      }
+      if (r.tab === "meeting") {
+        setMainTab("meeting");
+        return;
+      }
+      if (r.tab === "ask") {
+        setMainTab("ask");
+        return;
+      }
+      if (r.tab === "settings") {
+        setMainTab("settings");
         return;
       }
       if (r.tab === "abuse-tracker") {
