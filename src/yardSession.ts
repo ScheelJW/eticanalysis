@@ -819,36 +819,38 @@ function openWoCountFromCheckSnapshot(check: YardCheckRow | null): number | null
   return null;
 }
 
-async function countWorkOrdersOnSnapshotForAsset(
-  env: Env,
-  snapshotDateKey: string,
-  assetId: string,
-): Promise<number> {
-  const dk = snapshotDateKey.trim();
-  if (!dk || !assetId.trim()) return 0;
-  const r = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT COUNT(*) AS c FROM work_order_snapshot
-     WHERE snapshot_date_key = ? AND UPPER(TRIM(asset_id)) = UPPER(TRIM(?))`,
-  )
-    .bind(dk, assetId)
-    .first<{ c: number }>();
-  return r?.c ?? 0;
-}
-
 /**
- * True if the yard_check was logged against a book day that showed ≥1 WO row
- * for this asset (same rule as openWoCount on the roster). Uses frozen JSON
- * when present; otherwise COUNT on work_order_snapshot for source_date_key
- * (covers legacy rows with empty snapshot_asset_json).
+ * Keys "snapshot_date_key|CANON_ASSET_ID" for assets that appear on work_order_snapshot
+ * for that report day. Batched to avoid one D1 round-trip per yard_check row.
  */
-async function hadOpenWoAtYardCheckTime(env: Env, check: YardCheckRow | null): Promise<boolean> {
-  if (!check) return false;
-  const fromJson = openWoCountFromCheckSnapshot(check);
-  if (fromJson !== null) return fromJson > 0;
-  const dk = (check.sourceDateKey ?? "").trim();
-  if (!dk) return false;
-  const n = await countWorkOrdersOnSnapshotForAsset(env, dk, check.assetId);
-  return n > 0;
+async function batchWorkOrderPresenceOnSnapshots(
+  env: Env,
+  byDateKey: Map<string, Set<string>>,
+): Promise<Set<string>> {
+  const out = new Set<string>();
+  const chunkSize = 80;
+  for (const [dk, canons] of byDateKey) {
+    const dateKey = dk.trim();
+    if (!dateKey || !canons.size) continue;
+    const arr = [...canons];
+    for (let i = 0; i < arr.length; i += chunkSize) {
+      const slice = arr.slice(i, i + chunkSize);
+      const ph = slice.map(() => "?").join(",");
+      const r = await env.ETIC_SNAPSHOTS.prepare(
+        `SELECT DISTINCT UPPER(TRIM(asset_id)) AS a
+         FROM work_order_snapshot
+         WHERE snapshot_date_key = ? AND UPPER(TRIM(asset_id)) IN (${ph})`,
+      )
+        .bind(dateKey, ...slice)
+        .all<{ a: string }>();
+      const prefix = dateKey + "|";
+      for (const row of r.results ?? []) {
+        const a = (row.a ?? "").trim();
+        if (a) out.add(prefix + a);
+      }
+    }
+  }
+  return out;
 }
 
 async function getYardCheckIntervalDays(env: Env): Promise<number> {
@@ -2028,6 +2030,21 @@ export async function listOpenFindings(env: Env): Promise<{
 
   const assetByKey = rosterByCanon;
 
+  const byDateKeyForWoFallback = new Map<string, Set<string>>();
+  for (const [assetId, latest] of latestAnyByAsset) {
+    if (openWoCountFromCheckSnapshot(latest) !== null) continue;
+    const dk = (latest.sourceDateKey ?? "").trim();
+    if (!dk) continue;
+    const c = canonicalYardAssetKey(assetId);
+    let s = byDateKeyForWoFallback.get(dk);
+    if (!s) {
+      s = new Set();
+      byDateKeyForWoFallback.set(dk, s);
+    }
+    s.add(c);
+  }
+  const woPresenceAtCheck = await batchWorkOrderPresenceOnSnapshots(env, byDateKeyForWoFallback);
+
   const findings: YardFinding[] = [];
   const totals: Record<FindingKind | "total" | "acknowledged", number> = {
     missing: 0,
@@ -2089,9 +2106,16 @@ export async function listOpenFindings(env: Env): Promise<{
   for (const [assetId, latest] of latestAnyByAsset) {
     const ra = assetByKey.get(canonicalYardAssetKey(assetId));
     const hasCurrentOpenWo = !!ra && !ra.isUnlisted && (ra.openWoCount ?? 0) > 0;
-    // Book state at check time: snapshot_asset_json when present, else COUNT
-    // on work_order_snapshot for source_date_key (legacy empty JSON).
-    const hadOpenWoWhenWalkerSawIt = await hadOpenWoAtYardCheckTime(env, latest);
+    const fromJson = openWoCountFromCheckSnapshot(latest);
+    let hadOpenWoWhenWalkerSawIt = false;
+    if (fromJson !== null) {
+      hadOpenWoWhenWalkerSawIt = fromJson > 0;
+    } else {
+      const dk = (latest.sourceDateKey ?? "").trim();
+      if (dk) {
+        hadOpenWoWhenWalkerSawIt = woPresenceAtCheck.has(dk + "|" + canonicalYardAssetKey(assetId));
+      }
+    }
     if (!hasCurrentOpenWo && !hadOpenWoWhenWalkerSawIt) {
       pushFinding(assetId, "unlisted", latest);
     }

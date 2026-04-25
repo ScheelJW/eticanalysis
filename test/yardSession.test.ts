@@ -84,10 +84,17 @@ class MemoryD1 {
       return this.fleetRows;
     }
     if (sql.includes("FROM work_order_snapshot") && sql.includes("snapshot_date_key = ?")) {
-      if (sql.includes("COUNT(*)")) {
-        const aid = String(binds[1] ?? "").trim().toUpperCase();
-        const n = this.workOrderRows.filter((row) => String(row.asset_id ?? "").trim().toUpperCase() === aid).length;
-        return [{ c: n }];
+      if (sql.includes("DISTINCT UPPER(TRIM(asset_id))") && sql.includes("IN (")) {
+        const ids = new Set(binds.slice(1).map((x) => String(x ?? "").trim().toUpperCase()));
+        const out: { a: string }[] = [];
+        const seen = new Set<string>();
+        for (const row of this.workOrderRows) {
+          const a = String(row.asset_id ?? "").trim().toUpperCase();
+          if (!a || !ids.has(a) || seen.has(a)) continue;
+          seen.add(a);
+          out.push({ a });
+        }
+        return out;
       }
       if (sql.includes("mel_tier = 'below'")) return [{ asset_id: "AF123" }];
       if (sql.includes("SELECT DISTINCT asset_id")) return this.workOrderRows.map((row) => ({ asset_id: row.asset_id }));
