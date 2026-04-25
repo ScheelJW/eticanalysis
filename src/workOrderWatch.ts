@@ -8,6 +8,7 @@ import {
 } from "./yardCheck";
 import { getStalenessThresholds } from "./melWatch";
 import { buildLineCompletions } from "./meeting";
+import { autoCloseYardFindingsOnNewWorkOrders } from "./yardSession";
 
 export type MelTier = "below" | "at" | "above" | "unknown";
 
@@ -194,6 +195,7 @@ export async function ingestWorkOrderSnapshot(
   rows: RawWorkOrder[],
   updatedAtIso: string,
   workbookBinary?: ArrayBuffer,
+  opts?: { skipAutoCloseYardFindings?: boolean },
 ): Promise<void> {
   const cleaned = rows
     .map((wo) => ({
@@ -528,6 +530,16 @@ export async function ingestWorkOrderSnapshot(
     await verifyWorkOrderActionsForSnapshot(env, dateKey);
   } catch (err) {
     console.error("verifyWorkOrderActionsForSnapshot failed", err);
+  }
+
+  // Auto-resolve Needs Fix (unlisted / discrepancy) when the book now shows
+  // an open WO for an asset that had none on the prior snapshot.
+  try {
+    await autoCloseYardFindingsOnNewWorkOrders(env, dateKey, updatedAtIso, {
+      skip: !!opts?.skipAutoCloseYardFindings,
+    });
+  } catch (err) {
+    console.error("autoCloseYardFindingsOnNewWorkOrders failed", err);
   }
 }
 

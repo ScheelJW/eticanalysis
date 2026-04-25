@@ -7,6 +7,8 @@
 // the walker saw when they marked that vehicle present.
 
 type Env = { ETIC_SNAPSHOTS: D1Database; ETIC_BUCKET: R2Bucket };
+/** D1 (+ optional R2) — listOpenFindings and ingest hooks only need D1. */
+type YardDbEnv = { ETIC_SNAPSHOTS: D1Database; ETIC_BUCKET?: R2Bucket };
 
 export type YardSessionStatus = "open" | "closed";
 
@@ -148,7 +150,7 @@ function mergeYardCheckRowsByCanonical<T extends YardCheckMergeRow>(rows: T[]): 
   return [...by.values()];
 }
 
-async function hasWorkOrderSnapshotRowsForDate(env: Env, dateKey: string): Promise<boolean> {
+async function hasWorkOrderSnapshotRowsForDate(env: YardDbEnv, dateKey: string): Promise<boolean> {
   if (!dateKey) return false;
   const r = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT 1 AS ok FROM work_order_snapshot WHERE snapshot_date_key = ? LIMIT 1`,
@@ -158,7 +160,7 @@ async function hasWorkOrderSnapshotRowsForDate(env: Env, dateKey: string): Promi
   return !!r;
 }
 
-async function hasFleetSnapshotRowsForDate(env: Env, dateKey: string): Promise<boolean> {
+async function hasFleetSnapshotRowsForDate(env: YardDbEnv, dateKey: string): Promise<boolean> {
   if (!dateKey) return false;
   const r = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT 1 AS ok FROM fleet_p_a_snapshot WHERE snapshot_date_key = ? LIMIT 1`,
@@ -168,7 +170,7 @@ async function hasFleetSnapshotRowsForDate(env: Env, dateKey: string): Promise<b
   return !!r;
 }
 
-async function hasYardRosterRowsForDate(env: Env, dateKey: string): Promise<boolean> {
+async function hasYardRosterRowsForDate(env: YardDbEnv, dateKey: string): Promise<boolean> {
   return await hasFleetSnapshotRowsForDate(env, dateKey) || await hasWorkOrderSnapshotRowsForDate(env, dateKey);
 }
 
@@ -176,7 +178,7 @@ async function hasYardRosterRowsForDate(env: Env, dateKey: string): Promise<bool
  * Yard follows the newest D1 snapshot that has extracted roster rows. R2 latest
  * can lag after rebuilds, but the walker needs the latest queryable D1 roster.
  */
-async function getLatestSnapshotDateKey(env: Env): Promise<string> {
+async function getLatestSnapshotDateKey(env: YardDbEnv): Promise<string> {
   let row = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT e.date_key
        FROM etic_snapshots e
@@ -200,6 +202,7 @@ async function getLatestSnapshotDateKey(env: Env): Promise<string> {
   if (row?.date_key) return row.date_key;
 
   try {
+    if (!env.ETIC_BUCKET) throw new Error("no R2");
     const latestObj = await env.ETIC_BUCKET.get("analyses/latest.json");
     if (latestObj) {
       const latest = JSON.parse(await latestObj.text()) as { dateKey?: string };
@@ -404,7 +407,7 @@ function collectLocationValues(row: YardRosterSourceRow, allLocations: Set<strin
  * open-WO context from the same ETIC day. Checked assets outside Fleet P&A are
  * added later by getRollingRoster as unlisted/floor-to-book finds.
  */
-export async function getYardRosterForDate(env: Env, dateKey: string): Promise<YardRoster> {
+export async function getYardRosterForDate(env: YardDbEnv, dateKey: string): Promise<YardRoster> {
   if (!dateKey) return { assets: [], locations: [] };
   const [fleetRows, woRows] = await Promise.all([
     env.ETIC_SNAPSHOTS.prepare(
@@ -493,7 +496,7 @@ export async function getYardRosterForDate(env: Env, dateKey: string): Promise<Y
  * Backwards-compatible alias for callers that only need the asset list.
  * Prefer getYardRosterForDate going forward.
  */
-export async function getAssetRosterForDate(env: Env, dateKey: string): Promise<YardAsset[]> {
+export async function getAssetRosterForDate(env: YardDbEnv, dateKey: string): Promise<YardAsset[]> {
   const r = await getYardRosterForDate(env, dateKey);
   return r.assets;
 }
@@ -806,7 +809,7 @@ function rowToCheck(r: CheckReadRow): YardCheckRow {
   };
 }
 
-async function getYardCheckIntervalDays(env: Env): Promise<number> {
+async function getYardCheckIntervalDays(env: YardDbEnv): Promise<number> {
   const r = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT value FROM app_config WHERE key = ?`,
   )
@@ -846,7 +849,7 @@ function isOpenWoDue(openWoCount: number, daysSince: number | null, intervalDays
  * One-shot rolling roster: latest snapshot's assets + their last-check info +
  * photo counts + new-asset flag (first appearance vs the prior snapshot).
  */
-export async function getRollingRoster(env: Env): Promise<RollingRoster> {
+export async function getRollingRoster(env: YardDbEnv): Promise<RollingRoster> {
   const intervalDays = await getYardCheckIntervalDays(env);
   const dateKey = await getLatestSnapshotDateKey(env);
   if (!dateKey) {
@@ -1752,7 +1755,7 @@ export function extractFleetFmaNotesFromRaw(raw: Record<string, unknown> | null 
 }
 
 async function enrichFindingsPreviewPhotos(
-  env: Env,
+  env: YardDbEnv,
   findings: YardFinding[],
 ): Promise<void> {
   const ids = [...new Set(findings.map((f) => f.assetId).filter(Boolean))];
@@ -1783,7 +1786,7 @@ async function enrichFindingsPreviewPhotos(
 }
 
 async function enrichFindingsFleetFmaNotes(
-  env: Env,
+  env: YardDbEnv,
   dateKey: string,
   findings: YardFinding[],
 ): Promise<void> {
@@ -1874,7 +1877,7 @@ export async function listFindingActionsForAsset(
  *
  * See the FM&A FOLLOW-UP QUEUE comment block above for the rules.
  */
-export async function listOpenFindings(env: Env): Promise<{
+export async function listOpenFindings(env: YardDbEnv): Promise<{
   findings: YardFinding[];
   totals: Record<FindingKind | "total" | "acknowledged", number>;
 }> {
@@ -2017,17 +2020,19 @@ export type ResolveFindingInput = {
   woOpened?: string;
   note?: string;
   resolvedBy?: string;
+  /** When set (e.g. ETIC ingest clock), used instead of wall time for resolved_at_iso. */
+  resolvedAtIso?: string;
 };
 
 export async function resolveFinding(
-  env: Env,
+  env: YardDbEnv,
   input: ResolveFindingInput,
 ): Promise<YardFindingAction> {
   const assetId = input.assetId.trim();
   if (!assetId) throw new Error("assetId required");
   if (!VALID_KINDS.has(input.kind)) throw new Error("invalid kind");
   if (!VALID_RESOLUTIONS.has(input.resolution)) throw new Error("invalid resolution");
-  const nowIso = new Date().toISOString();
+  const nowIso = (input.resolvedAtIso ?? "").trim() || new Date().toISOString();
   const r = await env.ETIC_SNAPSHOTS.prepare(
     `INSERT INTO yard_finding_action
        (asset_id, kind, check_id, resolution, wo_opened, note, resolved_by, resolved_at_iso)
@@ -2047,6 +2052,101 @@ export async function resolveFinding(
     .first<FindingActionRow>();
   if (!r) throw new Error("failed to record action");
   return rowToAction(r);
+}
+
+type WoSnapMini = { asset_id: string; work_order_id: string };
+
+/**
+ * After a new workbook lands, any **open** unlisted / discrepancy Needs Fix row
+ * for an asset that just gained its first open WO on this snapshot is auto-
+ * resolved as wo_opened (same outcome as FM&A picking "WO opened").
+ *
+ * Skipped during full rebuild/replay so historical ingests do not fabricate
+ * actions. Uses the same open/ack rules as listOpenFindings.
+ */
+export async function autoCloseYardFindingsOnNewWorkOrders(
+  env: YardDbEnv,
+  snapshotDateKey: string,
+  updatedAtIso: string,
+  opts?: { skip?: boolean },
+): Promise<number> {
+  if (opts?.skip || !snapshotDateKey) return 0;
+
+  const prevRow = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT date_key FROM etic_snapshots
+      WHERE deleted_at_iso IS NULL AND date_key < ?
+      ORDER BY date_key DESC LIMIT 1`,
+  )
+    .bind(snapshotDateKey)
+    .first<{ date_key: string }>();
+  const prevKey = prevRow?.date_key ?? "";
+
+  const cur = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT asset_id, work_order_id FROM work_order_snapshot WHERE snapshot_date_key = ?`,
+  )
+    .bind(snapshotDateKey)
+    .all<WoSnapMini>();
+
+  const woIdsByCanon = new Map<string, string[]>();
+  for (const row of cur.results ?? []) {
+    const aid = (row.asset_id ?? "").trim();
+    const wid = (row.work_order_id ?? "").trim();
+    if (!aid || !wid) continue;
+    const c = canonicalYardAssetKey(aid);
+    const list = woIdsByCanon.get(c) ?? [];
+    if (!list.includes(wid)) list.push(wid);
+    woIdsByCanon.set(c, list);
+  }
+
+  const prevCountByCanon = new Map<string, number>();
+  if (prevKey) {
+    const prev = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT asset_id, COUNT(*) AS n
+         FROM work_order_snapshot
+        WHERE snapshot_date_key = ?
+        GROUP BY asset_id`,
+    )
+      .bind(prevKey)
+      .all<{ asset_id: string; n: number }>();
+    for (const row of prev.results ?? []) {
+      const aid = (row.asset_id ?? "").trim();
+      if (!aid) continue;
+      prevCountByCanon.set(canonicalYardAssetKey(aid), row.n ?? 0);
+    }
+  }
+
+  const gainedFirstWo = new Set<string>();
+  for (const [c, wids] of woIdsByCanon) {
+    if (!wids.length) continue;
+    const prevN = prevCountByCanon.get(c) ?? 0;
+    if (prevN === 0) gainedFirstWo.add(c);
+  }
+  if (gainedFirstWo.size === 0) return 0;
+
+  const { findings } = await listOpenFindings(env);
+  let n = 0;
+  for (const f of findings) {
+    if (f.isAcknowledged) continue;
+    if (f.kind !== "unlisted" && f.kind !== "discrepancy") continue;
+    const c = canonicalYardAssetKey(f.assetId);
+    if (!gainedFirstWo.has(c)) continue;
+    const wids = woIdsByCanon.get(c) ?? [];
+    if (!wids.length) continue;
+    const woOpened =
+      wids.length === 1 ? wids[0] : [...wids].sort((a, b) => a.localeCompare(b, undefined, { numeric: true })).join(", ");
+    await resolveFinding(env, {
+      assetId: f.assetId,
+      kind: f.kind,
+      checkId: f.kind === "unlisted" ? null : f.triggerCheck?.id ?? null,
+      resolution: "wo_opened",
+      woOpened,
+      note: "Auto-closed: open work order(s) appeared on ETIC snapshot " + snapshotDateKey + ".",
+      resolvedBy: "ETIC ingest",
+      resolvedAtIso: updatedAtIso,
+    });
+    n += 1;
+  }
+  return n;
 }
 
 /** Reopen a finding by deleting its most-recent action for (asset, kind). */
