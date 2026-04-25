@@ -1749,7 +1749,7 @@ async function replayWorkOrderWatchForDate(env: Env, dateKey: string): Promise<n
     const bytes = await obj.arrayBuffer();
     const raw = await extractRawWorkOrdersFromBinary(bytes);
     const ts = ingestTimestampForHistoryEntry(entry);
-    await ingestWorkOrderSnapshot(env, dateKey, raw, ts, bytes);
+    await ingestWorkOrderSnapshot(env, dateKey, raw, ts, bytes, { skipAutoCloseYardFindings: true });
     const melRows = await extractMelRowsFromBinary(bytes);
     await ingestMelSnapshot(env, dateKey, melRows, ts);
     lastRowCount = raw.length;
@@ -1852,7 +1852,7 @@ export async function rebuildWorkOrderWatchFromHistory(env: Env): Promise<Rebuil
   for (const { row, bytes } of loaded) {
     const raw = await extractRawWorkOrdersFromBinary(bytes);
     const ts = ingestTimestampForSnapshotRebuild(row);
-    await ingestWorkOrderSnapshot(env, row.date_key, raw, ts, bytes);
+    await ingestWorkOrderSnapshot(env, row.date_key, raw, ts, bytes, { skipAutoCloseYardFindings: true });
     const melRows = await extractMelRowsFromBinary(bytes);
     await ingestMelSnapshot(env, row.date_key, melRows, ts);
   }
