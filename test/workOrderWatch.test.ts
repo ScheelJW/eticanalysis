@@ -7,6 +7,7 @@ import {
   getChangelogForDisplay,
   ingestWorkOrderSnapshot,
   melMgmtCodesMatch,
+  normalizeRemarksForCompare,
   parseEticDate,
 } from "../src/workOrderWatch";
 import type { WatchRow } from "../src/workOrderWatch";
@@ -39,6 +40,16 @@ describe("parseEticDate", () => {
 describe("calendarDaysBetween", () => {
   it("counts whole days", () => {
     expect(calendarDaysBetween("2026-04-01", "2026-04-04")).toBe(3);
+  });
+});
+
+describe("normalizeRemarksForCompare", () => {
+  it("treats line-ending and NBSP churn as unchanged", () => {
+    const a = "Waiting on parts.\r\nShop notified.";
+    const b = "Waiting on parts.\nShop notified.";
+    const c = "Waiting on parts.\u00A0 Shop notified.";
+    expect(normalizeRemarksForCompare(a)).toBe(normalizeRemarksForCompare(b));
+    expect(normalizeRemarksForCompare(a)).toBe(normalizeRemarksForCompare(c));
   });
 });
 
@@ -370,5 +381,34 @@ describe("ingestWorkOrderSnapshot", () => {
     const display = await getChangelogForDisplay(env, "WO-1");
 
     expect(display.filter((row) => row.field === "initial").map((row) => row.snapshot_date_key)).toEqual(["2026-02-26"]);
+  });
+
+  it("does not log remarks change when only whitespace / line endings differ", async () => {
+    const db = new MockD1Database();
+    const env = { ETIC_SNAPSHOTS: db as unknown as D1Database };
+
+    await ingestWorkOrderSnapshot(env, "2026-02-26", [
+      wo({
+        workOrderId: "WO-1",
+        assetId: "AF1",
+        remarks: "Same text\r\nline two",
+        currentMel: "Below MEL",
+      }),
+    ], "2026-02-26T18:00:00.000Z");
+    await ingestWorkOrderSnapshot(env, "2026-04-16", [
+      wo({
+        workOrderId: "WO-1",
+        assetId: "AF1",
+        remarks: "Same text\nline two",
+        currentMel: "Below MEL",
+      }),
+    ], "2026-04-16T18:00:00.000Z");
+
+    expect(db.changelog.some((row) => row.field === "remarks")).toBe(false);
+    const snapApr = db.snapshots.get("2026-04-16")?.get("WO-1");
+    expect(snapApr?.last_remark_change_date).toBe("2026-02-26");
+
+    const display = await getChangelogForDisplay(env, "WO-1");
+    expect(display.some((row) => row.field === "remarks")).toBe(false);
   });
 });

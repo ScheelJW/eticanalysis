@@ -9860,6 +9860,15 @@ function renderDashboardHtml(): string {
       border-radius: 10px;
     }
     .wo-refine-sel option { background: var(--surface); color: var(--text); }
+    .filter-reset-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      justify-content: flex-end;
+      margin-top: 4px;
+    }
+    .filter-reset-row .ghost { font-size: 0.76rem; padding: 5px 10px; }
 
     /* Tucked at bottom of WO sidebar: internal FM&A tool, not primary UI */
     .wo-fma-aside {
@@ -12024,6 +12033,17 @@ function renderDashboardHtml(): string {
       font-size: 0.84rem;
     }
     .mel-search-wrap input::placeholder { color: var(--muted); }
+    .mel-toolbar-foot {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      justify-content: flex-end;
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px solid var(--border);
+    }
+
     .mel-toolbar-refine {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -12617,6 +12637,12 @@ function renderDashboardHtml(): string {
       gap: 10px;
       min-height: 0;
     }
+    .meeting-queue-filters .meeting-reset-filters {
+      grid-column: 1 / -1;
+      justify-self: end;
+      margin-top: 2px;
+    }
+
     .meeting-queue-filters {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -13827,6 +13853,7 @@ function renderDashboardHtml(): string {
     .smx-stat.warn .v { color: var(--warn); }
     .smx-stat.crit .v { color: #7a1020; }
     .smx-toolbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 12px; }
+    .smx-toolbar .smx-reset-filters { margin-left: auto; }
     .smx-search input {
       min-width: 220px; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border);
       background: var(--bg); font: inherit;
@@ -13887,7 +13914,13 @@ function renderDashboardHtml(): string {
       min-height: 200px;
     }
     .authz-panel h3 { margin: 0 0 10px; font-size: 1.05rem; }
-    .authz-toolbar { margin-bottom: 10px; }
+    .authz-toolbar {
+      margin-bottom: 10px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
     .authz-toolbar input {
       width: 100%; max-width: 360px; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border);
       background: var(--bg); font: inherit;
@@ -14051,6 +14084,9 @@ function renderDashboardHtml(): string {
                 <button type="button" class="preset-chip" data-preset="90d" title="~90 days of snapshots">90d</button>
                 <button type="button" class="preset-chip" data-preset="1y" title="~365 days of snapshots">1y</button>
               </div>
+              <div class="filter-reset-row" style="grid-column:1/-1">
+                <button type="button" class="ghost" id="mc-chart-reset-filters" title="Restore default date range, Fleet series, line chart">Reset filters</button>
+              </div>
             </div>
             <div class="mc-chart-slicer-block hidden" id="mc-chart-slicer-block" aria-live="polite">
               <div class="mc-chart-slicer-row">
@@ -14105,6 +14141,9 @@ function renderDashboardHtml(): string {
                 <button type="button" class="preset-chip" data-preset="1y" title="Compare against ~1 year ago">1y</button>
               </div>
               <span class="bd-compare-summary" id="bd-compare-summary"></span>
+              <div class="filter-reset-row" style="grid-column:1/-1;width:100%">
+                <button type="button" class="ghost" id="bd-reset-filters" title="Units tab, clear compare-to date">Reset filters</button>
+              </div>
             </div>
             <div class="breakdown-grid" id="breakdown-grid"></div>
           </div>
@@ -14199,6 +14238,9 @@ function renderDashboardHtml(): string {
                 <option value="slip">Sort: Total slip</option>
               </select>
             </div>
+            <div class="filter-reset-row">
+              <button type="button" class="ghost" id="wo-reset-filters" title="Clear search, chips, and refine dropdowns">Reset filters</button>
+            </div>
             <div class="wo-list-meta" id="wo-list-meta">Loading…</div>
             <div class="wo-list" id="wo-list"></div>
             <div class="wo-fma-aside">
@@ -14223,6 +14265,7 @@ function renderDashboardHtml(): string {
                     </label>
                     <button type="button" class="btn-etic fma-rpt-btn" id="fma-rpt-load">Load</button>
                     <button type="button" class="btn-etic fma-rpt-btn" id="fma-rpt-copy">Copy email</button>
+                    <button type="button" class="ghost fma-rpt-btn" id="fma-rpt-reset" title="14 days, no shop filter, pending only">Reset filters</button>
                   </div>
                   <p class="status" id="fma-rpt-msg" role="status"></p>
                   <div class="wo-fma-followup-table-wrap table-wrap" id="fma-rpt-table-wrap"></div>
@@ -14327,6 +14370,7 @@ function renderDashboardHtml(): string {
             <button type="button" class="smx-filter-btn" data-smx-filter="overdue">Overdue <span class="smx-n" data-smx-c="overdue">0</span></button>
             <button type="button" class="smx-filter-btn" data-smx-filter="due_soon">Due soon <span class="smx-n" data-smx-c="due_soon">0</span></button>
             <button type="button" class="smx-filter-btn" data-smx-filter="missing">Missing data <span class="smx-n" data-smx-c="missing">0</span></button>
+            <button type="button" class="ghost smx-reset-filters" id="smx-reset-filters" title="Clear search and chip filter">Reset filters</button>
           </div>
         </div>
         <div class="smx-table-wrap">
@@ -14361,6 +14405,7 @@ function renderDashboardHtml(): string {
               <label class="smx-search"><span class="sr-only">Filter MEL keys</span>
                 <input type="text" id="authz-asset-query" placeholder="Filter MEL key, unit, detail doc, mgmt…" autocomplete="off" />
               </label>
+              <button type="button" class="ghost" id="authz-reset-filters" title="Clear search">Reset filters</button>
             </div>
             <p class="hint" id="authz-assets-meta" style="margin:0 0 8px"></p>
             <div class="authz-table-wrap">
@@ -14520,6 +14565,9 @@ function renderDashboardHtml(): string {
               </div>
             </label>
           </div>
+          <div class="mel-toolbar-foot">
+            <button type="button" class="ghost" id="mel-reset-filters" title="All status, clear search and unit/mgmt/tier, default sort, turn off compare">Reset filters</button>
+          </div>
         </div>
 
         <div class="mel-layout" id="mel-layout-list">
@@ -14603,6 +14651,9 @@ function renderDashboardHtml(): string {
                 <label class="mini-toggle"><input type="checkbox" id="meeting-only-pushed" /> Only pushed ETICs</label>
                 <label class="mini-toggle"><input type="checkbox" id="meeting-only-slipped" /> Only slipped</label>
               </div>
+              <div class="filter-reset-row" style="justify-content:flex-start;margin:4px 0 0">
+                <button type="button" class="ghost" id="meeting-setup-reset-filters" title="All shops / units / keys and clear toggles">Reset filters</button>
+              </div>
               <div class="meeting-preview" id="meeting-preview">0 work orders selected</div>
               <div class="meeting-start-row">
                 <button type="button" class="primary" id="meeting-start" disabled>Start meeting</button>
@@ -14662,6 +14713,7 @@ function renderDashboardHtml(): string {
                   <option value="shop_asc">Shop A→Z</option>
                   <option value="shop_desc">Shop Z→A</option>
                 </select>
+                <button type="button" class="ghost meeting-reset-filters" id="meeting-queue-reset-filters" title="Clear search, all statuses, meeting order">Reset filters</button>
               </div>
               <div class="meeting-queue-list" id="meeting-queue-list"></div>
             </aside>
@@ -14757,6 +14809,7 @@ function renderDashboardHtml(): string {
               </label>
               <button type="button" class="ghost" id="yard-findings-refresh" style="padding:6px 12px;"
                       title="Re-fetch the list. The page also reloads automatically when you switch into this tab.">Refresh</button>
+              <button type="button" class="ghost" id="yard-findings-reset-filters" style="padding:6px 12px;" title="All kinds, hide resolved">Reset filters</button>
             </div>
             <div id="yard-findings-list" class="yard-findings-list">Loading\u2026</div>
           </div>
@@ -14778,6 +14831,7 @@ function renderDashboardHtml(): string {
               </label>
               <button type="button" class="ghost" id="yard-report-apply" style="padding:8px 14px;">Run report</button>
               <a class="ghost" id="yard-report-csv" href="/api/yard/activity?format=csv" style="padding:8px 14px;text-decoration:none;">Export CSV</a>
+              <button type="button" class="ghost" id="yard-activity-reset-filters" style="padding:8px 14px;" title="Clear from/to dates">Reset filters</button>
               <span class="hint" style="margin-left:auto;">Checks and Needs Fix actions in the selected date range.</span>
             </div>
             <div id="yard-activity-list" class="yard-activity-list">Loading\u2026</div>
@@ -14899,6 +14953,7 @@ function renderDashboardHtml(): string {
                     </div>
                     <input type="search" id="wv-asset-filter" class="wv-asset-filter"
                            placeholder="Filter by asset id…" autocomplete="off" spellcheck="false" />
+                    <button type="button" class="ghost" id="wv-reset-filters" title="Clear fleet list filter">Reset filters</button>
                   </div>
                   <div class="wv-asset-chip-wrap" id="wv-asset-chip-wrap">
                     <p class="wv-chip-hint hint">Open this tab and hit Refresh to load every asset that has a waiver. Tap an id to load it.</p>
@@ -14972,6 +15027,7 @@ function renderDashboardHtml(): string {
                   <button type="button" class="abuse-type-chip abu" id="abuse-filter-abuse" data-abuse-filter="abuse">Abuse</button>
                 </div>
                 <label class="abuse-filter"><input type="checkbox" id="abuse-open-only" checked /> Open only</label>
+                <button type="button" class="ghost" id="abuse-reset-filters" title="All case types, open only (default)">Reset filters</button>
               </div>
               <div class="abuse-table-scroll">
                 <table class="abuse-case-table" aria-label="Accident and abuse cases">
@@ -15199,6 +15255,7 @@ function renderDashboardHtml(): string {
                 <input type="checkbox" id="settings-mel-only-critical" />
                 <span>Show critical only</span>
               </label>
+              <button type="button" class="ghost" id="settings-mel-reset-filters" title="Clear search and show all keys">Reset filters</button>
             </div>
             <div class="settings-mel-table" id="settings-mel-table">Loading…</div>
           </section>
@@ -15753,6 +15810,29 @@ function renderDashboardHtml(): string {
       } catch {
         // URL state is convenience only.
       }
+    }
+
+    function resetSnapshotBreakdownFilters() {
+      breakdownFilter = "units";
+      document.querySelectorAll(".bd-tab").forEach(function (b) {
+        b.classList.toggle("active", (b.getAttribute("data-bd-filter") || "") === "units");
+      });
+      const bdSel = document.getElementById("bd-compare-date");
+      if (bdSel) bdSel.value = "";
+      void setBreakdownCompareDate("");
+      refreshPresetChipsState("bd-preset-chips", "", selectedDate || "");
+    }
+
+    function resetMcChartPanelFilters() {
+      const modeEl = document.getElementById("mc-chart-mode");
+      const vizEl = document.getElementById("mc-chart-viz");
+      if (modeEl) modeEl.value = "fleet";
+      if (vizEl) vizEl.value = "line";
+      setMcChartDefaultRange();
+      refreshMcChartPresetChips();
+      void loadMcChartDimensions().then(function () {
+        refreshMcChart();
+      });
     }
 
     let historyEntries = [];
@@ -17069,6 +17149,8 @@ function renderDashboardHtml(): string {
           });
         });
       }
+      const mcChartReset = document.getElementById("mc-chart-reset-filters");
+      if (mcChartReset) mcChartReset.addEventListener("click", resetMcChartPanelFilters);
       const chartWrap = document.querySelector(".mc-chart-wrap");
       if (chartWrap && typeof ResizeObserver !== "undefined" && !chartWrap._mcResizeObs) {
         chartWrap._mcResizeObs = true;
@@ -18224,7 +18306,7 @@ function renderDashboardHtml(): string {
       }).join("");
     }
 
-    function renderTimeline(payload, woRow) {
+    function renderTimeline(payload, woRow, opts) {
       const el = document.getElementById("wo-timeline");
       function timelineSortKey(it) {
         if (it.kind === "opened") return (it.ev.date || "") + "T00:00:00";
@@ -18310,10 +18392,15 @@ function renderDashboardHtml(): string {
         byKey.get(k).push({ kind: "opened", ev: { date: k, raw: woRow.establishedDate } });
       }
       const keys = Array.from(byKey.keys()).sort(function (a, b) { return a < b ? 1 : a > b ? -1 : 0; });
-      // Relative "today / N days ago" must use the real calendar date — NOT the
-      // work-order "as of" (selectedDate), or every event on the current report
-      // date reads as "today" and looks like the last ingest invented the change.
-      const calendarAsOf = new Date().toISOString().slice(0, 10);
+      // Relative "today / N days ago" is anchored to the latest ETIC snapshot date
+      // (same as Work orders "as of"), not wall-clock today. Otherwise when the
+      // newest workbook is e.g. 8 days old, every snapshot-dated event wrongly
+      // shows "8 days ago" even though it is current as of that report.
+      const anchorKey =
+        (opts && opts.asOfDateKey && String(opts.asOfDateKey).trim()) ||
+        woAsOfDate() ||
+        "";
+      const calendarAsOf = anchorKey || new Date().toISOString().slice(0, 10);
 
       const days = keys.map(function (k) {
         const grp = byKey.get(k);
@@ -18344,10 +18431,10 @@ function renderDashboardHtml(): string {
             : ago < 0
               ? "in " + -ago + "d"
               : ago === 0
-                ? "today"
+                ? "latest report"
                 : ago === 1
-                  ? "1 day ago"
-                  : ago + " days ago";
+                  ? "1 report day before"
+                  : ago + " report days before";
 
         const grpDisplay = dedupeEticTimelineGroup(grp);
         const evs = grpDisplay.map(function (item) {
@@ -18612,7 +18699,7 @@ function renderDashboardHtml(): string {
       timelineEl.innerHTML = "<div class='wo-timeline-empty'>Loading timeline…</div>";
       loadChangelog(r.workOrderId).then(function (payload) {
         renderYardSnapshotPanel(payload);
-        renderTimeline(payload, r);
+        renderTimeline(payload, r, { asOfDateKey: data.asOfDateKey });
       }).catch(function () {
         renderYardSnapshotPanel({ yardWalks: [] });
         timelineEl.innerHTML = "<div class='wo-timeline-empty'>Could not load timeline.</div>";
@@ -18684,10 +18771,12 @@ function renderDashboardHtml(): string {
 
     async function applyHashRoute() {
       const r = readHashRoute();
-      if (r.tab === "wo" && r.workOrderId) {
+      // Keep in sync with readHashRoute() query ?tab= values — anything not
+      // handled here incorrectly falls through to snapshot (see bug: ?tab=mel).
+      if (r.tab === "wo") {
         setMainTab("wo");
         if (selectedDate) await loadAndRenderWoList(selectedDate);
-        await selectWo(r.workOrderId, false);
+        if (r.workOrderId) await selectWo(r.workOrderId, false);
         return;
       }
       if (r.tab === "waivers") {
@@ -18701,6 +18790,26 @@ function renderDashboardHtml(): string {
       }
       if (r.tab === "authz") {
         setMainTab("authz");
+        return;
+      }
+      if (r.tab === "mel") {
+        setMainTab("mel");
+        return;
+      }
+      if (r.tab === "smx") {
+        setMainTab("smx");
+        return;
+      }
+      if (r.tab === "meeting") {
+        setMainTab("meeting");
+        return;
+      }
+      if (r.tab === "ask") {
+        setMainTab("ask");
+        return;
+      }
+      if (r.tab === "settings") {
+        setMainTab("settings");
         return;
       }
       if (r.tab === "abuse-tracker") {
@@ -19393,6 +19502,8 @@ function renderDashboardHtml(): string {
           renderBreakdownCard(currentBreakdown);
         });
       });
+      const bdReset = document.getElementById("bd-reset-filters");
+      if (bdReset) bdReset.addEventListener("click", resetSnapshotBreakdownFilters);
 
       // Per-Unit "Compare to" picker.
       const bdCompareSel = document.getElementById("bd-compare-date");
@@ -19452,6 +19563,13 @@ function renderDashboardHtml(): string {
       }
       const authzQ = document.getElementById("authz-asset-query");
       if (authzQ) authzQ.addEventListener("input", function () { renderAuthzAssets(); });
+      const authzReset = document.getElementById("authz-reset-filters");
+      if (authzReset) {
+        authzReset.addEventListener("click", function () {
+          if (authzQ) authzQ.value = "";
+          renderAuthzAssets();
+        });
+      }
       const smxFilt = document.getElementById("smx-filters");
       if (smxFilt) {
         smxFilt.addEventListener("click", function (e) {
@@ -19466,6 +19584,17 @@ function renderDashboardHtml(): string {
       }
       const smxQ = document.getElementById("smx-query");
       if (smxQ) smxQ.addEventListener("input", function () { renderScheduleMxTable(); });
+      const smxReset = document.getElementById("smx-reset-filters");
+      if (smxReset && smxFilt) {
+        smxReset.addEventListener("click", function () {
+          smxFilter = "all";
+          if (smxQ) smxQ.value = "";
+          smxFilt.querySelectorAll(".smx-filter-btn").forEach(function (x) {
+            x.classList.toggle("active", (x.getAttribute("data-smx-filter") || "") === "all");
+          });
+          renderScheduleMxTable();
+        });
+      }
       const melTabBtn = document.getElementById("tab-mel");
       if (melTabBtn) melTabBtn.addEventListener("click", function () { setMainTab("mel"); syncDashboardQuery("mel"); });
       const meetTabBtn = document.getElementById("tab-meeting");
@@ -19557,6 +19686,33 @@ function renderDashboardHtml(): string {
         woSort = ev.target.value || "default";
         rerenderCurrentWoList();
       });
+      const woReset = document.getElementById("wo-reset-filters");
+      if (woReset) {
+        woReset.addEventListener("click", function () {
+          woFilter = "all";
+          woQuery = "";
+          woUnit = "";
+          woMelKey = "";
+          woShop = "";
+          woMgmtCd = "";
+          woSort = "default";
+          if (woInput) woInput.value = "";
+          document.querySelectorAll("#wo-filters .wo-filter-btn").forEach(function (b) {
+            b.classList.toggle("active", (b.getAttribute("data-filter") || "") === "all");
+          });
+          const u = document.getElementById("wo-unit");
+          const mk = document.getElementById("wo-melkey");
+          const sh = document.getElementById("wo-shop");
+          const mg = document.getElementById("wo-mgmtcd");
+          const so = document.getElementById("wo-sort");
+          if (u) u.value = "";
+          if (mk) mk.value = "";
+          if (sh) sh.value = "";
+          if (mg) mg.value = "";
+          if (so) so.value = "default";
+          rerenderCurrentWoList();
+        });
+      }
 
       var fmaRptLastRows = null;
 
@@ -19670,8 +19826,19 @@ function renderDashboardHtml(): string {
 
       const fmaLoadBtn = document.getElementById("fma-rpt-load");
       const fmaCopyBtn = document.getElementById("fma-rpt-copy");
+      const fmaResetBtn = document.getElementById("fma-rpt-reset");
       if (fmaLoadBtn) fmaLoadBtn.addEventListener("click", function () { loadFmaFollowUpReport(); });
       if (fmaCopyBtn) fmaCopyBtn.addEventListener("click", function () { copyFmaFollowUpEmail(); });
+      if (fmaResetBtn) {
+        fmaResetBtn.addEventListener("click", function () {
+          const daysEl = document.getElementById("fma-rpt-days");
+          const shopEl = document.getElementById("fma-rpt-shop");
+          const verEl = document.getElementById("fma-rpt-verification");
+          if (daysEl) daysEl.value = "14";
+          if (shopEl) shopEl.value = "";
+          if (verEl) verEl.value = "pending";
+        });
+      }
 
       const fmaRptWrap = document.getElementById("fma-rpt-table-wrap");
       if (fmaRptWrap) {
@@ -20263,6 +20430,39 @@ function renderDashboardHtml(): string {
         });
         btn.dataset.wired = "1";
       });
+
+      const melReset = document.getElementById("mel-reset-filters");
+      if (melReset && !melReset.dataset.wired) {
+        melReset.addEventListener("click", async function () {
+          melState.filter = "all";
+          melState.query = "";
+          melState.unit = "";
+          melState.mgmt = "";
+          melState.tier = "";
+          melState.sort = "deficit";
+          melState.cmpDate = "";
+          melState.selectedKey = null;
+          melCloseDeltaPopover();
+          const ms = document.getElementById("mel-search");
+          if (ms) ms.value = "";
+          const mu = document.getElementById("mel-unit");
+          const mm = document.getElementById("mel-mgmt");
+          const mt = document.getElementById("mel-tier");
+          const mso = document.getElementById("mel-sort");
+          if (mu) mu.value = "";
+          if (mm) mm.value = "";
+          if (mt) mt.value = "";
+          if (mso) mso.value = "deficit";
+          if (cmpSel) cmpSel.value = "";
+          document.querySelectorAll("[data-mel-filter]").forEach(function (b) {
+            b.classList.toggle("active", (b.getAttribute("data-mel-filter") || "") === "all");
+          });
+          await loadMelCompare();
+          renderMelView();
+          refreshPresetChipsState("mel-preset-chips", "", melState.asOfDate);
+        });
+        melReset.dataset.wired = "1";
+      }
 
       const exportBtn = document.getElementById("mel-slide-export");
       if (exportBtn && !exportBtn.dataset.wired) {
@@ -21976,6 +22176,17 @@ function renderDashboardHtml(): string {
         });
         onlyCrit.dataset.wired = "1";
       }
+      const settingsMelReset = document.getElementById("settings-mel-reset-filters");
+      if (settingsMelReset && !settingsMelReset.dataset.wired) {
+        settingsMelReset.addEventListener("click", function () {
+          settingsState.filter = "";
+          settingsState.onlyCritical = false;
+          if (search) search.value = "";
+          if (onlyCrit) onlyCrit.checked = false;
+          renderSettingsMelTable();
+        });
+        settingsMelReset.dataset.wired = "1";
+      }
       const subAdd = document.getElementById("settings-sub-add");
       if (subAdd && !subAdd.dataset.wired) {
         subAdd.addEventListener("click", saveSubdivisionFromForm);
@@ -22276,6 +22487,13 @@ function renderDashboardHtml(): string {
       });
       const wvAf = document.getElementById("wv-asset-filter");
       if (wvAf) wvAf.addEventListener("input", function () { renderWaiverAssetChipList(); });
+      const wvReset = document.getElementById("wv-reset-filters");
+      if (wvReset) {
+        wvReset.addEventListener("click", function () {
+          if (wvAf) wvAf.value = "";
+          renderWaiverAssetChipList();
+        });
+      }
       const createName = document.getElementById("wv-create-name");
       if (createName) createName.value = localStorage.getItem("waiver.reviewerName") || "";
       const createAsset = document.getElementById("wv-create-asset");
@@ -22875,6 +23093,32 @@ function renderDashboardHtml(): string {
       });
       const refresh = document.getElementById("yard-findings-refresh");
       if (refresh) refresh.addEventListener("click", function () { yardLoadFindings(); });
+      const findingsReset = document.getElementById("yard-findings-reset-filters");
+      if (findingsReset) {
+        findingsReset.addEventListener("click", function () {
+          yardFmState.kindFilter = "all";
+          const ackToggle = document.getElementById("yard-findings-show-ack");
+          if (ackToggle) ackToggle.checked = false;
+          yardFmState.showAck = false;
+          const chipRoot = document.getElementById("yard-findings-chips");
+          if (chipRoot) {
+            chipRoot.querySelectorAll(".yard-findings-chip").forEach(function (c) {
+              c.classList.toggle("active", (c.getAttribute("data-finding-kind") || "") === "all");
+            });
+          }
+          yardRenderFindingsCounts();
+          yardRenderFindings();
+        });
+      }
+      const actReset = document.getElementById("yard-activity-reset-filters");
+      if (actReset) {
+        actReset.addEventListener("click", function () {
+          const f = document.getElementById("yard-report-from");
+          const t = document.getElementById("yard-report-to");
+          if (f) f.value = "";
+          if (t) t.value = "";
+        });
+      }
 
       const list = document.getElementById("yard-findings-list");
       if (list && list.dataset.yardWoHistWired !== "1") {
@@ -26436,6 +26680,18 @@ function renderDashboardHtml(): string {
           abuseLoadList();
         });
       });
+      var abuseFiltReset = document.getElementById("abuse-reset-filters");
+      if (abuseFiltReset) {
+        abuseFiltReset.addEventListener("click", function () {
+          abuseTrackerState.caseTypeFilter = "all";
+          document.querySelectorAll("[data-abuse-filter]").forEach(function (c2) {
+            c2.classList.toggle("active", (c2.getAttribute("data-abuse-filter") || "") === "all");
+          });
+          var oo2 = document.getElementById("abuse-open-only");
+          if (oo2) oo2.checked = true;
+          abuseLoadList();
+        });
+      }
       var ex = document.getElementById("abuse-export-csv");
       if (ex) ex.addEventListener("click", abuseExportCsv);
       var sv = document.getElementById("abuse-save-case");
@@ -26465,6 +26721,29 @@ function renderDashboardHtml(): string {
         const el = document.getElementById(id);
         if (el) el.addEventListener("change", updateMeetingPreview);
       });
+      const setupReset = document.getElementById("meeting-setup-reset-filters");
+      if (setupReset && !setupReset.dataset.wired) {
+        setupReset.addEventListener("click", function () {
+          const shop = document.getElementById("meeting-shop");
+          const unit = document.getElementById("meeting-unit");
+          const melk = document.getElementById("meeting-melkey");
+          const mgmt = document.getElementById("meeting-mgmtcd");
+          const tier = document.getElementById("meeting-meltier");
+          const st = document.getElementById("meeting-only-stale");
+          const pu = document.getElementById("meeting-only-pushed");
+          const sl = document.getElementById("meeting-only-slipped");
+          if (shop) shop.value = "";
+          if (unit) unit.value = "";
+          if (melk) melk.value = "";
+          if (mgmt) mgmt.value = "";
+          if (tier) tier.value = "";
+          if (st) st.checked = false;
+          if (pu) pu.checked = false;
+          if (sl) sl.checked = false;
+          updateMeetingPreview();
+        });
+        setupReset.dataset.wired = "1";
+      }
       const startBtn = document.getElementById("meeting-start");
       if (startBtn) startBtn.addEventListener("click", startMeeting);
       const refreshHist = document.getElementById("meeting-history-refresh");
@@ -26485,6 +26764,16 @@ function renderDashboardHtml(): string {
       if (qSearch) qSearch.addEventListener("input", renderMeetingQueue);
       if (qStatus) qStatus.addEventListener("change", renderMeetingQueue);
       if (qSort) qSort.addEventListener("change", renderMeetingQueue);
+      const qReset = document.getElementById("meeting-queue-reset-filters");
+      if (qReset && !qReset.dataset.wired) {
+        qReset.addEventListener("click", function () {
+          if (qSearch) qSearch.value = "";
+          if (qStatus) qStatus.value = "";
+          if (qSort) qSort.value = "order";
+          renderMeetingQueue();
+        });
+        qReset.dataset.wired = "1";
+      }
 
       const pause = document.getElementById("meeting-pause");
       if (pause) pause.addEventListener("click", toggleMeetingPause);
