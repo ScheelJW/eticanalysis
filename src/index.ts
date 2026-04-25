@@ -6972,7 +6972,7 @@ function renderYardAppHtml(): string {
     function formatLastParkedMeta(a){
       if (!a) return "";
       if (a.isNeverChecked) {
-        return "Location from ETIC only — no yard check recorded yet.";
+        return "No yard check location recorded yet.";
       }
       var iso = a.lastCheckedAtIso;
       var by = (a.lastCheckedBy || "").trim();

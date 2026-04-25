@@ -187,6 +187,20 @@ describe("Yard roster", () => {
     expect(roster.totals.fresh).toBe(1);
   });
 
+  it("does not use ETIC/Fleet locations as current yard locations", async () => {
+    const db = new MemoryD1();
+    const env = { ETIC_SNAPSHOTS: db, ETIC_BUCKET: {} };
+
+    const roster = await getRollingRoster(env as never);
+    const openWo = roster.assets.find((asset) => asset.assetId === "AF123");
+    const fleetOnly = roster.assets.find((asset) => asset.assetId === "AF999");
+
+    expect(openWo?.previousLocation).toBe("Old lot");
+    expect(openWo?.lastLocation).toBe("");
+    expect(fleetOnly?.previousLocation).toBe("Hangar 2");
+    expect(fleetOnly?.lastLocation).toBe("");
+  });
+
   it("flags checked assets without latest open WOs as unlisted findings", async () => {
     const db = new MemoryD1();
     const env = { ETIC_SNAPSHOTS: db, ETIC_BUCKET: {} };

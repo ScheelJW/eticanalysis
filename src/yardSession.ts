@@ -971,7 +971,7 @@ export async function getRollingRoster(env: Env): Promise<RollingRoster> {
       isNewAsset: isNew,
       isUnlisted: false,
       photoCount: photoByCanon.get(c) ?? 0,
-      lastLocation: lastLocByCanon.get(c) || a.previousLocation,
+      lastLocation: lastLocByCanon.get(c) || "",
       lastNotes: last?.notes ?? "",
       isBelowMel: belowMelAssets.has(c),
     });
