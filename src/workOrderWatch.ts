@@ -8,6 +8,7 @@ import {
 } from "./yardCheck";
 import { getStalenessThresholds } from "./melWatch";
 import { buildLineCompletions } from "./meeting";
+import { extractFleetFmaNotesFromRaw } from "./yardSession";
 
 export type MelTier = "below" | "at" | "above" | "unknown";
 
@@ -595,6 +596,31 @@ export async function getFleetPaSnapshotForDate(
     rawRowJson: row.raw_row_json,
     updatedAtIso: row.updated_at_iso,
   }));
+}
+
+/** FM&A notes cell from Fleet (P&A) sheet for this asset on the given report date (D1 fact table). */
+export async function getFleetPaFmaNotesForAsset(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  dateKey: string,
+  assetId: string,
+): Promise<string> {
+  const aid = (assetId ?? "").trim();
+  const dk = (dateKey ?? "").trim();
+  if (!aid || !dk || !/^\d{4}-\d{2}-\d{2}$/.test(dk)) return "";
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT raw_row_json FROM fleet_p_a_snapshot
+      WHERE snapshot_date_key = ? AND UPPER(TRIM(asset_id)) = UPPER(TRIM(?))`,
+  )
+    .bind(dk, aid)
+    .first<{ raw_row_json: string | null }>();
+  if (!r?.raw_row_json) return "";
+  let raw: Record<string, unknown> = {};
+  try {
+    raw = JSON.parse(r.raw_row_json) as Record<string, unknown>;
+  } catch {
+    return "";
+  }
+  return extractFleetFmaNotesFromRaw(raw);
 }
 
 /** Schedule maintenance (Fleet P&A Schedule Mx / due columns). */

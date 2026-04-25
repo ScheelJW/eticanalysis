@@ -23,6 +23,7 @@ import {
   getWorkOrderSnapshotCoverage,
   getWorkOrderTimeline,
   getFleetPaSnapshotForDate,
+  getFleetPaFmaNotesForAsset,
   ingestWorkOrderSnapshot,
   listFmaFollowUpActionsForReport,
   logWorkOrderAction,
@@ -4982,6 +4983,10 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
   if (woLookup) {
     const scopedRow = await getWatchRowByIdForDate(env, woLookup, asOf);
     const row = scopedRow ?? (await getWatchRowById(env, woLookup, asOf));
+    let fleetPaFmaNotes = "";
+    if (row?.assetId) {
+      fleetPaFmaNotes = await getFleetPaFmaNotesForAsset(env, asOf, row.assetId);
+    }
     return Response.json(
       {
         asOfDateKey: asOf,
@@ -4989,6 +4994,7 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
         found: row !== null,
         inSnapshot: scopedRow !== null,
         row: row ?? null,
+        fleetPaFmaNotes,
       },
       { headers: cacheHeaders() },
     );
@@ -9352,6 +9358,14 @@ function renderDashboardHtml(): string {
       display: inline-block;
       margin: 0 6px;
       color: var(--subtle);
+    }
+    .wo-fleet-fma-card .wo-fleet-fma-asof { margin: 0 0 8px; font-size: 0.78rem; color: var(--muted); }
+    .wo-fleet-fma-text {
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 0.9rem;
+      line-height: 1.45;
+      color: var(--text);
     }
     .wo-remarks-body .seg {
       display: inline;
@@ -14521,6 +14535,12 @@ function renderDashboardHtml(): string {
                 <div class="wo-remarks-body" id="wo-remarks-text"></div>
               </section>
 
+              <section class="wo-detail-block wo-fleet-fma-card hidden" id="wo-fleet-fma-wrap" aria-labelledby="wo-fleet-fma-heading">
+                <h3 class="wo-detail-block-title" id="wo-fleet-fma-heading">Fleet P&amp;A — FM&amp;A notes</h3>
+                <p class="hint wo-fleet-fma-asof" id="wo-fleet-fma-asof"></p>
+                <div class="wo-fleet-fma-body" id="wo-fleet-fma-body"></div>
+              </section>
+
               <details class="wo-detail-block wo-yard-details" id="wo-yard-details" hidden>
                 <summary class="wo-detail-block-title">Yard check — notes &amp; discrepancies</summary>
                 <p class="hint" style="margin:0 0 10px">Walker data for this asset (same as Yard Check app). Shown on the <strong>Change timeline</strong> below by date.</p>
@@ -18367,6 +18387,25 @@ function renderDashboardHtml(): string {
       el.innerHTML = tiles.join("");
     }
 
+    function renderWoFleetPaFma(notes, asOfDateKey) {
+      const wrap = document.getElementById("wo-fleet-fma-wrap");
+      const body = document.getElementById("wo-fleet-fma-body");
+      const asofEl = document.getElementById("wo-fleet-fma-asof");
+      if (!wrap || !body) return;
+      const t = (notes || "").trim();
+      if (!t) {
+        wrap.classList.add("hidden");
+        body.innerHTML = "";
+        if (asofEl) asofEl.textContent = "";
+        return;
+      }
+      wrap.classList.remove("hidden");
+      if (asofEl) {
+        asofEl.textContent = "From the Fleet (P&A) sheet on report " + fmtKeyLong(asOfDateKey) + " (matched to this asset id).";
+      }
+      body.innerHTML = "<div class='wo-fleet-fma-text'>" + esc(t) + "</div>";
+    }
+
     function renderWoRemarks(r) {
       const body = document.getElementById("wo-remarks-text");
       const when = document.getElementById("wo-remarks-when");
@@ -18895,6 +18934,7 @@ function renderDashboardHtml(): string {
         wrap.classList.add("hidden");
         empty.innerHTML = "No work order <strong>" + esc(data.workOrderId || "") + "</strong> in the index yet.";
         loadWoAbuseStrip("");
+        renderWoFleetPaFma("", "");
         return;
       }
       const r = data.row;
@@ -18908,6 +18948,7 @@ function renderDashboardHtml(): string {
       loadWoAbuseStrip(r.workOrderId);
       renderWoKpis(r, data.asOfDateKey);
       renderWoRemarks(r);
+      renderWoFleetPaFma(data.fleetPaFmaNotes || "", data.asOfDateKey);
       renderWoFacts(r);
       if (r.remarkStale) {
         ban.classList.remove("hidden");
