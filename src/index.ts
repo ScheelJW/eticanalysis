@@ -22527,12 +22527,18 @@ function renderDashboardHtml(): string {
         list.dataset.yardWoHistWired = "1";
         list.addEventListener("toggle", function (e) {
           const det = e.target;
-          if (!det || det.tagName !== "DETAILS" || !det.classList.contains("yard-wo-history")) return;
-          if (!det.open) return;
+          if (!det || det.tagName !== "DETAILS" || !det.open) return;
           const aid = det.getAttribute("data-asset");
           if (!aid) return;
-          const body = det.querySelector(".yard-wo-history-body");
-          if (body) yardLoadWoHistoryForUnlisted(aid, body);
+          if (det.classList.contains("yard-fma-notes-history")) {
+            const body = det.querySelector(".yard-fma-notes-history-body");
+            if (body) yardLoadFmaNotesHistoryForUnlisted(aid, body);
+            return;
+          }
+          if (det.classList.contains("yard-wo-history")) {
+            const body = det.querySelector(".yard-wo-history-body");
+            if (body) yardLoadWoHistoryForUnlisted(aid, body);
+          }
         }, true);
       }
       if (list) list.addEventListener("click", function (e) {
@@ -22740,9 +22746,9 @@ function renderDashboardHtml(): string {
       return head + body + "</tbody></table></div>";
     }
 
-    function yardLoadWoHistoryForUnlisted(assetId, bodyEl) {
+    function yardEnsureWoHistoryRows(assetId, bodyEl, onRows) {
       if (yardFmState.woHistoryByAsset[assetId]) {
-        bodyEl.innerHTML = yardFormatWoHistoryTable(yardFmState.woHistoryByAsset[assetId]);
+        onRows(yardFmState.woHistoryByAsset[assetId]);
         return;
       }
       bodyEl.innerHTML = '<div class="hint" style="padding:6px 0;">Loading\u2026</div>';
@@ -22751,11 +22757,43 @@ function renderDashboardHtml(): string {
         .then(function (j) {
           var rows = Array.isArray(j.rows) ? j.rows : [];
           yardFmState.woHistoryByAsset[assetId] = rows;
-          bodyEl.innerHTML = yardFormatWoHistoryTable(rows);
+          onRows(rows);
         })
         .catch(function () {
           bodyEl.innerHTML = '<div class="yard-wo-history-empty">Could not load snapshot history.</div>';
         });
+    }
+
+    function yardLoadWoHistoryForUnlisted(assetId, bodyEl) {
+      yardEnsureWoHistoryRows(assetId, bodyEl, function (rows) {
+        bodyEl.innerHTML = yardFormatWoHistoryTable(rows);
+      });
+    }
+
+    function yardFormatFmaNotesHistoryTable(rows) {
+      var filtered = rows.filter(function (r) { return (r.fleetFmaNotes || "").trim(); });
+      if (!filtered.length) {
+        return '<div class="yard-wo-history-empty">No FM&amp;A / Fleet P&amp;A notes in any stored work order row for this asset.</div>';
+      }
+      var head = '<div class="yard-wo-history-table-wrap"><table class="yard-wo-history-table"><thead><tr>' +
+        "<th>Snapshot</th><th>WO</th><th>FM&amp;A (Fleet P&amp;A)</th>" +
+        "</tr></thead><tbody>";
+      var body = filtered.map(function (r) {
+        var snap = esc(r.snapshotDateKey || "");
+        var wo = r.workOrderId || "";
+        var noteFull = (r.fleetFmaNotes || "").trim();
+        var noteShow = noteFull.replace(/\\s+/g, " ");
+        if (noteShow.length > 220) noteShow = noteShow.slice(0, 217) + "\u2026";
+        var woCell = '<button type="button" class="wo-link" data-yard-open-wo="' + esc(wo) + '">' + esc(wo) + "</button>";
+        return "<tr><td>" + snap + "</td><td>" + woCell + "</td><td class=\"fleet-fma-hist-cell\" title=\"" + esc(noteFull) + "\">" + esc(noteShow) + "</td></tr>";
+      }).join("");
+      return head + body + "</tbody></table></div>";
+    }
+
+    function yardLoadFmaNotesHistoryForUnlisted(assetId, bodyEl) {
+      yardEnsureWoHistoryRows(assetId, bodyEl, function (rows) {
+        bodyEl.innerHTML = yardFormatFmaNotesHistoryTable(rows);
+      });
     }
 
     function yardRenderFindingCard(f) {
@@ -22785,7 +22823,10 @@ function renderDashboardHtml(): string {
       const woHistHtml = f.kind === "unlisted"
         ? '<details class="yard-wo-history" data-asset="' + escapeHtml(f.assetId) + '">' +
           "<summary>Past ETIC snapshots \u2014 work orders for this asset</summary>" +
-          '<div class="yard-wo-history-body"></div></details>'
+          '<div class="yard-wo-history-body"></div></details>' +
+          '<details class="yard-wo-history yard-fma-notes-history" data-asset="' + escapeHtml(f.assetId) + '">' +
+          "<summary>FM&amp;A notes by snapshot (Fleet P&amp;A)</summary>" +
+          '<div class="yard-wo-history-body yard-fma-notes-history-body"></div></details>'
         : "";
       const thumb = f.previewPhotoUrl
         ? '<button type="button" class="yard-finding-thumb" data-yard-finding-photo="' + escapeHtml(f.previewPhotoUrl) + '" title="View photo"><img src="' + escapeHtml(f.previewPhotoUrl) + '" alt="" loading="lazy" decoding="async" /></button>'
