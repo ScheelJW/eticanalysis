@@ -6327,7 +6327,10 @@ function renderYardAppHtml(): string {
         font-size: 12px;
         justify-self: end;
         max-width: 200px;
+        color: var(--muted);
       }
+      .yard-desktop-walker b { color: var(--text); }
+      .yard-desktop-walker a { color: var(--accent); font-weight: 700; }
       .yard-desktop-walker.walker-row.input { max-width: 200px; }
       .yard-desktop-walker.walker-row.input input {
         height: 32px;
