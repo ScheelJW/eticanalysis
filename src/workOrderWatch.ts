@@ -1429,6 +1429,68 @@ export async function getWatchRowsForDate(
   return out;
 }
 
+/** For timeline UX: detect gaps where the fleet had other snapshot dates but this WO has no row. */
+export type WorkOrderSnapshotCoverage = {
+  workOrderId: string;
+  woSnapshotDateKeysAsc: string[];
+  distinctFleetSnapshotCount: number;
+  /** Fleet report dates between this WO's first and last snapshot that have no row for this WO. */
+  missingFleetSnapshotDatesBetweenFirstAndLast: number;
+  maxCalendarGapDaysBetweenWoSnapshots: number;
+};
+
+export async function getWorkOrderSnapshotCoverage(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  workOrderId: string,
+): Promise<WorkOrderSnapshotCoverage> {
+  const woDatesR = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT DISTINCT snapshot_date_key FROM work_order_snapshot WHERE work_order_id = ? ORDER BY snapshot_date_key ASC`,
+  )
+    .bind(workOrderId)
+    .all<{ snapshot_date_key: string }>();
+  const woSnapshotDateKeysAsc = (woDatesR.results ?? []).map((x) => x.snapshot_date_key).filter(Boolean);
+
+  const fleetR = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT COUNT(DISTINCT snapshot_date_key) AS c FROM work_order_snapshot`,
+  ).first<{ c: number }>();
+  const distinctFleetSnapshotCount = Number(fleetR?.c ?? 0);
+
+  let maxCalendarGapDaysBetweenWoSnapshots = 0;
+  for (let i = 1; i < woSnapshotDateKeysAsc.length; i++) {
+    const a = woSnapshotDateKeysAsc[i - 1]!;
+    const b = woSnapshotDateKeysAsc[i]!;
+    maxCalendarGapDaysBetweenWoSnapshots = Math.max(
+      maxCalendarGapDaysBetweenWoSnapshots,
+      calendarDaysBetween(a, b),
+    );
+  }
+
+  let missingFleetSnapshotDatesBetweenFirstAndLast = 0;
+  if (woSnapshotDateKeysAsc.length >= 2) {
+    const first = woSnapshotDateKeysAsc[0]!;
+    const last = woSnapshotDateKeysAsc[woSnapshotDateKeysAsc.length - 1]!;
+    const rangeR = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT DISTINCT snapshot_date_key AS d
+         FROM work_order_snapshot
+        WHERE snapshot_date_key >= ? AND snapshot_date_key <= ?`,
+    )
+      .bind(first, last)
+      .all<{ d: string }>();
+    const woSet = new Set(woSnapshotDateKeysAsc);
+    for (const row of rangeR.results ?? []) {
+      if (!woSet.has(row.d)) missingFleetSnapshotDatesBetweenFirstAndLast += 1;
+    }
+  }
+
+  return {
+    workOrderId,
+    woSnapshotDateKeysAsc,
+    distinctFleetSnapshotCount,
+    missingFleetSnapshotDatesBetweenFirstAndLast,
+    maxCalendarGapDaysBetweenWoSnapshots,
+  };
+}
+
 /** Entire timeline of a single WO across every snapshot it appeared in. */
 export async function getWorkOrderTimeline(
   env: { ETIC_SNAPSHOTS: D1Database },

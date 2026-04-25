@@ -20,6 +20,7 @@ import {
   getScheduleMxFleetForDate,
   getWatchRowsLatest,
   getWorkOrderActions,
+  getWorkOrderSnapshotCoverage,
   getWorkOrderTimeline,
   getFleetPaSnapshotForDate,
   ingestWorkOrderSnapshot,
@@ -4840,11 +4841,12 @@ async function handleWorkOrderChangelogApi(env: Env, request: Request): Promise<
     return Response.json({ ok: false, error: "Missing workOrderId query parameter." }, { status: 400 });
   }
   const assetId = await getAssetIdForWorkOrder(env, wo);
-  const [entries, actions, meetingNotes, yardWalks] = await Promise.all([
+  const [entries, actions, meetingNotes, yardWalks, snapshotCoverage] = await Promise.all([
     getChangelogForDisplay(env, wo, 500),
     getWorkOrderActions(env, wo, 200),
     getMeetingNotesForWorkOrder(env, wo),
     assetId ? getYardWalksForAsset(env, assetId) : Promise.resolve([]),
+    getWorkOrderSnapshotCoverage(env, wo),
   ]);
   return Response.json(
     {
@@ -4854,6 +4856,7 @@ async function handleWorkOrderChangelogApi(env: Env, request: Request): Promise<
       actions,
       meetingNotes,
       yardWalks,
+      snapshotCoverage,
     },
     { headers: cacheHeaders() },
   );
@@ -10726,6 +10729,17 @@ function renderDashboardHtml(): string {
       margin: 0 2px;
     }
     .wo-timeline-empty { color: var(--muted); font-size: 0.88rem; padding: 12px 0; }
+    .wo-timeline-gap-banner {
+      margin: 0 0 14px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(245, 199, 84, 0.45);
+      background: rgba(245, 199, 84, 0.10);
+      color: var(--text);
+      font-size: 0.84rem;
+      line-height: 1.45;
+    }
+    .wo-timeline-gap-banner strong { color: var(--warn); }
 
     /* --- Adjustments ------------------------------------------------------ */
     .hero { padding-top: 0; margin-bottom: 24px; padding-bottom: 22px; }
@@ -18339,6 +18353,47 @@ function renderDashboardHtml(): string {
       // date reads as "today" and looks like the last ingest invented the change.
       const calendarAsOf = new Date().toISOString().slice(0, 10);
 
+      let gapBanner = "";
+      const cov = payload && payload.snapshotCoverage;
+      if (cov && Array.isArray(cov.woSnapshotDateKeysAsc)) {
+        const woDates = cov.woSnapshotDateKeysAsc;
+        const nWo = woDates.length;
+        const nFleet = Number(cov.distinctFleetSnapshotCount) || 0;
+        const miss = Number(cov.missingFleetSnapshotDatesBetweenFirstAndLast) || 0;
+        const maxGap = Number(cov.maxCalendarGapDaysBetweenWoSnapshots) || 0;
+        const bigFleetSparseWo = nFleet >= 6 && nWo <= 4;
+        if (nWo >= 2 && (miss > 0 || maxGap > 21 || bigFleetSparseWo)) {
+          const firstD = woDates[0] || "";
+          const lastD = woDates[nWo - 1] || "";
+          const parts = [];
+          parts.push(
+            "The timeline is built by comparing <strong>consecutive days this work order exists in the saved snapshot history</strong>. It does not guess what changed on dates we never stored for this WO.",
+          );
+          if (miss > 0 && firstD && lastD) {
+            parts.push(
+              "Between <strong>" +
+                esc(fmtKeyLong(firstD)) +
+                "</strong> and <strong>" +
+                esc(fmtKeyLong(lastD)) +
+                "</strong> there are <strong>" +
+                String(miss) +
+                "</strong> fleet report day(s) with no row for this WO — updates that happened on those missing days will show together on the next day we have.",
+            );
+          } else if (maxGap > 21) {
+            parts.push(
+              "Largest calendar gap between <strong>two consecutive stored rows</strong> for this WO is <strong>" +
+                String(maxGap) +
+                "</strong> days, so the next changelog block can bundle many real-world edits that happened in between.",
+            );
+          } else if (bigFleetSparseWo) {
+            parts.push(
+              "This WO only appears on <strong>" + String(nWo) + "</strong> snapshot date(s) while the fleet index has <strong>" + String(nFleet) + "</strong> — expect compressed timelines until history is complete for this WO.",
+            );
+          }
+          gapBanner = "<div class='wo-timeline-gap-banner' role='status'>" + parts.join(" ") + "</div>";
+        }
+      }
+
       const days = keys.map(function (k) {
         const grp = byKey.get(k);
         grp.sort(function (a, b) { return timelineSortKey(a).localeCompare(timelineSortKey(b)); });
@@ -18513,7 +18568,7 @@ function renderDashboardHtml(): string {
         );
       }).join("");
 
-      el.innerHTML = days;
+      el.innerHTML = gapBanner + days;
     }
 
     /**
