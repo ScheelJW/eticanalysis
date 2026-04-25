@@ -656,6 +656,10 @@ export type MelRollupRow = {
   total_recall: number;
 };
 export async function getMelRollup(env: Env): Promise<MelRollupRow[]> {
+  // Bar height + MC%: prefer sums from mel_snapshot. When a day has no MEL rows
+  // (ingest gap / partial rebuild), fall back to fleet FMC/NMC on etic_snapshots
+  // so the trend matches the Snapshot tab instead of invisible bars + a bogus
+  // MC% chord across the chart.
   try {
     const r = await env.ETIC_SNAPSHOTS.prepare(
       `SELECT es.date_key AS snapshot_date_key,
@@ -663,13 +667,19 @@ export async function getMelRollup(env: Env): Promise<MelRollupRow[]> {
               COALESCE(SUM(CASE WHEN ms.mel_status='below' THEN 1 ELSE 0 END), 0) AS below,
               COALESCE(SUM(CASE WHEN ms.mel_status='at'    THEN 1 ELSE 0 END), 0) AS at,
               COALESCE(SUM(CASE WHEN ms.mel_status='above' THEN 1 ELSE 0 END), 0) AS above,
-              COALESCE(SUM(ms.nmc_count), 0) AS total_nmc,
-              COALESCE(SUM(ms.fmc_count), 0) AS total_fmc,
+              CASE WHEN COUNT(ms.mel_key) > 0
+                THEN COALESCE(SUM(ms.nmc_count), 0)
+                ELSE COALESCE(es.nmc, 0)
+              END AS total_nmc,
+              CASE WHEN COUNT(ms.mel_key) > 0
+                THEN COALESCE(SUM(ms.fmc_count), 0)
+                ELSE COALESCE(es.fmc, 0)
+              END AS total_fmc,
               COALESCE(SUM(ms.recall_delta), 0) AS total_recall
          FROM etic_snapshots es
          LEFT JOIN mel_snapshot ms ON ms.snapshot_date_key = es.date_key
         WHERE es.deleted_at_iso IS NULL OR trim(es.deleted_at_iso) = ''
-        GROUP BY es.date_key
+        GROUP BY es.date_key, es.fmc, es.nmc
         ORDER BY es.date_key ASC`,
     ).all<MelRollupRow>();
     return r.results ?? [];
@@ -680,12 +690,18 @@ export async function getMelRollup(env: Env): Promise<MelRollupRow[]> {
               COALESCE(SUM(CASE WHEN ms.mel_status='below' THEN 1 ELSE 0 END), 0) AS below,
               COALESCE(SUM(CASE WHEN ms.mel_status='at'    THEN 1 ELSE 0 END), 0) AS at,
               COALESCE(SUM(CASE WHEN ms.mel_status='above' THEN 1 ELSE 0 END), 0) AS above,
-              COALESCE(SUM(ms.nmc_count), 0) AS total_nmc,
-              COALESCE(SUM(ms.fmc_count), 0) AS total_fmc,
+              CASE WHEN COUNT(ms.mel_key) > 0
+                THEN COALESCE(SUM(ms.nmc_count), 0)
+                ELSE COALESCE(es.nmc, 0)
+              END AS total_nmc,
+              CASE WHEN COUNT(ms.mel_key) > 0
+                THEN COALESCE(SUM(ms.fmc_count), 0)
+                ELSE COALESCE(es.fmc, 0)
+              END AS total_fmc,
               COALESCE(SUM(ms.recall_delta), 0) AS total_recall
          FROM etic_snapshots es
          LEFT JOIN mel_snapshot ms ON ms.snapshot_date_key = es.date_key
-        GROUP BY es.date_key
+        GROUP BY es.date_key, es.fmc, es.nmc
         ORDER BY es.date_key ASC`,
     ).all<MelRollupRow>();
     return r.results ?? [];
