@@ -6801,13 +6801,12 @@ function renderYardAppHtml(): string {
       return String(s == null ? "" : s).trim().toUpperCase();
     }
 
-    /** True for the "Due for check" filter: check cadence only (never / due / overdue / fresh+never path).
-     *  Floor-to-book unlisted assets (isUnlisted) are a separate FM&A / Findings queue — not "due for another walk"
-     *  because they are not on the latest ETIC roster. NCE / below MEL stay as row badges only. */
+    /** Due means latest-ingest open WO plus no present check inside the yard interval. */
     function yardDueForCheck(a){
       if (a.isUnlisted) return false;
-      if (a.rollingState === "due" || a.rollingState === "overdue" || a.rollingState === "never") return true;
-      return false;
+      if (!(Number(a.openWoCount) > 0)) return false;
+      if (!a.lastCheckedAtIso) return true;
+      return Number(a.daysSinceLastCheck) >= Number((state.roster && state.roster.intervalDays) || 7);
     }
 
     function applyFilter(){

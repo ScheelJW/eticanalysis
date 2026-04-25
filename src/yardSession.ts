@@ -669,9 +669,9 @@ export async function deleteSession(env: Env, sessionId: number): Promise<boolea
 
 /* =============================================================================
    ROLLING YARD CHECK MODEL
-   Each "check" is a row in yard_check (no session). An asset is "due" if its
-   most-recent check is older than the configured cadence (default 7 days),
-   or if no check has been recorded yet.
+   Each "check" is a row in yard_check (no session). The searchable roster is the
+   current fleet, but the "due" queue is intentionally narrower: assets with an
+   open WO on the latest ingest and no present check inside the cadence.
    ========================================================================== */
 
 /** How many days a check is fresh for. Override via app_config["yardCheckIntervalDays"]. */
@@ -837,6 +837,10 @@ function bucketState(daysSince: number | null, intervalDays: number): RollingAss
   return "fresh";
 }
 
+function isOpenWoDue(openWoCount: number, daysSince: number | null, intervalDays: number): boolean {
+  return openWoCount > 0 && (daysSince === null || daysSince >= intervalDays);
+}
+
 /**
  * One-shot rolling roster: latest snapshot's assets + their last-check info +
  * photo counts + new-asset flag (first appearance vs the prior snapshot).
@@ -971,10 +975,12 @@ export async function getRollingRoster(env: Env): Promise<RollingRoster> {
       isBelowMel: belowMelAssets.has(c),
     });
     totals.total += 1;
-    if (state === "fresh") totals.fresh += 1;
-    else if (state === "due") totals.due += 1;
-    else if (state === "overdue") totals.overdue += 1;
-    else totals.never += 1;
+    if (isOpenWoDue(a.openWoCount, days, intervalDays)) {
+      if (state === "overdue" || state === "never") totals.overdue += 1;
+      else totals.due += 1;
+    } else {
+      totals.fresh += 1;
+    }
     if (last && last.at.slice(0, 10) === todayPrefix) totals.checkedToday += 1;
     if (last && days !== null && days < 7) totals.checkedThisWeek += 1;
   }

@@ -167,4 +167,21 @@ describe("Yard roster", () => {
     expect(ghost?.isUnlisted).toBe(true);
     expect(ghost?.lastLocation).toBe("Lot Z");
   });
+
+  it("counts due checks only for latest open-WO assets older than the interval", async () => {
+    const db = new MemoryD1();
+    const env = { ETIC_SNAPSHOTS: db, ETIC_BUCKET: {} };
+    await recordCheck(env as never, { assetId: "AF999", location: "Hangar 2", checkedBy: "Walker" });
+
+    const roster = await getRollingRoster(env as never);
+    const openWo = roster.assets.find((asset) => asset.assetId === "AF123");
+    const fleetOnly = roster.assets.find((asset) => asset.assetId === "AF999");
+
+    expect(openWo?.openWoCount).toBe(1);
+    expect(openWo?.rollingState).toBe("never");
+    expect(fleetOnly?.openWoCount).toBe(0);
+    expect(fleetOnly?.rollingState).toBe("fresh");
+    expect(roster.totals.never + roster.totals.due + roster.totals.overdue).toBe(1);
+    expect(roster.totals.fresh).toBe(1);
+  });
 });
