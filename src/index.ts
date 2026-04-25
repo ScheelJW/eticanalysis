@@ -5953,6 +5953,21 @@ function renderYardAppHtml(): string {
     .row:active { background: var(--bg2); border-color: var(--accent); }
     .row .id { font-weight: 700; font-size: 17px; }
     .row .meta { color: var(--muted); font-size: 13px; margin-top: 2px; }
+    .row .row-loc {
+      margin-top: 8px; padding: 10px 12px; border-radius: 8px;
+      background: linear-gradient(180deg, #e8f0ff 0%, #dfe8f8 100%);
+      border: 1px solid rgba(0, 58, 140, 0.22);
+      font-size: 15px; font-weight: 700; color: var(--accent-strong);
+      line-height: 1.35; word-break: break-word;
+    }
+    .row .row-loc.muted {
+      background: var(--bg2); border-color: var(--border);
+      color: var(--muted); font-weight: 600; font-size: 14px;
+    }
+    .row .row-loc .row-loc-lbl {
+      display: block; font-size: 10px; font-weight: 700; letter-spacing: 0.06em;
+      text-transform: uppercase; color: var(--muted); margin-bottom: 4px;
+    }
     .row .body { flex: 1 1 auto; min-width: 0; }
     .row .body .meta { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .row .right { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; flex: 0 0 auto; }
@@ -6008,6 +6023,35 @@ function renderYardAppHtml(): string {
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
     .sheet-body { flex: 1 1 auto; overflow-y: auto; padding: 12px 14px 140px; }
+    .yard-loc-hero {
+      background: linear-gradient(180deg, #f0f6ff 0%, #e4edfc 100%);
+      border: 1px solid rgba(0, 58, 140, 0.28); border-radius: 12px;
+      padding: 16px 14px 14px; margin-bottom: 12px;
+      box-shadow: 0 2px 8px rgba(0, 58, 140, 0.08);
+    }
+    .yard-loc-hero-label {
+      font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+      color: var(--muted); margin-bottom: 6px;
+    }
+    .yard-loc-hero-value {
+      font-size: 1.45rem; font-weight: 800; color: var(--accent-strong);
+      line-height: 1.25; word-break: break-word;
+    }
+    .yard-loc-hero-value.unknown { font-size: 1.1rem; font-weight: 700; color: var(--muted); }
+    .yard-loc-hero-sub { margin-top: 6px; font-size: 13px; color: var(--text-dim); }
+    .yard-loc-hero-meta { margin-top: 8px; font-size: 12px; color: var(--muted); line-height: 1.45; }
+    .yard-loc-hero-hint { margin: 10px 0 0; font-size: 12px; color: var(--muted); line-height: 1.4; }
+    .yard-log-section {
+      background: transparent; border: none; margin: 0; padding: 0;
+    }
+    .yard-log-section > summary {
+      list-style: none; cursor: pointer; user-select: none;
+      padding: 12px 14px; border-radius: 10px; border: 1px dashed var(--border);
+      background: var(--bg1); font-size: 14px; font-weight: 700; color: var(--accent);
+      margin-bottom: 12px;
+    }
+    .yard-log-section > summary::-webkit-details-marker { display: none; }
+    .yard-log-section[open] > summary { margin-bottom: 12px; border-style: solid; }
     .card {
       background: var(--bg1); border: 1px solid var(--border);
       border-radius: 10px; padding: 14px; margin-bottom: 12px;
@@ -6445,7 +6489,8 @@ function renderYardAppHtml(): string {
       .yard-desk-table tbody tr:hover { background: rgba(0,58,140,0.04); }
       .yard-desk-table tbody tr.yard-desk-active { background: rgba(0,58,140,0.10); outline: 1px solid rgba(0,58,140,0.35); outline-offset: -1px; }
       .yard-desk-table .col-asset { font-family: ui-monospace, monospace; font-weight: 700; font-size: 0.9rem; }
-      .yard-desk-table .col-loc { color: var(--text); word-break: break-word; }
+      .yard-desk-table .col-loc { color: var(--text); word-break: break-word; font-size: 0.95rem; font-weight: 700; line-height: 1.35; }
+      .yard-desk-table .col-loc .yard-desk-loc-unknown { color: var(--muted); font-weight: 600; font-size: 0.88rem; }
       .yard-desk-table .col-notes { color: var(--muted); font-size: 0.82rem; line-height: 1.35; }
       .yard-desk-table .col-meta { font-size: 0.78rem; color: var(--muted); white-space: nowrap; }
       .yard-desk-table .yard-pill {
@@ -6469,9 +6514,16 @@ function renderYardAppHtml(): string {
       .yard-desk-aside .lbl {
         display: block; font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); margin-bottom: 6px;
       }
-      .yard-desk-loc-big {
-        font-size: 1.25rem; font-weight: 600; color: var(--text); line-height: 1.3; word-break: break-word;
+      .yard-desk-loc-callout {
+        margin-top: 4px; padding: 14px 16px; border-radius: 12px;
+        background: linear-gradient(180deg, #f0f6ff 0%, #e4edfc 100%);
+        border: 1px solid rgba(0, 58, 140, 0.22);
+        box-shadow: 0 2px 8px rgba(0, 58, 140, 0.06);
       }
+      .yard-desk-loc-big {
+        font-size: 1.45rem; font-weight: 800; color: var(--accent-strong); line-height: 1.25; word-break: break-word;
+      }
+      .yard-desk-loc-big.muted { font-size: 1.15rem; font-weight: 700; color: var(--muted); }
       .yard-desk-loc-meta {
         font-size: 0.82rem;
         color: var(--muted);
@@ -6588,7 +6640,7 @@ function renderYardAppHtml(): string {
     </div>
 
     <div class="yard-desk" id="yard-desk">
-      <p class="yard-desk-hint">Search and pick a row for location, notes, and history. <span style="color:var(--muted)">NCE and Below MEL tags are work-order context only. Items marked Found, no open WO need a work-order or records fix.</span></p>
+      <p class="yard-desk-hint"><strong>Last parked at</strong> is the main column — search an asset to see where it was last seen. Expand &ldquo;Log a yard visit&rdquo; only when you are updating the record. <span style="color:var(--muted)">NCE and Below MEL tags are work-order context only. Items marked Found, no open WO need a work-order or records fix.</span></p>
       <div class="yard-desk-split">
         <div class="yard-desk-table-wrap">
           <table class="yard-desk-table" aria-label="Yard vehicle lookup">
@@ -6598,7 +6650,7 @@ function renderYardAppHtml(): string {
             <thead>
               <tr>
                 <th>Asset</th>
-                <th>Parked at</th>
+                <th>Last parked at</th>
                 <th>Notes</th>
                 <th>Status</th>
               </tr>
@@ -6610,8 +6662,8 @@ function renderYardAppHtml(): string {
           <div id="yard-desk-empty" class="yard-desk-empty">Select a vehicle in the table to see its last known location, notes, and location history.</div>
           <div id="yard-desk-fill" class="hidden">
             <div class="yard-desk-asset-id" id="yard-d-asset" style="font-family:ui-monospace,monospace;font-weight:700;font-size:1.1rem;margin-bottom:12px;"></div>
-            <div>
-              <span class="lbl">Parked at</span>
+            <div class="yard-desk-loc-callout">
+              <span class="lbl">Last parked at</span>
               <div class="yard-desk-loc-big" id="yard-d-loc">—</div>
               <div class="yard-desk-loc-meta" id="yard-d-loc-meta"></div>
             </div>
@@ -6645,7 +6697,7 @@ function renderYardAppHtml(): string {
       <div class="yard-up-track"><div class="yard-up-fill" id="yard-up-fill"></div></div>
     </div>
     <div class="save-bar">
-      <p class="save-bar-hint">One save = one yard visit (set parking location first).</p>
+      <p class="save-bar-hint">Only when logging a visit: set parking spot, then Save once.</p>
       <button class="save-btn" id="save-btn">Save check</button>
     </div>
   </div>
@@ -6889,6 +6941,13 @@ function renderYardAppHtml(): string {
       yc("done", state.assets.filter(function(a){ return a.rollingState === "fresh"; }).length);
     }
 
+    function yardListLocBlock(a){
+      var raw = (a.lastLocation || "").trim();
+      if (raw) {
+        return '<div class="row-loc"><span class="row-loc-lbl">Last parked at</span>' + escapeHtml(raw) + '</div>';
+      }
+      return '<div class="row-loc muted"><span class="row-loc-lbl">Last parked at</span>No location logged yet</div>';
+    }
     function renderList(){
       var rows = applyFilter();
       var list = $("list");
@@ -6904,7 +6963,6 @@ function renderYardAppHtml(): string {
         if (a.shop) sub.push("\uD83D\uDD27 " + escapeHtml(a.shop));
         else if (a.owningUnit) sub.push(escapeHtml(a.owningUnit));
         if (a.makeModel) sub.push(escapeHtml(a.makeModel));
-        if (a.lastLocation) sub.push("\uD83D\uDCCD " + escapeHtml(a.lastLocation));
         // Badges = orthogonal flags only. The colored age line below already
         // conveys never/due/overdue/done, so we don't repeat it here.
         var badges = "";
@@ -6916,6 +6974,7 @@ function renderYardAppHtml(): string {
         html += '<div class="row" data-id="' + escapeHtml(a.assetId) + '">' +
           '<div class="body">' +
             '<div class="id">' + escapeHtml(a.assetId) + '</div>' +
+            yardListLocBlock(a) +
             (sub.length ? '<div class="meta">' + sub.join(" \u00B7 ") + '</div>' : '') +
           '</div>' +
           '<div class="right">' +
@@ -6957,7 +7016,9 @@ function renderYardAppHtml(): string {
       var h = "";
       for (var i = 0; i < rows.length; i++) {
         var a = rows[i];
-        var loc = a.lastLocation ? escapeHtml(a.lastLocation) : "\u2014";
+        var loc = a.lastLocation
+          ? escapeHtml(a.lastLocation)
+          : '<span class="yard-desk-loc-unknown">No location yet</span>';
         var notesRaw = (a.lastNotes || "").trim();
         var notesCell = notesRaw ? truncDeskHtml(notesRaw, 160) : "<span style=\\"color:var(--subtle)\\">\u2014</span>";
         var active = state.deskSelectedId === a.assetId ? " yard-desk-active" : "";
@@ -7005,7 +7066,10 @@ function renderYardAppHtml(): string {
       var elLocMeta = document.getElementById("yard-d-loc-meta");
       var elNotes = document.getElementById("yard-d-notes");
       if (elAsset) elAsset.textContent = a.assetId;
-      if (elLoc) elLoc.textContent = a.lastLocation || "\u2014";
+      if (elLoc) {
+        elLoc.textContent = a.lastLocation || "No location logged yet";
+        elLoc.classList.toggle("muted", !((a.lastLocation || "").trim()));
+      }
       if (elLocMeta) elLocMeta.textContent = formatLastParkedMeta(a);
       if (elNotes) elNotes.textContent = (a.lastNotes || "").trim() || "(no notes on last check)";
       loadDeskDetail(assetId);
@@ -7372,6 +7436,28 @@ function renderYardAppHtml(): string {
       var lastSeen = a.isNeverChecked ? "Never checked" :
         (fmtAge(a.daysSinceLastCheck, false) + (a.lastCheckedBy ? " by " + escapeHtml(a.lastCheckedBy) : ""));
 
+      var locRawHero = (a.lastLocation || "").trim();
+      var locHeroValClass = "yard-loc-hero-value" + (locRawHero ? "" : " unknown");
+      var locHeroValInner = locRawHero ? escapeHtml(locRawHero) : "No location logged yet";
+      var locHeroSubParts = [];
+      if (a.shop) locHeroSubParts.push(escapeHtml(a.shop));
+      if (a.makeModel) locHeroSubParts.push(escapeHtml(a.makeModel));
+      var locHeroSubBlock = locHeroSubParts.length
+        ? ('<div class="yard-loc-hero-sub">' + locHeroSubParts.join(" \u00B7 ") + '</div>')
+        : "";
+      var locMetaStr = formatLastParkedMeta(a);
+      var locHeroMetaBlock = locMetaStr
+        ? ('<div class="yard-loc-hero-meta">' + escapeHtml(locMetaStr) + '</div>')
+        : "";
+      var locHeroBlock =
+        '<div class="yard-loc-hero">' +
+          '<div class="yard-loc-hero-label">Last known parking spot</div>' +
+          '<div class="' + locHeroValClass + '">' + locHeroValInner + '</div>' +
+          locHeroSubBlock +
+          locHeroMetaBlock +
+          '<p class="yard-loc-hero-hint">Open <strong>Log a yard visit</strong> below only when you are saving a new check, photo, or note.</p>' +
+        '</div>';
+
       // Open work orders for this asset — the remarks fleet managers actually
       // care about. Shows the most recently changed remark first.
       var wos = d.openWorkOrders || [];
@@ -7435,29 +7521,14 @@ function renderYardAppHtml(): string {
           '</div>';
       }
 
-      $("sheet-body").innerHTML =
-        fmaBanner +
-        unlistedBanner +
-        '<div class="card">' +
-          '<h4>Asset</h4>' +
-          '<dl class="kv">' +
-            '<dt>Asset ID</dt><dd>' + escapeHtml(a.assetId) + '</dd>' +
-            (a.shop ? '<dt>Shop</dt><dd>' + escapeHtml(a.shop) + '</dd>' : '') +
-            (a.owningUnit ? '<dt>Unit</dt><dd>' + escapeHtml(a.owningUnit) + '</dd>' : '') +
-            (a.makeModel ? '<dt>Make/Model</dt><dd>' + escapeHtml(a.makeModel) + '</dd>' : '') +
-            (a.vehNomen ? '<dt>Nomen</dt><dd>' + escapeHtml(a.vehNomen) + '</dd>' : '') +
-            (a.vinSerial ? '<dt>VIN/Serial</dt><dd style="font-family:ui-monospace,monospace;">' + escapeHtml(a.vinSerial) + '</dd>' : '') +
-            (a.openWoCount ? '<dt>Open WOs</dt><dd>' + a.openWoCount + '</dd>' : '') +
-            '<dt>Last seen</dt><dd>' + lastSeen + '</dd>' +
-          '</dl>' +
-        '</div>' +
+      var logVisitInner =
         // Walker only logs assets they actually see. The "Status" row used to
         // include a "Not here" button — see the comment above STATUS for why
         // it was removed. The single "Found it" button now lives at the bottom
         // (Save) implicitly: opening this sheet and tapping Save is the act of
         // confirming presence.
         '<div class="card">' +
-          '<h4>Location</h4>' +
+          '<h4>Parking spot (new check)</h4>' +
           '<div class="chip-pick" id="loc-pick">' + locChipHtml + '</div>' +
           '<input id="loc-input-other" list="loc-options" placeholder="Other location (optional)" value="' + escapeHtml(customLoc) + '" style="margin-top:8px;" />' +
         '</div>' +
@@ -7469,6 +7540,24 @@ function renderYardAppHtml(): string {
         '<div class="card">' +
           '<h4>Photos <span style="color:var(--muted2);font-weight:normal;">(' + photos.length + ')</span></h4>' +
           '<div class="photos">' + photoHtml + '</div>' +
+        '</div>';
+
+      $("sheet-body").innerHTML =
+        fmaBanner +
+        unlistedBanner +
+        locHeroBlock +
+        '<div class="card">' +
+          '<h4>Vehicle details</h4>' +
+          '<dl class="kv">' +
+            '<dt>Asset ID</dt><dd>' + escapeHtml(a.assetId) + '</dd>' +
+            (a.shop ? '<dt>Shop</dt><dd>' + escapeHtml(a.shop) + '</dd>' : '') +
+            (a.owningUnit ? '<dt>Unit</dt><dd>' + escapeHtml(a.owningUnit) + '</dd>' : '') +
+            (a.makeModel ? '<dt>Make/Model</dt><dd>' + escapeHtml(a.makeModel) + '</dd>' : '') +
+            (a.vehNomen ? '<dt>Nomen</dt><dd>' + escapeHtml(a.vehNomen) + '</dd>' : '') +
+            (a.vinSerial ? '<dt>VIN/Serial</dt><dd style="font-family:ui-monospace,monospace;">' + escapeHtml(a.vinSerial) + '</dd>' : '') +
+            (a.openWoCount ? '<dt>Open WOs</dt><dd>' + a.openWoCount + '</dd>' : '') +
+            '<dt>Last seen</dt><dd>' + lastSeen + '</dd>' +
+          '</dl>' +
         '</div>' +
         (wos.length
           ? ('<div class="card">' +
@@ -7476,6 +7565,10 @@ function renderYardAppHtml(): string {
               wosHtml +
              '</div>')
           : '') +
+        '<details class="yard-log-section">' +
+          '<summary>Log a yard visit (location, notes, photos)</summary>' +
+          logVisitInner +
+        '</details>' +
         '<div class="card">' +
           '<h4>Check history</h4>' +
           historyHtml +
