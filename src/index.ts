@@ -103,6 +103,7 @@ import {
   getMelSnapshotDates,
   getAuthzManagerData,
   getMelSubdivisions,
+  getAppConfig,
   getStalenessThresholds,
   ingestMelSnapshot,
   setAppConfig,
@@ -1779,6 +1780,190 @@ export type RebuildWorkOrderWatchSummary = {
   missing: EticSnapshotRebuildRow[];
 };
 
+const WATCH_REBUILD_CHUNK_STATE_KEY = "watch_rebuild_chunk_state";
+
+export type WatchRebuildChunkState = {
+  v: 1;
+  startedAtIso: string;
+  nextIndex: number;
+  total: number;
+  lastProcessedDateKey: string | null;
+};
+
+export type WatchRebuildChunkResult = {
+  ok: boolean;
+  done: boolean;
+  message: string;
+  total: number;
+  nextIndex: number;
+  processedThisRequest: number;
+  lastProcessedDateKey: string | null;
+  startedAtIso?: string;
+  error?: string;
+};
+
+/**
+ * Replay ETIC workbooks into WO/MEL watch tables in small batches so a single
+ * Worker invocation stays under CPU limits. First call clears watch tables and
+ * stores progress in app_config; repeat until `done`.
+ */
+export async function runWatchRebuildChunk(env: Env, chunkDays: number): Promise<WatchRebuildChunkResult> {
+  const days = Math.min(10, Math.max(1, Math.floor(chunkDays) || 2));
+  const snapshots = await loadActiveEticSnapshotsForRebuild(env);
+  if (snapshots.length === 0) {
+    return {
+      ok: false,
+      done: true,
+      message: "No active etic_snapshots rows to rebuild.",
+      total: 0,
+      nextIndex: 0,
+      processedThisRequest: 0,
+      lastProcessedDateKey: null,
+      error: "empty",
+    };
+  }
+
+  let state = await getAppConfig<WatchRebuildChunkState>(env, WATCH_REBUILD_CHUNK_STATE_KEY);
+  const nowIso = new Date().toISOString();
+
+  if (!state || state.v !== 1) {
+    const missing: EticSnapshotRebuildRow[] = [];
+    const HEAD_BATCH = 24;
+    for (let i = 0; i < snapshots.length; i += HEAD_BATCH) {
+      const slice = snapshots.slice(i, i + HEAD_BATCH);
+      const heads = await Promise.all(slice.map((row) => env.ETIC_BUCKET.head(row.workbook_key)));
+      for (let j = 0; j < heads.length; j++) {
+        if (!heads[j]) missing.push(slice[j]!);
+      }
+    }
+    if (missing.length > 0) {
+      for (const row of missing) {
+        console.error(
+          JSON.stringify({
+            level: "error",
+            message: "rebuild_chunk: workbook missing in R2",
+            date_key: row.date_key,
+            workbook_key: row.workbook_key,
+          }),
+        );
+      }
+      return {
+        ok: false,
+        done: false,
+        message: `Cannot start rebuild: ${missing.length} workbook(s) missing from R2.`,
+        total: snapshots.length,
+        nextIndex: 0,
+        processedThisRequest: 0,
+        lastProcessedDateKey: null,
+        error: "r2_missing",
+      };
+    }
+
+    await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM work_order_changelog`).run();
+    await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM work_order_state`).run();
+    await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM work_order_snapshot`).run();
+    await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM fleet_p_a_snapshot`).run();
+    await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM mel_changelog`).run();
+    await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM mel_state`).run();
+    await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM mel_snapshot`).run();
+
+    state = {
+      v: 1,
+      startedAtIso: nowIso,
+      nextIndex: 0,
+      total: snapshots.length,
+      lastProcessedDateKey: null,
+    };
+    await setAppConfig(env, WATCH_REBUILD_CHUNK_STATE_KEY, state, nowIso);
+  }
+
+  if (snapshots.length !== state.total) {
+    return {
+      ok: false,
+      done: false,
+      message:
+        "etic_snapshots row count changed since rebuild started; aborting. Wait for in-flight ingests to finish, clear app_config watch_rebuild_chunk_state if stuck, then restart.",
+      total: snapshots.length,
+      nextIndex: state.nextIndex,
+      processedThisRequest: 0,
+      lastProcessedDateKey: state.lastProcessedDateKey,
+      error: "snapshot_count_mismatch",
+    };
+  }
+
+  let idx = state.nextIndex;
+  if (idx >= snapshots.length) {
+    await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM app_config WHERE key = ?`).bind(WATCH_REBUILD_CHUNK_STATE_KEY).run();
+    return {
+      ok: true,
+      done: true,
+      message: "Watch rebuild already complete.",
+      total: snapshots.length,
+      nextIndex: snapshots.length,
+      processedThisRequest: 0,
+      lastProcessedDateKey: state.lastProcessedDateKey,
+    };
+  }
+
+  const end = Math.min(idx + days, snapshots.length);
+  let processedThisRequest = 0;
+  let lastKey: string | null = state.lastProcessedDateKey;
+
+  for (let i = idx; i < end; i++) {
+    const row = snapshots[i]!;
+    const obj = await env.ETIC_BUCKET.get(row.workbook_key);
+    if (!obj) {
+      return {
+        ok: false,
+        done: false,
+        message: `R2 object disappeared mid-rebuild: ${row.date_key}`,
+        total: snapshots.length,
+        nextIndex: i,
+        processedThisRequest,
+        lastProcessedDateKey: lastKey,
+        error: "r2_gone",
+      };
+    }
+    const bytes = await obj.arrayBuffer();
+    const raw = await extractRawWorkOrdersFromBinary(bytes);
+    const ts = ingestTimestampForSnapshotRebuild(row);
+    await ingestWorkOrderSnapshot(env, row.date_key, raw, ts, bytes);
+    const melRows = await extractMelRowsFromBinary(bytes);
+    await ingestMelSnapshot(env, row.date_key, melRows, ts);
+    processedThisRequest += 1;
+    lastKey = row.date_key;
+  }
+
+  const nextIndex = end;
+  const done = nextIndex >= snapshots.length;
+
+  if (done) {
+    await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM app_config WHERE key = ?`).bind(WATCH_REBUILD_CHUNK_STATE_KEY).run();
+  } else {
+    const nextState: WatchRebuildChunkState = {
+      v: 1,
+      startedAtIso: state.startedAtIso,
+      nextIndex,
+      total: state.total,
+      lastProcessedDateKey: lastKey,
+    };
+    await setAppConfig(env, WATCH_REBUILD_CHUNK_STATE_KEY, nextState, nowIso);
+  }
+
+  return {
+    ok: true,
+    done,
+    message: done
+      ? `Watch rebuild complete: ${snapshots.length} snapshot day(s) ingested.`
+      : `Replayed ${processedThisRequest} day(s); ${snapshots.length - nextIndex} remaining. POST again with rebuild_chunk=1 until done.`,
+    total: snapshots.length,
+    nextIndex,
+    processedThisRequest,
+    lastProcessedDateKey: lastKey,
+    startedAtIso: state.startedAtIso,
+  };
+}
+
 /**
  * Every active row in the same D1 index the dashboard uses (etic_snapshots), oldest→newest.
  * Each pass runs ingest against the **prior** work_order_snapshot rows in D1, so diffs and
@@ -1828,15 +2013,14 @@ export function ingestTimestampForSnapshotRebuild(row: EticSnapshotRebuildRow): 
  */
 export async function rebuildWorkOrderWatchFromHistory(env: Env): Promise<RebuildWorkOrderWatchSummary> {
   const snapshots = await loadActiveEticSnapshotsForRebuild(env);
-  const loaded: Array<{ row: EticSnapshotRebuildRow; bytes: ArrayBuffer }> = [];
   const missing: EticSnapshotRebuildRow[] = [];
-  for (const row of snapshots) {
-    const obj = await env.ETIC_BUCKET.get(row.workbook_key);
-    if (!obj) {
-      missing.push(row);
-      continue;
+  const HEAD_BATCH = 24;
+  for (let i = 0; i < snapshots.length; i += HEAD_BATCH) {
+    const slice = snapshots.slice(i, i + HEAD_BATCH);
+    const heads = await Promise.all(slice.map((row) => env.ETIC_BUCKET.head(row.workbook_key)));
+    for (let j = 0; j < heads.length; j++) {
+      if (!heads[j]) missing.push(slice[j]!);
     }
-    loaded.push({ row, bytes: await obj.arrayBuffer() });
   }
   if (missing.length > 0) {
     for (const row of missing) {
@@ -1859,14 +2043,21 @@ export async function rebuildWorkOrderWatchFromHistory(env: Env): Promise<Rebuil
   await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM mel_changelog`).run();
   await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM mel_state`).run();
   await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM mel_snapshot`).run();
-  for (const { row, bytes } of loaded) {
+  let processed = 0;
+  for (const row of snapshots) {
+    const obj = await env.ETIC_BUCKET.get(row.workbook_key);
+    if (!obj) {
+      throw new Error(`R2 workbook missing mid-rebuild: ${row.date_key}`);
+    }
+    const bytes = await obj.arrayBuffer();
     const raw = await extractRawWorkOrdersFromBinary(bytes);
     const ts = ingestTimestampForSnapshotRebuild(row);
     await ingestWorkOrderSnapshot(env, row.date_key, raw, ts, bytes);
     const melRows = await extractMelRowsFromBinary(bytes);
     await ingestMelSnapshot(env, row.date_key, melRows, ts);
+    processed += 1;
   }
-  return { total: snapshots.length, processed: loaded.length, missing };
+  return { total: snapshots.length, processed, missing };
 }
 
 type EmailIngestWatchRefreshSummary = {
@@ -1905,6 +2096,29 @@ async function handleDebugWatchCounts(env: Env): Promise<Response> {
   const eticSample = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT work_order_id, asset_id, mel_tier, etic_raw, etic_date FROM work_order_state WHERE etic_date IS NOT NULL ORDER BY last_snapshot_date DESC LIMIT 10`,
   ).all();
+  let eticSnapshotDates = 0;
+  let workOrderSnapshotDates = 0;
+  let melSnapshotDates = 0;
+  try {
+    const e = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT COUNT(DISTINCT date_key) AS c FROM etic_snapshots WHERE deleted_at_iso IS NULL`,
+    ).first<{ c: number }>();
+    eticSnapshotDates = e?.c ?? 0;
+  } catch {
+    const e = await env.ETIC_SNAPSHOTS.prepare(`SELECT COUNT(DISTINCT date_key) AS c FROM etic_snapshots`).first<{
+      c: number;
+    }>();
+    eticSnapshotDates = e?.c ?? 0;
+  }
+  const w = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT COUNT(DISTINCT snapshot_date_key) AS c FROM work_order_snapshot`,
+  ).first<{ c: number }>();
+  workOrderSnapshotDates = w?.c ?? 0;
+  const m = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT COUNT(DISTINCT snapshot_date_key) AS c FROM mel_snapshot`,
+  ).first<{ c: number }>();
+  melSnapshotDates = m?.c ?? 0;
+  const chunkState = await getAppConfig<WatchRebuildChunkState>(env, WATCH_REBUILD_CHUNK_STATE_KEY);
   return Response.json(
     {
       totalState: stateCount?.c ?? 0,
@@ -1912,6 +2126,11 @@ async function handleDebugWatchCounts(env: Env): Promise<Response> {
       rowsByLastSnapshotDate: latest.results ?? [],
       melBreakdown: melBreakdown.results ?? [],
       eticSample: eticSample.results ?? [],
+      eticSnapshotDates,
+      workOrderSnapshotDates,
+      melSnapshotDates,
+      watchRebuildChunkInProgress: !!(chunkState && chunkState.v === 1 && chunkState.nextIndex < chunkState.total),
+      watchRebuildChunk: chunkState && chunkState.v === 1 ? chunkState : null,
     },
     { headers: cacheHeaders() },
   );
@@ -4652,6 +4871,21 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
       const count = await replayWorkOrderWatchForDate(env, replayDate);
       return Response.json({ ok: true, dateKey: replayDate, rowsIngested: count }, { headers: cacheHeaders() });
     }
+    if (url.searchParams.get("rebuild_chunk") === "1") {
+      const chunkParam = url.searchParams.get("chunk_size");
+      const chunkSize = chunkParam ? Number.parseInt(chunkParam, 10) : 2;
+      const result = await runWatchRebuildChunk(env, chunkSize);
+      if (!result.ok && result.error === "r2_missing") {
+        return Response.json(result, { status: 409, headers: cacheHeaders() });
+      }
+      if (!result.ok && result.error === "snapshot_count_mismatch") {
+        return Response.json(result, { status: 409, headers: cacheHeaders() });
+      }
+      if (!result.ok && result.error === "r2_gone") {
+        return Response.json(result, { status: 409, headers: cacheHeaders() });
+      }
+      return Response.json(result, { headers: cacheHeaders() });
+    }
     if (url.searchParams.get("rebuild") === "1") {
       const wait = url.searchParams.get("wait") === "1";
       if (wait) {
@@ -4681,7 +4915,7 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
         {
           ok: true,
           message:
-            "Work order watch is rebuilding from every active D1 etic_snapshots row, oldest to newest. Use wait=1 to block until completion.",
+            "Work order watch is rebuilding from every active D1 etic_snapshots row (single invocation — may hit Worker CPU limits for large history). Prefer POST /api/watch?rebuild_chunk=1&chunk_size=2 in a loop until done. Use rebuild=1&wait=1 to block on full rebuild.",
         },
         { headers: cacheHeaders() },
       );
@@ -4720,7 +4954,7 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
       return Response.json({ ok: true, overwrite, reports }, { headers: cacheHeaders() });
     }
     return new Response(
-      "Use POST /api/watch?rebuild=1 | ?repair_remark_dates=1[&wait=1] | ?replay=YYYY-MM-DD | ?reset=1 | ?backfill-from-json=1[&overwrite=1][&table=state|snapshot|both]",
+      "Use POST /api/watch?rebuild_chunk=1[&chunk_size=2] | ?rebuild=1[&wait=1] | ?repair_remark_dates=1[&wait=1] | ?replay=YYYY-MM-DD | ?reset=1 | ?backfill-from-json=1[&overwrite=1][&table=state|snapshot|both]",
       { status: 400 },
     );
   }
