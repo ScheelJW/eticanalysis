@@ -788,6 +788,7 @@ type CheckReadRow = {
   checked_by: string | null;
   checked_at_iso: string;
   source_date_key: string | null;
+  snapshot_asset_json?: string | null;
   asset_snapshot_json?: string | null;
 };
 
@@ -801,7 +802,7 @@ function rowToCheck(r: CheckReadRow): YardCheckRow {
     checkedBy: r.checked_by ?? "",
     checkedAtIso: r.checked_at_iso,
     sourceDateKey: r.source_date_key ?? "",
-    assetSnapshotJson: r.asset_snapshot_json ?? "",
+    assetSnapshotJson: r.snapshot_asset_json ?? r.asset_snapshot_json ?? "",
   };
 }
 
@@ -1119,14 +1120,14 @@ export async function recordCheck(env: Env, input: RecordCheckInput): Promise<Ya
   try {
     r = await env.ETIC_SNAPSHOTS.prepare(
       `INSERT INTO yard_check
-         (asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, asset_snapshot_json)
+         (asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, snapshot_asset_json)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-       RETURNING id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, asset_snapshot_json`,
+       RETURNING id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, snapshot_asset_json`,
     )
       .bind(...values, assetSnapshotJson)
       .first<CheckReadRow>();
   } catch (err) {
-    if (!isMissingColumnError(err, "asset_snapshot_json")) throw err;
+    if (!isMissingColumnError(err, "snapshot_asset_json")) throw err;
     r = await env.ETIC_SNAPSHOTS.prepare(
       `INSERT INTO yard_check
          (asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key)
@@ -1135,7 +1136,7 @@ export async function recordCheck(env: Env, input: RecordCheckInput): Promise<Ya
     )
       .bind(...values)
       .first<CheckReadRow>();
-    if (r) r.asset_snapshot_json = assetSnapshotJson;
+    if (r) r.snapshot_asset_json = assetSnapshotJson;
   }
   if (!r) throw new Error("failed to record check");
   return rowToCheck(r);
@@ -1168,7 +1169,7 @@ export async function updateYardCheck(env: Env, input: UpdateYardCheckInput): Pr
   if (!Number.isFinite(checkId) || checkId <= 0) throw new Error("checkId required");
 
   const r0 = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, asset_snapshot_json
+    `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, snapshot_asset_json
      FROM yard_check WHERE id = ?`,
   )
     .bind(checkId)
@@ -1218,7 +1219,7 @@ export async function updateYardCheck(env: Env, input: UpdateYardCheckInput): Pr
     .run();
 
   const r1 = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, asset_snapshot_json
+    `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, snapshot_asset_json
      FROM yard_check WHERE id = ?`,
   )
     .bind(checkId)
@@ -1276,7 +1277,7 @@ export async function getChecksForAsset(
   limit = 50,
 ): Promise<YardCheckRow[]> {
   const r = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, asset_snapshot_json
+    `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, snapshot_asset_json
      FROM yard_check
      WHERE UPPER(TRIM(asset_id)) = UPPER(TRIM(?))
      ORDER BY checked_at_iso DESC LIMIT ?`,
@@ -1288,7 +1289,7 @@ export async function getChecksForAsset(
 
 export async function getRecentChecks(env: Env, limit = 100): Promise<YardCheckRow[]> {
   const r = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, asset_snapshot_json
+    `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, snapshot_asset_json
      FROM yard_check ORDER BY checked_at_iso DESC LIMIT ?`,
   )
     .bind(limit)
@@ -2113,7 +2114,7 @@ export type YardActivityItem =
 export async function getRecentActivity(env: Env, limit = 100): Promise<YardActivityItem[]> {
   const [checks, actions] = await Promise.all([
     env.ETIC_SNAPSHOTS.prepare(
-      `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, asset_snapshot_json
+      `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, snapshot_asset_json
        FROM yard_check ORDER BY checked_at_iso DESC LIMIT ?`,
     ).bind(limit).all<CheckReadRow>(),
     env.ETIC_SNAPSHOTS.prepare(
