@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { recordCheck } from "../src/yardSession";
+import { getRollingRoster, getYardRosterForDate, recordCheck } from "../src/yardSession";
 
 type Row = Record<string, unknown>;
 
@@ -30,6 +30,41 @@ class MemoryStmt {
 
 class MemoryD1 {
   checks: Row[] = [];
+  fleetRows: Row[] = [
+    {
+      asset_id: "AF123",
+      owning_unit: "OPS",
+      shop: "Fleet Shop",
+      mgmt_cd: "MGT",
+      make_model: "Ford",
+      veh_nomen: "Truck",
+      mel_key: "MEL-A",
+      raw_row_json: JSON.stringify({ "fleet.location": "Fleet lot", "fleet.vin": "VIN123" }),
+    },
+    {
+      asset_id: "AF999",
+      owning_unit: "LRS",
+      shop: "Line",
+      mgmt_cd: "M2",
+      make_model: "Chevy",
+      veh_nomen: "Van",
+      mel_key: "MEL-B",
+      raw_row_json: JSON.stringify({ "fleet.location": "Hangar 2", "fleet.vin": "VIN999" }),
+    },
+  ];
+  workOrderRows: Row[] = [
+    {
+      asset_id: "AF123",
+      owning_unit: "OPS",
+      shop: "Bay 1",
+      mgmt_cd: "MGT",
+      make_model: "Ford",
+      veh_nomen: "Truck",
+      mel_key: "MEL-A",
+      mel_tier: "below",
+      raw_row_json: JSON.stringify({ Location: "Old lot", VIN: "VIN123" }),
+    },
+  ];
   nextId = 1;
 
   prepare(sql: string) {
@@ -38,24 +73,33 @@ class MemoryD1 {
 
   query(sql: string, binds: unknown[]): Row[] {
     if (sql.includes("FROM app_config")) return [];
+    if (sql.includes("FROM etic_snapshots") && sql.includes("ORDER BY e.date_key DESC")) {
+      return [{ date_key: "2026-04-02" }];
+    }
     if (sql.includes("FROM etic_snapshots") && sql.includes("ORDER BY date_key DESC LIMIT 1")) {
       return [{ date_key: "2026-04-02" }];
     }
     if (sql.includes("SELECT 1 AS x FROM work_order_snapshot")) return [];
+    if (sql.includes("FROM fleet_p_a_snapshot") && sql.includes("snapshot_date_key = ?")) {
+      return this.fleetRows;
+    }
     if (sql.includes("FROM work_order_snapshot") && sql.includes("snapshot_date_key = ?")) {
-      return [
-        {
-          asset_id: "AF123",
-          owning_unit: "OPS",
-          shop: "Bay 1",
-          mgmt_cd: "MGT",
-          make_model: "Ford",
-          veh_nomen: "Truck",
-          mel_key: "MEL-A",
-          mel_tier: "below",
-          raw_row_json: JSON.stringify({ Location: "Old lot", VIN: "VIN123" }),
-        },
-      ];
+      if (sql.includes("mel_tier = 'below'")) return [{ asset_id: "AF123" }];
+      if (sql.includes("SELECT DISTINCT asset_id")) return this.workOrderRows.map((row) => ({ asset_id: row.asset_id }));
+      return this.workOrderRows;
+    }
+    if (sql.includes("FROM yard_check") && sql.includes("ROW_NUMBER() OVER")) {
+      return this.checks;
+    }
+    if (sql.includes("FROM yard_check yc") && sql.includes("COALESCE(location")) {
+      return this.checks.filter((row) => String(row.location ?? "").trim()).map((row) => ({
+        asset_id: row.asset_id,
+        location: row.location,
+      }));
+    }
+    if (sql.includes("FROM yard_photo")) return [];
+    if (sql.includes("FROM etic_snapshots") && sql.includes("date_key < ?")) {
+      return [];
     }
     if (sql.includes("INSERT INTO yard_check")) {
       const row: Row = {
@@ -91,5 +135,36 @@ describe("recordCheck", () => {
     expect(check.assetSnapshotJson).toContain('"sourceDateKey":"2026-04-02"');
     expect(check.assetSnapshotJson).toContain('"assetId":"AF123"');
     expect(check.assetSnapshotJson).toContain('"previousLocation":"Old lot"');
+  });
+});
+
+describe("Yard roster", () => {
+  it("uses Fleet P&A as the searchable base and overlays open WO context", async () => {
+    const db = new MemoryD1();
+    const env = { ETIC_SNAPSHOTS: db, ETIC_BUCKET: {} };
+
+    const roster = await getYardRosterForDate(env as never, "2026-04-02");
+
+    expect(roster.assets.map((asset) => asset.assetId)).toEqual(["AF123", "AF999"]);
+    const openWoAsset = roster.assets.find((asset) => asset.assetId === "AF123");
+    expect(openWoAsset?.openWoCount).toBe(1);
+    expect(openWoAsset?.melTier).toBe("below");
+    expect(openWoAsset?.previousLocation).toBe("Old lot");
+    const fleetOnlyAsset = roster.assets.find((asset) => asset.assetId === "AF999");
+    expect(fleetOnlyAsset?.openWoCount).toBe(0);
+    expect(fleetOnlyAsset?.previousLocation).toBe("Hangar 2");
+  });
+
+  it("keeps checked non-fleet assets searchable as unlisted with latest yard location", async () => {
+    const db = new MemoryD1();
+    const env = { ETIC_SNAPSHOTS: db, ETIC_BUCKET: {} };
+    await recordCheck(env as never, { assetId: "AF-GHOST", location: "Lot Z", checkedBy: "Walker" });
+
+    const roster = await getRollingRoster(env as never);
+    const ghost = roster.assets.find((asset) => asset.assetId === "AF-GHOST");
+
+    expect(roster.assets.length).toBe(3);
+    expect(ghost?.isUnlisted).toBe(true);
+    expect(ghost?.lastLocation).toBe("Lot Z");
   });
 });

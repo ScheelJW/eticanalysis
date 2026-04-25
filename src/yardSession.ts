@@ -158,24 +158,60 @@ async function hasWorkOrderSnapshotRowsForDate(env: Env, dateKey: string): Promi
   return !!r;
 }
 
+async function hasFleetSnapshotRowsForDate(env: Env, dateKey: string): Promise<boolean> {
+  if (!dateKey) return false;
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT 1 AS ok FROM fleet_p_a_snapshot WHERE snapshot_date_key = ? LIMIT 1`,
+  )
+    .bind(dateKey)
+    .first<{ ok: number }>();
+  return !!r;
+}
+
+async function hasYardRosterRowsForDate(env: Env, dateKey: string): Promise<boolean> {
+  return await hasFleetSnapshotRowsForDate(env, dateKey) || await hasWorkOrderSnapshotRowsForDate(env, dateKey);
+}
+
 /**
- * Yard should follow the newest successfully analyzed workbook date, even when
- * etic_snapshots lags briefly behind due to background post-processing.
+ * Yard follows the newest D1 snapshot that has extracted roster rows. R2 latest
+ * can lag after rebuilds, but the walker needs the latest queryable D1 roster.
  */
 async function getLatestSnapshotDateKey(env: Env): Promise<string> {
+  let row = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT e.date_key
+       FROM etic_snapshots e
+      WHERE e.deleted_at_iso IS NULL
+        AND (
+          EXISTS (SELECT 1 FROM fleet_p_a_snapshot f WHERE f.snapshot_date_key = e.date_key)
+          OR EXISTS (SELECT 1 FROM work_order_snapshot w WHERE w.snapshot_date_key = e.date_key)
+        )
+      ORDER BY e.date_key DESC
+      LIMIT 1`,
+  ).first<{ date_key: string }>();
+  if (row?.date_key) return row.date_key;
+
+  row = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT snapshot_date_key AS date_key
+       FROM fleet_p_a_snapshot
+      GROUP BY snapshot_date_key
+      ORDER BY snapshot_date_key DESC
+      LIMIT 1`,
+  ).first<{ date_key: string }>();
+  if (row?.date_key) return row.date_key;
+
   try {
     const latestObj = await env.ETIC_BUCKET.get("analyses/latest.json");
     if (latestObj) {
       const latest = JSON.parse(await latestObj.text()) as { dateKey?: string };
       const dateKey = String(latest?.dateKey ?? "").trim();
-      if (/^\d{4}-\d{2}-\d{2}$/.test(dateKey) && await hasWorkOrderSnapshotRowsForDate(env, dateKey)) {
+      if (/^\d{4}-\d{2}-\d{2}$/.test(dateKey) && await hasYardRosterRowsForDate(env, dateKey)) {
         return dateKey;
       }
     }
   } catch {
     // Fall through to D1-based fallback.
   }
-  let row = await env.ETIC_SNAPSHOTS.prepare(
+  row = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT date_key FROM etic_snapshots WHERE deleted_at_iso IS NULL ORDER BY date_key DESC LIMIT 1`,
   ).first<{ date_key: string }>();
   if (!row?.date_key) {
@@ -320,58 +356,103 @@ function detectNce(raw: Record<string, unknown>): boolean {
   return false;
 }
 
+type YardRosterSourceRow = {
+  asset_id: string;
+  owning_unit: string | null;
+  shop: string | null;
+  mgmt_cd: string | null;
+  make_model: string | null;
+  veh_nomen: string | null;
+  mel_key: string | null;
+  mel_tier?: string | null;
+  raw_row_json: string | null;
+};
+
+function readYardAssetRow(row: YardRosterSourceRow): { prevLoc: string; vin: string; nce: boolean } {
+  let prevLoc = "";
+  let vin = "";
+  let nce = false;
+  if (row.raw_row_json) {
+    try {
+      const raw = JSON.parse(row.raw_row_json) as Record<string, unknown>;
+      prevLoc = extractLocation(raw);
+      vin = extractVinSerial(raw);
+      nce = detectNce(raw);
+    } catch {
+      // ignore JSON parse failures
+    }
+  }
+  return { prevLoc, vin, nce };
+}
+
+function collectLocationValues(row: YardRosterSourceRow, allLocations: Set<string>): void {
+  if (!row.raw_row_json) return;
+  try {
+    const raw = JSON.parse(row.raw_row_json) as Record<string, unknown>;
+    for (const [k, v] of Object.entries(raw)) {
+      const key = k.toLowerCase();
+      const val = String(v ?? "").trim();
+      if (val && key.includes("location")) allLocations.add(val);
+    }
+  } catch {
+    // ignore JSON parse failures
+  }
+}
+
 /**
- * Build the asset roster for a yard check from the work_order_snapshot rows
- * of a given snapshot. Aggregates per-asset across multiple open WOs and
- * collects every distinct location for the location dropdown.
+ * Build the yard-check roster from the full Fleet P&A snapshot, then overlay
+ * open-WO context from the same ETIC day. Checked assets outside Fleet P&A are
+ * added later by getRollingRoster as unlisted/floor-to-book finds.
  */
 export async function getYardRosterForDate(env: Env, dateKey: string): Promise<YardRoster> {
   if (!dateKey) return { assets: [], locations: [] };
-  const r = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT asset_id, owning_unit, shop, mgmt_cd, make_model, veh_nomen, mel_key, mel_tier, raw_row_json
-     FROM work_order_snapshot
-     WHERE snapshot_date_key = ? AND asset_id != ''`,
-  )
-    .bind(dateKey)
-    .all<{
-      asset_id: string;
-      owning_unit: string | null;
-      shop: string | null;
-      mgmt_cd: string | null;
-      make_model: string | null;
-      veh_nomen: string | null;
-      mel_key: string | null;
-      mel_tier: string | null;
-      raw_row_json: string | null;
-    }>();
+  const [fleetRows, woRows] = await Promise.all([
+    env.ETIC_SNAPSHOTS.prepare(
+      `SELECT asset_id, owning_unit, shop, mgmt_cd, make_model, veh_nomen, mel_key, raw_row_json
+       FROM fleet_p_a_snapshot
+       WHERE snapshot_date_key = ? AND asset_id != ''`,
+    )
+      .bind(dateKey)
+      .all<YardRosterSourceRow>(),
+    env.ETIC_SNAPSHOTS.prepare(
+      `SELECT asset_id, owning_unit, shop, mgmt_cd, make_model, veh_nomen, mel_key, mel_tier, raw_row_json
+       FROM work_order_snapshot
+       WHERE snapshot_date_key = ? AND asset_id != ''`,
+    )
+      .bind(dateKey)
+      .all<YardRosterSourceRow>(),
+  ]);
   const grouped = new Map<string, YardAsset>();
   const allLocations = new Set<string>();
-  for (const row of r.results ?? []) {
+
+  for (const row of fleetRows.results ?? []) {
     const id = (row.asset_id ?? "").trim();
     if (!id) continue;
+    collectLocationValues(row, allLocations);
+    const { prevLoc, vin, nce } = readYardAssetRow(row);
+    grouped.set(canonicalYardAssetKey(id), {
+      assetId: id,
+      owningUnit: row.owning_unit ?? "",
+      shop: row.shop ?? "",
+      mgmtCd: row.mgmt_cd ?? "",
+      makeModel: row.make_model ?? "",
+      vehNomen: row.veh_nomen ?? "",
+      melKey: row.mel_key ?? "",
+      melTier: "",
+      vinSerial: vin,
+      previousLocation: prevLoc,
+      openWoCount: 0,
+      isNce: nce,
+    });
+  }
+
+  for (const row of woRows.results ?? []) {
+    const id = (row.asset_id ?? "").trim();
+    if (!id) continue;
+    collectLocationValues(row, allLocations);
     const canon = canonicalYardAssetKey(id);
+    const { prevLoc, vin, nce } = readYardAssetRow(row);
     const existing = grouped.get(canon);
-    let prevLoc = "";
-    let vin = "";
-    let nce = false;
-    if (row.raw_row_json) {
-      try {
-        const raw = JSON.parse(row.raw_row_json) as Record<string, unknown>;
-        // Walk the row once for everything we need (location, VIN, NCE) AND
-        // collect every location-shaped value into the global dropdown set.
-        for (const [k, v] of Object.entries(raw)) {
-          const key = k.toLowerCase();
-          const val = String(v ?? "").trim();
-          if (!val) continue;
-          if (key.includes("location")) allLocations.add(val);
-        }
-        prevLoc = extractLocation(raw);
-        vin = extractVinSerial(raw);
-        nce = detectNce(raw);
-      } catch {
-        // ignore JSON parse failures
-      }
-    }
     if (!existing) {
       grouped.set(canon, {
         assetId: id,
@@ -387,20 +468,21 @@ export async function getYardRosterForDate(env: Env, dateKey: string): Promise<Y
         openWoCount: 1,
         isNce: nce,
       });
-    } else {
-      existing.openWoCount += 1;
-      if (!existing.previousLocation && prevLoc) existing.previousLocation = prevLoc;
-      if (!existing.vinSerial && vin) existing.vinSerial = vin;
-      if (!existing.owningUnit && row.owning_unit) existing.owningUnit = row.owning_unit;
-      if (!existing.shop && row.shop) existing.shop = row.shop;
-      if (!existing.mgmtCd && row.mgmt_cd) existing.mgmtCd = row.mgmt_cd;
-      if (!existing.makeModel && row.make_model) existing.makeModel = row.make_model;
-      if (!existing.vehNomen && row.veh_nomen) existing.vehNomen = row.veh_nomen;
-      if (!existing.melKey && row.mel_key) existing.melKey = row.mel_key;
-      if (!existing.melTier && row.mel_tier) existing.melTier = row.mel_tier;
-      if (nce) existing.isNce = true;
+      continue;
     }
+    existing.openWoCount += 1;
+    if (row.owning_unit) existing.owningUnit = row.owning_unit;
+    if (row.shop) existing.shop = row.shop;
+    if (row.mgmt_cd) existing.mgmtCd = row.mgmt_cd;
+    if (row.make_model) existing.makeModel = row.make_model;
+    if (row.veh_nomen) existing.vehNomen = row.veh_nomen;
+    if (row.mel_key) existing.melKey = row.mel_key;
+    if (row.mel_tier) existing.melTier = row.mel_tier;
+    if (prevLoc) existing.previousLocation = prevLoc;
+    if (vin) existing.vinSerial = vin;
+    if (nce) existing.isNce = true;
   }
+
   const assets = [...grouped.values()];
   assets.sort((a, b) => a.assetId.localeCompare(b.assetId, undefined, { numeric: true }));
   const locations = [...allLocations].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
