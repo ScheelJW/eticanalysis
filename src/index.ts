@@ -20885,15 +20885,24 @@ function renderDashboardHtml(): string {
                 "</g>";
       });
 
-      // MC% line
-      const linePts = series.map(function (s, i) {
-        if (s.mcPct == null) return null;
-        const cx = padL + i * stepX + stepX / 2;
-        const cy = padT + mcY(s.mcPct);
-        return cx + "," + cy;
-      }).filter(Boolean).join(" ");
+      // MC% line — only connect adjacent indices with real rate + non-zero stack.
+      function melChartMcLinePoint(s) {
+        if (!s || s.mcPct == null || typeof s.mcPct !== "number") return false;
+        const tot = (s.nmc || 0) + (s.fmc || 0);
+        return tot > 0;
+      }
+      let mcLineSvgs = "";
+      for (let i = 0; i < series.length - 1; i++) {
+        const a = series[i], b = series[i + 1];
+        if (!melChartMcLinePoint(a) || !melChartMcLinePoint(b)) continue;
+        const x1 = padL + i * stepX + stepX / 2;
+        const y1 = padT + mcY(a.mcPct);
+        const x2 = padL + (i + 1) * stepX + stepX / 2;
+        const y2 = padT + mcY(b.mcPct);
+        mcLineSvgs += "<line class='mc-line' x1='" + x1 + "' y1='" + y1 + "' x2='" + x2 + "' y2='" + y2 + "'/>";
+      }
       const dots = series.map(function (s, i) {
-        if (s.mcPct == null) return "";
+        if (!melChartMcLinePoint(s)) return "";
         const cx = padL + i * stepX + stepX / 2;
         const cy = padT + mcY(s.mcPct);
         return "<circle class='mc-dot' cx='" + cx + "' cy='" + cy + "' r='2.5'><title>" + esc(fmtKeyShort(s.date)) + " · MC " + s.mcPct.toFixed(1) + "%</title></circle>";
@@ -20909,7 +20918,7 @@ function renderDashboardHtml(): string {
       return "<svg class='mel-chart' viewBox='0 0 " + W + " " + H + "' preserveAspectRatio='xMidYMid meet'>" +
              "<g class='grid'>" + gridLines + "</g>" +
              bars +
-             (linePts ? "<polyline class='mc-line' points='" + linePts + "'/>" : "") +
+             mcLineSvgs +
              dots +
              "<g class='axis'>" + xLabels + mcLabels + "</g>" +
              "</svg>";
