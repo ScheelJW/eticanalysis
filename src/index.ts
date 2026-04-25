@@ -10085,25 +10085,6 @@ function renderDashboardHtml(): string {
     .wo-opened {
       font-variant-numeric: tabular-nums;
     }
-    .wo-reason {
-      margin-top: 6px;
-      font-size: 0.78rem;
-      color: var(--text-dim);
-      line-height: 1.45;
-      background: rgba(0,58,140,0.04);
-      border-left: 2px solid rgba(0,58,140,0.32);
-      padding: 4px 10px;
-      border-radius: 4px;
-    }
-    .wo-reason .lbl {
-      display: inline-block;
-      margin-right: 8px;
-      font-size: 0.62rem;
-      letter-spacing: 0.10em;
-      text-transform: uppercase;
-      color: var(--subtle);
-      font-weight: 700;
-    }
 
     /* --- WO detail pane --------------------------------------------------- */
     .wo-detail-pane {
@@ -10212,25 +10193,6 @@ function renderDashboardHtml(): string {
       letter-spacing: 0.10em;
       font-weight: 700;
     }
-    .wo-hero-reason {
-      margin-top: 14px;
-      padding: 10px 14px;
-      background: rgba(0,58,140,0.05);
-      border-left: 3px solid rgba(0,58,140,0.38);
-      border-radius: 6px;
-      color: var(--text-dim);
-      font-size: 0.92rem;
-      line-height: 1.5;
-    }
-    .wo-hero-reason .lbl {
-      display: inline-block;
-      margin-right: 10px;
-      font-size: 0.62rem;
-      letter-spacing: 0.10em;
-      text-transform: uppercase;
-      color: var(--subtle);
-      font-weight: 700;
-    }
     .wo-hero-sub {
       margin-top: 8px;
       font-size: 0.82rem;
@@ -10262,24 +10224,25 @@ function renderDashboardHtml(): string {
       letter-spacing: -0.005em;
       margin-right: 2px;
     }
-    /* Inline reason chip — same visual language as the meta-chips elsewhere,
-       lives on the sub line so it doesn't dominate as its own row. */
+    /* Inline reason — same weight as WO list meta-chips (secondary metadata). */
     .wo-hero-sub .wo-hero-reason-chip {
       display: inline-flex;
-      align-items: baseline;
-      gap: 6px;
-      padding: 1px 8px;
-      border-radius: 6px;
-      background: rgba(0,58,140,0.06);
-      border: 1px solid rgba(0,58,140,0.18);
+      align-items: center;
+      gap: 4px;
+      padding: 2px 7px;
+      border-radius: 999px;
+      background: rgba(15,30,60,0.05);
       color: var(--text-dim);
+      font-size: 0.66rem;
+      font-weight: 500;
       font-variant-numeric: normal;
     }
     .wo-hero-sub .wo-hero-reason-chip .lbl {
-      font-size: 0.62rem;
-      letter-spacing: 0.10em;
+      font-size: 0.6rem;
+      letter-spacing: 0.04em;
       text-transform: uppercase;
-      color: var(--subtle);
+      color: var(--muted);
+      font-weight: 500;
     }
 
     .wo-kpis {
@@ -17665,7 +17628,6 @@ function renderDashboardHtml(): string {
             "Verify in MEL Calculator before moving equipment.";
           recallChip = "<span class='chip recall' title='" + rtitle + "'>Recall?</span>";
         }
-        const reasonChip = r.woReason ? "<div class='wo-reason'><span class='lbl'>Reason</span>" + esc(r.woReason) + "</div>" : "";
         const openedLine = r.establishedDateIso ? "<span class='wo-opened'>Opened " + esc(fmtKeyShort(r.establishedDateIso)) + "</span>" : (r.establishedDate ? "<span class='wo-opened'>Opened " + esc(fmtMaybeDate(r.establishedDate)) + "</span>" : "");
         const dsc = r.daysSinceRemarkChange == null
           ? "—"
@@ -17685,6 +17647,7 @@ function renderDashboardHtml(): string {
         if (r.melKey) metaChips.push("<span class='meta-chip'><span class='lbl'>MEL</span>" + esc(r.melKey) + "</span>");
         if (r.mgmtCd) metaChips.push("<span class='meta-chip'><span class='lbl'>Mgmt</span>" + esc(r.mgmtCd) + "</span>");
         if (r.makeModel) metaChips.push("<span class='meta-chip'><span class='lbl'>M/M</span>" + esc(r.makeModel) + "</span>");
+        if (r.woReason) metaChips.push("<span class='meta-chip'><span class='lbl'>Reason</span>" + esc(r.woReason) + "</span>");
         const metaChipsHtml = metaChips.length ? "<div class='meta-chips'>" + metaChips.join("") + "</div>" : "";
         return (
           "<button type='button' class='wo-card" + (isActive ? " active" : "") + "' data-wo='" + esc(r.workOrderId) + "' data-tier='" + esc(r.melTier || "unknown") + "' data-nce='" + (r.nce ? "1" : "0") + "'>" +
@@ -17706,7 +17669,6 @@ function renderDashboardHtml(): string {
               renderYardPhotoThumb(r.assetId) +
             "</div>"
           ) : "") +
-          reasonChip +
           metaChipsHtml +
           "<div class='meta'>" +
           "<span><span class='k'>ETIC</span> <span class='v'>" + esc(etic) + "</span></span>" +
