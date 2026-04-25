@@ -2111,16 +2111,42 @@ export type YardActivityItem =
   | { kind: "check"; at: string; check: YardCheckRow }
   | { kind: "action"; at: string; action: YardFindingAction };
 
-export async function getRecentActivity(env: Env, limit = 100): Promise<YardActivityItem[]> {
+export async function getRecentActivity(
+  env: Env,
+  limit = 100,
+  range?: { fromIso?: string; toIso?: string },
+): Promise<YardActivityItem[]> {
+  const fromIso = (range?.fromIso ?? "").trim();
+  const toIso = (range?.toIso ?? "").trim();
+  const checkWhere: string[] = [];
+  const actionWhere: string[] = [];
+  const checkParams: string[] = [];
+  const actionParams: string[] = [];
+  if (fromIso) {
+    checkWhere.push("checked_at_iso >= ?");
+    actionWhere.push("resolved_at_iso >= ?");
+    checkParams.push(fromIso);
+    actionParams.push(fromIso);
+  }
+  if (toIso) {
+    checkWhere.push("checked_at_iso < ?");
+    actionWhere.push("resolved_at_iso < ?");
+    checkParams.push(toIso);
+    actionParams.push(toIso);
+  }
+  const checkSql =
+    `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, snapshot_asset_json
+       FROM yard_check` +
+    (checkWhere.length ? ` WHERE ${checkWhere.join(" AND ")}` : "") +
+    ` ORDER BY checked_at_iso DESC LIMIT ?`;
+  const actionSql =
+    `SELECT id, asset_id, kind, check_id, resolution, wo_opened, note, resolved_by, resolved_at_iso
+       FROM yard_finding_action` +
+    (actionWhere.length ? ` WHERE ${actionWhere.join(" AND ")}` : "") +
+    ` ORDER BY resolved_at_iso DESC LIMIT ?`;
   const [checks, actions] = await Promise.all([
-    env.ETIC_SNAPSHOTS.prepare(
-      `SELECT id, asset_id, location, discrepancies, status, checked_by, checked_at_iso, source_date_key, snapshot_asset_json
-       FROM yard_check ORDER BY checked_at_iso DESC LIMIT ?`,
-    ).bind(limit).all<CheckReadRow>(),
-    env.ETIC_SNAPSHOTS.prepare(
-      `SELECT id, asset_id, kind, check_id, resolution, wo_opened, note, resolved_by, resolved_at_iso
-       FROM yard_finding_action ORDER BY resolved_at_iso DESC LIMIT ?`,
-    ).bind(limit).all<FindingActionRow>(),
+    env.ETIC_SNAPSHOTS.prepare(checkSql).bind(...checkParams, limit).all<CheckReadRow>(),
+    env.ETIC_SNAPSHOTS.prepare(actionSql).bind(...actionParams, limit).all<FindingActionRow>(),
   ]);
   const items: YardActivityItem[] = [
     ...(checks.results ?? []).map((r) => ({ kind: "check" as const, at: r.checked_at_iso, check: rowToCheck(r) })),

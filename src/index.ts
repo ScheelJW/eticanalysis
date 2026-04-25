@@ -2296,10 +2296,60 @@ async function handleYardFindingReopenApi(env: Env, request: Request): Promise<R
   }
 }
 
-/** GET — interleaved feed of recent checks + actions. */
+function parseOptionalDateParam(url: URL, name: string): string {
+  const v = (url.searchParams.get(name) ?? "").trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : "";
+}
+
+function dateKeyToStartIso(dateKey: string): string {
+  return dateKey ? `${dateKey}T00:00:00.000Z` : "";
+}
+
+function dateKeyToNextStartIso(dateKey: string): string {
+  if (!dateKey) return "";
+  const [y, m, d] = dateKey.split("-").map((x) => Number.parseInt(x, 10));
+  const dt = new Date(Date.UTC(y, (m || 1) - 1, d || 1, 0, 0, 0));
+  if (Number.isNaN(dt.getTime())) return "";
+  dt.setUTCDate(dt.getUTCDate() + 1);
+  return dt.toISOString();
+}
+
+function csvEscape(v: unknown): string {
+  return '"' + String(v ?? "").replace(/"/g, '""') + '"';
+}
+
+/** GET — interleaved feed of checks + actions, optionally date-bounded. */
 async function handleYardActivityApi(env: Env, url: URL): Promise<Response> {
   const limit = Math.min(500, Math.max(1, Number.parseInt(url.searchParams.get("limit") ?? "100", 10)));
-  const items = await getYardRecentActivity(env, limit);
+  const from = parseOptionalDateParam(url, "from");
+  const to = parseOptionalDateParam(url, "to");
+  const format = (url.searchParams.get("format") ?? "").trim().toLowerCase();
+  const items = await getYardRecentActivity(env, limit, {
+    fromIso: dateKeyToStartIso(from),
+    toIso: dateKeyToNextStartIso(to),
+  });
+  if (format === "csv") {
+    const rows = [
+      ["type", "at", "asset_id", "who", "location", "status_or_resolution", "issue", "wo_opened", "note"],
+      ...items.map((it) => {
+        if (it.kind === "check") {
+          const c = it.check;
+          return ["check", it.at, c.assetId, c.checkedBy, c.location, c.status, c.discrepancies, "", ""];
+        }
+        const a = it.action;
+        return ["action", it.at, a.assetId, a.resolvedBy, "", a.resolution, a.kind, a.woOpened, a.note];
+      }),
+    ];
+    const csv = rows.map((r) => r.map(csvEscape).join(",")).join("\n") + "\n";
+    const suffix = from || to ? `_${from || "start"}_${to || "today"}` : "";
+    return new Response(csv, {
+      headers: {
+        "Content-Type": "text/csv; charset=utf-8",
+        "Content-Disposition": `attachment; filename="yard-needs-fix-report${suffix}.csv"`,
+        ...cacheHeaders(),
+      },
+    });
+  }
   return Response.json({ items }, { headers: cacheHeaders() });
 }
 
@@ -14479,6 +14529,19 @@ function renderDashboardHtml(): string {
           </div>
 
           <div id="yard-sub-activity" class="yard-subpanel hidden" style="padding:16px 20px;">
+            <div class="yard-findings-controls" style="display:flex;gap:8px;align-items:end;flex-wrap:wrap;margin-bottom:12px;">
+              <label class="field" style="max-width:170px;">
+                <span class="label">From</span>
+                <input type="date" id="yard-report-from" />
+              </label>
+              <label class="field" style="max-width:170px;">
+                <span class="label">To</span>
+                <input type="date" id="yard-report-to" />
+              </label>
+              <button type="button" class="ghost" id="yard-report-apply" style="padding:8px 14px;">Run report</button>
+              <a class="ghost" id="yard-report-csv" href="/api/yard/activity?format=csv" style="padding:8px 14px;text-decoration:none;">Export CSV</a>
+              <span class="hint" style="margin-left:auto;">Checks and Needs Fix actions in the selected date range.</span>
+            </div>
             <div id="yard-activity-list" class="yard-activity-list">Loading\u2026</div>
           </div>
         </section>
@@ -14490,7 +14553,7 @@ function renderDashboardHtml(): string {
               <h3 style="margin:0;" id="yard-resolve-title">Resolve finding</h3>
               <button type="button" class="ghost" id="yard-resolve-close" aria-label="Close" style="font-size:20px;line-height:1;padding:4px 10px;">\u00D7</button>
             </header>
-            <p class="hint" id="yard-resolve-sub" style="margin:0 0 12px;"></p>
+            <div class="hint" id="yard-resolve-sub" style="margin:0 0 12px;"></div>
             <div class="settings-grid">
               <label class="field">
                 <span class="label">What did you do?</span>
@@ -15403,6 +15466,11 @@ function renderDashboardHtml(): string {
       const qs = new URLSearchParams(location.search);
       const qTab = String(qs.get("tab") || "").trim().toLowerCase();
       if (qTab === "waivers") return { tab: "waivers", dateKey: null, workOrderId: null };
+      if (qTab === "yard") {
+        const yv = String(qs.get("yard") || qs.get("yv") || "").trim().toLowerCase();
+        return { tab: "yard", dateKey: null, workOrderId: null, abuseCaseId: null, yardSub: yv || null };
+      }
+      if (qTab) return { tab: qTab, dateKey: null, workOrderId: null, abuseCaseId: null };
       const raw = (location.hash || "").replace(/^#/, "");
       if (!raw) return { tab: "snapshot", dateKey: null, workOrderId: null, abuseCaseId: null };
       if (raw.indexOf("wo=") === 0) {
@@ -15426,6 +15494,22 @@ function renderDashboardHtml(): string {
         return { tab: "snapshot", dateKey: raw, workOrderId: null, abuseCaseId: null };
       }
       return { tab: "snapshot", dateKey: null, workOrderId: null, abuseCaseId: null };
+    }
+
+    function syncDashboardQuery(tab, extras) {
+      try {
+        const u = new URL(location.href);
+        u.hash = "";
+        u.searchParams.set("tab", tab);
+        ["yard", "yv", "wv", "waiverView"].forEach(function (k) { u.searchParams.delete(k); });
+        Object.entries(extras || {}).forEach(function ([k, v]) {
+          if (v == null || v === "") u.searchParams.delete(k);
+          else u.searchParams.set(k, String(v));
+        });
+        history.replaceState(null, "", u.pathname + u.search + u.hash);
+      } catch {
+        // URL state is convenience only.
+      }
     }
 
     let historyEntries = [];
@@ -18299,6 +18383,11 @@ function renderDashboardHtml(): string {
         setMainTab("waivers");
         return;
       }
+      if (r.tab === "yard") {
+        yardFmState.subTab = r.yardSub || "roster";
+        setMainTab("yard");
+        return;
+      }
       if (r.tab === "authz") {
         setMainTab("authz");
         return;
@@ -19042,7 +19131,7 @@ function renderDashboardHtml(): string {
         if (selectedWoId) setHashWorkOrder(selectedWoId);
       });
       const smxTabBtn = document.getElementById("tab-schedule-mx");
-      if (smxTabBtn) smxTabBtn.addEventListener("click", function () { setMainTab("smx"); });
+      if (smxTabBtn) smxTabBtn.addEventListener("click", function () { setMainTab("smx"); syncDashboardQuery("smx"); });
       const authzTabBtn = document.getElementById("tab-authz");
       if (authzTabBtn) {
         authzTabBtn.addEventListener("click", function () {
@@ -19067,19 +19156,19 @@ function renderDashboardHtml(): string {
       const smxQ = document.getElementById("smx-query");
       if (smxQ) smxQ.addEventListener("input", function () { renderScheduleMxTable(); });
       const melTabBtn = document.getElementById("tab-mel");
-      if (melTabBtn) melTabBtn.addEventListener("click", function () { setMainTab("mel"); });
+      if (melTabBtn) melTabBtn.addEventListener("click", function () { setMainTab("mel"); syncDashboardQuery("mel"); });
       const meetTabBtn = document.getElementById("tab-meeting");
-      if (meetTabBtn) meetTabBtn.addEventListener("click", function () { setMainTab("meeting"); });
+      if (meetTabBtn) meetTabBtn.addEventListener("click", function () { setMainTab("meeting"); syncDashboardQuery("meeting"); });
       const yardTabBtn = document.getElementById("tab-yard");
-      if (yardTabBtn) yardTabBtn.addEventListener("click", function () { setMainTab("yard"); });
+      if (yardTabBtn) yardTabBtn.addEventListener("click", function () { setMainTab("yard"); syncDashboardQuery("yard", { yard: yardFmState.subTab || "roster" }); });
       const wvTabBtn = document.getElementById("tab-waivers");
-      if (wvTabBtn) wvTabBtn.addEventListener("click", function () { setMainTab("waivers"); });
+      if (wvTabBtn) wvTabBtn.addEventListener("click", function () { setMainTab("waivers"); syncDashboardQuery("waivers"); });
       const abuseTabBtn = document.getElementById("tab-abuse-tracker");
-      if (abuseTabBtn) abuseTabBtn.addEventListener("click", function () { setMainTab("abuse-tracker"); });
+      if (abuseTabBtn) abuseTabBtn.addEventListener("click", function () { setMainTab("abuse-tracker"); syncDashboardQuery("abuse-tracker"); });
       const askTabBtn = document.getElementById("tab-ask");
-      if (askTabBtn) askTabBtn.addEventListener("click", function () { setMainTab("ask"); });
+      if (askTabBtn) askTabBtn.addEventListener("click", function () { setMainTab("ask"); syncDashboardQuery("ask"); });
       const setTabBtn = document.getElementById("tab-settings");
-      if (setTabBtn) setTabBtn.addEventListener("click", function () { setMainTab("settings"); });
+      if (setTabBtn) setTabBtn.addEventListener("click", function () { setMainTab("settings"); syncDashboardQuery("settings"); });
 
       askInit();
 
@@ -22303,7 +22392,9 @@ function renderDashboardHtml(): string {
     }
 
     function yardActivateSub(sub) {
+      sub = (sub === "findings" || sub === "activity" || sub === "roster") ? sub : "roster";
       yardFmState.subTab = sub;
+      syncDashboardQuery("yard", { yard: sub === "findings" ? "needs-fix" : sub });
       ["findings", "roster", "activity"].forEach(function (s) {
         const tabEl = document.querySelector('[data-yard-sub="' + s + '"]');
         const panelEl = document.getElementById("yard-sub-" + s);
@@ -22484,8 +22575,15 @@ function renderDashboardHtml(): string {
       if (a.shop) ctx.push("Shop " + a.shop);
       if (a.owningUnit) ctx.push("Unit " + a.owningUnit);
       if (a.makeModel) ctx.push(a.makeModel);
-      if (finding.triggerCheck && finding.triggerCheck.discrepancies) {
-        ctx.push('"' + finding.triggerCheck.discrepancies + '"');
+      if (a.lastLocation) ctx.push("Parked " + a.lastLocation);
+      if (a.openWoCount != null) ctx.push((a.openWoCount || 0) + " open WO");
+      if (finding.triggerCheck) {
+        ctx.push("Seen " + fmtRelTs(finding.triggerCheck.checkedAtIso) + (finding.triggerCheck.checkedBy ? " by " + finding.triggerCheck.checkedBy : ""));
+        if (finding.triggerCheck.sourceDateKey) ctx.push("Book " + finding.triggerCheck.sourceDateKey);
+        if (finding.triggerCheck.discrepancies) ctx.push('"' + finding.triggerCheck.discrepancies + '"');
+      }
+      if (finding.fleetFmaNotes) {
+        ctx.push("Fleet notes: " + finding.fleetFmaNotes);
       }
       sub.textContent = ctx.join(" \u00B7 ");
       // Pre-fill last-known values
@@ -22528,6 +22626,16 @@ function renderDashboardHtml(): string {
         });
         const j = await r.json();
         if (!r.ok) throw new Error(j.error || "save failed");
+        const key = t.assetId + "|" + t.kind;
+        yardFmState.findings = (yardFmState.findings || []).map(function (f) {
+          if ((f.assetId + "|" + f.kind) !== key) return f;
+          f.isAcknowledged = true;
+          f.lastAction = j.action || f.lastAction;
+          return f;
+        });
+        if (yardFmState.totals) yardFmState.totals.acknowledged = (yardFmState.totals.acknowledged || 0) + 1;
+        yardRenderFindingsCounts();
+        yardRenderFindings();
         yardLoadFindings();
         return true;
       } catch (e) {
