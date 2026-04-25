@@ -627,6 +627,27 @@ export type WatchRow = {
   scheduleMxNeedsEntry: boolean;
   /** Fleet / workbook "days down" style column when present in raw row JSON. */
   daysDown: number | null;
+  /**
+   * When this WO's asset is **above-MEL** and its mgmt code appears on another MEL line
+   * that is also **above MEL** with spare NMC, moving this NMC asset there via recall would
+   * keep **both** MEL lines strictly **above** required (heuristic from MEL Calculator sheet).
+   */
+  melRecallHint?: MelRecallHint | null;
+};
+
+/** Computed MEL recall opportunity (see attachMelRecallHints). */
+export type MelRecallHint = {
+  donorMelKey: string;
+  donorUnit: string;
+  donorMgmtCodeName: string;
+  supporterMelKey: string;
+  supporterUnit: string;
+  supporterMgmtCodeName: string;
+  otherNmcOnDonorMel: number;
+  /** FMC − mel_required on donor after hypothetical −1 FMC from recall. */
+  donorSurplusAfterRecall: number;
+  /** FMC − mel_required on supporter after hypothetical −1 NMC from recall. */
+  supporterSurplusAfterRecall: number;
 };
 
 type WatchReadRow = {
@@ -1178,6 +1199,130 @@ async function getFirstSeenDate(
     .bind(workOrderId)
     .first<{ first_seen: string | null }>();
   return r?.first_seen ?? "";
+}
+
+type MelSnapRecallRow = {
+  mel_key: string;
+  unit: string;
+  mgmt_code_name: string;
+  fmc_count: number;
+  nmc_count: number;
+  mel_required: number;
+  mel_status: string;
+};
+
+function normMgmtRecall(s: string): string {
+  return s.replace(/\s+/g, " ").trim().toUpperCase();
+}
+
+/** True if MEL calculator auth mgmt text matches fleet/WO mgmt cd (e.g. B216). */
+export function melMgmtCodesMatch(mgmtCodeName: string, assetMgmtCd: string): boolean {
+  const a = normMgmtRecall(assetMgmtCd);
+  const b = normMgmtRecall(mgmtCodeName);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  if (b.includes(a) || a.includes(b)) return true;
+  const tokenRe = /\b([A-Z]{1,3}\d{2,6})\b/g;
+  const tokensA = new Set<string>();
+  let m: RegExpExecArray | null;
+  const reA = new RegExp(tokenRe);
+  while ((m = reA.exec(a)) !== null) tokensA.add(m[1]);
+  for (const t of tokensA) {
+    if (t.length >= 3 && b.includes(t)) return true;
+  }
+  const tokensB = new Set<string>();
+  const reB = new RegExp(tokenRe);
+  while ((m = reB.exec(b)) !== null) tokensB.add(m[1]);
+  for (const t of tokensB) {
+    if (t.length >= 3 && a.includes(t)) return true;
+  }
+  return false;
+}
+
+function melStatusIsAbove(status: string): boolean {
+  return (status || "").toLowerCase().includes("above");
+}
+
+/**
+ * If this WO is **above** MEL tier and a **different** MEL line's authorization mgmt code
+ * matches the asset mgmt cd, both lines are **above** in the book, and the source MEL has
+ * spare FMC cushion, surface a recall opportunity hint.
+ */
+export function computeMelRecallHintForRow(
+  melRows: MelSnapRecallRow[],
+  row: WatchRow,
+): MelRecallHint | null {
+  if (!melRows.length) return null;
+  if (row.melTier !== "above") return null;
+  const assetMgmt = (row.mgmtCd || "").trim();
+  if (!assetMgmt) return null;
+  const sourceKey = (row.melKey || "").trim();
+  if (!sourceKey) return null;
+
+  const byKey = new Map<string, MelSnapRecallRow>();
+  for (const r of melRows) {
+    if (r.mel_key) byKey.set(r.mel_key.trim(), r);
+  }
+  const source = byKey.get(sourceKey);
+  if (!source || !melStatusIsAbove(source.mel_status)) return null;
+  const reqS = source.mel_required ?? 0;
+  const fmcS = source.fmc_count ?? 0;
+  // Cushion: recalling an NMC asset off this MEL should not push a borderline line to at/below.
+  if (fmcS < reqS + 2) return null;
+
+  let best: MelRecallHint | null = null;
+  for (const dest of melRows) {
+    const dk = (dest.mel_key || "").trim();
+    if (!dk || dk === sourceKey) continue;
+    if (!melMgmtCodesMatch(dest.mgmt_code_name || "", assetMgmt)) continue;
+    if (!melStatusIsAbove(dest.mel_status)) continue;
+    const reqD = dest.mel_required ?? 0;
+    const fmcD = dest.fmc_count ?? 0;
+    if (fmcD < reqD + 1) continue;
+
+    const otherNmc = Math.max(0, (source.nmc_count ?? 0) - 1);
+    const hint: MelRecallHint = {
+      donorMelKey: source.mel_key,
+      donorUnit: source.unit ?? "",
+      donorMgmtCodeName: source.mgmt_code_name ?? "",
+      supporterMelKey: dest.mel_key,
+      supporterUnit: dest.unit ?? "",
+      supporterMgmtCodeName: dest.mgmt_code_name ?? "",
+      otherNmcOnDonorMel: otherNmc,
+      donorSurplusAfterRecall: fmcS - reqS,
+      supporterSurplusAfterRecall: fmcD - reqD,
+    };
+    if (!best || hint.supporterSurplusAfterRecall > best.supporterSurplusAfterRecall) best = hint;
+  }
+  return best;
+}
+
+async function loadMelSnapshotRecallRows(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  dateKey: string,
+): Promise<MelSnapRecallRow[]> {
+  if (!dateKey) return [];
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT mel_key, unit, mgmt_code_name, fmc_count, nmc_count, mel_required, mel_status
+     FROM mel_snapshot WHERE snapshot_date_key = ?`,
+  )
+    .bind(dateKey)
+    .all<MelSnapRecallRow>();
+  return r.results ?? [];
+}
+
+/** Attaches melRecallHint to each row (same-date MEL snapshot). */
+export async function attachMelRecallHints(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  dateKey: string,
+  rows: WatchRow[],
+): Promise<void> {
+  if (!rows.length || !dateKey) return;
+  const melRows = await loadMelSnapshotRecallRows(env, dateKey);
+  if (!melRows.length) return;
+  for (const row of rows) {
+    row.melRecallHint = computeMelRecallHintForRow(melRows, row);
+  }
 }
 
 /** One work order’s latest state; staleness vs asOfDateKey. Returns null if not in index. */

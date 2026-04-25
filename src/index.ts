@@ -10180,6 +10180,31 @@ function renderDashboardHtml(): string {
     .wo-chip.tier-at { background: rgba(245,199,84,0.14); color: var(--warn); border-color: rgba(245,199,84,0.3); }
     .wo-chip.tier-above { background: rgba(94,227,151,0.14); color: var(--success); border-color: rgba(94,227,151,0.3); }
     .wo-chip.tier-unknown { background: rgba(15,30,60,0.06); color: var(--muted); border-color: rgba(15,30,60,0.12); }
+    .wo-chip.recall {
+      background: rgba(0, 58, 140, 0.10);
+      color: var(--accent);
+      border-color: rgba(0, 58, 140, 0.35);
+      font-weight: 600;
+    }
+    .wo-recall-banner {
+      margin-top: 12px;
+      padding: 12px 14px;
+      border-radius: 10px;
+      border: 1px solid rgba(0, 58, 140, 0.22);
+      background: linear-gradient(180deg, #f0f6ff 0%, #e8f0fb 100%);
+      font-size: 0.92rem;
+      line-height: 1.45;
+      color: var(--text);
+    }
+    .wo-recall-banner .lbl {
+      display: block;
+      font-size: 0.72rem;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 6px;
+    }
     .wo-chip.nce {
       background: rgba(0,58,140,0.14);
       color: var(--accent);
@@ -17611,6 +17636,14 @@ function renderDashboardHtml(): string {
         } else if (r.scheduleMxBucket === "due_soon") {
           smxChips += "<span class='chip smx-soon' title='Due within ~30 days'>Sched Mx due soon</span>";
         }
+        var recallChip = "";
+        if (r.melRecallHint) {
+          var rh = r.melRecallHint;
+          var rtitle = "MEL recall candidate (book heuristic): this asset is above-MEL; mgmt " + esc(r.mgmtCd || "") +
+            " appears on another above-MEL line (" + esc(rh.supporterMelKey) + "). " +
+            "Verify in MEL Calculator before moving equipment.";
+          recallChip = "<span class='chip recall' title='" + rtitle + "'>Recall?</span>";
+        }
         const reasonChip = r.woReason ? "<div class='wo-reason'><span class='lbl'>Reason</span>" + esc(r.woReason) + "</div>" : "";
         const openedLine = r.establishedDateIso ? "<span class='wo-opened'>Opened " + esc(fmtKeyShort(r.establishedDateIso)) + "</span>" : (r.establishedDate ? "<span class='wo-opened'>Opened " + esc(fmtMaybeDate(r.establishedDate)) + "</span>" : "");
         const dsc = r.daysSinceRemarkChange == null
@@ -17636,7 +17669,7 @@ function renderDashboardHtml(): string {
           "<button type='button' class='wo-card" + (isActive ? " active" : "") + "' data-wo='" + esc(r.workOrderId) + "' data-tier='" + esc(r.melTier || "unknown") + "' data-nce='" + (r.nce ? "1" : "0") + "'>" +
           "<div class='top-line'>" +
           "<span class='wo-id'>" + esc(r.workOrderId) + "</span>" +
-          "<span class='badges'>" + nceChip + smxChips + tierBadge + staleChip + "</span>" +
+          "<span class='badges'>" + nceChip + smxChips + recallChip + tierBadge + staleChip + "</span>" +
           "</div>" +
           "<div class='top-line wo-card-asset-row'><span class='asset'>" + esc(r.assetId || "—") + "</span>" +
           (r.partsStatus ? "<span class='asset parts-inline'>" + esc(r.partsStatus) + "</span>" : "<span></span>") +
@@ -17767,6 +17800,12 @@ function renderDashboardHtml(): string {
       const el = document.getElementById("wo-hero");
       const chips = [];
       if (r.nce) chips.push("<span class='wo-chip nce' title='Nuclear Certified Equipment" + (r.nceStatus ? " · " + esc(r.nceStatus) : "") + "'>NCE</span>");
+      if (r.melRecallHint) {
+        const rh = r.melRecallHint;
+        chips.push(
+          "<span class='wo-chip recall' title='From same-day MEL Calculator: both MEL lines show above; donor has spare FMC cushion. Confirm before recall.'>Recall candidate</span>",
+        );
+      }
       chips.push("<span class='wo-chip " + tierClass(r.melTier) + "'>" + esc(r.melTier || "unknown") + "</span>");
       if (r.remarkStale) chips.push("<span class='wo-chip stale'>Stale</span>");
       else chips.push("<span class='wo-chip ok'>On cadence</span>");
@@ -17790,6 +17829,22 @@ function renderDashboardHtml(): string {
           "<span class='wo-hero-reason-chip'><span class='lbl'>Reason</span>" + esc(r.woReason) + "</span>"
         );
       }
+      var recallBanner = "";
+      if (r.melRecallHint) {
+        const rh = r.melRecallHint;
+        recallBanner =
+          "<div class='wo-recall-banner'>" +
+          "<span class='lbl'>MEL recall opportunity (verify in book)</span>" +
+          "This work order is <strong>above MEL</strong> on <strong>" + esc(rh.donorMelKey) + "</strong>" +
+          (rh.donorUnit ? " (" + esc(rh.donorUnit) + ")" : "") +
+          ". The asset mgmt code matches authorization on <strong>" + esc(rh.supporterMelKey) + "</strong>" +
+          (rh.supporterUnit ? " (" + esc(rh.supporterUnit) + ")" : "") +
+          ", which also shows <strong>above MEL</strong> today. " +
+          "If you recall this NMC asset to that MEL, the book still shows both lines <strong>above</strong> required " +
+          "(donor FMC cushion " + rh.donorSurplusAfterRecall + " over MEL; other NMC on donor line " + rh.otherNmcOnDonorMel + "). " +
+          "<strong>Confirm with MEL Calculator and your recall policy before moving equipment.</strong>" +
+          "</div>";
+      }
       el.innerHTML =
         "<div class='wo-hero-row'>" +
         "<div class='wo-hero-id'>" + esc(r.workOrderId) + "</div>" +
@@ -17800,7 +17855,8 @@ function renderDashboardHtml(): string {
           : "") +
         (metaParts.length
           ? "<div class='wo-hero-sub wo-hero-sub-meta'>" + metaParts.join("<span class='dot'>·</span>") + "</div>"
-          : "");
+          : "") +
+        recallBanner;
     }
 
     function renderWoKpis(r, asOf) {
