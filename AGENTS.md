@@ -415,6 +415,22 @@ This is the canonical "cross-cutting feature" pattern.
 6. Add a CSS class near other badge styles (around line 4990) and any
    presenter-specific size bump near `.p-id-strip` (around line 6892).
 
+### MEL tab — compare snapshot deltas (totals strip)
+
+When **Compare to** is set, the six summary tiles show ▲/▼ pills. Those pills are
+**clickable**: they open a modal that attributes the rolled-up delta to **individual
+`mel_key` rows** (same Unit / Mgmt / tier / search scope as the list). Each row can
+jump to the detail list via **Show in list**.
+
+- **Assets below MEL** and **To reach AT MEL** use the same definitions as
+  `melAggregate()` (NMC counted only for keys with `mel_status === "below"`, and
+  “to reach” = sum of `max(0, mel_required - fmc_count)` on below keys).
+- **Fleet MC%** is a **ratio** over all FMC+NMC in scope; the modal explains that
+  per-key breakdown is via **Total FMC** / **Total NMC** clicks, not a single asset list.
+- Implementation lives in the desktop `<script>`: `melMetricDeltaLines`,
+  `melOpenDeltaPopover`, `#mel-delta-pop` (no extra API — uses `melState.rows` vs
+  `melState.cmpRows` from `/api/mel`).
+
 ### Add a D1 column
 
 1. New migration file `migrations/00NN_<name>.sql` (numeric, monotonic).

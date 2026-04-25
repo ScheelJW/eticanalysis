@@ -11844,6 +11844,58 @@ function renderDashboardHtml(): string {
     .mel-delta.good { background: rgba(94,227,151,0.12); color: var(--success); }
     .mel-delta.bad  { background: rgba(255,90,99,0.12);  color: var(--danger); }
     .mel-delta.flat { background: var(--bg1); color: var(--subtle); }
+    button.mel-delta {
+      border: none; cursor: pointer; font: inherit; font-size: 0.72rem;
+      box-shadow: 0 0 0 1px rgba(15,30,60,0.08);
+    }
+    button.mel-delta:hover { filter: brightness(1.04); }
+    button.mel-delta:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+    .mel-delta-pop {
+      position: fixed; inset: 0; z-index: 12000;
+      display: flex; align-items: center; justify-content: center; padding: 16px;
+      box-sizing: border-box;
+    }
+    .mel-delta-pop.hidden { display: none; }
+    .mel-delta-pop-backdrop {
+      position: absolute; inset: 0; background: rgba(10, 20, 40, 0.45);
+    }
+    .mel-delta-pop-card {
+      position: relative; z-index: 1; width: min(560px, 100%);
+      max-height: min(82vh, 720px); overflow: hidden;
+      display: flex; flex-direction: column;
+      background: var(--bg1); border: 1px solid var(--border);
+      border-radius: 14px; box-shadow: 0 16px 48px rgba(15,30,60,0.22);
+    }
+    .mel-delta-pop-title { margin: 0 36px 6px 18px; padding-top: 18px; font-size: 1.05rem; font-weight: 700; }
+    .mel-delta-pop-sub { margin: 0 18px 12px; font-size: 0.82rem; color: var(--muted); line-height: 1.45; }
+    .mel-delta-pop-body {
+      padding: 0 18px 18px; overflow: auto; font-size: 0.82rem; line-height: 1.45;
+    }
+    .mel-delta-pop-x {
+      position: absolute; top: 10px; right: 10px; width: 34px; height: 34px;
+      border-radius: 8px; border: 1px solid var(--border); background: var(--bg1);
+      font-size: 1.25rem; line-height: 1; cursor: pointer; color: var(--muted);
+    }
+    .mel-delta-pop-x:hover { color: var(--text); }
+    .mel-delta-row {
+      display: flex; flex-direction: column; gap: 4px;
+      padding: 10px 12px; margin-bottom: 8px; border-radius: 10px;
+      background: var(--surface); border: 1px solid var(--border); text-align: left;
+    }
+    .mel-delta-row-top {
+      display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 12px;
+      justify-content: space-between;
+    }
+    .mel-delta-row-key { font-weight: 700; font-family: ui-monospace, monospace; font-size: 0.8rem; }
+    .mel-delta-row-meta { color: var(--muted); font-size: 0.76rem; }
+    .mel-delta-row-dets { font-size: 0.78rem; color: var(--text-dim); }
+    button.mel-delta-row-focus {
+      align-self: flex-start; margin-top: 6px; padding: 5px 10px;
+      border-radius: 8px; border: 1px solid var(--accent); background: rgba(0,58,140,0.08);
+      color: var(--accent-strong); font-size: 0.72rem; font-weight: 600; cursor: pointer;
+    }
+    button.mel-delta-row-focus:hover { background: rgba(0,58,140,0.14); }
 
     /* --- Trend chart --- */
     .mel-trend-card {
@@ -14402,6 +14454,16 @@ function renderDashboardHtml(): string {
         </div>
 
         <div class="mel-totals" id="mel-totals" aria-label="MEL totals"></div>
+
+        <div id="mel-delta-pop" class="mel-delta-pop hidden" role="dialog" aria-modal="true" aria-labelledby="mel-delta-pop-title">
+          <div class="mel-delta-pop-backdrop" id="mel-delta-pop-backdrop" aria-hidden="true"></div>
+          <div class="mel-delta-pop-card">
+            <button type="button" class="mel-delta-pop-x" id="mel-delta-pop-close" aria-label="Close detail">\u00D7</button>
+            <h4 id="mel-delta-pop-title" class="mel-delta-pop-title"></h4>
+            <p id="mel-delta-pop-sub" class="mel-delta-pop-sub"></p>
+            <div id="mel-delta-pop-body" class="mel-delta-pop-body"></div>
+          </div>
+        </div>
 
         <div class="mel-toolbar">
           <div class="mel-toolbar-head">
@@ -19930,6 +19992,174 @@ function renderDashboardHtml(): string {
       };
     }
 
+    function melRowMap(rows) {
+      const m = new Map();
+      for (let i = 0; i < rows.length; i++) {
+        const r = rows[i];
+        if (r && r.mel_key) m.set(r.mel_key, r);
+      }
+      return m;
+    }
+
+    function melNmcInBelow(r) {
+      return r && r.mel_status === "below" ? r.nmc_count || 0 : 0;
+    }
+
+    function melAssetsToReachRow(r) {
+      if (!r || r.mel_status !== "below") return 0;
+      const need = (r.mel_required || 0) - (r.fmc_count || 0);
+      return need > 0 ? need : 0;
+    }
+
+    /**
+     * Per–MEL-key contributions to a rolled-up delta (then → now), using the same
+     * scope filter as the totals strip. Each item: { key, contrib, lines[] }.
+     */
+    function melMetricDeltaLines(metric, thenRows, nowRows) {
+      const thenM = melRowMap(thenRows);
+      const nowM = melRowMap(nowRows);
+      const keys = new Set([...thenM.keys(), ...nowM.keys()]);
+      const out = [];
+      keys.forEach(function (k) {
+        const a = thenM.get(k) || null;
+        const b = nowM.get(k) || null;
+        let contrib = 0;
+        let lines = [];
+        if (metric === "assetsBelow") {
+          const before = melNmcInBelow(a);
+          const after = melNmcInBelow(b);
+          contrib = after - before;
+          if (contrib !== 0) {
+            lines.push(
+              "NMC in below-MEL keys: " + before + " \u2192 " + after + " (status " + (a ? esc(String(a.mel_status)) : "\u2014") + " \u2192 " + (b ? esc(String(b.mel_status)) : "\u2014") + ")",
+            );
+          }
+        } else if (metric === "assetsToReachAt") {
+          const before = melAssetsToReachRow(a);
+          const after = melAssetsToReachRow(b);
+          contrib = after - before;
+          if (contrib !== 0) {
+            lines.push("FMC gap to AT MEL: " + before + " \u2192 " + after);
+          }
+        } else if (metric === "nmc") {
+          const before = a ? a.nmc_count || 0 : 0;
+          const after = b ? b.nmc_count || 0 : 0;
+          contrib = after - before;
+          if (contrib !== 0) {
+            lines.push("NMC: " + before + " \u2192 " + after + " · FMC: " + (a ? a.fmc_count || 0 : 0) + " \u2192 " + (b ? b.fmc_count || 0 : 0));
+          }
+        } else if (metric === "fmc") {
+          const before = a ? a.fmc_count || 0 : 0;
+          const after = b ? b.fmc_count || 0 : 0;
+          contrib = after - before;
+          if (contrib !== 0) {
+            lines.push("FMC: " + before + " \u2192 " + after + " · NMC: " + (a ? a.nmc_count || 0 : 0) + " \u2192 " + (b ? b.nmc_count || 0 : 0));
+          }
+        } else if (metric === "recall") {
+          const before = a ? a.recall_delta || 0 : 0;
+          const after = b ? b.recall_delta || 0 : 0;
+          contrib = after - before;
+          if (contrib !== 0) {
+            lines.push("Recall +/-: " + before + " \u2192 " + after);
+          }
+        }
+        if (contrib !== 0) {
+          const unit = (b && b.unit) || (a && a.unit) || "";
+          const st = (b && b.mel_status) || (a && a.mel_status) || "";
+          out.push({ key: k, contrib: contrib, lines: lines, unit: unit, status: st });
+        }
+      });
+      out.sort(function (x, y) { return Math.abs(y.contrib) - Math.abs(x.contrib) || x.key.localeCompare(y.key); });
+      return out;
+    }
+
+    function melCloseDeltaPopover() {
+      const pop = document.getElementById("mel-delta-pop");
+      if (!pop) return;
+      pop.classList.add("hidden");
+      pop.setAttribute("aria-hidden", "true");
+    }
+
+    function melOpenDeltaPopover(metric) {
+      const pop = document.getElementById("mel-delta-pop");
+      const titleEl = document.getElementById("mel-delta-pop-title");
+      const subEl = document.getElementById("mel-delta-pop-sub");
+      const bodyEl = document.getElementById("mel-delta-pop-body");
+      if (!pop || !titleEl || !subEl || !bodyEl || !melState.cmpDate) return;
+      const thenRows = melState.cmpRows.filter(melMatchesScope);
+      const nowRows = melState.rows.filter(melMatchesScope);
+      const cmpL = fmtKeyShort(melState.cmpDate);
+      const nowL = fmtKeyShort(melState.asOfDate);
+      let title = "";
+      let sub = "Scoped keys: " + nowRows.length + " · " + cmpL + " \u2192 " + nowL;
+      let html = "";
+      if (metric === "mcRate") {
+        title = "Fleet MC% change";
+        sub = "MC% is a ratio over all FMC+NMC in scope. Use Total FMC / Total NMC deltas for per-key detail, or scan the list for keys whose MC% moved.";
+        html = "<p class='hint' style='margin:0'>Tip: open <strong>Total FMC</strong> or <strong>Total NMC</strong> above to see which MEL keys moved.</p>";
+      } else {
+        const labels = {
+          assetsBelow: "Assets below MEL (NMC in below keys)",
+          assetsToReachAt: "To reach AT MEL (FMC gap sum)",
+          nmc: "Total NMC",
+          fmc: "Total FMC",
+          recall: "Recall +/-",
+        };
+        title = labels[metric] || metric;
+        const items = melMetricDeltaLines(metric, thenRows, nowRows);
+        if (!items.length) {
+          html = "<p style='margin:0;color:var(--muted)'>No per-key changes in this scope (or keys added/removed only — check full list).</p>";
+        } else {
+          const cap = 40;
+          const slice = items.slice(0, cap);
+          html = slice
+            .map(function (it) {
+              const sign = it.contrib > 0 ? "+" : "";
+              const u = it.unit ? "<span class='mel-delta-row-meta'>" + esc(it.unit) + "</span>" : "";
+              const st = it.status ? "<span class='mel-delta-row-meta'>" + esc(it.status) + "</span>" : "";
+              const det = it.lines.map(function (ln) { return "<div class='mel-delta-row-dets'>" + ln + "</div>"; }).join("");
+              return (
+                "<div class='mel-delta-row'>" +
+                  "<div class='mel-delta-row-top'>" +
+                    "<span class='mel-delta-row-key'>" + esc(it.key) + "</span>" +
+                    "<span class='mel-delta-row-meta'><strong>" + sign + it.contrib + "</strong> vs compare date</span>" +
+                  "</div>" +
+                  "<div class='mel-delta-row-meta'>" + u + (u && st ? " \u00B7 " : "") + st + "</div>" +
+                  det +
+                  "<button type='button' class='mel-delta-row-focus' data-mel-focus-key='" + esc(it.key) + "'>Show in list</button>" +
+                "</div>"
+              );
+            })
+            .join("");
+          if (items.length > cap) {
+            html += "<p style='margin:12px 0 0;font-size:0.78rem;color:var(--muted)'>" + (items.length - cap) + " more keys with smaller changes — narrow Unit/Mgmt/Search to focus.</p>";
+          }
+        }
+      }
+      titleEl.textContent = title;
+      subEl.textContent = sub;
+      bodyEl.innerHTML = html;
+      pop.classList.remove("hidden");
+      pop.setAttribute("aria-hidden", "false");
+    }
+
+    function melFocusKeyFromDelta(key) {
+      if (!key) return;
+      melState.selectedKey = key;
+      renderMelView();
+      requestAnimationFrame(function () {
+        const listEl = document.getElementById("mel-list");
+        if (!listEl) return;
+        const wraps = listEl.querySelectorAll(".mel-card-wrap[data-mel-key]");
+        let wrap = null;
+        wraps.forEach(function (w) {
+          if (w.getAttribute("data-mel-key") === key) wrap = w;
+        });
+        if (wrap) wrap.scrollIntoView({ block: "nearest", behavior: "smooth" });
+        loadAndRenderMelDetail(key);
+      });
+    }
+
     async function onEnterMelTab() {
       const sel = document.getElementById("mel-date");
       if (sel && !sel.dataset.wired) {
@@ -20034,6 +20264,42 @@ function renderDashboardHtml(): string {
           openAskForMelTotals();
         });
         askMelTotals.dataset.wired = "1";
+      }
+
+      const melTotalsEl = document.getElementById("mel-totals");
+      if (melTotalsEl && !melTotalsEl.dataset.deltaWired) {
+        melTotalsEl.dataset.deltaWired = "1";
+        melTotalsEl.addEventListener("click", function (ev) {
+          const dBtn = ev.target.closest("[data-mel-delta-metric]");
+          if (dBtn && melTotalsEl.contains(dBtn)) {
+            ev.preventDefault();
+            melOpenDeltaPopover(dBtn.getAttribute("data-mel-delta-metric") || "");
+            return;
+          }
+        });
+      }
+      const melDeltaPop = document.getElementById("mel-delta-pop");
+      if (melDeltaPop && !melDeltaPop.dataset.wired) {
+        melDeltaPop.dataset.wired = "1";
+        melDeltaPop.addEventListener("click", function (ev) {
+          const t = ev.target;
+          if (t && t.id === "mel-delta-pop-backdrop") melCloseDeltaPopover();
+          const x = ev.target.closest("#mel-delta-pop-close");
+          if (x) melCloseDeltaPopover();
+          const fk = ev.target.closest("[data-mel-focus-key]");
+          if (fk && melDeltaPop.contains(fk)) {
+            melCloseDeltaPopover();
+            melFocusKeyFromDelta(fk.getAttribute("data-mel-focus-key") || "");
+          }
+        });
+      }
+      if (document.documentElement.dataset.melDeltaEsc !== "1") {
+        document.documentElement.dataset.melDeltaEsc = "1";
+        document.addEventListener("keydown", function (ev) {
+          if (ev.key !== "Escape") return;
+          const pop = document.getElementById("mel-delta-pop");
+          if (pop && !pop.classList.contains("hidden")) melCloseDeltaPopover();
+        });
       }
 
       await loadAndRenderMel();
@@ -20365,6 +20631,27 @@ function renderDashboardHtml(): string {
       return "<span class='mel-delta " + cls + "' title='vs " + esc(fmtKeyShort(melState.cmpDate)) + "'>" + arrow + " " + val + "</span>";
     }
 
+    /** Same as melDelta but clickable to open per–MEL-key breakdown (metric id for melOpenDeltaPopover). */
+    function melDeltaButton(metricId, now, then, polarity) {
+      if (then == null || now == null) return "";
+      const diff = now - then;
+      if (Math.abs(diff) < 0.0001) return "<span class='mel-delta flat'>±0</span>";
+      const sign = diff > 0 ? "+" : "";
+      const isGood = polarity === "good-up" ? diff > 0 : diff < 0;
+      const cls = isGood ? "good" : "bad";
+      const arrow = diff > 0 ? "▲" : "▼";
+      let val;
+      if (polarity === "pct") {
+        val = sign + diff.toFixed(1) + "pp";
+      } else {
+        val = sign + diff;
+      }
+      return (
+        "<button type='button' class='mel-delta " + cls + "' data-mel-delta-metric='" + esc(metricId) + "'" +
+        " title='Click for per-MEL key detail vs " + esc(fmtKeyShort(melState.cmpDate)) + "'>" + arrow + " " + val + "</button>"
+      );
+    }
+
     function renderMelTotals() {
       const el = document.getElementById("mel-totals");
       if (!el) return;
@@ -20380,37 +20667,40 @@ function renderDashboardHtml(): string {
           lbl: "Assets below MEL", val: String(t.assetsBelow),
           sub: t.belowKeys + " keys below",
           cls: t.assetsBelow > 0 ? "danger" : "success",
-          delta: c ? melDelta(t.assetsBelow, c.assetsBelow, "good-down") : "",
+          delta: c ? melDeltaButton("assetsBelow", t.assetsBelow, c.assetsBelow, "good-down") : "",
         },
         {
           lbl: "To reach AT MEL", val: String(t.assetsToReachAt),
           sub: t.assetsToReachAt === 1 ? "asset needed" : "assets needed",
           cls: t.assetsToReachAt > 0 ? "warn" : "success",
-          delta: c ? melDelta(t.assetsToReachAt, c.assetsToReachAt, "good-down") : "",
+          delta: c ? melDeltaButton("assetsToReachAt", t.assetsToReachAt, c.assetsToReachAt, "good-down") : "",
         },
         {
           lbl: "Total NMC", val: String(t.nmc),
           sub: "out of " + (t.nmc + t.fmc) + " assigned",
           cls: "danger",
-          delta: c ? melDelta(t.nmc, c.nmc, "good-down") : "",
+          delta: c ? melDeltaButton("nmc", t.nmc, c.nmc, "good-down") : "",
         },
         {
           lbl: "Total FMC", val: String(t.fmc),
           sub: "mission capable",
           cls: "success",
-          delta: c ? melDelta(t.fmc, c.fmc, "good-up") : "",
+          delta: c ? melDeltaButton("fmc", t.fmc, c.fmc, "good-up") : "",
         },
         {
           lbl: "Fleet MC%", val: mcLabel,
           sub: t.keys + " MEL keys in scope",
           cls: "",
-          delta: c && c.mcRatePercent != null && t.mcRatePercent != null ? melDelta(t.mcRatePercent, c.mcRatePercent, "pct") : "",
+          delta:
+            c && c.mcRatePercent != null && t.mcRatePercent != null
+              ? melDeltaButton("mcRate", t.mcRatePercent, c.mcRatePercent, "pct")
+              : "",
         },
         {
           lbl: "Recall +/-", val: recallSign + t.recall,
           sub: t.recall === 0 ? "no loaners" : (t.recall < 0 ? "loaners pulled" : "loaners in"),
           cls: "accent",
-          delta: c ? melDelta(t.recall, c.recall, "good-up") : "",
+          delta: c ? melDeltaButton("recall", t.recall, c.recall, "good-up") : "",
         },
       ];
       el.innerHTML = cells.map(function (c) {
