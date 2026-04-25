@@ -806,6 +806,19 @@ function rowToCheck(r: CheckReadRow): YardCheckRow {
   };
 }
 
+/** openWoCount from recordCheck snapshot JSON; null if missing or legacy empty. */
+function openWoCountFromCheckSnapshot(check: YardCheckRow | null): number | null {
+  if (!check?.assetSnapshotJson?.trim()) return null;
+  try {
+    const parsed = JSON.parse(check.assetSnapshotJson) as { asset?: { openWoCount?: number } };
+    const n = parsed?.asset?.openWoCount;
+    if (typeof n === "number" && Number.isFinite(n) && n >= 0) return Math.floor(n);
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
 async function getYardCheckIntervalDays(env: Env): Promise<number> {
   const r = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT value FROM app_config WHERE key = ?`,
@@ -2044,7 +2057,15 @@ export async function listOpenFindings(env: Env): Promise<{
   for (const [assetId, latest] of latestAnyByAsset) {
     const ra = assetByKey.get(canonicalYardAssetKey(assetId));
     const hasCurrentOpenWo = !!ra && !ra.isUnlisted && (ra.openWoCount ?? 0) > 0;
-    if (!hasCurrentOpenWo) pushFinding(assetId, "unlisted", latest);
+    // Book state at check time (recordCheck stores roster + openWoCount in snapshot_asset_json).
+    // Without this, a newer ingest can close the WO and incorrectly resurrect "Found, no open WO"
+    // for a sighting that was logged while the asset still had an open WO on the book.
+    const openWoAtCheck = openWoCountFromCheckSnapshot(latest);
+    const hadOpenWoWhenWalkerSawIt =
+      openWoAtCheck !== null ? openWoAtCheck > 0 : false;
+    if (!hasCurrentOpenWo && !hadOpenWoWhenWalkerSawIt) {
+      pushFinding(assetId, "unlisted", latest);
+    }
     if (latest.discrepancies && latest.discrepancies.trim()) {
       pushFinding(assetId, "discrepancy", latest);
     }

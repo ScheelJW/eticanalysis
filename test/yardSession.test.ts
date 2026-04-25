@@ -216,4 +216,28 @@ describe("Yard roster", () => {
     expect(unlistedIds).toEqual(["AF-GHOST", "AF999"]);
     expect(result.totals.unlisted).toBe(2);
   });
+
+  it("does not flag unlisted when the walker sighting was under an open WO per check snapshot", async () => {
+    const db = new MemoryD1();
+    db.workOrderRows = [];
+    db.checks = [
+      {
+        id: 1,
+        asset_id: "AF123",
+        location: "Lot C",
+        discrepancies: "",
+        status: "present",
+        checked_by: "Walker",
+        checked_at_iso: "2026-04-10T12:00:00.000Z",
+        source_date_key: "2026-04-02",
+        asset_snapshot_json: JSON.stringify({
+          sourceDateKey: "2026-04-02",
+          asset: { assetId: "AF123", openWoCount: 1, melTier: "below" },
+        }),
+      },
+    ];
+    const env = { ETIC_SNAPSHOTS: db, ETIC_BUCKET: {} };
+    const result = await listOpenFindings(env as never);
+    expect(result.findings.some((f) => f.kind === "unlisted" && f.assetId === "AF123")).toBe(false);
+  });
 });
