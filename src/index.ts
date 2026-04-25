@@ -18306,7 +18306,7 @@ function renderDashboardHtml(): string {
       }).join("");
     }
 
-    function renderTimeline(payload, woRow) {
+    function renderTimeline(payload, woRow, opts) {
       const el = document.getElementById("wo-timeline");
       function timelineSortKey(it) {
         if (it.kind === "opened") return (it.ev.date || "") + "T00:00:00";
@@ -18392,10 +18392,15 @@ function renderDashboardHtml(): string {
         byKey.get(k).push({ kind: "opened", ev: { date: k, raw: woRow.establishedDate } });
       }
       const keys = Array.from(byKey.keys()).sort(function (a, b) { return a < b ? 1 : a > b ? -1 : 0; });
-      // Relative "today / N days ago" must use the real calendar date — NOT the
-      // work-order "as of" (selectedDate), or every event on the current report
-      // date reads as "today" and looks like the last ingest invented the change.
-      const calendarAsOf = new Date().toISOString().slice(0, 10);
+      // Relative "today / N days ago" is anchored to the latest ETIC snapshot date
+      // (same as Work orders "as of"), not wall-clock today. Otherwise when the
+      // newest workbook is e.g. 8 days old, every snapshot-dated event wrongly
+      // shows "8 days ago" even though it is current as of that report.
+      const anchorKey =
+        (opts && opts.asOfDateKey && String(opts.asOfDateKey).trim()) ||
+        woAsOfDate() ||
+        "";
+      const calendarAsOf = anchorKey || new Date().toISOString().slice(0, 10);
 
       const days = keys.map(function (k) {
         const grp = byKey.get(k);
@@ -18426,10 +18431,10 @@ function renderDashboardHtml(): string {
             : ago < 0
               ? "in " + -ago + "d"
               : ago === 0
-                ? "today"
+                ? "latest report"
                 : ago === 1
-                  ? "1 day ago"
-                  : ago + " days ago";
+                  ? "1 report day before"
+                  : ago + " report days before";
 
         const grpDisplay = dedupeEticTimelineGroup(grp);
         const evs = grpDisplay.map(function (item) {
@@ -18694,7 +18699,7 @@ function renderDashboardHtml(): string {
       timelineEl.innerHTML = "<div class='wo-timeline-empty'>Loading timeline…</div>";
       loadChangelog(r.workOrderId).then(function (payload) {
         renderYardSnapshotPanel(payload);
-        renderTimeline(payload, r);
+        renderTimeline(payload, r, { asOfDateKey: data.asOfDateKey });
       }).catch(function () {
         renderYardSnapshotPanel({ yardWalks: [] });
         timelineEl.innerHTML = "<div class='wo-timeline-empty'>Could not load timeline.</div>";
