@@ -22460,11 +22460,13 @@ function renderDashboardHtml(): string {
         chips.querySelectorAll(".yard-findings-chip").forEach(function (c) { c.classList.remove("active"); });
         t.classList.add("active");
         yardFmState.kindFilter = t.getAttribute("data-finding-kind") || "all";
+        yardRenderFindingsCounts();
         yardRenderFindings();
       });
       const ackToggle = document.getElementById("yard-findings-show-ack");
       if (ackToggle) ackToggle.addEventListener("change", function () {
         yardFmState.showAck = ackToggle.checked;
+        yardRenderFindingsCounts();
         yardRenderFindings();
       });
       const refresh = document.getElementById("yard-findings-refresh");
@@ -22572,14 +22574,34 @@ function renderDashboardHtml(): string {
         });
     }
 
+    /** Findings visible for chip counts: same rules as the list (respect Show resolved). */
+    function yardFindingsForChipCounts() {
+      const showAck = yardFmState.showAck;
+      return (yardFmState.findings || []).filter(function (f) {
+        return showAck || !f.isAcknowledged;
+      });
+    }
+
     function yardRenderFindingsCounts() {
-      const t = yardFmState.totals || {};
       const set = function(id, v) { const el = document.getElementById(id); if (el) el.textContent = String(v ?? 0); };
-      set("ff-all", t.total);
-      set("ff-unlisted", t.unlisted);
-      set("ff-discrepancy", t.discrepancy);
-      set("ff-unknown", t.unknown);
-      const open = (t.total || 0) - (t.acknowledged || 0);
+      const vis = yardFindingsForChipCounts();
+      var cAll = 0, cUn = 0, cDisc = 0, cUnk = 0;
+      for (var i = 0; i < vis.length; i++) {
+        var f = vis[i];
+        cAll += 1;
+        if (f.kind === "unlisted") cUn += 1;
+        else if (f.kind === "discrepancy") cDisc += 1;
+        else if (f.kind === "unknown") cUnk += 1;
+      }
+      set("ff-all", cAll);
+      set("ff-unlisted", cUn);
+      set("ff-discrepancy", cDisc);
+      set("ff-unknown", cUnk);
+      const allRows = yardFmState.findings || [];
+      var open = 0;
+      for (var j = 0; j < allRows.length; j++) {
+        if (!allRows[j].isAcknowledged) open += 1;
+      }
       set("yard-sub-findings-count", open);
     }
 
@@ -22771,7 +22793,6 @@ function renderDashboardHtml(): string {
           f.lastAction = j.action || f.lastAction;
           return f;
         });
-        if (yardFmState.totals) yardFmState.totals.acknowledged = (yardFmState.totals.acknowledged || 0) + 1;
         yardRenderFindingsCounts();
         yardRenderFindings();
         yardLoadFindings();
