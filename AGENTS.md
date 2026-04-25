@@ -258,6 +258,11 @@ console — don’t rely on `tsc` alone.
 **Sanity check:** You can extract the dashboard `<script>…</script>` body to a temp file and run
 `node --check` on it; that parses the same JS the browser runs.
 
+**Work order deep links:** `#wo=<id>` must **win over** `?tab=` in `readHashRoute()`. Otherwise
+`/?tab=mel#wo=…` or `/?tab=yard#wo=…` (links from MEL slide tables or yard history) only update
+the hash and never leave the current tab. `setHashWorkOrder()` should set `tab=wo` in the query
+when pushing WO state so refresh/share stay consistent.
+
 ---
 
 ## 5. Data model — D1 tables

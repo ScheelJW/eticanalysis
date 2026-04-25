@@ -15701,17 +15701,10 @@ function renderDashboardHtml(): string {
     }
 
     function readHashRoute() {
-      const qs = new URLSearchParams(location.search);
-      const qTab = String(qs.get("tab") || "").trim().toLowerCase();
-      if (qTab === "waivers") return { tab: "waivers", dateKey: null, workOrderId: null };
-      if (qTab === "yard") {
-        let yv = String(qs.get("yard") || qs.get("yv") || "").trim().toLowerCase();
-        if (yv === "needs-fix" || yv === "needsfix") yv = "findings";
-        return { tab: "yard", dateKey: null, workOrderId: null, abuseCaseId: null, yardSub: yv || null };
-      }
-      if (qTab) return { tab: qTab, dateKey: null, workOrderId: null, abuseCaseId: null };
       const raw = (location.hash || "").replace(/^#/, "");
-      if (!raw) return { tab: "snapshot", dateKey: null, workOrderId: null, abuseCaseId: null };
+      // Hash deep links win over ?tab= so e.g. /?tab=mel#wo=123 opens Work Orders
+      // (MEL slide and yard history use <a href="#wo=..."> while the query can
+      // still name another panel).
       if (raw.indexOf("wo=") === 0) {
         const id = decodeURIComponent(raw.slice(3).trim());
         return { tab: "wo", dateKey: null, workOrderId: id || null, abuseCaseId: null };
@@ -15732,6 +15725,17 @@ function renderDashboardHtml(): string {
       if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
         return { tab: "snapshot", dateKey: raw, workOrderId: null, abuseCaseId: null };
       }
+
+      const qs = new URLSearchParams(location.search);
+      const qTab = String(qs.get("tab") || "").trim().toLowerCase();
+      if (qTab === "waivers") return { tab: "waivers", dateKey: null, workOrderId: null };
+      if (qTab === "yard") {
+        let yv = String(qs.get("yard") || qs.get("yv") || "").trim().toLowerCase();
+        if (yv === "needs-fix" || yv === "needsfix") yv = "findings";
+        return { tab: "yard", dateKey: null, workOrderId: null, abuseCaseId: null, yardSub: yv || null };
+      }
+      if (qTab) return { tab: qTab, dateKey: null, workOrderId: null, abuseCaseId: null };
+      if (!raw) return { tab: "snapshot", dateKey: null, workOrderId: null, abuseCaseId: null };
       return { tab: "snapshot", dateKey: null, workOrderId: null, abuseCaseId: null };
     }
 
@@ -15797,8 +15801,24 @@ function renderDashboardHtml(): string {
 
     function setHashWorkOrder(woId) {
       const t = (woId || "").trim();
-      if (!t) { location.hash = ""; return; }
-      location.hash = "#wo=" + encodeURIComponent(t);
+      try {
+        const u = new URL(location.href);
+        if (!t) {
+          u.hash = "";
+          history.replaceState(null, "", u.pathname + u.search + u.hash);
+          return;
+        }
+        u.searchParams.set("tab", "wo");
+        ["yard", "yv", "wv", "waiverView"].forEach(function (k) { u.searchParams.delete(k); });
+        u.hash = "#wo=" + encodeURIComponent(t);
+        history.replaceState(null, "", u.pathname + u.search + u.hash);
+      } catch {
+        if (!t) {
+          location.hash = "";
+          return;
+        }
+        location.hash = "#wo=" + encodeURIComponent(t);
+      }
     }
 
     function setHashAbuseCase(caseId) {
