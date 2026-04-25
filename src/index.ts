@@ -10699,17 +10699,24 @@ function renderDashboardHtml(): string {
 
     /* FM&A finding chips */
     .yard-findings-chip {
-      background: var(--bg2); border: 1px solid var(--border); color: var(--text);
-      padding: 6px 12px; border-radius: 999px; font-size: 13px; cursor: pointer;
+      background: #ffffff; border: 1px solid var(--border); color: var(--text-dim);
+      padding: 7px 13px; border-radius: 999px; font-size: 13px; cursor: pointer;
+      box-shadow: 0 1px 2px rgba(15,30,60,0.04);
     }
-    .yard-findings-chip.active { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 600; }
-    .yard-findings-chip .count { opacity: 0.7; margin-left: 6px; font-size: 12px; }
+    .yard-findings-chip:hover { border-color: rgba(0,58,140,0.25); color: var(--accent); }
+    .yard-findings-chip.active {
+      background: var(--accent); color: #ffffff; border-color: var(--accent);
+      font-weight: 700; box-shadow: 0 3px 10px rgba(0,58,140,0.18);
+    }
+    .yard-findings-chip .count { opacity: 0.78; margin-left: 6px; font-size: 12px; }
+    .yard-findings-chip.active .count { opacity: 0.96; }
 
     /* Finding cards */
     .yard-finding {
       display: grid; grid-template-columns: auto 72px 1fr auto; gap: 12px 14px;
-      padding: 14px 16px; border: 1px solid var(--border); border-radius: 12px;
-      background: var(--bg1); margin-bottom: 8px;
+      padding: 14px 16px; border: 1px solid rgba(15,30,60,0.10); border-radius: 14px;
+      background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+      margin-bottom: 10px; box-shadow: 0 1px 2px rgba(15,30,60,0.04);
     }
     .yard-finding.acked { opacity: 0.55; }
     .yard-finding-icon {
@@ -10718,7 +10725,7 @@ function renderDashboardHtml(): string {
       font-size: 18px; font-weight: 700; box-sizing: border-box;
     }
     .yard-finding-icon.missing { background: #fde8eb; color: var(--danger); border: 1px solid #f1a3ab; }
-    .yard-finding-icon.unlisted { background: #fff8e6; color: #8a5a00; border: 1px solid #e7c779; }
+    .yard-finding-icon.unlisted { background: #fff4d6; color: #8a5a00; border: 1px solid #e7c779; }
     .yard-finding-icon.discrepancy { background: #e8eef8; color: #003a8c; border: 1px solid #9fbce0; }
     .yard-finding-icon.unknown { background: #eef1f5; color: #3d4a5c; border: 1px solid var(--border); }
     .yard-finding-body { min-width: 0; }
@@ -10755,6 +10762,14 @@ function renderDashboardHtml(): string {
       object-fit: contain; border-radius: 8px;
     }
     .yard-finding-meta { color: var(--muted); font-size: 13px; margin-top: 2px; }
+    .yard-finding-kind {
+      display: inline-flex; align-items: center; vertical-align: middle;
+      background: #fff4d6; color: #7a4d00; border: 1px solid #e7c779;
+      font-size: 10px; font-weight: 800; padding: 2px 7px; border-radius: 5px;
+      text-transform: uppercase; letter-spacing: 0.04em; margin-left: 4px;
+    }
+    .yard-finding-kind.discrepancy { background: #e8eef8; color: #003a8c; border-color: #9fbce0; }
+    .yard-finding-kind.unknown { background: #eef1f5; color: #3d4a5c; border-color: var(--border); }
     .yard-finding-disc {
       margin-top: 6px; font-size: 13px; color: var(--text);
       white-space: pre-wrap; word-break: break-word;
@@ -10765,7 +10780,11 @@ function renderDashboardHtml(): string {
       border: 1px solid var(--border); background: var(--bg2); color: var(--text);
       white-space: nowrap;
     }
-    .yard-finding-actions button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 600; }
+    .yard-finding-actions button.primary {
+      background: var(--accent); color: #ffffff; border-color: var(--accent);
+      font-weight: 700; box-shadow: 0 2px 8px rgba(0,58,140,0.18);
+    }
+    .yard-finding-actions button.primary:hover { background: var(--accent-strong); border-color: var(--accent-strong); }
     .yard-finding-actions button.ghost { background: transparent; }
     .yard-finding-action {
       grid-column: 1 / -1; margin-top: 8px; padding-top: 8px;
