@@ -428,6 +428,10 @@ export default {
       return Response.json({ ok: true, service: "etic-email-automation" });
     }
 
+    if (url.pathname === "/favicon.ico") {
+      return new Response(null, { status: 204, headers: { "cache-control": "public, max-age=86400" } });
+    }
+
     if (url.pathname === "/api/history") {
       return Response.json(await loadMergedHistory(env), { headers: cacheHeaders() });
     }
@@ -22774,14 +22778,14 @@ function renderDashboardHtml(): string {
         var shop = esc(r.shop || "");
         var etic = esc(r.eticDate || r.eticRaw || "");
         var parts = esc((r.partsStatus || "").slice(0, 96));
-        var fleetNoteFull = (r.fleetFmaNotes || "").trim();
-        var fleetNoteShow = fleetNoteFull.replace(/\\s+/g, " ");
-        if (fleetNoteShow.length > 160) fleetNoteShow = fleetNoteShow.slice(0, 157) + "\u2026";
-        var fleetNoteTd = fleetNoteFull
-          ? '<td class="fleet-fma-hist-cell" title="' + esc(fleetNoteFull) + '">' + esc(fleetNoteShow) + "</td>"
+        var fmaNoteFull = (r.fleetFmaNotes || "").trim();
+        var fmaNoteShow = fmaNoteFull.replace(/\\s+/g, " ");
+        if (fmaNoteShow.length > 160) fmaNoteShow = fmaNoteShow.slice(0, 157) + "\u2026";
+        var fmaNoteTd = fmaNoteFull
+          ? '<td class="fleet-fma-hist-cell" title="' + esc(fmaNoteFull) + '">' + esc(fmaNoteShow) + "</td>"
           : '<td class="fleet-fma-hist-cell">\u2014</td>';
         var woCell = '<button type="button" class="wo-link" data-yard-open-wo="' + esc(wo) + '">' + esc(wo) + '</button>';
-        return "<tr><td>" + snap + "</td><td>" + woCell + "</td><td>" + tier + "</td><td>" + shop + "</td><td>" + etic + "</td><td>" + parts + "</td>" + fleetNoteTd + "</tr>";
+        return "<tr><td>" + snap + "</td><td>" + woCell + "</td><td>" + tier + "</td><td>" + shop + "</td><td>" + etic + "</td><td>" + parts + "</td>" + fmaNoteTd + "</tr>";
       }).join("");
       return head + body + "</tbody></table></div>";
     }
@@ -22857,9 +22861,14 @@ function renderDashboardHtml(): string {
       if (a.isBelowMel) badges.push('<span class="badge below-mel">Below MEL</span>');
       if (f.photoCount > 0) badges.push('<span class="badge photos">\uD83D\uDCF7 ' + f.photoCount + '</span>');
       const disc = tc && tc.discrepancies ? '<div class="yard-finding-disc">\u201C' + escapeHtml(tc.discrepancies) + '\u201D</div>' : '';
-      const fmaHtml = f.fleetFmaNotes
-        ? '<div class="yard-finding-fma"><span class="lbl">FM&amp;A / fleet (P&amp;A) notes</span><div class="txt">' + escapeHtml(f.fleetFmaNotes) + '</div></div>'
-        : '';
+      var fmaNotesRaw = (f.fleetFmaNotes || "").trim();
+      var fmaHtml = "";
+      if (fmaNotesRaw) {
+        fmaHtml =
+          '<div class="yard-finding-fma"><span class="lbl">FM&amp;A / fleet (P&amp;A) notes</span><div class="txt">' +
+          escapeHtml(fmaNotesRaw) +
+          "</div></div>";
+      }
       const woHistHtml = f.kind === "unlisted"
         ? '<details class="yard-wo-history" data-asset="' + escapeHtml(f.assetId) + '">' +
           "<summary>Past ETIC snapshots \u2014 work orders for this asset</summary>" +
@@ -23204,7 +23213,7 @@ function renderDashboardHtml(): string {
       const sv = document.getElementById("yard-session-view");
       sv.classList.remove("hidden");
       const list = document.getElementById("yard-asset-list");
-      if (list) list.innerHTML = "<div class='yard-empty-state'>Loading fleet…</div>";
+      if (list) list.innerHTML = "<div class='yard-empty-state'>Loading fleet\u2026</div>";
       const nameEl = document.getElementById("yard-session-name");
       if (nameEl) nameEl.textContent = "Session #" + sessionId;
       try {
