@@ -1559,6 +1559,67 @@ export type AssetWorkOrder = {
   eticPushCount: number;
 };
 
+/** One row from work_order_snapshot (asset appeared on that day's ETIC). */
+export type WorkOrderSnapshotHistoryRow = {
+  snapshotDateKey: string;
+  workOrderId: string;
+  assetId: string;
+  melTier: string;
+  shop: string;
+  eticDate: string;
+  eticRaw: string;
+  remarks: string;
+  partsStatus: string;
+  lastRemarkChangeDate: string;
+};
+
+/**
+ * All stored snapshot rows for an asset (newest report date first), for FM&A
+ * to see when this asset last had an open work order in the historical books.
+ */
+export async function listWorkOrderSnapshotsForAsset(
+  env: Env,
+  assetId: string,
+  opts?: { limit?: number },
+): Promise<WorkOrderSnapshotHistoryRow[]> {
+  const lim = Math.min(500, Math.max(1, Math.floor(opts?.limit ?? 200)));
+  const id = assetId.trim();
+  if (!id) return [];
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT snapshot_date_key, work_order_id, asset_id, mel_tier, shop,
+            etic_date, etic_raw, remarks, parts_status, last_remark_change_date
+     FROM work_order_snapshot
+     WHERE UPPER(TRIM(asset_id)) = UPPER(TRIM(?))
+     ORDER BY snapshot_date_key DESC, work_order_id ASC
+     LIMIT ?`,
+  )
+    .bind(id, lim)
+    .all<{
+      snapshot_date_key: string;
+      work_order_id: string;
+      asset_id: string;
+      mel_tier: string | null;
+      shop: string | null;
+      etic_date: string | null;
+      etic_raw: string | null;
+      remarks: string | null;
+      parts_status: string | null;
+      last_remark_change_date: string | null;
+    }>();
+  return (r.results ?? []).map((row) => ({
+    snapshotDateKey: row.snapshot_date_key,
+    workOrderId: row.work_order_id,
+    assetId: row.asset_id ?? "",
+    melTier: row.mel_tier ?? "",
+    shop: row.shop ?? "",
+    eticDate: row.etic_date ?? "",
+    eticRaw: row.etic_raw ?? "",
+    remarks: row.remarks ?? "",
+    partsStatus: row.parts_status ?? "",
+    lastRemarkChangeDate: row.last_remark_change_date ?? "",
+  }));
+}
+
 type WoReadRow = {
   work_order_id: string;
   shop: string | null;

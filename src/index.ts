@@ -59,6 +59,7 @@ import {
   getRollingRoster,
   getYardRosterForDate,
   listOpenFindings as listYardOpenFindings,
+  listWorkOrderSnapshotsForAsset as listYardWorkOrderSnapshotsForAsset,
   listPhotosForAsset as listYardPhotosForAsset,
   recordCheck as recordYardCheck,
   deleteCheck as deleteYardCheckRow,
@@ -606,6 +607,9 @@ export default {
     }
     if (url.pathname === "/api/yard/findings") {
       return handleYardFindingsApi(env);
+    }
+    if (url.pathname === "/api/yard/work-orders-by-asset") {
+      return handleYardWorkOrdersByAssetApi(env, url);
     }
     if (url.pathname === "/api/yard/findings/resolve") {
       return handleYardFindingResolveApi(env, request);
@@ -2243,6 +2247,20 @@ async function handleYardPhotoLatestApi(env: Env): Promise<Response> {
 async function handleYardFindingsApi(env: Env): Promise<Response> {
   const result = await listYardOpenFindings(env);
   return Response.json(result, { headers: cacheHeaders() });
+}
+
+/** GET ?assetId= — all work_order_snapshot rows for an asset (newest report first). */
+async function handleYardWorkOrdersByAssetApi(env: Env, url: URL): Promise<Response> {
+  const assetId = (url.searchParams.get("assetId") ?? "").trim();
+  if (!assetId) {
+    return Response.json({ error: "assetId is required" }, { status: 400, headers: cacheHeaders() });
+  }
+  const limRaw = url.searchParams.get("limit");
+  const limit = limRaw ? Number.parseInt(limRaw, 10) : undefined;
+  const rows = await listYardWorkOrderSnapshotsForAsset(env, assetId, {
+    limit: Number.isFinite(limit) ? limit : undefined,
+  });
+  return Response.json({ assetId, rows }, { headers: cacheHeaders() });
 }
 
 /** POST — record an FM&A action against a finding. */
@@ -10908,6 +10926,33 @@ function renderDashboardHtml(): string {
       margin-top: 6px; font-size: 13px; color: var(--text);
       white-space: pre-wrap; word-break: break-word;
     }
+    .yard-wo-history {
+      margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px; font-size: 12px;
+    }
+    .yard-wo-history summary {
+      cursor: pointer; font-weight: 600; color: var(--accent-strong); user-select: none;
+    }
+    .yard-wo-history summary::-webkit-details-marker { display: none; }
+    .yard-wo-history-body { margin-top: 8px; color: var(--text-dim); }
+    .yard-wo-history-table-wrap {
+      overflow: auto; max-height: 260px; border: 1px solid var(--border); border-radius: 8px;
+    }
+    .yard-wo-history-table {
+      width: 100%; border-collapse: collapse; font-size: 11px;
+    }
+    .yard-wo-history-table th, .yard-wo-history-table td {
+      padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: top;
+    }
+    .yard-wo-history-table th {
+      position: sticky; top: 0; background: var(--bg2); font-weight: 700; font-size: 10px;
+      text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted);
+    }
+    .yard-wo-history-table tr:last-child td { border-bottom: none; }
+    .yard-wo-history-table .wo-link {
+      color: var(--accent-strong); font-weight: 600; text-decoration: none; cursor: pointer; border: 0; background: none; padding: 0; font: inherit;
+    }
+    .yard-wo-history-table .wo-link:hover { text-decoration: underline; }
+    .yard-wo-history-empty { color: var(--muted); padding: 8px 4px; font-size: 12px; }
     .yard-finding-actions { display: flex; flex-direction: column; gap: 6px; align-items: flex-end; }
     .yard-finding-actions button {
       padding: 6px 12px; border-radius: 8px; font-size: 13px; cursor: pointer;
@@ -22395,6 +22440,8 @@ function renderDashboardHtml(): string {
       showAck: false,
       activity: [],
       resolveTarget: null, // { assetId, kind, checkId, asset }
+      /** assetId -> cached /api/yard/work-orders-by-asset response for unlisted cards */
+      woHistoryByAsset: {},
     };
     // Internal kinds are stable API values; labels below are what users see.
     // Absence-derived "missing" is no longer listed in the queue — see Fleet list instead.
@@ -22473,7 +22520,26 @@ function renderDashboardHtml(): string {
       if (refresh) refresh.addEventListener("click", function () { yardLoadFindings(); });
 
       const list = document.getElementById("yard-findings-list");
+      if (list && list.dataset.yardWoHistWired !== "1") {
+        list.dataset.yardWoHistWired = "1";
+        list.addEventListener("toggle", function (e) {
+          const det = e.target;
+          if (!det || det.tagName !== "DETAILS" || !det.classList.contains("yard-wo-history")) return;
+          if (!det.open) return;
+          const aid = det.getAttribute("data-asset");
+          if (!aid) return;
+          const body = det.querySelector(".yard-wo-history-body");
+          if (body) yardLoadWoHistoryForUnlisted(aid, body);
+        }, true);
+      }
       if (list) list.addEventListener("click", function (e) {
+        const woBtn = e.target.closest("[data-yard-open-wo]");
+        if (woBtn) {
+          e.preventDefault();
+          const wo = woBtn.getAttribute("data-yard-open-wo");
+          if (wo) selectWo(wo, true);
+          return;
+        }
         const ph = e.target.closest("[data-yard-finding-photo]");
         if (ph) {
           e.preventDefault();
@@ -22552,6 +22618,7 @@ function renderDashboardHtml(): string {
         .then(function (j) {
           yardFmState.findings = j.findings || [];
           yardFmState.totals = j.totals || yardFmState.totals;
+          yardFmState.woHistoryByAsset = {};
           yardRenderFindingsCounts();
           if (yardFmState.subTab === "findings") yardRenderFindings();
         })
@@ -22566,6 +22633,7 @@ function renderDashboardHtml(): string {
         .then(function (j) {
           yardFmState.findings = j.findings || [];
           yardFmState.totals = j.totals || yardFmState.totals;
+          yardFmState.woHistoryByAsset = {};
           yardRenderFindingsCounts();
           yardRenderFindings();
         })
@@ -22643,6 +22711,44 @@ function renderDashboardHtml(): string {
       list.innerHTML = html;
     }
 
+    function yardFormatWoHistoryTable(rows) {
+      if (!rows.length) {
+        return '<div class="yard-wo-history-empty">No work order rows in any stored ETIC snapshot for this asset id.</div>';
+      }
+      var head = '<div class="yard-wo-history-table-wrap"><table class="yard-wo-history-table"><thead><tr>' +
+        '<th>Snapshot</th><th>WO</th><th>MEL</th><th>Shop</th><th>ETIC</th><th>Parts</th>' +
+        '</tr></thead><tbody>';
+      var body = rows.map(function (r) {
+        var snap = esc(r.snapshotDateKey || "");
+        var wo = r.workOrderId || "";
+        var tier = esc(r.melTier || "");
+        var shop = esc(r.shop || "");
+        var etic = esc(r.eticDate || r.eticRaw || "");
+        var parts = esc((r.partsStatus || "").slice(0, 96));
+        var woCell = '<button type="button" class="wo-link" data-yard-open-wo="' + esc(wo) + '">' + esc(wo) + '</button>';
+        return "<tr><td>" + snap + "</td><td>" + woCell + "</td><td>" + tier + "</td><td>" + shop + "</td><td>" + etic + "</td><td>" + parts + "</td></tr>";
+      }).join("");
+      return head + body + "</tbody></table></div>";
+    }
+
+    function yardLoadWoHistoryForUnlisted(assetId, bodyEl) {
+      if (yardFmState.woHistoryByAsset[assetId]) {
+        bodyEl.innerHTML = yardFormatWoHistoryTable(yardFmState.woHistoryByAsset[assetId]);
+        return;
+      }
+      bodyEl.innerHTML = '<div class="hint" style="padding:6px 0;">Loading\u2026</div>';
+      fetch("/api/yard/work-orders-by-asset?assetId=" + encodeURIComponent(assetId), { cache: "no-store" })
+        .then(function (r) { return r.json(); })
+        .then(function (j) {
+          var rows = Array.isArray(j.rows) ? j.rows : [];
+          yardFmState.woHistoryByAsset[assetId] = rows;
+          bodyEl.innerHTML = yardFormatWoHistoryTable(rows);
+        })
+        .catch(function () {
+          bodyEl.innerHTML = '<div class="yard-wo-history-empty">Could not load snapshot history.</div>';
+        });
+    }
+
     function yardRenderFindingCard(f) {
       const a = f.asset || {};
       const tc = f.triggerCheck;
@@ -22667,6 +22773,11 @@ function renderDashboardHtml(): string {
       const fmaHtml = f.fleetFmaNotes
         ? '<div class="yard-finding-fma"><span class="lbl">FM&amp;A / fleet (P&amp;A) notes</span><div class="txt">' + escapeHtml(f.fleetFmaNotes) + '</div></div>'
         : '';
+      const woHistHtml = f.kind === "unlisted"
+        ? '<details class="yard-wo-history" data-asset="' + escapeHtml(f.assetId) + '">' +
+          "<summary>Past ETIC snapshots \u2014 work orders for this asset</summary>" +
+          '<div class="yard-wo-history-body"></div></details>'
+        : "";
       const thumb = f.previewPhotoUrl
         ? '<button type="button" class="yard-finding-thumb" data-yard-finding-photo="' + escapeHtml(f.previewPhotoUrl) + '" title="View photo"><img src="' + escapeHtml(f.previewPhotoUrl) + '" alt="" loading="lazy" decoding="async" /></button>'
         : '<div class="yard-finding-thumb placeholder" aria-hidden="true">No\u00A0photo</div>';
@@ -22686,6 +22797,7 @@ function renderDashboardHtml(): string {
           '<div class="yard-finding-meta">' + meta.join(" \u00B7 ") + '</div>' +
           disc +
           fmaHtml +
+          woHistHtml +
         '</div>' +
         '<div class="yard-finding-actions">' + buttons + '</div>' +
         lastActionBlock +
