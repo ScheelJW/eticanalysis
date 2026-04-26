@@ -1,4 +1,5 @@
 import type { FleetRecord, RawWorkOrder } from "./yardCheck";
+import { nceInfoFromSnapshotRawJson } from "./yardSession";
 import {
   extractFleetMapsFromBinary,
   extractRawWorkOrdersFromBinary,
@@ -980,11 +981,31 @@ export type ScheduleMxFleetRow = {
   location: string;
   makeModel: string;
   mgmtCd: string;
+  /** Open work orders on **latest ETIC** snapshot for this asset (preferred for UI). */
   workOrderCount: number;
   nce: boolean;
   nceStatus: string;
   /** Overdue schedule maintenance on an NCE asset — highest leadership priority. */
   scheduleMxNceCritical: boolean;
+  /** Owning unit from latest ETIC when available. */
+  owningUnit: string;
+  /** Vehicle nomenclature / type line from latest ETIC (e.g. LIN nomen). */
+  vehNomen: string;
+  /** Date key of the ETIC workbook used for unit / NCE / open WO context. */
+  eticSnapshotDateKey: string | null;
+  /** Sample of open WO ids on latest ETIC (comma-separated). */
+  eticOpenWorkOrderIds: string;
+  /** True when any open WO parts status looks like in-shop maintenance. */
+  eticOpenInMaintenance: boolean;
+  /**
+   * After rules: open WO (or in-shop maintenance) clears sched-mx overdue / due-soon noise.
+   * KPIs, filters, and badges use this bucket.
+   */
+  scheduleMxPlanEffectiveBucket: ScheduleMxBucket;
+  /** NCE + effective overdue (recomputed after open-WO waiver). */
+  scheduleMxPlanEffectiveNceCritical: boolean;
+  /** ELMS said overdue/due soon but we treated as OK because of open WO / maintenance. */
+  scheduleMxSuppressedByOpenWo: boolean;
   elmsLastMaintDateIso: string | null;
   elmsNextMaintDateIso: string | null;
   elmsLastUtilQty: number | null;
@@ -1015,23 +1036,419 @@ async function loadWoCountsPerAsset(
   return m;
 }
 
-function sortScheduleMxRows(out: ScheduleMxFleetRow[]): ScheduleMxFleetRow[] {
-  function rank(a: ScheduleMxFleetRow): number {
-    if (a.scheduleMxNceCritical) return 0;
-    if (a.scheduleMxBucket === "overdue") return 1;
-    if (a.scheduleMxBucket === "due_soon") return 2;
-    if (a.scheduleMxBucket === "missing") return 3;
-    return 4;
+/** Newest non-deleted ETIC workbook date in D1 (same idea as yard rolling roster). */
+export async function getLatestEticSnapshotDateKey(env: { ETIC_SNAPSHOTS: D1Database }): Promise<string | null> {
+  const row = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT date_key FROM etic_snapshots WHERE deleted_at_iso IS NULL ORDER BY date_key DESC LIMIT 1`,
+  ).first<{ date_key: string }>();
+  const k = row?.date_key?.trim() ?? "";
+  return k || null;
+}
+
+function partsStatusLooksInMaintenance(partsStatus: string): boolean {
+  const s = (partsStatus ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+  if (!s) return false;
+  return (
+    s.includes("maint") ||
+    s.includes("shop") ||
+    s.includes("bay") ||
+    s.includes("vm ") ||
+    s.includes("in repair") ||
+    s.includes("deferred maint") ||
+    /\bmx\b/.test(s)
+  );
+}
+
+export type ScheduleMxEticAssetContext = {
+  workOrderIds: string[];
+  owningUnit: string;
+  makeModel: string;
+  vehNomen: string;
+  mgmtCd: string;
+  nce: boolean;
+  nceStatus: string;
+  inMaintenance: boolean;
+};
+
+/**
+ * Per-asset context from the **latest** ETIC workbook: **Fleet P&A** row for unit /
+ * make-model / type / mgmt / NCE, plus **Work Order Inquiry** rows for open WO ids and
+ * in-shop parts status. Used to enrich Schedule Mx (ELMS plans) without trusting ELMS
+ * item lines for fleet identity.
+ */
+export async function loadScheduleMxEticContextByAsset(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  assetIds: string[],
+): Promise<{ eticDateKey: string | null; byAsset: Map<string, ScheduleMxEticAssetContext> }> {
+  const byAsset = new Map<string, ScheduleMxEticAssetContext>();
+  const eticDateKey = await getLatestEticSnapshotDateKey(env);
+  if (!eticDateKey || assetIds.length === 0) {
+    return { eticDateKey, byAsset };
   }
+  const ids = [...new Set(assetIds.map((a) => (a ?? "").trim()).filter(Boolean))];
+  // D1 SQLite bind limit is 100 parameters; leave headroom for snapshot_date_key.
+  const batchSize = 90;
+
+  type FleetPaRow = {
+    asset_id: string;
+    owning_unit: string | null;
+    make_model: string | null;
+    veh_nomen: string | null;
+    mgmt_cd: string | null;
+    raw_row_json: string | null;
+  };
+  const fleetByAsset = new Map<string, FleetPaRow>();
+  for (let i = 0; i < ids.length; i += batchSize) {
+    const chunk = ids.slice(i, i + batchSize);
+    const ph = chunk.map(() => "?").join(",");
+    const r = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT asset_id, owning_unit, make_model, veh_nomen, mgmt_cd, raw_row_json
+       FROM fleet_p_a_snapshot
+       WHERE snapshot_date_key = ? AND asset_id IN (${ph})`,
+    )
+      .bind(eticDateKey, ...chunk)
+      .all<FleetPaRow>();
+    for (const row of r.results ?? []) {
+      const aid = (row.asset_id ?? "").trim();
+      if (aid) fleetByAsset.set(aid, row);
+    }
+  }
+
+  type WoAgg = {
+    workOrderIds: string[];
+    inMaintenance: boolean;
+    owningUnit: string;
+    makeModel: string;
+    vehNomen: string;
+    mgmtCd: string;
+    nce: boolean;
+    nceStatus: string;
+  };
+  const woByAsset = new Map<string, WoAgg>();
+  for (let i = 0; i < ids.length; i += batchSize) {
+    const chunk = ids.slice(i, i + batchSize);
+    const ph = chunk.map(() => "?").join(",");
+    const r = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT asset_id, work_order_id, parts_status, owning_unit, make_model, veh_nomen, mgmt_cd, raw_row_json
+       FROM work_order_snapshot
+       WHERE snapshot_date_key = ? AND asset_id IN (${ph})
+       ORDER BY asset_id, work_order_id`,
+    )
+      .bind(eticDateKey, ...chunk)
+      .all<{
+        asset_id: string;
+        work_order_id: string;
+        parts_status: string | null;
+        owning_unit: string | null;
+        make_model: string | null;
+        veh_nomen: string | null;
+        mgmt_cd: string | null;
+        raw_row_json: string | null;
+      }>();
+    for (const row of r.results ?? []) {
+      const aid = (row.asset_id ?? "").trim();
+      if (!aid) continue;
+      let ctx = woByAsset.get(aid);
+      if (!ctx) {
+        ctx = {
+          workOrderIds: [],
+          inMaintenance: false,
+          owningUnit: "",
+          makeModel: "",
+          vehNomen: "",
+          mgmtCd: "",
+          nce: false,
+          nceStatus: "",
+        };
+        woByAsset.set(aid, ctx);
+      }
+      const wid = (row.work_order_id ?? "").trim();
+      if (wid && !ctx.workOrderIds.includes(wid)) ctx.workOrderIds.push(wid);
+      const ps = (row.parts_status ?? "").trim();
+      if (partsStatusLooksInMaintenance(ps)) ctx.inMaintenance = true;
+      const ou = (row.owning_unit ?? "").trim();
+      if (ou && !ctx.owningUnit) ctx.owningUnit = ou;
+      const mm = (row.make_model ?? "").trim();
+      if (mm && !ctx.makeModel) ctx.makeModel = mm;
+      const vn = (row.veh_nomen ?? "").trim();
+      if (vn && !ctx.vehNomen) ctx.vehNomen = vn;
+      const mg = (row.mgmt_cd ?? "").trim();
+      if (mg && !ctx.mgmtCd) ctx.mgmtCd = mg;
+      const ni = nceInfoFromSnapshotRawJson(row.raw_row_json);
+      if (ni.nce) {
+        ctx.nce = true;
+        if (ni.nceStatus && !ctx.nceStatus) ctx.nceStatus = ni.nceStatus;
+      }
+    }
+  }
+
+  for (const aid of ids) {
+    const f = fleetByAsset.get(aid);
+    const w = woByAsset.get(aid);
+    if (!f && (!w || w.workOrderIds.length === 0)) continue;
+    const fpNce = f ? nceInfoFromSnapshotRawJson(f.raw_row_json) : { nce: false, nceStatus: "" };
+    const nce = fpNce.nce || !!w?.nce;
+    const nceStatus = (fpNce.nceStatus || w?.nceStatus || "").trim();
+    byAsset.set(aid, {
+      workOrderIds: w?.workOrderIds ?? [],
+      owningUnit: (f?.owning_unit ?? "").trim() || (w?.owningUnit ?? ""),
+      makeModel: (f?.make_model ?? "").trim() || (w?.makeModel ?? ""),
+      vehNomen: (f?.veh_nomen ?? "").trim() || (w?.vehNomen ?? ""),
+      mgmtCd: (f?.mgmt_cd ?? "").trim() || (w?.mgmtCd ?? ""),
+      nce,
+      nceStatus,
+      inMaintenance: w?.inMaintenance ?? false,
+    });
+  }
+  return { eticDateKey, byAsset };
+}
+
+function applyEticContextToScheduleMxRow(
+  row: ScheduleMxFleetRow,
+  ctx: ScheduleMxEticAssetContext | undefined,
+  eticDateKey: string | null,
+): ScheduleMxFleetRow {
+  const woCount = eticDateKey != null ? (ctx?.workOrderIds.length ?? 0) : row.workOrderCount;
+  const owningUnit = ctx && ctx.owningUnit ? ctx.owningUnit : row.owningUnit;
+  const makeModel = ctx && ctx.makeModel ? ctx.makeModel : row.makeModel;
+  const vehNomen = ctx && ctx.vehNomen ? ctx.vehNomen : row.vehNomen;
+  const mgmtCd = ctx && ctx.mgmtCd ? ctx.mgmtCd : row.mgmtCd;
+  const nce = ctx ? ctx.nce : row.nce;
+  const nceStatus = ctx ? ctx.nceStatus : row.nceStatus;
+  const inMaint = ctx ? ctx.inMaintenance : false;
+  const openWoSample = ctx ? ctx.workOrderIds.slice(0, 8).join(", ") : "";
+  const base = row.scheduleMxBucket;
+  let effective: ScheduleMxBucket = base;
+  let suppressed = false;
+  if ((woCount > 0 || inMaint) && (base === "overdue" || base === "due_soon")) {
+    effective = "ok";
+    suppressed = true;
+  }
+  const nceCrit = nce && effective === "overdue";
+  return {
+    ...row,
+    makeModel,
+    mgmtCd,
+    nce,
+    nceStatus,
+    workOrderCount: woCount,
+    owningUnit,
+    vehNomen,
+    eticSnapshotDateKey: eticDateKey,
+    eticOpenWorkOrderIds: openWoSample,
+    eticOpenInMaintenance: inMaint,
+    scheduleMxPlanEffectiveBucket: effective,
+    scheduleMxPlanEffectiveNceCritical: nceCrit,
+    scheduleMxNceCritical: nceCrit,
+    scheduleMxSuppressedByOpenWo: suppressed,
+  };
+}
+
+export function enrichScheduleMxRowsWithLatestEtic(
+  rows: ScheduleMxFleetRow[],
+  eticDateKey: string | null,
+  byAsset: Map<string, ScheduleMxEticAssetContext>,
+): ScheduleMxFleetRow[] {
+  return rows.map((row) => {
+    const aid = (row.assetId ?? "").trim();
+    const ctx = aid ? byAsset.get(aid) : undefined;
+    return applyEticContextToScheduleMxRow(row, ctx, eticDateKey);
+  });
+}
+
+/** Per-plan priority for roll-up: lower = worse (uses ETIC-adjusted effective bucket). */
+function scheduleMxPlanWorstRank(row: ScheduleMxFleetRow): number {
+  if (row.scheduleMxPlanEffectiveNceCritical) return 0;
+  const b = row.scheduleMxPlanEffectiveBucket ?? row.scheduleMxBucket;
+  if (b === "overdue") return 1;
+  if (b === "due_soon") return 2;
+  if (b === "missing") return 3;
+  return 4;
+}
+
+function sortScheduleMxRows(out: ScheduleMxFleetRow[]): ScheduleMxFleetRow[] {
   out.sort(function (a, b) {
-    const ra = rank(a);
-    const rb = rank(b);
+    const ra = scheduleMxPlanWorstRank(a);
+    const rb = scheduleMxPlanWorstRank(b);
     if (ra !== rb) return ra - rb;
     const ac = a.assetId.localeCompare(b.assetId);
     if (ac !== 0) return ac;
     return a.planRowKey.localeCompare(b.planRowKey);
   });
   return out;
+}
+
+/**
+ * KPI counts by **asset** (vehicle): each asset is classified by its **worst** plan row.
+ * Matches sidebar card logic so tiles are not inflated by multiple plans per asset.
+ */
+/** Wing / unit rollup for commander-style scheduled maintenance compliance (by asset worst plan). */
+export type ScheduleMxCommanderUnitRow = {
+  unit: string;
+  totalVehicles: number;
+  notOverdue: number;
+  pctNotOverdue: number;
+  overdue: number;
+  nceOverdue: number;
+};
+
+export type ScheduleMxCommanderSummary = {
+  wing: {
+    totalVehicles: number;
+    notOverdue: number;
+    pctNotOverdue: number;
+    overdue: number;
+    nceOverdue: number;
+  };
+  units: ScheduleMxCommanderUnitRow[];
+};
+
+/** Worst rank for an asset across its plan rows (same scale as scheduleMxPlanWorstRank). */
+function scheduleMxAssetWorstRank(plans: ScheduleMxFleetRow[]): number {
+  let worst = 4;
+  for (const p of plans) {
+    const r = scheduleMxPlanWorstRank(p);
+    if (r < worst) worst = r;
+  }
+  return worst;
+}
+
+/**
+ * Raw ELMS / extract bucket only (no open-WO triage waiver). Matches wing commander-style
+ * compliance reports; can be higher than triage "effective" overdue counts.
+ */
+function scheduleMxPlanRawWorstRank(row: ScheduleMxFleetRow): number {
+  const b = row.scheduleMxBucket;
+  if (row.nce && b === "overdue") return 0;
+  if (b === "overdue") return 1;
+  if (b === "due_soon") return 2;
+  if (b === "missing") return 3;
+  return 4;
+}
+
+function scheduleMxAssetRawWorstRank(plans: ScheduleMxFleetRow[]): number {
+  let worst = 4;
+  for (const p of plans) {
+    const r = scheduleMxPlanRawWorstRank(p);
+    if (r < worst) worst = r;
+  }
+  return worst;
+}
+
+/**
+ * Commander summary: one row per owning unit + wing totals.
+ * Overdue / NCE overdue use **raw** extract buckets (not open-WO-waived effective buckets).
+ */
+export function computeScheduleMxCommanderSummary(rows: ScheduleMxFleetRow[]): ScheduleMxCommanderSummary {
+  const byAssetInUnit = new Map<string, Map<string, ScheduleMxFleetRow[]>>();
+  for (const row of rows) {
+    const u = (row.owningUnit ?? "").trim() || "(Unknown unit)";
+    const aid = (row.assetId ?? "").trim() || "—";
+    let am = byAssetInUnit.get(u);
+    if (!am) {
+      am = new Map();
+      byAssetInUnit.set(u, am);
+    }
+    let al = am.get(aid);
+    if (!al) {
+      al = [];
+      am.set(aid, al);
+    }
+    al.push(row);
+  }
+  const units: ScheduleMxCommanderUnitRow[] = [];
+  let wingTotal = 0;
+  let wingNotOd = 0;
+  let wingOd = 0;
+  let wingNceOd = 0;
+  const sortedUnitNames = [...byAssetInUnit.keys()].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  for (const unit of sortedUnitNames) {
+    const am = byAssetInUnit.get(unit)!;
+    let total = 0;
+    let overdue = 0;
+    let nceOverdue = 0;
+    for (const [, plans] of am) {
+      total += 1;
+      const wr = scheduleMxAssetRawWorstRank(plans);
+      if (wr <= 1) overdue += 1;
+      if (wr === 0) nceOverdue += 1;
+    }
+    const notOverdue = total - overdue;
+    const pct = total > 0 ? Math.round((notOverdue / total) * 10000) / 100 : 0;
+    units.push({
+      unit,
+      totalVehicles: total,
+      notOverdue,
+      pctNotOverdue: pct,
+      overdue,
+      nceOverdue,
+    });
+    wingTotal += total;
+    wingNotOd += notOverdue;
+    wingOd += overdue;
+    wingNceOd += nceOverdue;
+  }
+  const wingPct = wingTotal > 0 ? Math.round((wingNotOd / wingTotal) * 10000) / 100 : 0;
+  return {
+    wing: {
+      totalVehicles: wingTotal,
+      notOverdue: wingNotOd,
+      pctNotOverdue: wingPct,
+      overdue: wingOd,
+      nceOverdue: wingNceOd,
+    },
+    units,
+  };
+}
+
+export function computeScheduleMxAssetStats(rows: ScheduleMxFleetRow[]): {
+  planRows: number;
+  distinctAssets: number;
+  assets: number;
+  nceCritical: number;
+  overdue: number;
+  dueSoon: number;
+  missing: number;
+  ok: number;
+} {
+  const byAsset = new Map<string, ScheduleMxFleetRow[]>();
+  for (const row of rows) {
+    const aid = (row.assetId ?? "").trim() || "—";
+    let list = byAsset.get(aid);
+    if (!list) {
+      list = [];
+      byAsset.set(aid, list);
+    }
+    list.push(row);
+  }
+  let nceCritical = 0;
+  let overdue = 0;
+  let dueSoon = 0;
+  let missing = 0;
+  let ok = 0;
+  for (const plans of byAsset.values()) {
+    let worst = 4;
+    for (const p of plans) {
+      const r = scheduleMxPlanWorstRank(p);
+      if (r < worst) worst = r;
+    }
+    if (worst === 0) nceCritical++;
+    else if (worst === 1) overdue++;
+    else if (worst === 2) dueSoon++;
+    else if (worst === 3) missing++;
+    else ok++;
+  }
+  const distinctAssets = byAsset.size;
+  return {
+    planRows: rows.length,
+    distinctAssets,
+    assets: distinctAssets,
+    nceCritical,
+    overdue,
+    dueSoon,
+    missing,
+    ok,
+  };
 }
 
 function pickElmsFromRaw(raw: Record<string, string>, needleFragments: string[]): string {
@@ -1139,12 +1556,24 @@ export function analyzeElmsScheduleMxFromRaw(
     if (elmsCurrentMeter >= elmsNextUtilQty) scheduleMxOverdueUtil = true;
   }
 
+  /** Meter interval says we are still before the next util target (authoritative vs stale calendar cells). */
+  const utilSaysNotOverdue =
+    elmsNextUtilQty != null && elmsCurrentMeter != null && elmsCurrentMeter < elmsNextUtilQty;
+  if (dateOverdue && utilSaysNotOverdue) {
+    dateOverdue = false;
+    dateOverdueByDays = null;
+    daysUntil = null;
+  }
+
   const legacy = analyzeScheduleMxFromRaw(raw, asOfDateKey);
   const hasElmsSignal =
     !!elmsNextMaintDateIso ||
     (elmsNextUtilQty != null && elmsCurrentMeter != null) ||
     !!lastMaintText ||
-    !!nextMaintText;
+    !!nextUtilText ||
+    !!lastUtilText ||
+    !!nextMaintText ||
+    !!meterText;
 
   let bucket: ScheduleMxBucket;
   let scheduleMxOverdueByDays: number | null = legacy.scheduleMxOverdueByDays;
@@ -1176,7 +1605,16 @@ export function analyzeElmsScheduleMxFromRaw(
       bucket = "ok";
       scheduleMxDueIso = elmsNextMaintDateIso ?? legacy.scheduleMxDueIso;
       scheduleMxDaysUntil = daysUntil ?? legacy.scheduleMxDaysUntil;
-      if (!scheduleMxStatus && elmsNextMaintDateIso) scheduleMxStatus = "Current";
+      if (!scheduleMxStatus) {
+        if (elmsNextMaintDateIso) {
+          scheduleMxStatus = "Current";
+        } else if (elmsNextUtilQty != null) {
+          scheduleMxStatus =
+            elmsCurrentMeter != null
+              ? "Current (meter before next utilization target — no calendar date on this plan)"
+              : "Utilization target in ELMS — current reading not in this row (no calendar date)";
+        }
+      }
     } else {
       bucket = "missing";
       needsEntry = true;
@@ -1250,6 +1688,14 @@ function buildScheduleMxRowsFromFleetSheet(
       nceStatus,
       scheduleMxNceCritical,
       ...smx,
+      owningUnit: "",
+      vehNomen: "",
+      eticSnapshotDateKey: null,
+      eticOpenWorkOrderIds: "",
+      eticOpenInMaintenance: false,
+      scheduleMxPlanEffectiveBucket: smx.scheduleMxBucket,
+      scheduleMxPlanEffectiveNceCritical: scheduleMxNceCritical,
+      scheduleMxSuppressedByOpenWo: false,
     });
   }
   return sortScheduleMxRows(out);
@@ -1293,6 +1739,14 @@ function buildScheduleMxRowsFromPlanRows(
       nceStatus,
       scheduleMxNceCritical,
       ...smx,
+      owningUnit: "",
+      vehNomen: "",
+      eticSnapshotDateKey: null,
+      eticOpenWorkOrderIds: "",
+      eticOpenInMaintenance: false,
+      scheduleMxPlanEffectiveBucket: smx.scheduleMxBucket,
+      scheduleMxPlanEffectiveNceCritical: scheduleMxNceCritical,
+      scheduleMxSuppressedByOpenWo: false,
     });
   }
   return sortScheduleMxRows(out);
@@ -1661,7 +2115,10 @@ export async function getScheduleMxFleetForDate(
   const planRows = await loadScheduleMxPlanRowsForDate(env, dateKey);
   if (planRows.length === 0) return [];
   const woCounts = await loadWoCountsPerAsset(env, dateKey);
-  return buildScheduleMxRowsFromPlanRows(planRows, woCounts, dateKey);
+  const rows = buildScheduleMxRowsFromPlanRows(planRows, woCounts, dateKey);
+  const assetIds = [...new Set(rows.map((r) => (r.assetId ?? "").trim()).filter(Boolean))];
+  const { eticDateKey, byAsset } = await loadScheduleMxEticContextByAsset(env, assetIds);
+  return sortScheduleMxRows(enrichScheduleMxRowsWithLatestEtic(rows, eticDateKey, byAsset));
 }
 
 async function getEarliestSnapshotDate(env: { ETIC_SNAPSHOTS: D1Database }): Promise<string> {

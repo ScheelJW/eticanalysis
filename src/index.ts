@@ -18,6 +18,8 @@ import {
   getWatchRowByIdForDate,
   getWatchRowsForDate,
   getScheduleMxFleetForDate,
+  computeScheduleMxAssetStats,
+  computeScheduleMxCommanderSummary,
   getLatestScheduleMxExtractDateKey,
   listScheduleMxExtractDateKeysDesc,
   getWatchRowsLatest,
@@ -1452,13 +1454,28 @@ async function handleSnapshotsList(env: Env): Promise<Response> {
 
 /** MC% time series for charts: fleet (etic_snapshots), unit (Asset Manager label), MEL key, mgmt code, or MEL unit column. */
 async function handleMcSeriesApi(env: Env, url: URL): Promise<Response> {
-  const from = url.searchParams.get("from") || "";
-  const to = url.searchParams.get("to") || "";
+  let from = url.searchParams.get("from") || "";
+  let to = url.searchParams.get("to") || "";
   const mode = (url.searchParams.get("mode") || "fleet").toLowerCase();
   const key = (url.searchParams.get("key") || "").trim();
 
   if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) {
-    return Response.json({ error: "Invalid from/to (use YYYY-MM-DD)" }, { status: 400, headers: cacheHeaders() });
+    const span = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT date_key FROM etic_snapshots
+       WHERE deleted_at_iso IS NULL
+       ORDER BY date_key DESC
+       LIMIT 90`,
+    ).all<{ date_key: string }>();
+    const keys = (span.results ?? []).map((r) => (r.date_key ?? "").trim()).filter(Boolean);
+    if (!keys.length) {
+      return Response.json(
+        { mode, points: [], note: "No ETIC snapshots in range; chart dates were empty." },
+        { headers: cacheHeaders() },
+      );
+    }
+    const asc = keys.slice().sort();
+    from = asc[0]!;
+    to = asc[asc.length - 1]!;
   }
   if (from > to) {
     return Response.json({ error: "from must be <= to" }, { status: 400, headers: cacheHeaders() });
@@ -1634,10 +1651,25 @@ async function handleMcSeriesApi(env: Env, url: URL): Promise<Response> {
 
 /** Distinct slicer values for MC chart (union across snapshots in [from, to]). */
 async function handleMcSeriesDimensionsApi(env: Env, url: URL): Promise<Response> {
-  const from = url.searchParams.get("from") || "";
-  const to = url.searchParams.get("to") || "";
+  let from = url.searchParams.get("from") || "";
+  let to = url.searchParams.get("to") || "";
   if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) {
-    return Response.json({ error: "Invalid from/to (YYYY-MM-DD)" }, { status: 400, headers: cacheHeaders() });
+    const span = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT date_key FROM etic_snapshots
+       WHERE deleted_at_iso IS NULL
+       ORDER BY date_key DESC
+       LIMIT 90`,
+    ).all<{ date_key: string }>();
+    const keys = (span.results ?? []).map((r) => (r.date_key ?? "").trim()).filter(Boolean);
+    if (!keys.length) {
+      return Response.json(
+        { melKeys: [], melUnits: [], mgmtNames: [], amRows: [], note: "No snapshots" },
+        { headers: cacheHeaders() },
+      );
+    }
+    const asc = keys.slice().sort();
+    from = asc[0]!;
+    to = asc[asc.length - 1]!;
   }
   if (from > to) {
     return Response.json({ error: "from must be <= to" }, { status: 400, headers: cacheHeaders() });
@@ -4844,7 +4876,7 @@ async function handleScheduleMxApi(env: Env, request: Request): Promise<Response
   if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) {
     return Response.json(
       {
-        error: "No Schedule Mx import for that date. Send a CSV or XLSX to prevmx@2t3.app, or pass date=YYYY-MM-DD.",
+        error: "No schedule maintenance import for that date.",
         dateKey: null,
         stats: null,
         rows: [],
@@ -4866,20 +4898,11 @@ async function handleScheduleMxApi(env: Env, request: Request): Promise<Response
       { status: 404, headers: cacheHeaders() },
     );
   }
-  const distinctAssets = new Set(rows.map((r) => r.assetId)).size;
-  const stats = {
-    planRows: rows.length,
-    distinctAssets,
-    assets: distinctAssets,
-    missing: rows.filter((r) => r.scheduleMxBucket === "missing").length,
-    noDue: rows.filter((r) => r.scheduleMxBucket === "no_due").length,
-    overdue: rows.filter((r) => r.scheduleMxBucket === "overdue").length,
-    dueSoon: rows.filter((r) => r.scheduleMxBucket === "due_soon").length,
-    ok: rows.filter((r) => r.scheduleMxBucket === "ok").length,
-    nceCritical: rows.filter((r) => r.scheduleMxNceCritical).length,
-  };
+  const stats = computeScheduleMxAssetStats(rows);
+  const commander = computeScheduleMxCommanderSummary(rows);
+  const eticDateKey = rows.length ? rows[0].eticSnapshotDateKey ?? null : null;
   return Response.json(
-    { dateKey, stats, rows, source: "prevmx_extract" },
+    { dateKey, eticDateKey, stats, commander, rows, source: "prevmx_extract" },
     { headers: cacheHeaders() },
   );
 }
@@ -13896,57 +13919,482 @@ function renderDashboardHtml(): string {
       position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
       clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
     }
-    .smx-header {
-      display: flex; justify-content: space-between; align-items: flex-start; gap: 16px;
-      flex-wrap: wrap; margin-bottom: 16px;
+    /* Commander summary (wing / unit scheduled maintenance compliance) */
+    .smx-commander-wrap {
+      margin-bottom: 20px;
+      padding: 16px 18px 18px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      box-shadow: 0 1px 0 rgba(15, 30, 60, 0.04);
     }
-    .smx-title { margin: 0 0 6px; font-size: 1.35rem; }
-    .smx-sub { margin: 0; color: var(--muted); font-size: 0.9rem; line-height: 1.45; max-width: 860px; }
+    .smx-commander-head {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px 16px;
+      margin-bottom: 14px;
+    }
+    .smx-commander-title {
+      margin: 0 0 4px;
+      font-size: 1.08rem;
+      font-weight: 800;
+      color: var(--text);
+      letter-spacing: -0.02em;
+    }
+    .smx-commander-sub {
+      margin: 0;
+      font-size: 0.78rem;
+      color: var(--muted);
+      line-height: 1.4;
+      max-width: 720px;
+    }
+    .smx-commander-actions { flex-shrink: 0; }
+    .smx-btn-outlook {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 14px;
+      font-size: 0.78rem;
+      font-weight: 700;
+      border-radius: 10px;
+      border: 1px solid rgba(0, 58, 140, 0.35);
+      background: linear-gradient(180deg, rgba(0, 58, 140, 0.12) 0%, rgba(0, 58, 140, 0.06) 100%);
+      color: var(--accent-strong);
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .smx-btn-outlook:hover { filter: brightness(1.05); }
+    .smx-btn-outlook--sm {
+      padding: 5px 10px;
+      font-size: 0.68rem;
+      border-radius: 8px;
+    }
+    .smx-commander-kpis {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .smx-cmd-kpi {
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      min-width: 0;
+    }
+    .smx-cmd-kpi .lbl {
+      display: block;
+      font-size: 0.55rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .smx-cmd-kpi .v {
+      font-size: 1.15rem;
+      font-weight: 800;
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
+      line-height: 1.15;
+    }
+    .smx-cmd-kpi.good .v { color: var(--success); }
+    .smx-cmd-kpi.warn .v { color: var(--warn); }
+    .smx-cmd-kpi.bad .v { color: var(--danger); }
+    .smx-cmd-kpi.crit .v { color: #7a1020; }
+    .smx-commander-filter-hint {
+      margin: 0 0 10px;
+      font-size: 0.76rem;
+      color: var(--muted);
+    }
+    .smx-commander-table-scroll {
+      overflow-x: auto;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+    }
+    .smx-commander-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.8rem;
+    }
+    .smx-commander-table th,
+    .smx-commander-table td {
+      padding: 10px 12px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+    }
+    .smx-commander-table th {
+      font-size: 0.58rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      background: var(--bg1);
+    }
+    .smx-commander-table tbody tr:last-child td { border-bottom: none; }
+    .smx-commander-table .smx-cmd-num {
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+    .smx-commander-table .smx-cmd-mail-col { width: 1%; white-space: nowrap; }
+    .smx-commander-table tbody tr.smx-cmd-row--ok { background: rgba(34, 160, 90, 0.06); }
+    .smx-commander-table tbody tr.smx-cmd-row--warn { background: rgba(245, 199, 84, 0.12); }
+    .smx-commander-table tbody tr.smx-cmd-row--bad { background: rgba(176, 0, 32, 0.07); }
+    .smx-commander-table tbody tr.smx-cmd-row--active {
+      outline: 2px solid var(--accent);
+      outline-offset: -2px;
+    }
+    .smx-cmd-unit-btn {
+      display: inline;
+      padding: 0;
+      margin: 0;
+      border: none;
+      background: none;
+      font: inherit;
+      font-weight: 700;
+      color: var(--accent);
+      cursor: pointer;
+      text-align: left;
+      text-decoration: underline;
+      text-underline-offset: 2px;
+    }
+    .smx-cmd-unit-btn:hover { color: var(--accent-strong); }
+    .smx-cmd-pct {
+      display: inline-flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      width: 100%;
+    }
+    .smx-cmd-pct-bar {
+      flex: 1;
+      max-width: 72px;
+      height: 6px;
+      border-radius: 999px;
+      background: var(--border);
+      overflow: hidden;
+    }
+    .smx-cmd-pct-bar > i {
+      display: block;
+      height: 100%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, var(--success) 0%, #1a9a52 100%);
+      max-width: 100%;
+    }
+    .smx-cmd-pct-bar.warn > i {
+      background: linear-gradient(90deg, var(--warn) 0%, #c98a00 100%);
+    }
+    .smx-cmd-pct-bar.bad > i {
+      background: linear-gradient(90deg, var(--danger) 0%, #8b1538 100%);
+    }
+
+    /* Schedule Mx tab — same split-pane rhythm as Work Orders */
+    .smx-layout .smx-panel-heading { margin-bottom: 10px; }
+    .smx-panel-title { margin: 0 0 4px; font-size: 1.05rem; font-weight: 700; color: var(--text); }
+    .smx-date-field { display: block; margin-bottom: 12px; }
+    .smx-date-field .wo-refine-sel { width: 100%; }
+    .smx-refine-one {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+      padding: 4px 0 10px;
+    }
     .nce-inline { font-weight: 800; color: var(--accent); }
-    .smx-asof-pill {
-      font-size: 0.72rem; font-weight: 700; padding: 6px 12px; border-radius: 999px;
-      background: rgba(0,58,140,0.12); color: var(--accent); border: 1px solid rgba(0,58,140,0.3);
+    .smx-stats {
+      display: flex; flex-wrap: wrap; gap: 8px 10px;
+      margin-bottom: 12px;
     }
-    .smx-stats { display: flex; flex-wrap: wrap; gap: 10px 14px; margin-bottom: 14px; }
     .smx-stat {
       background: var(--card); border: 1px solid var(--border); border-radius: 10px;
-      padding: 10px 14px; min-width: 118px;
+      padding: 8px 12px; min-width: 96px;
     }
-    .smx-stat .lbl { display: block; font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
-    .smx-stat .v { font-size: 1.28rem; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.2; }
+    .smx-stat .lbl { display: block; font-size: 0.58rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+    .smx-stat .v { font-size: 1.05rem; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.2; }
     .smx-stat.bad .v { color: var(--danger); }
     .smx-stat.warn .v { color: var(--warn); }
     .smx-stat.crit .v { color: #7a1020; }
-    .smx-toolbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 12px; }
-    .smx-search input {
-      min-width: 220px; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border);
-      background: var(--bg); font: inherit;
+    .smx-n { font-variant-numeric: tabular-nums; }
+    .smx-card {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 12px 14px 12px 18px;
+      border-radius: 12px;
+      border: 1px solid transparent;
+      background: transparent;
+      cursor: pointer;
+      transition: background 0.12s ease, border-color 0.12s ease;
+      text-align: left;
+      font-family: var(--font);
     }
-    .smx-filters { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-    .smx-filter-btn {
-      padding: 6px 12px; border-radius: 999px; border: 1px solid var(--border);
-      background: var(--bg1); font: inherit; font-size: 0.82rem; cursor: pointer;
+    .smx-card::before {
+      content: "";
+      position: absolute;
+      left: 6px;
+      top: 14px;
+      bottom: 14px;
+      width: 2px;
+      border-radius: 2px;
+      background: transparent;
+      transition: background 0.15s ease;
     }
-    .smx-filter-btn.active {
-      border-color: var(--accent); background: rgba(0,58,140,0.08); color: var(--accent); font-weight: 700;
+    .smx-card[data-smx-tier="nce_crit"]::before { background: #8b1538; }
+    .smx-card[data-smx-tier="overdue"]::before { background: var(--danger); }
+    .smx-card[data-smx-tier="due_soon"]::before { background: var(--warn); }
+    .smx-card[data-smx-tier="missing"]::before { background: var(--warn); }
+    .smx-card[data-smx-tier="ok"]::before { background: var(--success); }
+    .smx-card[data-smx-tier="no_due"]::before { background: var(--subtle); }
+    .smx-card:hover { background: var(--bg1); border-color: var(--border); }
+    .smx-card.active {
+      background: var(--accent-soft);
+      border-color: rgba(0,58,140,0.4);
     }
-    .smx-n { opacity: 0.8; font-weight: 600; margin-left: 4px; font-variant-numeric: tabular-nums; }
-    .smx-table-wrap {
-      overflow: auto; border: 1px solid var(--border); border-radius: 10px;
-      max-height: min(70vh, 720px);
+    .smx-card .top-line {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
     }
-    .smx-table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
-    .smx-table th {
-      text-align: left; padding: 10px 12px; background: var(--bg2); position: sticky; top: 0; z-index: 1;
-      font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted);
+    .smx-card .smx-card-title {
+      font-size: 0.88rem;
+      font-weight: 600;
+      color: var(--text);
+      line-height: 1.3;
+      min-width: 0;
     }
-    .smx-table td { padding: 10px 12px; border-top: 1px solid var(--border); vertical-align: top; }
-    .smx-table tr.smx-row-nce-crit td { box-shadow: inset 3px 0 0 #8b1538; }
-    .smx-table tr.smx-row-nce-crit { background: rgba(176,0,32,0.09); }
-    .smx-table tr.smx-row-overdue { background: rgba(176,0,32,0.04); }
-    .smx-table .asset-mono { font-family: var(--font-mono); font-weight: 700; }
+    .smx-card .badges { display: inline-flex; gap: 6px; align-items: center; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
+    .smx-card .badges .smx-chip-btn {
+      margin: 0;
+      padding: 2px 8px;
+      border: none;
+      border-radius: 999px;
+      font: inherit;
+      font-size: 0.62rem;
+      font-weight: 700;
+      line-height: 1.2;
+      cursor: pointer;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      background: rgba(139, 21, 56, 0.18);
+      color: #7a1020;
+      box-shadow: inset 0 0 0 1px rgba(139, 21, 56, 0.25);
+    }
+    .smx-card .badges .smx-chip-btn:hover { filter: brightness(1.06); }
+    .smx-card .badges .smx-chip-btn:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    .smx-plan-block .badges .smx-chip-btn {
+      margin: 0;
+      padding: 2px 8px;
+      border: none;
+      border-radius: 999px;
+      font: inherit;
+      font-size: 0.62rem;
+      font-weight: 700;
+      cursor: pointer;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      background: rgba(255, 138, 138, 0.14);
+      color: var(--danger);
+    }
+    .smx-plan-block .badges .smx-chip-btn:hover { filter: brightness(1.05); }
+    .smx-plan-block .badges .smx-chip-btn:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    .smx-card .asset-mono {
+      font-family: var(--font-mono);
+      font-size: 0.92rem;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .smx-card .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 14px;
+      font-size: 0.74rem;
+      color: var(--text-dim);
+      font-variant-numeric: tabular-nums;
+    }
+    .smx-card .meta .k { color: var(--muted); font-weight: 500; margin-right: 4px; }
+    .smx-card .meta .v { font-weight: 500; color: var(--text); }
+    .smx-card .meta .v.danger { color: var(--danger); font-weight: 600; }
+    .smx-plan-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+    .smx-plan-block {
+      margin: 0;
+      padding: 0 0 18px;
+      border-bottom: 1px solid var(--border);
+    }
+    .smx-plan-block:last-child {
+      border-bottom: none;
+      padding-bottom: 0;
+    }
+    .smx-plan-block-title {
+      margin: 0 0 12px;
+      font-size: 0.95rem;
+      font-weight: 700;
+      color: var(--text);
+      line-height: 1.35;
+    }
+    .smx-plan-block-title .smx-plan-sub {
+      display: block;
+      font-size: 0.72rem;
+      font-weight: 500;
+      color: var(--muted);
+      margin-top: 4px;
+    }
+    .smx-plan-facts.wo-facts {
+      gap: 12px;
+      padding: 10px 12px;
+    }
+    .smx-plan-facts .wo-facts-group-h {
+      margin: 0 0 6px;
+      font-size: 0.58rem;
+      letter-spacing: 0.07em;
+    }
+    .smx-plan-facts .wo-facts-dl {
+      gap: 8px 14px;
+    }
+    .smx-plan-facts .wo-facts-pair dt {
+      font-size: 0.55rem;
+      margin: 0 0 2px;
+    }
+    .smx-plan-facts .wo-facts-pair dd {
+      font-size: 0.82rem;
+      line-height: 1.3;
+    }
+    .smx-plain-callout {
+      margin: 0 0 10px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      background: rgba(0,58,140,0.06);
+      border: 1px solid rgba(0,58,140,0.15);
+      font-size: 0.86rem;
+      line-height: 1.45;
+      color: var(--text);
+    }
+    .smx-plain-callout--compact {
+      margin: 0 0 8px;
+      padding: 8px 10px;
+      font-size: 0.78rem;
+      line-height: 1.35;
+    }
+    .smx-plain-callout--warn {
+      background: rgba(176,0,32,0.06);
+      border-color: rgba(176,0,32,0.2);
+    }
+    .smx-plain-lead {
+      margin: 8px 0 0;
+      font-size: 0.76rem;
+      color: var(--text);
+    }
+    .smx-plain-lead--warn { color: var(--danger); font-weight: 600; }
+    .smx-util-metrics {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 6px 8px;
+    }
+    @media (max-width: 520px) {
+      .smx-util-metrics { grid-template-columns: 1fr; }
+    }
+    .smx-util-metric {
+      min-width: 0;
+      padding: 6px 8px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+    .smx-util-m-lbl {
+      display: block;
+      font-size: 0.55rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      margin-bottom: 2px;
+    }
+    .smx-util-m-val {
+      display: block;
+      font-size: 0.8rem;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
+      line-height: 1.25;
+    }
+    .smx-plain-callout .smx-util-progress-wrap {
+      margin-top: 8px;
+    }
+    .smx-plain-callout .smx-util-progress-label {
+      font-size: 0.68rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .smx-util-progress {
+      height: 6px;
+      border-radius: 999px;
+      background: var(--border);
+      overflow: hidden;
+    }
+    .smx-util-progress > i {
+      display: block;
+      height: 100%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, var(--accent) 0%, var(--accent-strong) 100%);
+      max-width: 100%;
+    }
+    .smx-util-progress.warn > i { background: linear-gradient(90deg, var(--warn) 0%, #c98a00 100%); }
+    .smx-util-progress.danger > i { background: linear-gradient(90deg, var(--danger) 0%, #8b1538 100%); }
+    .smx-plan-identity {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
+      gap: 10px 18px;
+      margin: 0 0 14px;
+      padding: 12px 14px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      font-size: 0.78rem;
+    }
+    .smx-plan-identity .smx-id-pair { min-width: 0; }
+    .smx-plan-identity .smx-id-lbl {
+      display: block;
+      font-size: 0.58rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      color: var(--muted);
+      margin-bottom: 3px;
+    }
+    .smx-plan-identity .smx-id-val {
+      font-size: 0.88rem;
+      font-weight: 600;
+      color: var(--text);
+      line-height: 1.35;
+      word-break: break-word;
+    }
+    .smx-plan-identity a.wo-id,
+    .smx-wo-inline a.wo-id {
+      font-family: var(--font-mono);
+      font-weight: 600;
+      color: var(--accent);
+      text-decoration: none;
+    }
+    .smx-plan-identity a.wo-id:hover,
+    .smx-wo-inline a.wo-id:hover { text-decoration: underline; }
+    .smx-wo-inline { display: inline; }
     .smx-pill {
-      display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 0.72rem; font-weight: 700;
+      display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.62rem; font-weight: 700;
       text-transform: uppercase; letter-spacing: 0.04em;
     }
     .smx-pill.overdue { background: rgba(176,0,32,0.16); color: var(--danger); }
@@ -14400,43 +14848,86 @@ function renderDashboardHtml(): string {
       </div>
 
       <div id="panel-schedule-mx" class="hidden">
-        <div class="smx-header">
-          <div>
-            <h2 class="smx-title">Schedule Maintenance Status</h2>
-            <p class="smx-sub">Each row is one <strong>maintenance plan</strong> per asset from the <strong>ELMS extract</strong> (email <code>prevmx@2t3.app</code>). Due/overdue uses <strong>next maint date</strong> and <strong>current meter</strong> vs <strong>next util qty</strong> when those columns exist. Same import date as Work Orders is only used for optional open WO counts. Sub work order tie-in (Plan ID) comes later.</p>
+        <div id="smx-commander-wrap" class="smx-commander-wrap hidden" aria-label="Wing maintenance status">
+          <div class="smx-commander-head">
+            <div class="smx-commander-titles">
+              <h2 class="smx-commander-title" id="smx-commander-title">Wing maintenance status</h2>
+              <p class="smx-commander-sub" id="smx-commander-sub"></p>
+            </div>
+            <div class="smx-commander-actions">
+              <button type="button" class="btn smx-btn-outlook" id="smx-commander-mail-wing" title="Open Outlook with a pre-filled commander summary">
+                RTS Outlook — wing summary
+              </button>
+            </div>
           </div>
-          <span class="smx-asof-pill" id="smx-asof-pill" title="Latest prevmx import date">Latest import</span>
-          <label class="smx-search" style="margin-left:10px"><span class="sr-only">Import date</span>
-            <select id="smx-date-select" aria-label="Schedule Mx import date"></select>
-          </label>
-        </div>
-        <div class="smx-stats" id="smx-stats" role="status">Loading…</div>
-        <div class="smx-toolbar">
-          <label class="smx-search"><span class="sr-only">Filter rows</span>
-            <input type="text" id="smx-query" placeholder="Filter asset, plan, location…" autocomplete="off" />
-          </label>
-          <div class="smx-filters" id="smx-filters" role="tablist" aria-label="Schedule maintenance filters">
-            <button type="button" class="smx-filter-btn active" data-smx-filter="all">All <span class="smx-n" data-smx-c="all">0</span></button>
-            <button type="button" class="smx-filter-btn" data-smx-filter="nce_critical"><span class="nce-inline">NCE</span> overdue <span class="smx-n" data-smx-c="nce_critical">0</span></button>
-            <button type="button" class="smx-filter-btn" data-smx-filter="overdue">Overdue <span class="smx-n" data-smx-c="overdue">0</span></button>
-            <button type="button" class="smx-filter-btn" data-smx-filter="due_soon">Due soon <span class="smx-n" data-smx-c="due_soon">0</span></button>
-            <button type="button" class="smx-filter-btn" data-smx-filter="missing">Missing data <span class="smx-n" data-smx-c="missing">0</span></button>
+          <div class="smx-commander-kpis" id="smx-commander-kpis"></div>
+          <p class="smx-commander-filter-hint hidden" id="smx-commander-filter-hint">
+            <span id="smx-commander-filter-label"></span>
+            <button type="button" class="linkish" id="smx-commander-clear-unit">Clear unit filter</button>
+          </p>
+          <div class="smx-commander-table-scroll">
+            <table class="smx-commander-table" id="smx-commander-table" aria-label="Scheduled maintenance by unit">
+              <thead>
+                <tr>
+                  <th scope="col">Unit</th>
+                  <th scope="col" class="smx-cmd-num">Total</th>
+                  <th scope="col" class="smx-cmd-num">Not overdue</th>
+                  <th scope="col" class="smx-cmd-num">% OK</th>
+                  <th scope="col" class="smx-cmd-num">Overdue</th>
+                  <th scope="col" class="smx-cmd-num">NCE od</th>
+                  <th scope="col" class="smx-cmd-mail-col">RTS</th>
+                </tr>
+              </thead>
+              <tbody id="smx-commander-tbody"></tbody>
+            </table>
           </div>
         </div>
-        <div class="smx-table-wrap">
-          <table class="smx-table" aria-label="Schedule maintenance by plan">
-            <thead>
-              <tr>
-                <th>Asset / plan</th>
-                <th>Last / next</th>
-                <th>Utilization</th>
-                <th>NCE</th>
-                <th>Status</th>
-                <th>State</th>
-              </tr>
-            </thead>
-            <tbody id="smx-tbody"><tr><td colspan="6">Loading…</td></tr></tbody>
-          </table>
+        <div class="wo-layout smx-layout">
+          <aside class="wo-sidebar">
+            <div class="smx-panel-heading">
+              <h2 class="smx-panel-title">Schedule maintenance</h2>
+            </div>
+            <label class="smx-date-field">
+              <span class="sr-only">Import date</span>
+              <select id="smx-date-select" class="wo-refine-sel" aria-label="Schedule Mx import date"></select>
+            </label>
+            <div class="smx-stats" id="smx-stats" role="status">Loading…</div>
+            <div class="wo-searchbar">
+              <input type="text" id="smx-query" placeholder="Search asset, plan, location…" autocomplete="off" aria-label="Search schedule maintenance by asset or plan" />
+              <span class="wo-asof-pill" id="smx-asof-pill" title="Import date">—</span>
+            </div>
+            <div class="wo-filters" id="smx-filters" role="tablist" aria-label="Schedule maintenance filters">
+              <button type="button" class="wo-filter-btn active" data-smx-filter="all">All <span class="count smx-n" data-smx-c="all">0</span></button>
+              <button type="button" class="wo-filter-btn" data-smx-filter="nce_critical"><span class="nce-inline">NCE</span> overdue <span class="count smx-n" data-smx-c="nce_critical">0</span></button>
+              <button type="button" class="wo-filter-btn" data-smx-filter="overdue">Overdue <span class="count smx-n" data-smx-c="overdue">0</span></button>
+              <button type="button" class="wo-filter-btn" data-smx-filter="due_soon">Due soon <span class="count smx-n" data-smx-c="due_soon">0</span></button>
+              <button type="button" class="wo-filter-btn" data-smx-filter="missing">Missing <span class="count smx-n" data-smx-c="missing">0</span></button>
+            </div>
+            <div class="smx-refine-one">
+              <select id="smx-sort" class="wo-refine-sel" aria-label="Sort assets">
+                <option value="priority">Sort: Priority (worst first)</option>
+                <option value="asset">Sort: Asset ID</option>
+                <option value="plan">Sort: First plan name</option>
+                <option value="next">Sort: Earliest next maint</option>
+                <option value="next_desc">Sort: Latest next maint</option>
+                <option value="wo">Sort: Open WOs</option>
+              </select>
+            </div>
+            <div class="wo-list-meta" id="smx-list-meta">Loading…</div>
+            <div class="wo-list" id="smx-list"></div>
+          </aside>
+          <section class="wo-detail-pane">
+            <div id="smx-detail-empty" class="wo-empty">Select an asset to see maintenance plans.</div>
+            <div id="smx-detail" class="hidden wo-detail-inner">
+              <section class="wo-detail-overview" aria-label="Asset schedule maintenance summary">
+                <div class="wo-hero" id="smx-hero"></div>
+              </section>
+              <section class="wo-detail-block" aria-labelledby="smx-facts-heading">
+                <h3 class="wo-detail-block-title" id="smx-facts-heading">Maintenance plans</h3>
+                <div id="smx-plans-wrap"></div>
+              </section>
+            </div>
+          </section>
         </div>
       </div>
 
@@ -17427,19 +17918,553 @@ function renderDashboardHtml(): string {
 
     var smxRows = [];
     var smxStats = null;
+    /** Latest ETIC workbook date used for unit / NCE / open WO enrichment (YYYY-MM-DD). */
+    var smxEticDateKey = null;
     var smxFilter = "all";
+
+    function smxSetFilter(mode) {
+      smxFilter = mode || "all";
+      var smxFilt = document.getElementById("smx-filters");
+      if (smxFilt) {
+        smxFilt.querySelectorAll(".wo-filter-btn").forEach(function (x) {
+          var k = x.getAttribute("data-smx-filter") || "";
+          x.classList.toggle("active", k === smxFilter);
+        });
+      }
+      renderScheduleMxList();
+    }
+    var smxSort = "priority";
+    /** Selected asset id for list + detail (matches row.assetId). */
+    var smxSelectedAssetId = "";
     /** Selected prevmx import date (YYYY-MM-DD); null = use latest from server. */
     var smxSelectedDateKey = null;
+    /** Wing commander summary from API + optional unit filter for asset list. */
+    var smxCommander = null;
+    var smxCommanderFilterUnit = "";
+
+    function smxFmtPct2(n) {
+      var x = Number(n);
+      if (!Number.isFinite(x)) return "0.00";
+      return x.toFixed(2);
+    }
+
+    function smxCommanderReportTitle() {
+      return "Biweekly Scheduled Maintenance Commander Summary (Including NCE)";
+    }
+
+    function smxMailtoUrl(subject, body) {
+      return "mailto:?subject=" + encodeURIComponent(subject) + "&body=" + encodeURIComponent(body);
+    }
+
+    function smxCommanderPlainTableRow(cells) {
+      return cells.join("\t");
+    }
+
+    function smxCommanderEmailBodyWing(cmd, importKey, eticKey) {
+      var w = cmd.wing;
+      var lines = [];
+      lines.push(smxCommanderReportTitle());
+      lines.push("");
+      lines.push("Scheduled maintenance import: " + (importKey ? fmtKeyLong(importKey) : "—"));
+      lines.push("Fleet book (ETIC) context: " + (eticKey ? fmtKeyLong(eticKey) : "—"));
+      lines.push("");
+      lines.push("Wing totals — Total vehicles: " + w.totalVehicles + " · Not overdue: " + w.notOverdue + " · % not overdue: " + smxFmtPct2(w.pctNotOverdue) + "% · Overdue: " + w.overdue + " · NCE overdue: " + w.nceOverdue);
+      lines.push("");
+      lines.push(smxCommanderPlainTableRow(["Unit", "Total vehicles", "Not overdue", "% Not overdue", "Overdue", "NCE overdue"]));
+      var units = cmd.units || [];
+      for (var i = 0; i < units.length; i++) {
+        var u = units[i];
+        lines.push(
+          smxCommanderPlainTableRow([
+            u.unit,
+            String(u.totalVehicles),
+            String(u.notOverdue),
+            smxFmtPct2(u.pctNotOverdue),
+            String(u.overdue),
+            String(u.nceOverdue),
+          ]),
+        );
+      }
+      lines.push("");
+      lines.push("— Sent from ETIC dashboard (Schedule maintenance)");
+      return lines.join("\r\n");
+    }
+
+    function smxCommanderEmailBodyUnit(row, importKey, eticKey) {
+      var lines = [];
+      lines.push(smxCommanderReportTitle());
+      lines.push("");
+      lines.push("Scheduled maintenance import: " + (importKey ? fmtKeyLong(importKey) : "—"));
+      lines.push("Fleet book (ETIC) context: " + (eticKey ? fmtKeyLong(eticKey) : "—"));
+      lines.push("");
+      lines.push("Unit: " + row.unit);
+      lines.push("");
+      lines.push(smxCommanderPlainTableRow(["Unit", "Total vehicles", "Not overdue", "% Not overdue", "Overdue", "NCE overdue"]));
+      lines.push(
+        smxCommanderPlainTableRow([
+          row.unit,
+          String(row.totalVehicles),
+          String(row.notOverdue),
+          smxFmtPct2(row.pctNotOverdue),
+          String(row.overdue),
+          String(row.nceOverdue),
+        ]),
+      );
+      lines.push("");
+      lines.push("— Sent from ETIC dashboard (Schedule maintenance)");
+      return lines.join("\r\n");
+    }
+
+    function renderSmxCommander() {
+      var wrap = document.getElementById("smx-commander-wrap");
+      var sub = document.getElementById("smx-commander-sub");
+      var kpis = document.getElementById("smx-commander-kpis");
+      var tbody = document.getElementById("smx-commander-tbody");
+      var hint = document.getElementById("smx-commander-filter-hint");
+      var hintLbl = document.getElementById("smx-commander-filter-label");
+      if (!wrap || !kpis || !tbody) return;
+      if (!smxCommander || !smxRows.length) {
+        wrap.classList.add("hidden");
+        return;
+      }
+      wrap.classList.remove("hidden");
+      var dk = smxSelectedDateKey || "";
+      var ek = smxEticDateKey || "";
+      if (sub) {
+        sub.textContent =
+          "Rollup by owning unit from this maintenance import. Each vehicle counts once (worst plan by raw ELMS/extract status — not the open-WO triage waiver). Import " +
+          (dk ? fmtKeyLong(dk) : "—") +
+          " · Fleet book " +
+          (ek ? fmtKeyLong(ek) : "—") +
+          ".";
+      }
+      var w = smxCommander.wing;
+      kpis.innerHTML =
+        "<div class='smx-cmd-kpi'><span class='lbl'>Total vehicles</span><span class='v'>" +
+        esc(String(w.totalVehicles)) +
+        "</span></div>" +
+        "<div class='smx-cmd-kpi good'><span class='lbl'>Not overdue</span><span class='v'>" +
+        esc(String(w.notOverdue)) +
+        "</span></div>" +
+        "<div class='smx-cmd-kpi good'><span class='lbl'>Wing % OK</span><span class='v'>" +
+        esc(smxFmtPct2(w.pctNotOverdue)) +
+        "%</span></div>" +
+        "<div class='smx-cmd-kpi " +
+        (w.overdue > 0 ? "bad" : "") +
+        "'><span class='lbl'>Overdue</span><span class='v'>" +
+        esc(String(w.overdue)) +
+        "</span></div>" +
+        "<div class='smx-cmd-kpi " +
+        (w.nceOverdue > 0 ? "crit" : "") +
+        "'><span class='lbl'>NCE overdue</span><span class='v'>" +
+        esc(String(w.nceOverdue)) +
+        "</span></div>";
+      var units = smxCommander.units || [];
+      tbody.innerHTML = units
+        .map(function (u) {
+          var pct = u.pctNotOverdue;
+          var rowCls = "smx-cmd-row--ok";
+          if (u.nceOverdue > 0) rowCls = "smx-cmd-row--bad";
+          else if (u.overdue > 0) rowCls = "smx-cmd-row--warn";
+          if (smxCommanderFilterUnit && smxCommanderFilterUnit === u.unit) rowCls += " smx-cmd-row--active";
+          var barCls = "smx-cmd-pct-bar";
+          if (pct < 85) barCls += " bad";
+          else if (pct < 100) barCls += " warn";
+          return (
+            "<tr class='" +
+            esc(rowCls) +
+            "' data-smx-cmd-unit='" +
+            esc(u.unit) +
+            "'>" +
+            "<td><button type='button' class='smx-cmd-unit-btn' data-smx-cmd-unit='" +
+            esc(u.unit) +
+            "' title='Filter asset list to this unit'>" +
+            esc(u.unit) +
+            "</button></td>" +
+            "<td class='smx-cmd-num'>" +
+            esc(String(u.totalVehicles)) +
+            "</td>" +
+            "<td class='smx-cmd-num'>" +
+            esc(String(u.notOverdue)) +
+            "</td>" +
+            "<td class='smx-cmd-num'><span class='smx-cmd-pct'><span class='" +
+            esc(barCls) +
+            "'><i style='width:" +
+            esc(String(Math.min(100, Math.max(0, pct)))) +
+            "%'></i></span>" +
+            esc(smxFmtPct2(pct)) +
+            "%</span></td>" +
+            "<td class='smx-cmd-num'>" +
+            esc(String(u.overdue)) +
+            "</td>" +
+            "<td class='smx-cmd-num'>" +
+            esc(String(u.nceOverdue)) +
+            "</td>" +
+            "<td class='smx-cmd-mail-col'><button type='button' class='btn smx-btn-outlook smx-btn-outlook--sm smx-cmd-mail-unit' data-smx-mail-unit='" +
+            esc(u.unit) +
+            "'>RTS Outlook</button></td>" +
+            "</tr>"
+          );
+        })
+        .join("");
+      if (hint && hintLbl) {
+        if (smxCommanderFilterUnit) {
+          hint.classList.remove("hidden");
+          hintLbl.textContent = "Asset list filtered to unit " + smxCommanderFilterUnit + ". ";
+        } else {
+          hint.classList.add("hidden");
+          hintLbl.textContent = "";
+        }
+      }
+    }
+
+    function smxNormUnitFromRow(row) {
+      var u = (row && row.owningUnit ? String(row.owningUnit) : "").trim();
+      return u || "(Unknown unit)";
+    }
+
+    function smxEffBucket(row) {
+      return row.scheduleMxPlanEffectiveBucket || row.scheduleMxBucket || "ok";
+    }
+
+    function smxPlanRank(row) {
+      if (row.scheduleMxPlanEffectiveNceCritical) return 0;
+      var b = smxEffBucket(row);
+      if (b === "overdue") return 1;
+      if (b === "due_soon") return 2;
+      if (b === "missing") return 3;
+      return 4;
+    }
+
+    function smxCardTierFromRank(rk) {
+      if (rk === 0) return "nce_crit";
+      if (rk === 1) return "overdue";
+      if (rk === 2) return "due_soon";
+      if (rk === 3) return "missing";
+      return "ok";
+    }
+
+    function smxCardTierForPlans(plans) {
+      var best = 4;
+      for (var i = 0; i < plans.length; i++) {
+        var r = smxPlanRank(plans[i]);
+        if (r < best) best = r;
+      }
+      return smxCardTierFromRank(best);
+    }
+
+    function smxNextKey(row) {
+      return row.elmsNextMaintDateIso || row.scheduleMxDueIso || "9999-99-99";
+    }
+
+    function smxFilteredPlanRows() {
+      const qel = document.getElementById("smx-query");
+      const q = (qel && qel.value) ? qel.value.trim() : "";
+      return smxRows.filter(function (row) {
+        if (smxCommanderFilterUnit && smxNormUnitFromRow(row) !== smxCommanderFilterUnit) return false;
+        return smxMatchesFilter(row, smxFilter) && smxMatchesQuery(row, q);
+      });
+    }
+
+    /** assetId -> plan rows (only rows passing current filter + query). */
+    function smxPlansByAsset() {
+      const m = new Map();
+      const filtered = smxFilteredPlanRows();
+      for (var i = 0; i < filtered.length; i++) {
+        var row = filtered[i];
+        var aid = String(row.assetId || "").trim() || "—";
+        if (!m.has(aid)) m.set(aid, []);
+        m.get(aid).push(row);
+      }
+      return m;
+    }
+
+    function smxSortPlansForAsset(plans) {
+      const out = plans.slice();
+      out.sort(function (a, b) {
+        var ra = smxPlanRank(a);
+        var rb = smxPlanRank(b);
+        if (ra !== rb) return ra - rb;
+        var na = smxNextKey(a);
+        var nb = smxNextKey(b);
+        if (na !== nb) return na < nb ? -1 : 1;
+        return (a.planRowKey || "").localeCompare(b.planRowKey || "");
+      });
+      return out;
+    }
+
+    function smxSortedAssetIds(byAsset) {
+      const sortSel = document.getElementById("smx-sort");
+      const mode = (sortSel && sortSel.value) ? sortSel.value : smxSort;
+      const ids = Array.from(byAsset.keys());
+      function aggWorstRank(plans) {
+        var best = 4;
+        for (var i = 0; i < plans.length; i++) {
+          var r = smxPlanRank(plans[i]);
+          if (r < best) best = r;
+        }
+        return best;
+      }
+      function minNext(plans) {
+        var k = "9999-99-99";
+        for (var i = 0; i < plans.length; i++) {
+          var nk = smxNextKey(plans[i]);
+          if (nk < k) k = nk;
+        }
+        return k;
+      }
+      function maxNext(plans) {
+        var k = "0000-00-00";
+        for (var i = 0; i < plans.length; i++) {
+          var nk = smxNextKey(plans[i]);
+          if (nk > k) k = nk;
+        }
+        return k;
+      }
+      function firstPlanName(plans) {
+        var sorted = smxSortPlansForAsset(plans);
+        var nm = (sorted[0] && sorted[0].planName) ? String(sorted[0].planName).trim() : "";
+        return nm || "—";
+      }
+      ids.sort(function (ida, idb) {
+        var pa = byAsset.get(ida) || [];
+        var pb = byAsset.get(idb) || [];
+        if (mode === "asset") {
+          return ida.localeCompare(idb, undefined, { sensitivity: "base", numeric: true });
+        }
+        if (mode === "plan") {
+          return firstPlanName(pa).localeCompare(firstPlanName(pb), undefined, { sensitivity: "base", numeric: true });
+        }
+        if (mode === "next") {
+          var na = minNext(pa);
+          var nb = minNext(pb);
+          if (na !== nb) return na < nb ? -1 : 1;
+          return ida.localeCompare(idb, undefined, { sensitivity: "base", numeric: true });
+        }
+        if (mode === "next_desc") {
+          var xa = maxNext(pa);
+          var xb = maxNext(pb);
+          if (xa !== xb) return xa < xb ? 1 : -1;
+          return ida.localeCompare(idb, undefined, { sensitivity: "base", numeric: true });
+        }
+        if (mode === "wo") {
+          var wa = (pa[0] && pa[0].workOrderCount) ? pa[0].workOrderCount : 0;
+          var wb = (pb[0] && pb[0].workOrderCount) ? pb[0].workOrderCount : 0;
+          if (wa !== wb) return wb - wa;
+          return ida.localeCompare(idb, undefined, { sensitivity: "base", numeric: true });
+        }
+        var ra = aggWorstRank(pa);
+        var rb = aggWorstRank(pb);
+        if (ra !== rb) return ra - rb;
+        return ida.localeCompare(idb, undefined, { sensitivity: "base", numeric: true });
+      });
+      return ids;
+    }
+
+    function selectSmxAsset(assetId, scrollIntoView) {
+      smxSelectedAssetId = assetId || "";
+      const list = document.getElementById("smx-list");
+      if (list) {
+        list.querySelectorAll(".smx-card").forEach(function (el) {
+          el.classList.toggle("active", el.getAttribute("data-smx-asset") === smxSelectedAssetId);
+        });
+      }
+      const empty = document.getElementById("smx-detail-empty");
+      const wrap = document.getElementById("smx-detail");
+      if (!empty || !wrap) return;
+      if (!smxSelectedAssetId) {
+        empty.classList.remove("hidden");
+        wrap.classList.add("hidden");
+        return;
+      }
+      const byAsset = smxPlansByAsset();
+      var plans = byAsset.get(smxSelectedAssetId) || [];
+      if (!plans.length) {
+        plans = smxRows.filter(function (r) { return String(r.assetId || "").trim() === smxSelectedAssetId; });
+      }
+      if (!plans.length) {
+        empty.classList.remove("hidden");
+        wrap.classList.add("hidden");
+        return;
+      }
+      plans = smxSortPlansForAsset(plans);
+      empty.classList.add("hidden");
+      wrap.classList.remove("hidden");
+      renderSmxHeroAsset(smxSelectedAssetId, plans);
+      renderSmxPlansWrap(plans);
+      if (scrollIntoView && wrap.scrollIntoView) {
+        try {
+          wrap.scrollIntoView({ block: "nearest", behavior: "smooth" });
+        } catch (e2) { /* ignore */ }
+      }
+    }
+
+    function renderSmxHeroAsset(assetId, plans) {
+      const el = document.getElementById("smx-hero");
+      if (!el) return;
+      const chips = [];
+      var anyNce = false;
+      var nceStatus = "";
+      var anyCrit = false;
+      var worstRank = 4;
+      for (var i = 0; i < plans.length; i++) {
+        var p = plans[i];
+        if (p.nce) {
+          anyNce = true;
+          if (p.nceStatus && !nceStatus) nceStatus = p.nceStatus;
+        }
+        if (p.scheduleMxPlanEffectiveNceCritical) anyCrit = true;
+        var r = smxPlanRank(p);
+        if (r < worstRank) worstRank = r;
+      }
+      if (anyNce) {
+        chips.push(
+          "<span class='wo-chip nce' title='Nuclear Certified Equipment" +
+            (nceStatus ? " · " + esc(nceStatus) : "") +
+            "'>NCE</span>",
+        );
+      }
+      if (anyCrit) {
+        chips.push("<span class='wo-chip tier-below' title='At least one plan is overdue on NCE'>NCE overdue</span>");
+      }
+      if (worstRank === 1) chips.push("<span class='wo-chip tier-below'>Overdue plan</span>");
+      else if (worstRank === 2) chips.push("<span class='wo-chip tier-at'>Due soon</span>");
+      else if (worstRank === 3) chips.push("<span class='wo-chip stale'>Missing data</span>");
+      else if (worstRank === 4) {
+        var allNoDue = plans.every(function (x) { return smxEffBucket(x) === "no_due"; });
+        if (allNoDue && plans.length) chips.push("<span class='wo-chip tier-unknown'>No due date</span>");
+        else chips.push("<span class='wo-chip ok'>Current</span>");
+      }
+      chips.push(
+        "<span class='wo-chip tier-unknown' title='Maintenance plans on this asset'>" +
+          plans.length +
+          " plan" +
+          (plans.length === 1 ? "" : "s") +
+          "</span>",
+      );
+      el.innerHTML =
+        "<div class='wo-hero-row'>" +
+        "<div class='wo-hero-id'>" + esc(assetId) + "</div>" +
+        chips.join("") +
+        "</div>" +
+        smxAssetIdentityStripFromPlans(plans) +
+        "<div class='wo-hero-sub wo-hero-sub-primary'>" +
+        renderSightingBadge(assetId) +
+        "</div>";
+    }
+
+    function smxFactsHtmlForPlan(row) {
+      const eff = smxEffBucket(row);
+      const rawB = row.scheduleMxBucket || "";
+      const sched = [];
+      sched.push({ dt: "Source status", dd: esc(row.scheduleMxStatus || "—") });
+      sched.push({
+        dt: "Health (for triage)",
+        dd:
+          "<span class='smx-pill " + esc(eff) + "'>" +
+          esc(smxPillLabel(eff)) +
+          "</span>" +
+          (row.scheduleMxSuppressedByOpenWo && rawB !== eff
+            ? " <span class='facts-sub'>(Was " + esc(smxPillLabel(rawB)) + " — waived: open WO / in shop)</span>"
+            : ""),
+      });
+      const lastM = row.elmsLastMaintDateIso ? fmtKeyShort(row.elmsLastMaintDateIso) : "—";
+      const nextM = row.elmsNextMaintDateIso ? fmtKeyShort(row.elmsNextMaintDateIso) : "—";
+      sched.push({ dt: "Last maint", dd: esc(lastM) });
+      sched.push({ dt: "Next maint", dd: esc(nextM) });
+      if (row.location && String(row.location).trim()) {
+        sched.push({ dt: "Location", dd: esc(String(row.location).trim()) });
+      }
+      if (row.scheduleMxDueIso && row.scheduleMxDueIso !== row.elmsNextMaintDateIso) {
+        sched.push({ dt: "Computed due", dd: esc(fmtKeyShort(row.scheduleMxDueIso)) });
+      }
+      if (row.scheduleMxOverdueByDays != null) {
+        sched.push({ dt: "Overdue by", dd: esc(String(row.scheduleMxOverdueByDays) + " days") });
+      }
+      if (row.scheduleMxDaysUntil != null && eff === "due_soon") {
+        sched.push({ dt: "Days until due", dd: esc(String(row.scheduleMxDaysUntil)) });
+      }
+      var plainCal = smxPlainDateLine(row);
+      if (plainCal) sched.push({ dt: "Calendar (plain language)", dd: esc(plainCal) });
+      const plan = [];
+      if (row.planDesc) plan.push({ dt: "What this plan is", dd: esc(row.planDesc) });
+      function factPair(x) {
+        return "<div class='wo-facts-pair'><dt>" + esc(x.dt) + "</dt><dd>" + x.dd + "</dd></div>";
+      }
+      function factGroup(title, rows2) {
+        if (!rows2.length) return "";
+        return (
+          "<section class='wo-facts-group' aria-label='" + esc(title) + "'>" +
+          "<h4 class='wo-facts-group-h'>" + esc(title) + "</h4>" +
+          "<dl class='wo-facts-dl'>" + rows2.map(factPair).join("") + "</dl>" +
+          "</section>"
+        );
+      }
+      return (
+        factGroup("Schedule", sched) +
+        smxPlainUtilBlock(row) +
+        factGroup("This maintenance plan", plan)
+      );
+    }
+
+    function renderSmxPlansWrap(plans) {
+      const wrap = document.getElementById("smx-plans-wrap");
+      if (!wrap) return;
+      wrap.innerHTML =
+        "<div class='smx-plan-stack'>" +
+        plans
+          .map(function (row) {
+            const title = ((row.planName || "").trim() || "Maintenance plan");
+            const sub = row.planId ? "Plan ID " + esc(row.planId) : "";
+            var effB = smxEffBucket(row);
+            var rawB2 = row.scheduleMxBucket || "";
+            var badges =
+              (row.nce ? "<span class='chip nce'>NCE</span>" : "") +
+              (row.scheduleMxPlanEffectiveNceCritical
+                ? "<button type='button' class='chip stale smx-chip-btn smx-nce-crit-chip' title='Show all NCE overdue assets'>NCE overdue</button>"
+                : "") +
+              "<span class='smx-pill " +
+              esc(effB) +
+              "'>" +
+              esc(smxPillLabel(effB)) +
+              "</span>" +
+              (row.scheduleMxSuppressedByOpenWo && rawB2 !== effB
+                ? " <span class='smx-pill " + esc(rawB2) + "' title='Raw bucket before open-WO waiver'>" +
+                  esc(smxPillLabel(rawB2)) +
+                  "</span>"
+                : "");
+            return (
+              "<article class='smx-plan-block' aria-label='" + esc(title) + "'>" +
+              "<h4 class='smx-plan-block-title'>" +
+              esc(title) +
+              (sub ? "<span class='smx-plan-sub'>" + sub + "</span>" : "") +
+              "</h4>" +
+              "<div class='badges' style='margin-bottom:12px'>" +
+              badges +
+              "</div>" +
+              "<div class='wo-facts smx-plan-facts' style='padding-top:0'>" +
+              smxFactsHtmlForPlan(row) +
+              "</div>" +
+              "</article>"
+            );
+          })
+          .join("") +
+        "</div>";
+    }
 
     async function loadScheduleMxTab() {
       const pill = document.getElementById("smx-asof-pill");
       const dateSel = document.getElementById("smx-date-select");
       const statsEl = document.getElementById("smx-stats");
-      const tbody = document.getElementById("smx-tbody");
+      const listMeta = document.getElementById("smx-list-meta");
+      const list = document.getElementById("smx-list");
       if (statsEl) {
         statsEl.innerHTML = "<span class='smx-stat'><span class='lbl'>Loading</span><span class='v'>…</span></span>";
       }
-      if (tbody) tbody.innerHTML = "<tr><td colspan='6'>Loading…</td></tr>";
+      if (listMeta) listMeta.textContent = "Loading…";
+      if (list) list.innerHTML = "";
+      smxSelectedAssetId = "";
+      selectSmxAsset("", false);
       try {
         const rd = await fetch("/api/schedule-mx?dates=1", { cache: "no-store" });
         const jd = await rd.json();
@@ -17457,30 +18482,63 @@ function renderDashboardHtml(): string {
           dateSel.disabled = dates.length === 0;
         }
         var dk = smxSelectedDateKey || latest || "";
-        if (pill) pill.textContent = dk ? fmtKeyLong(dk) : "No imports";
+        if (pill) {
+          pill.textContent = dk ? fmtKeyLong(dk) : "No imports";
+          pill.removeAttribute("title");
+        }
         if (!dk) {
-          if (statsEl) statsEl.textContent = "No Schedule Mx imports yet — send a CSV or XLSX to prevmx@2t3.app.";
-          if (tbody) tbody.innerHTML = "<tr><td colspan='6'>No data.</td></tr>";
+          if (statsEl) statsEl.textContent = "No schedule maintenance imports yet.";
+          if (listMeta) listMeta.textContent = "";
+          if (list) {
+            list.innerHTML = "<div class='problem-empty' style='padding:18px 4px'>No imports yet.</div>";
+          }
           smxRows = [];
           smxStats = null;
+          smxCommander = null;
+          smxCommanderFilterUnit = "";
+          renderSmxCommander();
           return;
         }
         const r = await fetch("/api/schedule-mx?date=" + encodeURIComponent(dk), { cache: "no-store" });
         const j = await r.json();
         if (!r.ok) {
           if (statsEl) statsEl.textContent = j.error || "Could not load schedule maintenance.";
-          if (tbody) tbody.innerHTML = "<tr><td colspan='6'>No rows for this date.</td></tr>";
+          if (listMeta) listMeta.textContent = "";
+          if (list) {
+            list.innerHTML = "<div class='problem-empty' style='padding:18px 4px'>No rows for this date.</div>";
+          }
           smxRows = [];
           smxStats = null;
+          smxCommander = null;
+          smxCommanderFilterUnit = "";
+          renderSmxCommander();
           return;
         }
         smxRows = Array.isArray(j.rows) ? j.rows : [];
         smxStats = j.stats || null;
+        smxCommander = j.commander || null;
+        smxCommanderFilterUnit = "";
+        smxEticDateKey = j.eticDateKey || null;
+        if (pill && dk && smxEticDateKey) {
+          pill.setAttribute("title", "Import " + fmtKeyLong(dk) + " · Fleet book " + fmtKeyLong(smxEticDateKey));
+        }
+        var titleEl = document.getElementById("smx-commander-title");
+        if (titleEl) {
+          titleEl.textContent =
+            "Wing maintenance status" + (dk ? " · " + fmtKeyLong(dk) : "");
+        }
+        renderSmxCommander();
         renderScheduleMxStats();
-        renderScheduleMxTable();
+        renderScheduleMxList();
+        loadSightings(false).then(function () {
+          const p = document.getElementById("panel-schedule-mx");
+          if (!p || p.classList.contains("hidden")) return;
+          renderScheduleMxList();
+        });
       } catch (e) {
         if (statsEl) statsEl.textContent = "Could not load schedule maintenance.";
-        if (tbody) tbody.innerHTML = "<tr><td colspan='6'>Could not load.</td></tr>";
+        if (listMeta) listMeta.textContent = "";
+        if (list) list.innerHTML = "<div class='problem-empty' style='padding:18px 4px'>Could not load.</div>";
       }
     }
 
@@ -17607,10 +18665,10 @@ function renderDashboardHtml(): string {
 
     function smxMatchesFilter(row, f) {
       if (f === "all") return true;
-      if (f === "nce_critical") return row.scheduleMxNceCritical;
-      if (f === "overdue") return row.scheduleMxBucket === "overdue";
-      if (f === "due_soon") return row.scheduleMxBucket === "due_soon";
-      if (f === "missing") return row.scheduleMxBucket === "missing";
+      if (f === "nce_critical") return row.scheduleMxPlanEffectiveNceCritical;
+      if (f === "overdue") return smxEffBucket(row) === "overdue";
+      if (f === "due_soon") return smxEffBucket(row) === "due_soon";
+      if (f === "missing") return smxEffBucket(row) === "missing";
       return true;
     }
 
@@ -17624,6 +18682,9 @@ function renderDashboardHtml(): string {
         (row.location || "").toLowerCase().indexOf(ql) !== -1 ||
         (row.mgmtCd || "").toLowerCase().indexOf(ql) !== -1 ||
         (row.makeModel || "").toLowerCase().indexOf(ql) !== -1 ||
+        (row.owningUnit || "").toLowerCase().indexOf(ql) !== -1 ||
+        (row.vehNomen || "").toLowerCase().indexOf(ql) !== -1 ||
+        (row.eticOpenWorkOrderIds || "").toLowerCase().indexOf(ql) !== -1 ||
         (row.scheduleMxStatus || "").toLowerCase().indexOf(ql) !== -1
       );
     }
@@ -17631,22 +18692,23 @@ function renderDashboardHtml(): string {
     function renderScheduleMxStats() {
       const box = document.getElementById("smx-stats");
       if (!box || !smxStats) return;
-      function pill(k, label, cls) {
+      function pill(k, label, cls, hint) {
+        const t = hint ? " title='" + esc(hint) + "'" : "";
         return (
-          "<div class='smx-stat " + cls + "'>" +
+          "<div class='smx-stat " + cls + "'" + t + ">" +
             "<span class='lbl'>" + esc(label) + "</span>" +
             "<span class='v'>" + esc(String(smxStats[k] ?? 0)) + "</span>" +
           "</div>"
         );
       }
       box.innerHTML =
-        pill("planRows", "Plan rows", "") +
-        pill("distinctAssets", "Assets", "") +
-        pill("nceCritical", "NCE overdue (critical)", "crit") +
-        pill("overdue", "Overdue", "bad") +
-        pill("dueSoon", "Due soon (≤30d)", "warn") +
-        pill("missing", "Missing sched data", "warn") +
-        pill("ok", "OK / current", "");
+        pill("distinctAssets", "Assets", "", "") +
+        pill("planRows", "Plans", "", "") +
+        pill("nceCritical", "NCE overdue (critical)", "crit", "") +
+        pill("overdue", "Overdue", "bad", "") +
+        pill("dueSoon", "Due soon (≤30d)", "warn", "") +
+        pill("missing", "Missing sched data", "warn", "") +
+        pill("ok", "OK / current", "", "");
     }
 
     function smxPillLabel(bucket) {
@@ -17656,69 +18718,334 @@ function renderDashboardHtml(): string {
       return bucket || "—";
     }
 
-    function renderScheduleMxTable() {
-      const tbody = document.getElementById("smx-tbody");
-      if (!tbody) return;
-      const qel = document.getElementById("smx-query");
-      const q = (qel && qel.value) ? qel.value.trim() : "";
-      const filtered = smxRows.filter(function (row) {
-        return smxMatchesFilter(row, smxFilter) && smxMatchesQuery(row, q);
+    function smxFmtNum(n) {
+      try {
+        return Number(n).toLocaleString("en-US");
+      } catch (e) {
+        return String(n);
+      }
+    }
+
+    /** Human label for utilization type (avoid generic "units"). */
+    function smxUtilUomLabel(utRaw) {
+      const s = String(utRaw || "").toLowerCase().replace(/\s+/g, " ").trim();
+      if (!s) return "";
+      if (/\bmile|\bmi\b|mph/.test(s)) return "miles";
+      if (/\bhour|\bhr\b|hrs|operating hour/.test(s)) return "hours";
+      if (/\bkm\b|kilometer|kilomet/.test(s)) return "km";
+      return s;
+    }
+
+    /** Compact service-meter card: metrics + thin progress + one short line. */
+    function smxPlainUtilBlock(row) {
+      const uom = smxUtilUomLabel(row.elmsUtilType);
+      const cur = row.elmsCurrentMeter;
+      const nxt = row.elmsNextUtilQty;
+      const uSuffix = uom ? " " + uom : "";
+      if (cur == null || nxt == null) {
+        return (
+          "<section class='wo-facts-group smx-util-section' aria-label='Service meter'>" +
+          "<h4 class='wo-facts-group-h'>Service meter</h4>" +
+          "<div class='smx-plain-callout smx-plain-callout--compact' role='status'>No current reading and next target on this row.</div>" +
+          "</section>"
+        );
+      }
+      const rem = row.scheduleMxUtilRemaining != null ? row.scheduleMxUtilRemaining : nxt - cur;
+      const overUtil = row.scheduleMxOverdueUtil || rem < 0;
+      const safeNxt = Math.max(1, nxt);
+      const frac = Math.min(1, Math.max(0, cur / safeNxt));
+      const pctToward = Math.round(frac * 100);
+      const barW = Math.max(cur > 0 && pctToward < 2 ? 2 : 0, Math.min(100, pctToward));
+      const barCls = overUtil ? "danger" : pctToward >= 95 ? "danger" : pctToward >= 85 ? "warn" : "";
+      const curS = smxFmtNum(cur) + uSuffix;
+      const nxtS = smxFmtNum(nxt) + uSuffix;
+      const remS =
+        rem >= 0 ? smxFmtNum(rem) + uSuffix + " left" : smxFmtNum(Math.abs(rem)) + uSuffix + " over";
+      var lead = "";
+      var leadCls = "smx-plain-lead";
+      if (overUtil) {
+        leadCls += " smx-plain-lead--warn";
+        lead = "Past next target — open a work order or update the meter.";
+      } else if (pctToward < 1) {
+        lead = "Early in the interval (under 1% toward target).";
+      } else if (pctToward < 10) {
+        lead = "Early — about " + pctToward + "% toward target.";
+      } else {
+        lead = "About " + pctToward + "% toward target.";
+      }
+      const calloutCls =
+        "smx-plain-callout smx-plain-callout--compact" + (overUtil ? " smx-plain-callout--warn" : "");
+      return (
+        "<section class='wo-facts-group smx-util-section' aria-label='Service meter'>" +
+        "<h4 class='wo-facts-group-h'>Service meter</h4>" +
+        "<div class='" +
+        esc(calloutCls) +
+        "' role='status'>" +
+        "<div class='smx-util-metrics'>" +
+        "<div class='smx-util-metric'><span class='smx-util-m-lbl'>Current</span><span class='smx-util-m-val'>" +
+        esc(curS) +
+        "</span></div>" +
+        "<div class='smx-util-metric'><span class='smx-util-m-lbl'>Next target</span><span class='smx-util-m-val'>" +
+        esc(nxtS) +
+        "</span></div>" +
+        "<div class='smx-util-metric'><span class='smx-util-m-lbl'>Remaining</span><span class='smx-util-m-val'>" +
+        esc(remS) +
+        "</span></div>" +
+        "</div>" +
+        "<div class='smx-util-progress-wrap'>" +
+        "<div class='smx-util-progress-label'>Progress</div>" +
+        "<div class='smx-util-progress " +
+        esc(barCls) +
+        "' title='" +
+        esc(String(pctToward) + "%") +
+        "'><i style='width:" +
+        barW +
+        "%'></i></div></div>" +
+        "<p class='" +
+        esc(leadCls) +
+        "'>" +
+        lead +
+        "</p>" +
+        "</div></section>"
+      );
+    }
+
+    function smxOpenWoLinksHtml(idsCsv) {
+      const raw = String(idsCsv || "")
+        .split(/[,\s]+/)
+        .map(function (s) {
+          return s.trim();
+        })
+        .filter(Boolean);
+      if (!raw.length) return "";
+      const parts = [];
+      for (var i = 0; i < raw.length; i++) {
+        const w = raw[i];
+        parts.push(
+          "<a href='#wo=" +
+            encodeURIComponent(w) +
+            "' class='wo-id smx-open-wo' data-smx-open-wo='" +
+            esc(w) +
+            "'>" +
+            esc(w) +
+            "</a>",
+        );
+      }
+      return '<span class="smx-wo-inline">' + parts.join(", ") + "</span>";
+    }
+
+    function smxAssetIdentityStripFromPlans(plans) {
+      const p0 = plans && plans[0];
+      if (!p0) return "";
+      const pairs = [];
+      pairs.push({ lbl: "Unit", val: p0.owningUnit ? esc(p0.owningUnit) : "—" });
+      pairs.push({ lbl: "Make / model", val: p0.makeModel ? esc(p0.makeModel) : "—" });
+      pairs.push({ lbl: "Vehicle type", val: p0.vehNomen ? esc(p0.vehNomen) : "—" });
+      pairs.push({ lbl: "Mgmt code", val: p0.mgmtCd ? esc(p0.mgmtCd) : "—" });
+      if (p0.nce) {
+        pairs.push({
+          lbl: "NCE",
+          val:
+            "<span class='nce-badge'>Yes</span>" +
+            (p0.nceStatus ? " <span class='facts-sub'>" + esc(p0.nceStatus) + "</span>" : ""),
+        });
+      } else {
+        pairs.push({ lbl: "NCE", val: "No" });
+      }
+      var woN = p0.workOrderCount != null ? Number(p0.workOrderCount) : 0;
+      var woVal =
+        woN > 0
+          ? smxOpenWoLinksHtml(p0.eticOpenWorkOrderIds) || esc(String(woN))
+          : "—";
+      pairs.push({
+        lbl: "Open WOs",
+        val: woVal,
       });
+      if (p0.eticOpenInMaintenance) {
+        pairs.push({ lbl: "Shop signal", val: "<span class='facts-sub'>Parts status looks in-shop</span>" });
+      }
+      return (
+        "<div class='smx-plan-identity' aria-label='Asset details'>" +
+        pairs
+          .map(function (p) {
+            return (
+              "<div class='smx-id-pair'><span class='smx-id-lbl'>" +
+              esc(p.lbl) +
+              "</span><span class='smx-id-val'>" +
+              p.val +
+              "</span></div>"
+            );
+          })
+          .join("") +
+        "</div>"
+      );
+    }
+
+    function smxPlainDateLine(row) {
+      const eff = smxEffBucket(row);
+      if (eff === "missing") {
+        return "Not enough schedule data on this plan.";
+      }
+      const nextM = row.elmsNextMaintDateIso ? fmtKeyShort(row.elmsNextMaintDateIso) : "";
+      if (!nextM) {
+        if (eff === "ok" || eff === "no_due") {
+          if (row.elmsNextUtilQty != null) {
+            return "This plan is tracked by the service meter, not a calendar date. See the meter section below.";
+          }
+          return "No next calendar service date on this plan.";
+        }
+        return "";
+      }
+      if (eff === "overdue") {
+        const d = row.scheduleMxOverdueByDays != null ? row.scheduleMxOverdueByDays + " day" + (row.scheduleMxOverdueByDays === 1 ? "" : "s") : "some time";
+        return "Next calendar service date was " + nextM + " (" + d + " past that date).";
+      }
+      if (eff === "due_soon" && row.scheduleMxDaysUntil != null) {
+        return "Next calendar service date is " + nextM + " (about " + row.scheduleMxDaysUntil + " day" + (row.scheduleMxDaysUntil === 1 ? "" : "s") + " away).";
+      }
+      if (eff === "ok" || eff === "no_due") {
+        return "Next calendar service date: " + nextM + ".";
+      }
+      return "";
+    }
+
+    function renderScheduleMxList() {
+      const list = document.getElementById("smx-list");
+      const meta = document.getElementById("smx-list-meta");
+      if (!list) return;
       document.querySelectorAll("#smx-filters .smx-n").forEach(function (el) {
         const k = el.getAttribute("data-smx-c");
         if (!k) return;
-        const n = smxRows.filter(function (row) { return smxMatchesFilter(row, k); }).length;
+        const seen = Object.create(null);
+        var n = 0;
+        for (var i = 0; i < smxRows.length; i++) {
+          var row = smxRows[i];
+          if (!smxMatchesFilter(row, k)) continue;
+          var aid = String(row.assetId || "").trim() || "—";
+          if (seen[aid]) continue;
+          seen[aid] = 1;
+          n++;
+        }
         el.textContent = n;
       });
-      if (!filtered.length) {
-        tbody.innerHTML = "<tr><td colspan='6'>No rows match.</td></tr>";
+      const byAsset = smxPlansByAsset();
+      const visibleAssetIds = smxSortedAssetIds(byAsset);
+      var totalDistinct = 0;
+      var seenAll = Object.create(null);
+      for (var j = 0; j < smxRows.length; j++) {
+        var aj = String(smxRows[j].assetId || "").trim() || "—";
+        if (!seenAll[aj]) {
+          seenAll[aj] = 1;
+          totalDistinct++;
+        }
+      }
+      if (meta) {
+        meta.textContent =
+          visibleAssetIds.length +
+          " of " +
+          totalDistinct +
+          " asset" +
+          (totalDistinct === 1 ? "" : "s");
+      }
+      if (smxSelectedAssetId && visibleAssetIds.indexOf(smxSelectedAssetId) < 0) {
+        smxSelectedAssetId = "";
+      }
+      if (!visibleAssetIds.length) {
+        list.innerHTML = "<div class='problem-empty' style='padding:18px 4px'>No assets match this filter.</div>";
+        selectSmxAsset("", false);
         return;
       }
-      tbody.innerHTML = filtered.map(function (row) {
-        const nce = row.nce
-          ? ("<span class='nce-inline' title='" + esc(row.nceStatus || "NCE") + "'>NCE</span>")
-          : "—";
-        const due = row.scheduleMxDueIso ? fmtKeyShort(row.scheduleMxDueIso) : "—";
-        const ov = row.scheduleMxOverdueByDays != null ? row.scheduleMxOverdueByDays + " d" : "—";
-        const pillCls = row.scheduleMxBucket || "";
-        let trCls = "";
-        if (row.scheduleMxNceCritical) trCls = "smx-row-nce-crit";
-        else if (row.scheduleMxBucket === "overdue") trCls = "smx-row-overdue";
-        const mgmtLine = row.mgmtCd
-          ? ("Mgmt " + esc(row.mgmtCd) + " · " + row.workOrderCount + " WO")
-          : (String(row.workOrderCount) + " WO");
-        const lastNext =
-          (row.elmsLastMaintDateIso ? fmtKeyShort(row.elmsLastMaintDateIso) : "—") +
-          " → " +
-          (row.elmsNextMaintDateIso ? fmtKeyShort(row.elmsNextMaintDateIso) : due);
-        const ut = (row.elmsUtilType || "").trim();
-        const utilLine =
-          (row.elmsCurrentMeter != null ? esc(String(row.elmsCurrentMeter)) : "—") +
-          (ut ? " " + esc(ut) : "") +
-          " · next " +
-          (row.elmsNextUtilQty != null ? esc(String(row.elmsNextUtilQty)) : "—") +
-          (row.scheduleMxUtilRemaining != null
-            ? " (" + (row.scheduleMxUtilRemaining >= 0 ? "rem " : "over ") + Math.abs(row.scheduleMxUtilRemaining) + ")"
-            : "");
+      list.innerHTML = visibleAssetIds.map(function (assetId) {
+        var plans = byAsset.get(assetId) || [];
+        var isActive = assetId === smxSelectedAssetId;
+        var tier = smxCardTierForPlans(plans);
+        var anyNce = false;
+        var nceTitle = "";
+        var anyCrit = false;
+        var worstRank = 4;
+        var worstBucket = "ok";
+        for (var pi = 0; pi < plans.length; pi++) {
+          var p = plans[pi];
+          if (p.nce) {
+            anyNce = true;
+            if (p.nceStatus && !nceTitle) nceTitle = p.nceStatus;
+          }
+          if (p.scheduleMxPlanEffectiveNceCritical) anyCrit = true;
+          var rk = smxPlanRank(p);
+          if (rk < worstRank) {
+            worstRank = rk;
+            worstBucket = smxEffBucket(p);
+          }
+        }
+        var nceChip = anyNce
+          ? "<span class='chip nce' title='Nuclear Certified Equipment" + (nceTitle ? " · " + esc(nceTitle) : "") + "'>NCE</span>"
+          : "";
+        var critChip = anyCrit
+          ? "<button type='button' class='smx-chip-btn smx-nce-crit-chip' title='Show all NCE overdue assets'>NCE overdue</button>"
+          : "";
+        var aggPill =
+          "<span class='smx-pill " + esc(worstBucket) + "'>" + esc(smxPillLabel(worstBucket)) + "</span>";
+        var nextD = null;
+        var minK = "9999-99-99";
+        for (var qi = 0; qi < plans.length; qi++) {
+          var nk = smxNextKey(plans[qi]);
+          if (nk < minK) {
+            minK = nk;
+            nextD = plans[qi].elmsNextMaintDateIso || plans[qi].scheduleMxDueIso;
+          }
+        }
+        var nextTxt = nextD ? fmtKeyShort(nextD) : "—";
+        var wo = plans[0] && plans[0].workOrderCount != null ? plans[0].workOrderCount : 0;
+        var metaBits = [];
+        metaBits.push("<span><span class='k'>Plans</span><span class='v'>" + plans.length + "</span></span>");
+        metaBits.push("<span><span class='k'>Next</span><span class='v'>" + esc(nextTxt) + "</span></span>");
+        if (wo) metaBits.push("<span><span class='k'>WOs</span><span class='v'>" + wo + "</span></span>");
         return (
-          "<tr" + (trCls ? " class='" + esc(trCls) + "'" : "") + ">" +
-            "<td><span class='asset-mono'>" + esc(row.assetId) + "</span>" +
-              (row.planName ? "<div class='remark-snippet'><strong>" + esc(row.planName) + "</strong>" +
-                (row.planId ? " · Plan " + esc(row.planId) : "") + "</div>" : "") +
-              (row.location ? "<div class='remark-snippet'>" + esc(row.location) + "</div>" : "") +
-              (row.makeModel ? "<div class='remark-snippet'>" + esc(row.makeModel) + "</div>" : "") +
-              "<div class='remark-snippet'>" + mgmtLine + "</div>" +
-            "</td>" +
-            "<td><div class='remark-snippet'>" + esc(lastNext) + "</div>" +
-              (ov !== "—" ? "<div class='remark-snippet'>Overdue " + esc(ov) + "</div>" : "") +
-            "</td>" +
-            "<td><div class='remark-snippet'>" + utilLine + "</div></td>" +
-            "<td>" + nce + "</td>" +
-            "<td>" + esc(row.scheduleMxStatus || "—") + "</td>" +
-            "<td><span class='smx-pill " + esc(pillCls) + "'>" + esc(smxPillLabel(row.scheduleMxBucket)) + "</span></td>" +
-          "</tr>"
+          "<div class='smx-card" + (isActive ? " active" : "") + "' data-smx-asset='" + esc(assetId) + "' data-smx-tier='" + esc(tier) + "' tabindex='0' role='button' aria-label='Select asset " + esc(assetId) + "'>" +
+          "<div class='top-line'>" +
+          "<span class='asset-mono smx-card-select'>" + esc(assetId) + "</span>" +
+          "<span class='badges'>" + nceChip + critChip + aggPill + "</span>" +
+          "</div>" +
+          "<div class='wo-meta-line smx-card-select'>" + renderSightingBadge(assetId, { compact: true }) + "</div>" +
+          "<div class='meta smx-card-select'>" + metaBits.join("") + "</div>" +
+          "</div>"
         );
       }).join("");
+      list.querySelectorAll(".smx-card").forEach(function (el) {
+        el.addEventListener("click", function (ev) {
+          if (ev.target.closest("a.smx-open-wo") || ev.target.closest(".smx-nce-crit-chip")) return;
+          if (!ev.target.closest(".smx-card-select")) return;
+          var aid = el.getAttribute("data-smx-asset") || "";
+          selectSmxAsset(aid, true);
+          list.querySelectorAll(".smx-card").forEach(function (c) {
+            c.classList.toggle("active", c.getAttribute("data-smx-asset") === smxSelectedAssetId);
+          });
+        });
+        el.addEventListener("keydown", function (ev) {
+          if (ev.key !== "Enter" && ev.key !== " ") return;
+          if (ev.target !== el && !ev.target.closest(".smx-card-select")) return;
+          if (ev.target.closest(".smx-nce-crit-chip")) return;
+          ev.preventDefault();
+          var aid = el.getAttribute("data-smx-asset") || "";
+          selectSmxAsset(aid, true);
+          list.querySelectorAll(".smx-card").forEach(function (c) {
+            c.classList.toggle("active", c.getAttribute("data-smx-asset") === smxSelectedAssetId);
+          });
+        });
+      });
+      list.querySelectorAll("a.smx-open-wo").forEach(function (a) {
+        a.addEventListener("click", function (ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          var w = (a.getAttribute("data-smx-open-wo") || "").trim();
+          if (w) setHashWorkOrder(w);
+        });
+      });
+      if (!smxSelectedAssetId && visibleAssetIds.length) smxSelectedAssetId = visibleAssetIds[0];
+      selectSmxAsset(smxSelectedAssetId, false);
+      list.querySelectorAll(".smx-card").forEach(function (c) {
+        c.classList.toggle("active", c.getAttribute("data-smx-asset") === smxSelectedAssetId);
+      });
     }
 
     /* --- Work Orders list + filters -------------------------------------- */
@@ -19600,21 +20927,101 @@ function renderDashboardHtml(): string {
         smxFilt.addEventListener("click", function (e) {
           const b = e.target.closest("[data-smx-filter]");
           if (!b) return;
-          smxFilter = b.getAttribute("data-smx-filter") || "all";
-          smxFilt.querySelectorAll(".smx-filter-btn").forEach(function (x) {
-            x.classList.toggle("active", x === b);
-          });
-          renderScheduleMxTable();
+          smxSetFilter(b.getAttribute("data-smx-filter") || "all");
         });
       }
       const smxQ = document.getElementById("smx-query");
-      if (smxQ) smxQ.addEventListener("input", function () { renderScheduleMxTable(); });
+      if (smxQ) smxQ.addEventListener("input", function () { renderScheduleMxList(); });
+      const smxSortSel = document.getElementById("smx-sort");
+      if (smxSortSel && !smxSortSel.dataset.wired) {
+        smxSortSel.dataset.wired = "1";
+        smxSortSel.addEventListener("change", function () {
+          smxSort = smxSortSel.value || "priority";
+          renderScheduleMxList();
+        });
+      }
       const smxDateSel = document.getElementById("smx-date-select");
       if (smxDateSel && !smxDateSel.dataset.wired) {
         smxDateSel.dataset.wired = "1";
         smxDateSel.addEventListener("change", function () {
           smxSelectedDateKey = smxDateSel.value || null;
           loadScheduleMxTab();
+        });
+      }
+      const panelSmx = document.getElementById("panel-schedule-mx");
+      if (panelSmx && !panelSmx.dataset.smxWoNav) {
+        panelSmx.dataset.smxWoNav = "1";
+        panelSmx.addEventListener("click", function (ev) {
+          const nc = ev.target.closest(".smx-nce-crit-chip");
+          if (nc) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            smxSetFilter("nce_critical");
+            return;
+          }
+          const a = ev.target.closest("a.smx-open-wo");
+          if (!a) return;
+          if (ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.altKey || ev.button !== 0) return;
+          ev.preventDefault();
+          const w = (a.getAttribute("data-smx-open-wo") || "").trim();
+          if (w) setHashWorkOrder(w);
+        });
+      }
+      const smxMailWing = document.getElementById("smx-commander-mail-wing");
+      if (smxMailWing && !smxMailWing.dataset.wired) {
+        smxMailWing.dataset.wired = "1";
+        smxMailWing.addEventListener("click", function () {
+          if (!smxCommander) return;
+          var dk = smxSelectedDateKey || "";
+          var ek = smxEticDateKey || "";
+          var subj = smxCommanderReportTitle();
+          var body = smxCommanderEmailBodyWing(smxCommander, dk, ek);
+          window.location.href = smxMailtoUrl(subj, body);
+        });
+      }
+      const smxClearCmdUnit = document.getElementById("smx-commander-clear-unit");
+      if (smxClearCmdUnit && !smxClearCmdUnit.dataset.wired) {
+        smxClearCmdUnit.dataset.wired = "1";
+        smxClearCmdUnit.addEventListener("click", function () {
+          smxCommanderFilterUnit = "";
+          renderSmxCommander();
+          renderScheduleMxList();
+        });
+      }
+      const smxCmdTable = document.getElementById("smx-commander-table");
+      if (smxCmdTable && !smxCmdTable.dataset.wired) {
+        smxCmdTable.dataset.wired = "1";
+        smxCmdTable.addEventListener("click", function (ev) {
+          var unitBtn = ev.target.closest(".smx-cmd-unit-btn");
+          if (unitBtn) {
+            ev.preventDefault();
+            var u = (unitBtn.getAttribute("data-smx-cmd-unit") || "").trim();
+            smxCommanderFilterUnit = smxCommanderFilterUnit === u ? "" : u;
+            renderSmxCommander();
+            renderScheduleMxList();
+            return;
+          }
+          var mailBtn = ev.target.closest(".smx-cmd-mail-unit");
+          if (mailBtn) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            if (!smxCommander) return;
+            var unit = (mailBtn.getAttribute("data-smx-mail-unit") || "").trim();
+            var rowsU = smxCommander.units || [];
+            var row = null;
+            for (var ri = 0; ri < rowsU.length; ri++) {
+              if (rowsU[ri].unit === unit) {
+                row = rowsU[ri];
+                break;
+              }
+            }
+            if (!row) return;
+            var dk2 = smxSelectedDateKey || "";
+            var ek2 = smxEticDateKey || "";
+            var subj2 = smxCommanderReportTitle() + " — " + unit;
+            var body2 = smxCommanderEmailBodyUnit(row, dk2, ek2);
+            window.location.href = smxMailtoUrl(subj2, body2);
+          }
         });
       }
       const melTabBtn = document.getElementById("tab-mel");

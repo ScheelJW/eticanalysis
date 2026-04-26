@@ -5,6 +5,9 @@ import {
   calendarDaysBetween,
   classifyMelTier,
   computeMelRecallHintForRow,
+  computeScheduleMxAssetStats,
+  computeScheduleMxCommanderSummary,
+  enrichScheduleMxRowsWithLatestEtic,
   elmsPlanRowKeyFromRaw,
   getChangelogForDisplay,
   ingestWorkOrderSnapshot,
@@ -14,7 +17,7 @@ import {
   parseScheduleMxCsvToPlanRows,
   parseScheduleMxCsvToRawByAsset,
 } from "../src/workOrderWatch";
-import type { WatchRow } from "../src/workOrderWatch";
+import type { ScheduleMxFleetRow, WatchRow } from "../src/workOrderWatch";
 
 describe("classifyMelTier", () => {
   it("detects below / at / above from phrases", () => {
@@ -51,6 +54,207 @@ describe("parseCsvTextToRowArrays", () => {
     expect(rows.length).toBe(3);
     expect(rows[1]![1]).toContain("line1");
     expect(rows[1]![1]).toContain("line2");
+  });
+});
+
+describe("enrichScheduleMxRowsWithLatestEtic", () => {
+  it("waives overdue when latest ETIC shows an open WO", () => {
+    const base = analyzeElmsScheduleMxFromRaw({}, "2026-04-25");
+    const row = {
+      assetId: "AF01",
+      planRowKey: "p1",
+      planId: "",
+      planName: "Oil",
+      planDesc: "",
+      maintenanceScheduleId: "",
+      itemDesc: "",
+      location: "",
+      makeModel: "",
+      mgmtCd: "",
+      workOrderCount: 0,
+      nce: false,
+      nceStatus: "",
+      scheduleMxNceCritical: true,
+      owningUnit: "",
+      vehNomen: "",
+      eticSnapshotDateKey: null,
+      eticOpenWorkOrderIds: "",
+      eticOpenInMaintenance: false,
+      scheduleMxPlanEffectiveBucket: "overdue",
+      scheduleMxPlanEffectiveNceCritical: true,
+      scheduleMxSuppressedByOpenWo: false,
+      ...base,
+      scheduleMxBucket: "overdue",
+    } as ScheduleMxFleetRow;
+    const byAsset = new Map([
+      [
+        "AF01",
+        {
+          workOrderIds: ["WO-1"],
+          owningUnit: "1 AMXS",
+          makeModel: "F-150",
+          vehNomen: "TRUCK",
+          mgmtCd: "M16",
+          nce: true,
+          nceStatus: "Active",
+          inMaintenance: false,
+        },
+      ],
+    ]);
+    const out = enrichScheduleMxRowsWithLatestEtic([row], "2026-04-26", byAsset)[0]!;
+    expect(out.scheduleMxPlanEffectiveBucket).toBe("ok");
+    expect(out.scheduleMxSuppressedByOpenWo).toBe(true);
+    expect(out.workOrderCount).toBe(1);
+    expect(out.owningUnit).toBe("1 AMXS");
+    expect(out.scheduleMxPlanEffectiveNceCritical).toBe(false);
+  });
+});
+
+describe("computeScheduleMxAssetStats", () => {
+  it("counts each asset once using worst plan (not plan-row totals)", () => {
+    const base = analyzeElmsScheduleMxFromRaw({}, "2026-04-25");
+    const mk = (
+      assetId: string,
+      key: string,
+      bucket: "overdue" | "ok" | "due_soon" | "missing" | "no_due",
+      nceCrit?: boolean,
+    ) => {
+      const nc = !!nceCrit;
+      return {
+        assetId,
+        planRowKey: key,
+        planId: "",
+        planName: "",
+        planDesc: "",
+        maintenanceScheduleId: "",
+        itemDesc: "",
+        location: "",
+        makeModel: "",
+        mgmtCd: "",
+        workOrderCount: 0,
+        nce: false,
+        nceStatus: "",
+        scheduleMxNceCritical: nc,
+        owningUnit: "",
+        vehNomen: "",
+        eticSnapshotDateKey: null,
+        eticOpenWorkOrderIds: "",
+        eticOpenInMaintenance: false,
+        scheduleMxPlanEffectiveBucket: bucket,
+        scheduleMxPlanEffectiveNceCritical: nc,
+        scheduleMxSuppressedByOpenWo: false,
+        ...base,
+        scheduleMxBucket: bucket,
+      } as ScheduleMxFleetRow;
+    };
+
+    const rows = [
+      mk("AF01", "p1", "ok"),
+      mk("AF01", "p2", "overdue"),
+      mk("AF02", "p3", "ok"),
+      mk("AF02", "p4", "ok"),
+    ];
+    const s = computeScheduleMxAssetStats(rows);
+    expect(s.distinctAssets).toBe(2);
+    expect(s.planRows).toBe(4);
+    expect(s.overdue).toBe(1);
+    expect(s.ok).toBe(1);
+    expect(s.dueSoon).toBe(0);
+    expect(s.missing).toBe(0);
+  });
+});
+
+describe("computeScheduleMxCommanderSummary", () => {
+  it("rolls up by owning unit and counts NCE overdue separately", () => {
+    const base = analyzeElmsScheduleMxFromRaw({}, "2026-04-25");
+    const row = (
+      assetId: string,
+      unit: string,
+      bucket: "overdue" | "ok",
+      nceCrit: boolean,
+      key: string,
+    ): ScheduleMxFleetRow =>
+      ({
+        assetId,
+        planRowKey: key,
+        planId: "",
+        planName: "",
+        planDesc: "",
+        maintenanceScheduleId: "",
+        itemDesc: "",
+        location: "",
+        makeModel: "",
+        mgmtCd: "",
+        workOrderCount: 0,
+        nce: nceCrit,
+        nceStatus: nceCrit ? "Yes" : "",
+        scheduleMxNceCritical: nceCrit,
+        owningUnit: unit,
+        vehNomen: "",
+        eticSnapshotDateKey: null,
+        eticOpenWorkOrderIds: "",
+        eticOpenInMaintenance: false,
+        scheduleMxPlanEffectiveBucket: bucket,
+        scheduleMxPlanEffectiveNceCritical: nceCrit,
+        scheduleMxSuppressedByOpenWo: false,
+        ...base,
+        scheduleMxBucket: bucket,
+      }) as ScheduleMxFleetRow;
+
+    const rows = [
+      row("A1", "91 MW", "ok", false, "p1"),
+      row("A1", "91 MW", "ok", false, "p2"),
+      row("B1", "5 CES", "overdue", false, "p3"),
+      row("C1", "5 CES", "ok", false, "p4"),
+      row("D1", "791 MXS", "overdue", true, "p5"),
+    ];
+    const c = computeScheduleMxCommanderSummary(rows);
+    expect(c.wing.totalVehicles).toBe(4);
+    expect(c.wing.overdue).toBe(2);
+    expect(c.wing.nceOverdue).toBe(1);
+    expect(c.wing.notOverdue).toBe(2);
+    const u91 = c.units.find((x) => x.unit === "91 MW");
+    expect(u91?.totalVehicles).toBe(1);
+    expect(u91?.overdue).toBe(0);
+    const u5 = c.units.find((x) => x.unit === "5 CES");
+    expect(u5?.totalVehicles).toBe(2);
+    expect(u5?.overdue).toBe(1);
+    const u791 = c.units.find((x) => x.unit === "791 MXS");
+    expect(u791?.nceOverdue).toBe(1);
+    expect(u791?.overdue).toBe(1);
+  });
+
+  it("counts raw extract overdue even when triage waives effective bucket", () => {
+    const base = analyzeElmsScheduleMxFromRaw({}, "2026-04-25");
+    const row: ScheduleMxFleetRow = {
+      assetId: "AF99",
+      planRowKey: "p1",
+      planId: "",
+      planName: "",
+      planDesc: "",
+      maintenanceScheduleId: "",
+      itemDesc: "",
+      location: "",
+      makeModel: "",
+      mgmtCd: "",
+      workOrderCount: 1,
+      nce: false,
+      nceStatus: "",
+      scheduleMxNceCritical: false,
+      owningUnit: "TEST",
+      vehNomen: "",
+      eticSnapshotDateKey: "2026-04-26",
+      eticOpenWorkOrderIds: "WO-1",
+      eticOpenInMaintenance: false,
+      scheduleMxPlanEffectiveBucket: "ok",
+      scheduleMxPlanEffectiveNceCritical: false,
+      scheduleMxSuppressedByOpenWo: true,
+      ...base,
+      scheduleMxBucket: "overdue",
+    };
+    const c = computeScheduleMxCommanderSummary([row]);
+    expect(c.wing.totalVehicles).toBe(1);
+    expect(c.wing.overdue).toBe(1);
   });
 });
 
@@ -122,11 +326,9 @@ describe("parseScheduleMxCsvToRawByAsset (compat)", () => {
 });
 
 describe("analyzeElmsScheduleMxFromRaw", () => {
-  it("marks overdue when next maint date is before as-of", () => {
+  it("marks overdue when next maint date is before as-of (no util interval to contradict)", () => {
     const raw = {
       "fleet.next maint date": "2026-04-01",
-      "fleet.current meter reading": "1000",
-      "fleet.next util qty": "5000",
     };
     const a = analyzeElmsScheduleMxFromRaw(raw, "2026-04-25");
     expect(a.scheduleMxBucket).toBe("overdue");
@@ -142,6 +344,27 @@ describe("analyzeElmsScheduleMxFromRaw", () => {
     const a = analyzeElmsScheduleMxFromRaw(raw, "2026-04-25");
     expect(a.scheduleMxOverdueUtil).toBe(true);
     expect(a.scheduleMxBucket).toBe("overdue");
+  });
+
+  it("does not mark overdue from legacy slicer when ELMS util interval is clearly not due", () => {
+    const raw = {
+      "fleet.schedule mx slicer": "Overdue",
+      "fleet.current meter reading": "1000",
+      "fleet.next util qty": "5000",
+    };
+    const a = analyzeElmsScheduleMxFromRaw(raw, "2026-04-25");
+    expect(a.scheduleMxBucket).toBe("ok");
+  });
+
+  it("trusts meter over a stale parsed next-maint date when still before next util qty", () => {
+    const raw = {
+      "fleet.next maint date": "2026-04-01",
+      "fleet.current meter reading": "1000",
+      "fleet.next util qty": "5000",
+    };
+    const a = analyzeElmsScheduleMxFromRaw(raw, "2026-04-25");
+    expect(a.scheduleMxBucket).toBe("ok");
+    expect(a.scheduleMxOverdueUtil).toBe(false);
   });
 });
 
