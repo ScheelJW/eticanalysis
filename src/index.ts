@@ -13921,12 +13921,67 @@ function renderDashboardHtml(): string {
     }
     /* Commander summary (wing / unit scheduled maintenance compliance) */
     .smx-commander-wrap {
-      margin-bottom: 20px;
-      padding: 16px 18px 18px;
+      margin-bottom: 16px;
+      padding: 10px 14px 12px;
       background: var(--card);
       border: 1px solid var(--border);
       border-radius: 14px;
       box-shadow: 0 1px 0 rgba(15, 30, 60, 0.04);
+    }
+    .smx-commander-details {
+      margin: 0;
+      padding: 0;
+      border: none;
+    }
+    .smx-commander-details > summary {
+      list-style: none;
+      cursor: pointer;
+      margin: 0;
+      padding: 0;
+    }
+    .smx-commander-details > summary::-webkit-details-marker {
+      display: none;
+    }
+    .smx-commander-summary-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px 14px;
+    }
+    .smx-commander-summary-main {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+      flex: 1;
+    }
+    .smx-commander-summary-caret {
+      flex-shrink: 0;
+      width: 0.45em;
+      height: 0.45em;
+      border-right: 2px solid var(--muted);
+      border-bottom: 2px solid var(--muted);
+      transform: rotate(-45deg);
+      margin-top: -0.15em;
+      transition: transform 0.15s ease;
+      opacity: 0.75;
+    }
+    .smx-commander-details[open] .smx-commander-summary-caret {
+      transform: rotate(45deg);
+      margin-top: 0.1em;
+    }
+    .smx-commander-summary-line {
+      font-size: 0.84rem;
+      font-weight: 700;
+      color: var(--text);
+      letter-spacing: -0.01em;
+      line-height: 1.35;
+      min-width: 0;
+    }
+    .smx-commander-body {
+      margin-top: 12px;
+      padding-top: 2px;
     }
     .smx-commander-head {
       display: flex;
@@ -14010,9 +14065,10 @@ function renderDashboardHtml(): string {
       color: var(--muted);
     }
     .smx-commander-table-scroll {
-      overflow-x: auto;
+      overflow: auto;
       border-radius: 10px;
       border: 1px solid var(--border);
+      max-height: min(48vh, 420px);
     }
     .smx-commander-table {
       width: 100%;
@@ -14849,38 +14905,50 @@ function renderDashboardHtml(): string {
 
       <div id="panel-schedule-mx" class="hidden">
         <div id="smx-commander-wrap" class="smx-commander-wrap hidden" aria-label="Wing maintenance status">
-          <div class="smx-commander-head">
-            <div class="smx-commander-titles">
-              <h2 class="smx-commander-title" id="smx-commander-title">Wing maintenance status</h2>
-              <p class="smx-commander-sub" id="smx-commander-sub"></p>
+          <details id="smx-commander-details" class="smx-commander-details">
+            <summary class="smx-commander-summary">
+              <div class="smx-commander-summary-row">
+                <div class="smx-commander-summary-main">
+                  <span class="smx-commander-summary-caret" aria-hidden="true"></span>
+                  <span class="smx-commander-summary-line" id="smx-commander-summary-line"></span>
+                </div>
+                <div class="smx-commander-actions">
+                  <button type="button" class="btn smx-btn-outlook" id="smx-commander-mail-wing" title="Open Outlook with a pre-filled commander summary">
+                    RTS Outlook — wing summary
+                  </button>
+                </div>
+              </div>
+            </summary>
+            <div class="smx-commander-body">
+              <div class="smx-commander-head">
+                <div class="smx-commander-titles">
+                  <h2 class="smx-commander-title" id="smx-commander-title">Wing maintenance status</h2>
+                  <p class="smx-commander-sub" id="smx-commander-sub"></p>
+                </div>
+              </div>
+              <div class="smx-commander-kpis" id="smx-commander-kpis"></div>
+              <p class="smx-commander-filter-hint hidden" id="smx-commander-filter-hint">
+                <span id="smx-commander-filter-label"></span>
+                <button type="button" class="linkish" id="smx-commander-clear-unit">Clear unit filter</button>
+              </p>
+              <div class="smx-commander-table-scroll">
+                <table class="smx-commander-table" id="smx-commander-table" aria-label="Scheduled maintenance by unit">
+                  <thead>
+                    <tr>
+                      <th scope="col">Unit</th>
+                      <th scope="col" class="smx-cmd-num">Total</th>
+                      <th scope="col" class="smx-cmd-num">Not overdue</th>
+                      <th scope="col" class="smx-cmd-num">% OK</th>
+                      <th scope="col" class="smx-cmd-num">Overdue</th>
+                      <th scope="col" class="smx-cmd-num">NCE od</th>
+                      <th scope="col" class="smx-cmd-mail-col">RTS</th>
+                    </tr>
+                  </thead>
+                  <tbody id="smx-commander-tbody"></tbody>
+                </table>
+              </div>
             </div>
-            <div class="smx-commander-actions">
-              <button type="button" class="btn smx-btn-outlook" id="smx-commander-mail-wing" title="Open Outlook with a pre-filled commander summary">
-                RTS Outlook — wing summary
-              </button>
-            </div>
-          </div>
-          <div class="smx-commander-kpis" id="smx-commander-kpis"></div>
-          <p class="smx-commander-filter-hint hidden" id="smx-commander-filter-hint">
-            <span id="smx-commander-filter-label"></span>
-            <button type="button" class="linkish" id="smx-commander-clear-unit">Clear unit filter</button>
-          </p>
-          <div class="smx-commander-table-scroll">
-            <table class="smx-commander-table" id="smx-commander-table" aria-label="Scheduled maintenance by unit">
-              <thead>
-                <tr>
-                  <th scope="col">Unit</th>
-                  <th scope="col" class="smx-cmd-num">Total</th>
-                  <th scope="col" class="smx-cmd-num">Not overdue</th>
-                  <th scope="col" class="smx-cmd-num">% OK</th>
-                  <th scope="col" class="smx-cmd-num">Overdue</th>
-                  <th scope="col" class="smx-cmd-num">NCE od</th>
-                  <th scope="col" class="smx-cmd-mail-col">RTS</th>
-                </tr>
-              </thead>
-              <tbody id="smx-commander-tbody"></tbody>
-            </table>
-          </div>
+          </details>
         </div>
         <div class="wo-layout smx-layout">
           <aside class="wo-sidebar">
@@ -18022,6 +18090,8 @@ function renderDashboardHtml(): string {
       var tbody = document.getElementById("smx-commander-tbody");
       var hint = document.getElementById("smx-commander-filter-hint");
       var hintLbl = document.getElementById("smx-commander-filter-label");
+      var sumLine = document.getElementById("smx-commander-summary-line");
+      var detEl = document.getElementById("smx-commander-details");
       if (!wrap || !kpis || !tbody) return;
       if (!smxCommander || !smxRows.length) {
         wrap.classList.add("hidden");
@@ -18039,6 +18109,18 @@ function renderDashboardHtml(): string {
           ".";
       }
       var w = smxCommander.wing;
+      if (sumLine) {
+        var sumBits = [
+          "Wing rollup",
+          String(w.totalVehicles) + " vehicles",
+          smxFmtPct2(w.pctNotOverdue) + "% OK",
+          String(w.overdue) + " overdue",
+        ];
+        if (w.nceOverdue > 0) sumBits.push(String(w.nceOverdue) + " NCE od");
+        if (smxCommanderFilterUnit) sumBits.push("list: " + smxCommanderFilterUnit);
+        sumLine.textContent = sumBits.join(" · ") + " — expand for units";
+      }
+      if (detEl && smxCommanderFilterUnit) detEl.open = true;
       kpis.innerHTML =
         "<div class='smx-cmd-kpi'><span class='lbl'>Total vehicles</span><span class='v'>" +
         esc(String(w.totalVehicles)) +
@@ -20970,7 +21052,9 @@ function renderDashboardHtml(): string {
       const smxMailWing = document.getElementById("smx-commander-mail-wing");
       if (smxMailWing && !smxMailWing.dataset.wired) {
         smxMailWing.dataset.wired = "1";
-        smxMailWing.addEventListener("click", function () {
+        smxMailWing.addEventListener("click", function (ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
           if (!smxCommander) return;
           var dk = smxSelectedDateKey || "";
           var ek = smxEticDateKey || "";
