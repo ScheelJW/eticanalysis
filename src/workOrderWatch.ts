@@ -1326,6 +1326,55 @@ function parseCsvLine(line: string): string[] {
   return out;
 }
 
+/**
+ * Full-file CSV parse: record breaks are newlines **outside** quoted fields.
+ * Excel exports often embed CRLF inside quoted cells; splitting the file on \\n loses rows.
+ */
+export function parseCsvTextToRowArrays(csvText: string): string[][] {
+  const text = csvText.replace(/^\uFEFF/, "");
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cur = "";
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') {
+          cur += '"';
+          i++;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        cur += c;
+      }
+      continue;
+    }
+    if (c === '"') {
+      inQuotes = true;
+      continue;
+    }
+    if (c === ",") {
+      row.push(parseCsvSegment(cur));
+      cur = "";
+      continue;
+    }
+    if (c === "\r" || c === "\n") {
+      if (c === "\r" && text[i + 1] === "\n") i++;
+      row.push(parseCsvSegment(cur));
+      cur = "";
+      if (row.some((cell) => (cell ?? "").trim().length > 0)) rows.push(row);
+      row = [];
+      continue;
+    }
+    cur += c;
+  }
+  row.push(parseCsvSegment(cur));
+  if (row.some((cell) => (cell ?? "").trim().length > 0)) rows.push(row);
+  return rows;
+}
+
 function findAssetColumnIndex(headers: string[]): number {
   const scored: { i: number; score: number }[] = [];
   for (let i = 0; i < headers.length; i++) {
@@ -1379,17 +1428,24 @@ function buildPlanRowsFromTable(headers: string[], dataRows: string[][]): Schedu
   return out;
 }
 
+function dedupePlanRowKeys(rows: ScheduleMxPlanParseRow[]): ScheduleMxPlanParseRow[] {
+  const counts = new Map<string, number>();
+  return rows.map((r) => {
+    const base = r.planRowKey;
+    const n = counts.get(base) ?? 0;
+    counts.set(base, n + 1);
+    if (n === 0) return r;
+    return { ...r, planRowKey: base + "#" + String(n) };
+  });
+}
+
 /** Parse ELMS / Schedule Mx CSV: one entry per plan row (many per asset). */
 export function parseScheduleMxCsvToPlanRows(csvText: string): ScheduleMxPlanParseRow[] {
-  let t = csvText.replace(/^\uFEFF/, "");
-  const lines = t.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n").filter((l) => l.trim().length > 0);
-  if (lines.length < 2) return [];
-  const headers = parseCsvLine(lines[0]!).map((h) => h.trim());
-  const dataRows: string[][] = [];
-  for (let i = 1; i < lines.length; i++) {
-    dataRows.push(parseCsvLine(lines[i]!));
-  }
-  return buildPlanRowsFromTable(headers, dataRows);
+  const table = parseCsvTextToRowArrays(csvText);
+  if (table.length < 2) return [];
+  const headers = table[0]!.map((h) => h.trim());
+  const dataRows = table.slice(1);
+  return dedupePlanRowKeys(buildPlanRowsFromTable(headers, dataRows));
 }
 
 /** @deprecated for tests; use parseScheduleMxCsvToPlanRows — last plan per asset only. */

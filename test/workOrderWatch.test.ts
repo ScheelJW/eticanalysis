@@ -8,6 +8,7 @@ import {
   getChangelogForDisplay,
   ingestWorkOrderSnapshot,
   melMgmtCodesMatch,
+  parseCsvTextToRowArrays,
   parseEticDate,
   parseScheduleMxCsvToPlanRows,
   parseScheduleMxCsvToRawByAsset,
@@ -39,6 +40,19 @@ describe("parseEticDate", () => {
   });
 });
 
+describe("parseCsvTextToRowArrays", () => {
+  it("treats newline inside quotes as part of cell, not row break", () => {
+    const csv =
+      'Asset Id,Note\n' +
+      'AF01,"line1\nline2"\n' +
+      'AF02,x\n';
+    const rows = parseCsvTextToRowArrays(csv);
+    expect(rows.length).toBe(3);
+    expect(rows[1]![1]).toContain("line1");
+    expect(rows[1]![1]).toContain("line2");
+  });
+});
+
 describe("parseScheduleMxCsvToPlanRows", () => {
   it("maps headers to fleet.* keys and yields one row per CSV line", () => {
     const csv =
@@ -50,6 +64,17 @@ describe("parseScheduleMxCsvToPlanRows", () => {
     expect(rows[0]!.planRowKey).toBe("SCH1");
     expect(rows[1]!.planRowKey).toBe("SCH2");
     expect(rows[0]!.raw["fleet.next maint date"]).toBe("2026-05-01");
+  });
+
+  it("suffixes duplicate plan_row_key so D1 upserts do not collapse rows", () => {
+    const csv =
+      "Asset Id,Maintenance Schedule Id,Plan Name\n" +
+      "AF01B00001,SAME,A\n" +
+      "AF01B00001,SAME,B\n";
+    const rows = parseScheduleMxCsvToPlanRows(csv);
+    expect(rows.length).toBe(2);
+    expect(rows[0]!.planRowKey).toBe("SAME");
+    expect(rows[1]!.planRowKey).toBe("SAME#1");
   });
 
   it("strips UTF-8 BOM on first header", () => {
