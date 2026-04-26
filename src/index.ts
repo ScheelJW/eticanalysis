@@ -14441,7 +14441,7 @@ function renderDashboardHtml(): string {
         <div class="smx-stats" id="smx-stats" role="status">Loading…</div>
         <div class="smx-toolbar">
           <label class="smx-search"><span class="sr-only">Filter rows</span>
-            <input type="text" id="smx-query" placeholder="Filter asset, mgmt code…" autocomplete="off" />
+            <input type="text" id="smx-query" placeholder="Filter asset, WO id, type…" autocomplete="off" />
           </label>
           <button type="button" class="smx-reset-filters" id="smx-reset-filters">Reset filters</button>
           <div class="smx-filters" id="smx-filters" role="tablist" aria-label="Schedule maintenance filters">
