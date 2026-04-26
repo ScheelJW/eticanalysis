@@ -439,6 +439,27 @@ describe("analyzeElmsScheduleMxFromRaw", () => {
     expect(a.scheduleMxBucket).toBe("overdue");
   });
 
+  it("marks util overdue with no calendar next date (utilization-only OR path)", () => {
+    const raw = {
+      "fleet.current meter reading": "6000",
+      "fleet.next util qty": "5000",
+    };
+    const a = analyzeElmsScheduleMxFromRaw(raw, "2026-04-25");
+    expect(a.scheduleMxOverdueUtil).toBe(true);
+    expect(a.scheduleMxBucket).toBe("overdue");
+    expect(a.elmsNextMaintDateIso).toBeNull();
+  });
+
+  it("marks due soon from utilization when within 5% of target without calendar date", () => {
+    const raw = {
+      "fleet.current meter reading": "4800",
+      "fleet.next util qty": "5000",
+    };
+    const a = analyzeElmsScheduleMxFromRaw(raw, "2026-04-25");
+    expect(a.scheduleMxBucket).toBe("due_soon");
+    expect(a.scheduleMxOverdueUtil).toBe(false);
+  });
+
   it("does not mark overdue from legacy slicer when ELMS util interval is clearly not due", () => {
     const raw = {
       "fleet.schedule mx slicer": "Overdue",

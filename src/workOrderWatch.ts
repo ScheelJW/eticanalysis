@@ -1595,6 +1595,7 @@ export function analyzeElmsScheduleMxFromRaw(
   let needsEntry = legacy.scheduleMxNeedsEntry;
 
   if (hasElmsSignal) {
+    /** Due if **either** calendar or utilization says so (OR). Util overdue is never cleared by a future calendar date. */
     const overdue = dateOverdue || scheduleMxOverdueUtil;
     const dateDueSoon = !dateOverdue && elmsNextMaintDateIso != null && daysUntil != null && daysUntil >= 0 && daysUntil <= DUE_SOON_DAYS_ELMS;
     let utilDueSoon = false;
