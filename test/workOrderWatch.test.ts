@@ -46,6 +46,13 @@ describe("parseScheduleMxCsvToRawByAsset", () => {
     expect(raw["fleet.schedule mx status"]).toBe("Overdue");
     expect(raw["fleet.next schedule mx"]).toBe("4/15/2026");
   });
+
+  it("strips UTF-8 BOM on first header", () => {
+    const csv = "\uFEFFVehicle Id,Status\nAF01B00001,OK\n";
+    const m = parseScheduleMxCsvToRawByAsset(csv);
+    expect(m.size).toBe(1);
+    expect(m.get("AF01B00001")!["fleet.status"]).toBe("OK");
+  });
 });
 
 describe("calendarDaysBetween", () => {

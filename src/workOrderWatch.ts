@@ -1090,20 +1090,35 @@ function parseCsvLine(line: string): string[] {
 }
 
 function findAssetColumnIndex(headers: string[]): number {
+  const scored: { i: number; score: number }[] = [];
   for (let i = 0; i < headers.length; i++) {
     const n = normalizeHeaderKey(headers[i] ?? "");
     if (!n) continue;
-    if (n.includes("asset id") || n === "assetid" || n.endsWith("asset_id") || /^asset\s*#?$/.test(n)) {
-      return i;
-    }
+    let score = 0;
+    if (n.includes("asset id") || n === "assetid" || n.endsWith("asset_id") || /^asset\s*#?$/.test(n)) score = 100;
+    else if (n.includes("vehicle id") || n.includes("veh id")) score = 95;
+    else if (n.includes("equipment id") || n.includes("equip id")) score = 90;
+    else if (/\basset\b/.test(n) && (n.includes("id") || n.includes("#") || n.includes("number") || n.includes("no"))) score = 85;
+    else if (n.includes("af inventory") && (n.includes("id") || n.includes("#"))) score = 80;
+    else if (n.includes("inventory") && n.includes("asset")) score = 75;
+    if (score > 0) scored.push({ i, score });
   }
-  return -1;
+  if (!scored.length) return -1;
+  scored.sort((a, b) => b.score - a.score || a.i - b.i);
+  return scored[0]!.i;
 }
 
 function tableToRawByAsset(headers: string[], dataRows: string[][]): Map<string, Record<string, string>> {
   const assetIdx = findAssetColumnIndex(headers);
   if (assetIdx < 0) {
-    throw new Error("prevmx: no Asset Id column (expected a header like Asset Id)");
+    const preview = headers
+      .filter((h) => (h ?? "").trim())
+      .slice(0, 20)
+      .join(" | ");
+    throw new Error(
+      "prevmx: no asset-id column matched (expected headers like Asset Id, Vehicle Id, etc.). First headers: " +
+        (preview || "(none)"),
+    );
   }
   const headerFleet = headers.map((h) => `fleet.${normalizeHeaderKey(h)}`);
   const out = new Map<string, Record<string, string>>();
@@ -1122,9 +1137,10 @@ function tableToRawByAsset(headers: string[], dataRows: string[][]): Map<string,
   return out;
 }
 
-/** Parse ELMS / Schedule Mx CSV export: first row = headers, must include Asset Id. */
+/** Parse ELMS / Schedule Mx CSV export: first row = headers; asset column detected heuristically. */
 export function parseScheduleMxCsvToRawByAsset(csvText: string): Map<string, Record<string, string>> {
-  const lines = csvText.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n").filter((l) => l.trim().length > 0);
+  let t = csvText.replace(/^\uFEFF/, "");
+  const lines = t.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n").filter((l) => l.trim().length > 0);
   if (lines.length < 2) return new Map();
   const headers = parseCsvLine(lines[0]!).map((h) => h.trim());
   const dataRows: string[][] = [];

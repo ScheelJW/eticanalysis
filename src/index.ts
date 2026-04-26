@@ -261,29 +261,36 @@ export default {
       const subject = parsed.subject ?? "";
       const dateKey = resolveAnalysisDateKey(subject, now, env, safeName);
       const receivedAtIso = now.toISOString();
-      try {
-        const result = await ingestScheduleMxExtractFromAttachment(env, {
-          bytes,
-          fileName: safeName,
-          dateKey,
-          receivedAtIso,
-          from: message.from,
-          to: toAddr,
-        });
-        console.log(JSON.stringify({ level: "info", message: "prevmx_ingest_ok", ...result }));
-      } catch (err) {
-        console.error(
-          JSON.stringify({
-            level: "error",
-            message: "prevmx_ingest_failed",
-            error: err instanceof Error ? err.message : String(err),
-            from: message.from,
-            to: toAddr,
-            dateKey,
-            fileName: safeName,
-          }),
-        );
-      }
+      const fromAddr = message.from;
+      // Large ELMS CSVs can exceed the email-handler wall clock; finish in waitUntil.
+      ctx.waitUntil(
+        (async () => {
+          try {
+            const result = await ingestScheduleMxExtractFromAttachment(env, {
+              bytes,
+              fileName: safeName,
+              dateKey,
+              receivedAtIso,
+              from: fromAddr,
+              to: toAddr,
+            });
+            console.log(JSON.stringify({ level: "info", message: "prevmx_ingest_ok", ...result }));
+          } catch (err) {
+            console.error(
+              JSON.stringify({
+                level: "error",
+                message: "prevmx_ingest_failed",
+                error: err instanceof Error ? err.message : String(err),
+                from: fromAddr,
+                to: toAddr,
+                dateKey,
+                fileName: safeName,
+                bytes: bytes.byteLength,
+              }),
+            );
+          }
+        })(),
+      );
       return;
     }
 
