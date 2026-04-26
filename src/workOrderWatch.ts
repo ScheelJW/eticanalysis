@@ -798,7 +798,7 @@ export function analyzeScheduleMxFromRaw(
   scheduleMxBucket: ScheduleMxBucket;
   scheduleMxNeedsEntry: boolean;
 } {
-  const DUE_SOON_DAYS = 30;
+  const DUE_SOON_DAYS = 60;
   const slicer = findScheduleMxSlicer(raw);
   const status = findScheduleMxStatus(raw);
   const dueText = findScheduleMxDueText(raw);
@@ -1314,7 +1314,19 @@ export function elmsPlanRowKeyFromRaw(raw: Record<string, string>, assetId: stri
   return assetId + "|r" + String(rowIndex);
 }
 
-const DUE_SOON_DAYS_ELMS = 30;
+/** Calendar: due soon when next maint within this many days (~2 months). */
+const DUE_SOON_DAYS_ELMS = 60;
+/** Utilization: remaining until next service at or below this threshold (miles / ambiguous). */
+const DUE_SOON_UTIL_MILES = 1500;
+/** Utilization: remaining until next service at or below this threshold (hours). */
+const DUE_SOON_UTIL_HOURS = 50;
+
+function elmsUtilDueSoonThreshold(utilType: string): number {
+  const u = (utilType ?? "").toLowerCase();
+  if (/\bhour\b|\bhrs?\b|\bh\b/.test(u)) return DUE_SOON_UTIL_HOURS;
+  if (/\bmile\b|\bmi\b|\bodometer\b|\bodo\b/.test(u)) return DUE_SOON_UTIL_MILES;
+  return DUE_SOON_UTIL_MILES;
+}
 
 /**
  * Merge ELMS date/util signals with legacy Fleet (P&A) schedule fields when present in raw JSON.
@@ -1394,9 +1406,9 @@ export function analyzeElmsScheduleMxFromRaw(
     const overdue = dateOverdue || scheduleMxOverdueUtil;
     const dateDueSoon = !dateOverdue && elmsNextMaintDateIso != null && daysUntil != null && daysUntil >= 0 && daysUntil <= DUE_SOON_DAYS_ELMS;
     let utilDueSoon = false;
-    if (!scheduleMxOverdueUtil && scheduleMxUtilRemaining != null && scheduleMxUtilRemaining > 0 && elmsNextUtilQty != null && elmsNextUtilQty > 0) {
-      const pct = scheduleMxUtilRemaining / elmsNextUtilQty;
-      utilDueSoon = pct <= 0.05;
+    if (!scheduleMxOverdueUtil && scheduleMxUtilRemaining != null && scheduleMxUtilRemaining > 0) {
+      const thresh = elmsUtilDueSoonThreshold(elmsUtilType);
+      utilDueSoon = scheduleMxUtilRemaining <= thresh;
     }
     if (overdue) {
       bucket = "overdue";

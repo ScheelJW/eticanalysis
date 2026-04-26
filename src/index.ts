@@ -17682,7 +17682,7 @@ function renderDashboardHtml(): string {
         pill("inMaintenanceAssets", "Assets w/ open WO", "") +
         pill("nceCritical", "NCE + overdue (assets)", "crit") +
         pill("overdue", "Overdue assets (any plan)", "bad") +
-        pill("dueSoon", "Due soon assets (≤30d)", "warn") +
+        pill("dueSoon", "Due soon assets (~60d / util)", "warn") +
         pill("missing", "Missing data (assets)", "warn") +
         pill("ok", "OK assets (all plans)", "");
     }
@@ -18029,7 +18029,7 @@ function renderDashboardHtml(): string {
           smxChips += "<span class='chip smx-overdue" + (r.nce ? " smx-nce-critical" : "") +
             "' title='Scheduled maintenance overdue'>Sched Mx overdue" + od + (r.nce ? " · NCE" : "") + "</span>";
         } else if (r.scheduleMxBucket === "due_soon") {
-          smxChips += "<span class='chip smx-soon' title='Due within ~30 days'>Sched Mx due soon</span>";
+          smxChips += "<span class='chip smx-soon' title='Due within ~60 days, or util within 1500 mi / 50 hr'>Sched Mx due soon</span>";
         }
         var recallChip = "";
         if (r.melRecallHint) {

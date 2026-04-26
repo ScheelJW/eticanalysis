@@ -210,6 +210,36 @@ describe("analyzeElmsScheduleMxFromRaw", () => {
     expect(a.scheduleMxOverdueUtil).toBe(true);
     expect(a.scheduleMxBucket).toBe("overdue");
   });
+
+  it("marks due soon when next maint within 60 days", () => {
+    const raw = { "fleet.next maint date": "2026-06-20" };
+    const a = analyzeElmsScheduleMxFromRaw(raw, "2026-04-25");
+    expect(a.scheduleMxBucket).toBe("due_soon");
+  });
+
+  it("marks due soon when miles remaining at or below 1500", () => {
+    const raw = {
+      "fleet.next maint date": "2026-12-01",
+      "fleet.current meter reading": "8600",
+      "fleet.next util qty": "10000",
+      "fleet.utilization type": "Miles",
+    };
+    const a = analyzeElmsScheduleMxFromRaw(raw, "2026-04-25");
+    expect(a.scheduleMxUtilRemaining).toBe(1400);
+    expect(a.scheduleMxBucket).toBe("due_soon");
+  });
+
+  it("marks due soon when hours remaining at or below 50", () => {
+    const raw = {
+      "fleet.next maint date": "2026-12-01",
+      "fleet.current meter reading": "990",
+      "fleet.next util qty": "1035",
+      "fleet.utilization type": "Hours",
+    };
+    const a = analyzeElmsScheduleMxFromRaw(raw, "2026-04-25");
+    expect(a.scheduleMxUtilRemaining).toBe(45);
+    expect(a.scheduleMxBucket).toBe("due_soon");
+  });
 });
 
 describe("calendarDaysBetween", () => {
