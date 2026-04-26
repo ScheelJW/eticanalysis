@@ -18360,8 +18360,8 @@ function renderDashboardHtml(): string {
     }
 
     function renderScheduleMxTable() {
-      const tbody = document.getElementById("smx-feed-tbody");
-      if (!tbody) return;
+      const feed = document.getElementById("smx-feed");
+      if (!feed) return;
       const qel = document.getElementById("smx-query");
       const q = (qel && qel.value) ? qel.value.trim() : "";
       const filtered = smxRows.filter(function (row) {
@@ -18374,10 +18374,10 @@ function renderDashboardHtml(): string {
         el.textContent = n;
       });
       if (!filtered.length) {
-        tbody.innerHTML = "<tr><td colspan='4'>No assets match your filters.</td></tr>";
+        feed.innerHTML = "<div class='smx-empty'>No assets match your filters.</div>";
         return;
       }
-      tbody.innerHTML = filtered.map(function (row) {
+      feed.innerHTML = filtered.map(function (row) {
         var nceBadge = "—";
         if (row.nce) {
           nceBadge =
@@ -18410,8 +18410,8 @@ function renderDashboardHtml(): string {
           "<div class='smx-nested-inner'>" + smxRenderPlanMiniTable(plans) + "</div>" +
           "</details>";
         return (
-          "<tr class='smx-feed-row" + (trCls ? " " + esc(trCls) : "") + "'>" +
-            "<td class='smx-feed-asset-cell'><div class='smx-feed-asset'>" +
+          "<article class='smx-feed-row" + (trCls ? " " + esc(trCls) : "") + "'>" +
+            "<div class='smx-feed-asset-cell'><div class='smx-feed-asset'>" +
               "<span class='asset-mono'>" + esc(row.assetId) + "</span>" +
               "<span class='smx-feed-state smx-pill " + esc(wp.cls) + "'>" + esc(wp.label) + "</span>" +
             "</div>" +
@@ -18419,12 +18419,12 @@ function renderDashboardHtml(): string {
             (row.makeModel ? "<div class='remark-snippet'>" + esc(row.makeModel) + "</div>" : "") +
             (row.mgmtCd ? "<div class='remark-snippet'>Mgmt " + esc(row.mgmtCd) + "</div>" : "") +
             woLine +
-            "</td>" +
-            "<td><div class='smx-feed-count'>" + String(row.planCount || plans.length) + "</div>" +
-            "<div class='remark-snippet'>" + esc(smxAssetSummaryLine(row)) + "</div></td>" +
-            "<td>" + nceBadge + "</td>" +
-            "<td class='smx-feed-detail'>" + nested + "</td>" +
-          "</tr>"
+            "</div>" +
+            "<div><div class='smx-feed-count'>" + String(row.planCount || plans.length) + "</div>" +
+            "<div class='remark-snippet'>" + esc(smxAssetSummaryLine(row)) + "</div></div>" +
+            "<div>" + nceBadge + "</div>" +
+            "<div class='smx-feed-detail'>" + nested + "</div>" +
+          "</article>"
         );
       }).join("");
     }
