@@ -14167,6 +14167,46 @@ function renderDashboardHtml(): string {
       min-width: 0;
     }
     .smx-card .badges { display: inline-flex; gap: 6px; align-items: center; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
+    .smx-card .badges .smx-chip-btn {
+      margin: 0;
+      padding: 2px 8px;
+      border: none;
+      border-radius: 999px;
+      font: inherit;
+      font-size: 0.62rem;
+      font-weight: 700;
+      line-height: 1.2;
+      cursor: pointer;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      background: rgba(139, 21, 56, 0.18);
+      color: #7a1020;
+      box-shadow: inset 0 0 0 1px rgba(139, 21, 56, 0.25);
+    }
+    .smx-card .badges .smx-chip-btn:hover { filter: brightness(1.06); }
+    .smx-card .badges .smx-chip-btn:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    .smx-plan-block .badges .smx-chip-btn {
+      margin: 0;
+      padding: 2px 8px;
+      border: none;
+      border-radius: 999px;
+      font: inherit;
+      font-size: 0.62rem;
+      font-weight: 700;
+      cursor: pointer;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      background: rgba(255, 138, 138, 0.14);
+      color: var(--danger);
+    }
+    .smx-plan-block .badges .smx-chip-btn:hover { filter: brightness(1.05); }
+    .smx-plan-block .badges .smx-chip-btn:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
     .smx-card .asset-mono {
       font-family: var(--font-mono);
       font-size: 0.92rem;
@@ -17881,6 +17921,18 @@ function renderDashboardHtml(): string {
     /** Latest ETIC workbook date used for unit / NCE / open WO enrichment (YYYY-MM-DD). */
     var smxEticDateKey = null;
     var smxFilter = "all";
+
+    function smxSetFilter(mode) {
+      smxFilter = mode || "all";
+      var smxFilt = document.getElementById("smx-filters");
+      if (smxFilt) {
+        smxFilt.querySelectorAll(".wo-filter-btn").forEach(function (x) {
+          var k = x.getAttribute("data-smx-filter") || "";
+          x.classList.toggle("active", k === smxFilter);
+        });
+      }
+      renderScheduleMxList();
+    }
     var smxSort = "priority";
     /** Selected asset id for list + detail (matches row.assetId). */
     var smxSelectedAssetId = "";
@@ -18368,7 +18420,9 @@ function renderDashboardHtml(): string {
             var rawB2 = row.scheduleMxBucket || "";
             var badges =
               (row.nce ? "<span class='chip nce'>NCE</span>" : "") +
-              (row.scheduleMxPlanEffectiveNceCritical ? "<span class='chip stale'>NCE od</span>" : "") +
+              (row.scheduleMxPlanEffectiveNceCritical
+                ? "<button type='button' class='chip stale smx-chip-btn smx-nce-crit-chip' title='Show all NCE overdue assets'>NCE overdue</button>"
+                : "") +
               "<span class='smx-pill " +
               esc(effB) +
               "'>" +
@@ -18926,7 +18980,9 @@ function renderDashboardHtml(): string {
         var nceChip = anyNce
           ? "<span class='chip nce' title='Nuclear Certified Equipment" + (nceTitle ? " · " + esc(nceTitle) : "") + "'>NCE</span>"
           : "";
-        var critChip = anyCrit ? "<span class='chip stale' title='Overdue on NCE'>NCE od</span>" : "";
+        var critChip = anyCrit
+          ? "<button type='button' class='smx-chip-btn smx-nce-crit-chip' title='Show all NCE overdue assets'>NCE overdue</button>"
+          : "";
         var aggPill =
           "<span class='smx-pill " + esc(worstBucket) + "'>" + esc(smxPillLabel(worstBucket)) + "</span>";
         var nextD = null;
@@ -18945,19 +19001,31 @@ function renderDashboardHtml(): string {
         metaBits.push("<span><span class='k'>Next</span><span class='v'>" + esc(nextTxt) + "</span></span>");
         if (wo) metaBits.push("<span><span class='k'>WOs</span><span class='v'>" + wo + "</span></span>");
         return (
-          "<button type='button' class='smx-card" + (isActive ? " active" : "") + "' data-smx-asset='" + esc(assetId) + "' data-smx-tier='" + esc(tier) + "'>" +
+          "<div class='smx-card" + (isActive ? " active" : "") + "' data-smx-asset='" + esc(assetId) + "' data-smx-tier='" + esc(tier) + "' tabindex='0' role='button' aria-label='Select asset " + esc(assetId) + "'>" +
           "<div class='top-line'>" +
-          "<span class='asset-mono'>" + esc(assetId) + "</span>" +
+          "<span class='asset-mono smx-card-select'>" + esc(assetId) + "</span>" +
           "<span class='badges'>" + nceChip + critChip + aggPill + "</span>" +
           "</div>" +
-          "<div class='wo-meta-line'>" + renderSightingBadge(assetId, { compact: true }) + "</div>" +
-          "<div class='meta'>" + metaBits.join("") + "</div>" +
-          "</button>"
+          "<div class='wo-meta-line smx-card-select'>" + renderSightingBadge(assetId, { compact: true }) + "</div>" +
+          "<div class='meta smx-card-select'>" + metaBits.join("") + "</div>" +
+          "</div>"
         );
       }).join("");
       list.querySelectorAll(".smx-card").forEach(function (el) {
         el.addEventListener("click", function (ev) {
-          if (ev.target.closest("a.smx-open-wo")) return;
+          if (ev.target.closest("a.smx-open-wo") || ev.target.closest(".smx-nce-crit-chip")) return;
+          if (!ev.target.closest(".smx-card-select")) return;
+          var aid = el.getAttribute("data-smx-asset") || "";
+          selectSmxAsset(aid, true);
+          list.querySelectorAll(".smx-card").forEach(function (c) {
+            c.classList.toggle("active", c.getAttribute("data-smx-asset") === smxSelectedAssetId);
+          });
+        });
+        el.addEventListener("keydown", function (ev) {
+          if (ev.key !== "Enter" && ev.key !== " ") return;
+          if (ev.target !== el && !ev.target.closest(".smx-card-select")) return;
+          if (ev.target.closest(".smx-nce-crit-chip")) return;
+          ev.preventDefault();
           var aid = el.getAttribute("data-smx-asset") || "";
           selectSmxAsset(aid, true);
           list.querySelectorAll(".smx-card").forEach(function (c) {
@@ -20859,11 +20927,7 @@ function renderDashboardHtml(): string {
         smxFilt.addEventListener("click", function (e) {
           const b = e.target.closest("[data-smx-filter]");
           if (!b) return;
-          smxFilter = b.getAttribute("data-smx-filter") || "all";
-          smxFilt.querySelectorAll(".wo-filter-btn").forEach(function (x) {
-            x.classList.toggle("active", x === b);
-          });
-          renderScheduleMxList();
+          smxSetFilter(b.getAttribute("data-smx-filter") || "all");
         });
       }
       const smxQ = document.getElementById("smx-query");
@@ -20888,6 +20952,13 @@ function renderDashboardHtml(): string {
       if (panelSmx && !panelSmx.dataset.smxWoNav) {
         panelSmx.dataset.smxWoNav = "1";
         panelSmx.addEventListener("click", function (ev) {
+          const nc = ev.target.closest(".smx-nce-crit-chip");
+          if (nc) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            smxSetFilter("nce_critical");
+            return;
+          }
           const a = ev.target.closest("a.smx-open-wo");
           if (!a) return;
           if (ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.altKey || ev.button !== 0) return;
