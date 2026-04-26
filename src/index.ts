@@ -13958,54 +13958,336 @@ function renderDashboardHtml(): string {
       position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
       clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
     }
-    .smx-header {
-      display: flex; justify-content: space-between; align-items: flex-start; gap: 16px;
-      flex-wrap: wrap; margin-bottom: 16px;
+    .smx-shell {
+      display: grid;
+      gap: 18px;
+      margin-top: 2px;
     }
-    .smx-title { margin: 0 0 6px; font-size: 1.35rem; }
-    .smx-sub { margin: 0; color: var(--muted); font-size: 0.9rem; line-height: 1.45; max-width: 860px; }
+    .smx-overview {
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px 20px;
+      background: linear-gradient(170deg, rgba(0,58,140,0.05) 0%, var(--card) 46%);
+    }
+    .smx-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 14px 18px;
+      flex-wrap: wrap;
+      margin-bottom: 14px;
+    }
+    .smx-title { margin: 0 0 4px; font-size: 1.38rem; letter-spacing: -0.02em; }
+    .smx-sub {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.89rem;
+      line-height: 1.45;
+      max-width: 58rem;
+    }
+    .smx-header-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .smx-date-select select {
+      font: inherit;
+      font-size: 0.86rem;
+      font-weight: 700;
+      padding: 8px 10px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      min-width: 128px;
+    }
     .nce-inline { font-weight: 800; color: var(--accent); }
     .smx-asof-pill {
-      font-size: 0.72rem; font-weight: 700; padding: 6px 12px; border-radius: 999px;
-      background: rgba(0,58,140,0.12); color: var(--accent); border: 1px solid rgba(0,58,140,0.3);
+      font-size: 0.72rem;
+      font-weight: 700;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: rgba(0,58,140,0.12);
+      color: var(--accent);
+      border: 1px solid rgba(0,58,140,0.3);
     }
-    .smx-stats { display: flex; flex-wrap: wrap; gap: 10px 14px; margin-bottom: 14px; }
+    .smx-stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 10px;
+    }
     .smx-stat {
-      background: var(--card); border: 1px solid var(--border); border-radius: 10px;
-      padding: 10px 14px; min-width: 118px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      min-height: 74px;
     }
-    .smx-stat .lbl { display: block; font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
-    .smx-stat .v { font-size: 1.28rem; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.2; }
+    .smx-stat .lbl {
+      display: block;
+      font-size: 0.62rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .smx-stat .v {
+      font-size: 1.3rem;
+      font-weight: 800;
+      font-variant-numeric: tabular-nums;
+      line-height: 1.22;
+    }
     .smx-stat.bad .v { color: var(--danger); }
     .smx-stat.warn .v { color: var(--warn); }
     .smx-stat.crit .v { color: #7a1020; }
-    .smx-toolbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 12px; }
+    .smx-workspace {
+      display: grid;
+      grid-template-columns: minmax(0, 1.4fr) minmax(260px, 0.8fr);
+      gap: 16px;
+      align-items: start;
+    }
+    .smx-future-panel {
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: var(--card);
+      padding: 16px;
+      min-height: 220px;
+      display: grid;
+      gap: 10px;
+    }
+    .smx-future-panel h3 {
+      margin: 0;
+      font-size: 1.02rem;
+      letter-spacing: -0.01em;
+    }
+    .smx-future-panel p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.84rem;
+      line-height: 1.45;
+    }
+    .smx-future-slot {
+      border: 1px dashed var(--border);
+      border-radius: 10px;
+      padding: 12px;
+      min-height: 58px;
+      display: grid;
+      align-content: center;
+      gap: 4px;
+      background: rgba(0,0,0,0.015);
+    }
+    .smx-future-slot strong {
+      font-size: 0.83rem;
+      font-weight: 700;
+    }
+    .smx-future-slot small {
+      color: var(--muted);
+      font-size: 0.76rem;
+    }
+    .smx-calc-panel {
+      padding: 20px 20px 18px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: linear-gradient(165deg, rgba(0,58,140,0.05) 0%, var(--card) 52%);
+    }
+    .smx-calc-panel-head { margin-bottom: 14px; max-width: 52rem; }
+    .smx-calc-panel-head h3 {
+      margin: 0 0 6px;
+      font-size: 1.08rem;
+      font-weight: 800;
+      letter-spacing: -0.01em;
+    }
+    .smx-calc-lede {
+      margin: 0;
+      font-size: 0.88rem;
+      line-height: 1.48;
+      color: var(--muted);
+    }
+    .smx-calc-grid {
+      display: grid;
+      grid-template-columns: minmax(180px, 1.2fr) minmax(150px, 0.9fr) minmax(170px, 0.85fr) auto;
+      gap: 12px 14px;
+      align-items: end;
+    }
+    .smx-calc-field label {
+      display: block;
+      font-size: 0.7rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .smx-calc-hint {
+      font-weight: 500;
+      text-transform: none;
+      letter-spacing: 0;
+      color: var(--muted);
+      opacity: 0.86;
+    }
+    .smx-calc-field input[type="text"],
+    .smx-calc-field input[type="number"],
+    .smx-calc-field input[type="date"] {
+      width: 100%;
+      box-sizing: border-box;
+      font: inherit;
+      font-size: 0.92rem;
+      padding: 10px 11px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+    }
+    .smx-calc-field input:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(0,58,140,0.15);
+    }
+    .smx-calc-actions { display: flex; align-items: flex-end; }
+    .smx-calc-run {
+      font: inherit;
+      font-size: 0.92rem;
+      font-weight: 700;
+      padding: 10px 18px;
+      border-radius: 10px;
+      border: none;
+      background: var(--accent);
+      color: var(--accent-contrast, #fff);
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .smx-calc-run:hover { filter: brightness(1.06); }
+    .smx-calc-rules {
+      margin: 12px 0 0;
+      padding: 11px 14px 11px 1.6rem;
+      font-size: 0.8rem;
+      line-height: 1.5;
+      color: var(--muted);
+      background: rgba(0,0,0,0.02);
+      border-radius: 10px;
+      border: 1px solid var(--border);
+    }
+    .smx-calc-rules li { margin: 3px 0; }
+    .smx-calc-status {
+      margin: 12px 0 0;
+      min-height: 1.35em;
+      font-size: 0.88rem;
+      font-weight: 600;
+    }
+    .smx-calc-results {
+      margin-top: 10px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      overflow: auto;
+      max-height: min(46vh, 440px);
+      background: var(--bg);
+    }
+    .smx-calc-results-summary {
+      padding: 12px 14px;
+      font-size: 0.87rem;
+      border-bottom: 1px solid var(--border);
+      background: var(--card);
+    }
+    .smx-calc-table { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
+    .smx-calc-table th,
+    .smx-calc-table td {
+      padding: 10px 12px;
+      border-top: 1px solid var(--border);
+      text-align: left;
+      vertical-align: top;
+    }
+    .smx-calc-table th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: var(--bg2);
+      color: var(--muted);
+      font-size: 0.63rem;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+    }
+    .smx-calc-table tr:hover td { background: rgba(0,58,140,0.04); }
+    .smx-assets-panel {
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: var(--card);
+      padding: 14px;
+      display: grid;
+      gap: 12px;
+    }
+    .smx-assets-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+    }
+    .smx-assets-head h3 {
+      margin: 0;
+      font-size: 1rem;
+      letter-spacing: -0.01em;
+    }
+    .smx-assets-head p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+    .smx-toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
     .smx-reset-filters {
-      font: inherit; font-size: 0.82rem; padding: 6px 12px; border-radius: 8px;
-      border: 1px solid var(--border); background: var(--panel); color: var(--text); cursor: pointer;
+      font: inherit;
+      font-size: 0.81rem;
+      padding: 6px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--text);
+      cursor: pointer;
     }
     .smx-reset-filters:hover { border-color: var(--muted); }
     .smx-search input {
-      min-width: 220px; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border);
-      background: var(--bg); font: inherit;
+      min-width: 230px;
+      padding: 8px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      font: inherit;
     }
     .smx-filters { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
     .smx-filter-btn {
-      padding: 6px 12px; border-radius: 999px; border: 1px solid var(--border);
-      background: var(--bg1); font: inherit; font-size: 0.82rem; cursor: pointer;
+      padding: 6px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--bg1);
+      font: inherit;
+      font-size: 0.8rem;
+      cursor: pointer;
     }
     .smx-filter-btn.active {
-      border-color: var(--accent); background: rgba(0,58,140,0.08); color: var(--accent); font-weight: 700;
+      border-color: var(--accent);
+      background: rgba(0,58,140,0.08);
+      color: var(--accent);
+      font-weight: 700;
     }
     .smx-n { opacity: 0.8; font-weight: 600; margin-left: 4px; font-variant-numeric: tabular-nums; }
     .smx-table-wrap {
-      overflow: auto; border: 1px solid var(--border); border-radius: 10px;
-      max-height: min(70vh, 720px);
+      overflow: auto;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      max-height: min(52vh, 560px);
     }
-    .smx-table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+    .smx-table { width: 100%; border-collapse: collapse; font-size: 0.86rem; }
     .smx-table th {
-      text-align: left; padding: 10px 12px; background: var(--bg2); position: sticky; top: 0; z-index: 1;
-      font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted);
+      text-align: left;
+      padding: 10px 12px;
+      background: var(--bg2);
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      font-size: 0.64rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
     }
     .smx-table td { padding: 10px 12px; border-top: 1px solid var(--border); vertical-align: top; }
     .smx-table tr.smx-row-nce-crit td { box-shadow: inset 3px 0 0 #8b1538; }
@@ -14023,139 +14305,36 @@ function renderDashboardHtml(): string {
     .smx-mini-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; margin-top: 6px; }
     .smx-mini-table th, .smx-mini-table td { padding: 6px 8px; border-top: 1px solid var(--border); text-align: left; vertical-align: top; }
     .smx-mini-table th { color: var(--muted); font-weight: 600; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.06em; }
-    .smx-calc-panel {
-      margin: 0 0 22px;
-      padding: 22px 24px 24px;
-      border-radius: 14px;
-      border: 1px solid var(--border);
-      background: linear-gradient(165deg, rgba(0,58,140,0.06) 0%, var(--card) 48%);
-      box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+    @media (max-width: 1100px) {
+      .smx-workspace {
+        grid-template-columns: 1fr;
+      }
     }
-    .smx-calc-panel-head { margin-bottom: 18px; max-width: 52rem; }
-    .smx-calc-panel-head h3 {
-      margin: 0 0 6px;
-      font-size: 1.15rem;
-      font-weight: 800;
-      letter-spacing: -0.02em;
-    }
-    .smx-calc-lede {
-      margin: 0;
-      font-size: 0.92rem;
-      line-height: 1.5;
-      color: var(--muted);
-    }
-    .smx-calc-grid {
-      display: grid;
-      grid-template-columns: minmax(200px, 1.2fr) minmax(160px, 0.9fr) minmax(180px, 0.85fr) auto;
-      gap: 16px 18px;
-      align-items: end;
-    }
-    @media (max-width: 900px) {
+    @media (max-width: 860px) {
+      .smx-overview,
+      .smx-assets-panel,
+      .smx-calc-panel,
+      .smx-future-panel {
+        padding: 14px;
+      }
       .smx-calc-grid {
         grid-template-columns: 1fr 1fr;
       }
-      .smx-calc-actions { grid-column: 1 / -1; }
+      .smx-calc-actions {
+        grid-column: 1 / -1;
+      }
     }
-    @media (max-width: 520px) {
-      .smx-calc-grid { grid-template-columns: 1fr; }
+    @media (max-width: 560px) {
+      .smx-stats {
+        grid-template-columns: 1fr 1fr;
+      }
+      .smx-search input {
+        min-width: 100%;
+      }
+      .smx-calc-grid {
+        grid-template-columns: 1fr;
+      }
     }
-    .smx-calc-field label {
-      display: block;
-      font-size: 0.72rem;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.07em;
-      color: var(--muted);
-      margin-bottom: 6px;
-    }
-    .smx-calc-hint {
-      font-weight: 500;
-      text-transform: none;
-      letter-spacing: 0;
-      color: var(--muted);
-      opacity: 0.85;
-    }
-    .smx-calc-field input[type="text"],
-    .smx-calc-field input[type="number"],
-    .smx-calc-field input[type="date"] {
-      width: 100%;
-      box-sizing: border-box;
-      font: inherit;
-      font-size: 0.95rem;
-      padding: 12px 14px;
-      border-radius: 10px;
-      border: 1px solid var(--border);
-      background: var(--bg);
-      color: var(--text);
-    }
-    .smx-calc-field input:focus {
-      outline: none;
-      border-color: var(--accent);
-      box-shadow: 0 0 0 3px rgba(0,58,140,0.15);
-    }
-    .smx-calc-actions { display: flex; align-items: flex-end; }
-    .smx-calc-run {
-      font: inherit;
-      font-size: 0.95rem;
-      font-weight: 700;
-      padding: 12px 22px;
-      border-radius: 10px;
-      border: none;
-      background: var(--accent);
-      color: var(--accent-contrast, #fff);
-      cursor: pointer;
-      white-space: nowrap;
-    }
-    .smx-calc-run:hover { filter: brightness(1.06); }
-    .smx-calc-rules {
-      margin: 18px 0 0;
-      padding: 14px 18px 14px 2rem;
-      font-size: 0.82rem;
-      line-height: 1.55;
-      color: var(--muted);
-      background: rgba(0,0,0,0.03);
-      border-radius: 10px;
-      border: 1px solid var(--border);
-    }
-    .smx-calc-rules li { margin: 4px 0; }
-    .smx-calc-status {
-      margin: 16px 0 0;
-      min-height: 1.35em;
-      font-size: 0.9rem;
-      font-weight: 600;
-    }
-    .smx-calc-results {
-      margin-top: 12px;
-      border-radius: 12px;
-      border: 1px solid var(--border);
-      overflow: auto;
-      max-height: min(55vh, 520px);
-      background: var(--bg);
-    }
-    .smx-calc-results-summary {
-      padding: 14px 18px;
-      font-size: 0.9rem;
-      border-bottom: 1px solid var(--border);
-      background: var(--card);
-    }
-    .smx-calc-table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
-    .smx-calc-table th, .smx-calc-table td {
-      padding: 12px 14px;
-      border-top: 1px solid var(--border);
-      text-align: left;
-      vertical-align: top;
-    }
-    .smx-calc-table th {
-      position: sticky;
-      top: 0;
-      z-index: 1;
-      background: var(--bg2);
-      color: var(--muted);
-      font-size: 0.65rem;
-      text-transform: uppercase;
-      letter-spacing: 0.07em;
-    }
-    .smx-calc-table tr:hover td { background: rgba(0,58,140,0.04); }
     .smx-pill {
       display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 0.72rem; font-weight: 700;
       text-transform: uppercase; letter-spacing: 0.04em;
@@ -14622,18 +14801,35 @@ function renderDashboardHtml(): string {
           </label>
         </div>
         <div class="smx-stats" id="smx-stats" role="status">Loading…</div>
-        <div class="smx-toolbar">
-          <label class="smx-search"><span class="sr-only">Filter rows</span>
-            <input type="text" id="smx-query" placeholder="Filter asset, WO id, type…" autocomplete="off" />
-          </label>
-          <button type="button" class="smx-reset-filters" id="smx-reset-filters">Reset filters</button>
-          <div class="smx-filters" id="smx-filters" role="tablist" aria-label="Schedule maintenance filters">
-            <button type="button" class="smx-filter-btn active" data-smx-filter="all">All <span class="smx-n" data-smx-c="all">0</span></button>
-            <button type="button" class="smx-filter-btn" data-smx-filter="nce_critical"><span class="nce-inline">NCE</span> overdue <span class="smx-n" data-smx-c="nce_critical">0</span></button>
-            <button type="button" class="smx-filter-btn" data-smx-filter="overdue">Overdue <span class="smx-n" data-smx-c="overdue">0</span></button>
-            <button type="button" class="smx-filter-btn" data-smx-filter="due_soon">Due soon <span class="smx-n" data-smx-c="due_soon">0</span></button>
-            <button type="button" class="smx-filter-btn" data-smx-filter="missing">Missing data <span class="smx-n" data-smx-c="missing">0</span></button>
-          </div>
+        <div class="smx-workspace-grid">
+          <section class="smx-control-surface" aria-label="Schedule maintenance filters">
+            <div class="smx-toolbar">
+              <label class="smx-search"><span class="sr-only">Filter rows</span>
+                <input type="text" id="smx-query" placeholder="Filter asset, WO id, type…" autocomplete="off" />
+              </label>
+              <button type="button" class="smx-reset-filters" id="smx-reset-filters">Reset filters</button>
+              <div class="smx-filters" id="smx-filters" role="tablist" aria-label="Schedule maintenance filters">
+                <button type="button" class="smx-filter-btn active" data-smx-filter="all">All <span class="smx-n" data-smx-c="all">0</span></button>
+                <button type="button" class="smx-filter-btn" data-smx-filter="nce_critical"><span class="nce-inline">NCE</span> overdue <span class="smx-n" data-smx-c="nce_critical">0</span></button>
+                <button type="button" class="smx-filter-btn" data-smx-filter="overdue">Overdue <span class="smx-n" data-smx-c="overdue">0</span></button>
+                <button type="button" class="smx-filter-btn" data-smx-filter="due_soon">Due soon <span class="smx-n" data-smx-c="due_soon">0</span></button>
+                <button type="button" class="smx-filter-btn" data-smx-filter="missing">Missing data <span class="smx-n" data-smx-c="missing">0</span></button>
+              </div>
+            </div>
+            <p class="smx-toolbar-note">Start with the high-level counts, then drill into assets and plans. This area stays compact to leave room for chart panels below.</p>
+          </section>
+          <aside class="smx-chart-reserve" aria-label="Future chart workspace">
+            <div class="smx-chart-card">
+              <h3>Readiness trend workspace</h3>
+              <p>Reserved for timeline charts (overdue / due soon / in maintenance by date).</p>
+              <div class="smx-chart-ghost" aria-hidden="true"></div>
+            </div>
+            <div class="smx-chart-card">
+              <h3>Plan mix workspace</h3>
+              <p>Reserved for plan-type mix, NCE split, and WO tie-in visuals.</p>
+              <div class="smx-chart-ghost" aria-hidden="true"></div>
+            </div>
+          </aside>
         </div>
         <section class="smx-calc-panel" id="smx-shop-calc" aria-labelledby="smx-calc-heading">
           <div class="smx-calc-panel-head">
@@ -14664,20 +14860,15 @@ function renderDashboardHtml(): string {
           <p class="smx-calc-status" id="smx-calc-status" role="status"></p>
           <div id="smx-calc-results" class="smx-calc-results" aria-live="polite"></div>
         </section>
-        <div class="smx-table-wrap">
-          <table class="smx-table" aria-label="Schedule maintenance by asset">
-            <thead>
-              <tr>
-                <th>Asset</th>
-                <th>Plans</th>
-                <th>Summary</th>
-                <th>NCE</th>
-                <th>State</th>
-              </tr>
-            </thead>
-            <tbody id="smx-tbody"><tr><td colspan="5">Loading…</td></tr></tbody>
-          </table>
-        </div>
+        <section class="smx-data-section" aria-label="Schedule maintenance assets">
+          <div class="smx-data-head">
+            <h3>Asset workload</h3>
+            <p>Card layout keeps space for upcoming charts while still letting you open full plan detail per asset.</p>
+          </div>
+          <div class="smx-table-wrap smx-feed-wrap">
+            <div id="smx-feed" class="smx-asset-feed"><div class="smx-empty">Loading…</div></div>
+          </div>
+        </section>
       </div>
 
       <div id="panel-authz" class="hidden">
@@ -17675,11 +17866,11 @@ function renderDashboardHtml(): string {
       const pill = document.getElementById("smx-asof-pill");
       const dateSel = document.getElementById("smx-date-select");
       const statsEl = document.getElementById("smx-stats");
-      const tbody = document.getElementById("smx-tbody");
+      const tbody = document.getElementById("smx-queue-tbody");
       if (statsEl) {
         statsEl.innerHTML = "<span class='smx-stat'><span class='lbl'>Loading</span><span class='v'>…</span></span>";
       }
-      if (tbody) tbody.innerHTML = "<tr><td colspan='5'>Loading…</td></tr>";
+      if (tbody) tbody.innerHTML = "<tr><td colspan='6'>Loading…</td></tr>";
       try {
         const rd = await fetch("/api/schedule-mx?dates=1", { cache: "no-store" });
         const jd = await rd.json();
@@ -17700,7 +17891,7 @@ function renderDashboardHtml(): string {
         if (pill) pill.textContent = dk ? fmtKeyLong(dk) : "No imports";
         if (!dk) {
           if (statsEl) statsEl.textContent = "No Schedule Mx imports yet — send a CSV or XLSX to prevmx@2t3.app.";
-          if (tbody) tbody.innerHTML = "<tr><td colspan='5'>No data.</td></tr>";
+          if (tbody) tbody.innerHTML = "<tr><td colspan='6'>No data.</td></tr>";
           smxRows = [];
           smxStats = null;
           return;
@@ -17709,7 +17900,7 @@ function renderDashboardHtml(): string {
         const j = await r.json();
         if (!r.ok) {
           if (statsEl) statsEl.textContent = j.error || "Could not load schedule maintenance.";
-          if (tbody) tbody.innerHTML = "<tr><td colspan='5'>No rows for this date.</td></tr>";
+          if (tbody) tbody.innerHTML = "<tr><td colspan='6'>No rows for this date.</td></tr>";
           smxRows = [];
           smxStats = null;
           return;
@@ -17721,7 +17912,7 @@ function renderDashboardHtml(): string {
         syncSmxShopCalcAsOf();
       } catch (e) {
         if (statsEl) statsEl.textContent = "Could not load schedule maintenance.";
-        if (tbody) tbody.innerHTML = "<tr><td colspan='5'>Could not load.</td></tr>";
+        if (tbody) tbody.innerHTML = "<tr><td colspan='6'>Could not load.</td></tr>";
       }
     }
 
@@ -17896,8 +18087,9 @@ function renderDashboardHtml(): string {
 
     function renderScheduleMxStats() {
       const box = document.getElementById("smx-stats");
-      if (!box || !smxStats) return;
-      function pill(k, label, cls) {
+      const glance = document.getElementById("smx-glance");
+      if ((!box && !glance) || !smxStats) return;
+      function metric(k, label, cls) {
         return (
           "<div class='smx-stat " + cls + "'>" +
             "<span class='lbl'>" + esc(label) + "</span>" +
@@ -17906,16 +18098,28 @@ function renderDashboardHtml(): string {
         );
       }
       var eticLbl = smxStats.eticAsOfDateKey ? fmtKeyLong(smxStats.eticAsOfDateKey) : "—";
-      box.innerHTML =
-        pill("planRows", "Maint plans (rows in file)", "") +
-        pill("distinctAssets", "Assets", "") +
-        "<div class='smx-stat'><span class='lbl'>ETIC ref (WO / fleet)</span><span class='v'>" + esc(eticLbl) + "</span></div>" +
-        pill("inMaintenanceAssets", "Assets w/ open WO", "") +
-        pill("nceCritical", "NCE + overdue (assets)", "crit") +
-        pill("overdue", "Overdue assets (any plan)", "bad") +
-        pill("dueSoon", "Due soon assets (~60d / util)", "warn") +
-        pill("missing", "Missing data (assets)", "warn") +
-        pill("ok", "OK assets (all plans)", "");
+      if (box) {
+        box.innerHTML =
+          "<div class='smx-kpi-head'>" +
+            "<h3 class='smx-kpi-title'>Readiness overview</h3>" +
+            "<p class='smx-kpi-note'>All cards below are asset-level rollups; due soon uses 60-day calendar or utilization thresholds.</p>" +
+          "</div>" +
+          "<div class='smx-kpi-grid'>" +
+            metric("overdue", "Overdue assets", "bad") +
+            metric("dueSoon", "Due soon", "warn") +
+            metric("nceCritical", "NCE overdue", "crit") +
+            metric("inMaintenanceAssets", "In maintenance", "") +
+            metric("missing", "Missing data", "warn") +
+            metric("ok", "Current", "") +
+          "</div>";
+      }
+      if (glance) {
+        glance.innerHTML =
+          "<div class='smx-glance-item'><span class='k'>Schedule Mx import</span><strong>" + esc(smxSelectedDateKey ? fmtKeyLong(smxSelectedDateKey) : "—") + "</strong></div>" +
+          "<div class='smx-glance-item'><span class='k'>ETIC reference</span><strong>" + esc(eticLbl) + "</strong></div>" +
+          "<div class='smx-glance-item'><span class='k'>Assets</span><strong>" + esc(String(smxStats.distinctAssets ?? 0)) + "</strong></div>" +
+          "<div class='smx-glance-item'><span class='k'>Maint plans</span><strong>" + esc(String(smxStats.planRows ?? 0)) + "</strong></div>";
+      }
     }
 
     function smxPillLabel(bucket) {
@@ -18156,7 +18360,7 @@ function renderDashboardHtml(): string {
     }
 
     function renderScheduleMxTable() {
-      const tbody = document.getElementById("smx-tbody");
+      const tbody = document.getElementById("smx-feed-tbody");
       if (!tbody) return;
       const qel = document.getElementById("smx-query");
       const q = (qel && qel.value) ? qel.value.trim() : "";
@@ -18170,13 +18374,13 @@ function renderDashboardHtml(): string {
         el.textContent = n;
       });
       if (!filtered.length) {
-        tbody.innerHTML = "<tr><td colspan='5'>No rows match.</td></tr>";
+        tbody.innerHTML = "<tr><td colspan='4'>No assets match your filters.</td></tr>";
         return;
       }
       tbody.innerHTML = filtered.map(function (row) {
-        var nceBody = "—";
+        var nceBadge = "—";
         if (row.nce) {
-          nceBody =
+          nceBadge =
             "<span class='nce-inline' title='" + esc(row.nceStatus || "NCE") + "'>NCE</span>" +
             ((row.nceStatus || "").trim()
               ? "<div class='remark-snippet'>" + esc(row.nceStatus) + "</div>"
@@ -18206,17 +18410,20 @@ function renderDashboardHtml(): string {
           "<div class='smx-nested-inner'>" + smxRenderPlanMiniTable(plans) + "</div>" +
           "</details>";
         return (
-          "<tr" + (trCls ? " class='" + esc(trCls) + "'" : "") + ">" +
-            "<td><span class='asset-mono'>" + esc(row.assetId) + "</span>" +
-              (row.vehNomen ? "<div class='remark-snippet'>" + esc(row.vehNomen) + "</div>" : "") +
-              (row.makeModel ? "<div class='remark-snippet'>" + esc(row.makeModel) + "</div>" : "") +
-              (row.mgmtCd ? "<div class='remark-snippet'>Mgmt " + esc(row.mgmtCd) + "</div>" : "") +
-              woLine +
+          "<tr class='smx-feed-row" + (trCls ? " " + esc(trCls) : "") + "'>" +
+            "<td class='smx-feed-asset-cell'><div class='smx-feed-asset'>" +
+              "<span class='asset-mono'>" + esc(row.assetId) + "</span>" +
+              "<span class='smx-feed-state smx-pill " + esc(wp.cls) + "'>" + esc(wp.label) + "</span>" +
+            "</div>" +
+            (row.vehNomen ? "<div class='remark-snippet'>" + esc(row.vehNomen) + "</div>" : "") +
+            (row.makeModel ? "<div class='remark-snippet'>" + esc(row.makeModel) + "</div>" : "") +
+            (row.mgmtCd ? "<div class='remark-snippet'>Mgmt " + esc(row.mgmtCd) + "</div>" : "") +
+            woLine +
             "</td>" +
-            "<td>" + String(row.planCount || plans.length) + "</td>" +
-            "<td>" + esc(smxAssetSummaryLine(row)) + "</td>" +
-            "<td>" + nceBody + "</td>" +
-            "<td><span class='smx-pill " + esc(wp.cls) + "'>" + esc(wp.label) + "</span>" + nested + "</td>" +
+            "<td><div class='smx-feed-count'>" + String(row.planCount || plans.length) + "</div>" +
+            "<div class='remark-snippet'>" + esc(smxAssetSummaryLine(row)) + "</div></td>" +
+            "<td>" + nceBadge + "</td>" +
+            "<td class='smx-feed-detail'>" + nested + "</td>" +
           "</tr>"
         );
       }).join("");
