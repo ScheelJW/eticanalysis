@@ -13,8 +13,30 @@ import {
   parseEticDate,
   parseScheduleMxCsvToPlanRows,
   parseScheduleMxCsvToRawByAsset,
+  rollupScheduleMxPlansToAssets,
+  sortScheduleMxAssetRows,
 } from "../src/workOrderWatch";
-import type { WatchRow } from "../src/workOrderWatch";
+import type { ScheduleMxFleetRow, WatchRow } from "../src/workOrderWatch";
+
+function smxPlanRow(partial: Partial<ScheduleMxFleetRow> & Pick<ScheduleMxFleetRow, "assetId" | "planRowKey">): ScheduleMxFleetRow {
+  const smx = analyzeElmsScheduleMxFromRaw({}, "2026-04-25");
+  return {
+    ...smx,
+    planId: "",
+    planName: "",
+    planDesc: "",
+    maintenanceScheduleId: "",
+    itemDesc: "",
+    location: "",
+    makeModel: "",
+    mgmtCd: "",
+    workOrderCount: 0,
+    nce: false,
+    nceStatus: "",
+    scheduleMxNceCritical: false,
+    ...partial,
+  };
+}
 
 describe("classifyMelTier", () => {
   it("detects below / at / above from phrases", () => {
@@ -118,6 +140,48 @@ describe("parseScheduleMxCsvToRawByAsset (compat)", () => {
       "AF01B00001,P2,B\n";
     const m = parseScheduleMxCsvToRawByAsset(csv);
     expect(m.get("AF01B00001")!["fleet.plan name"]).toBe("B");
+  });
+});
+
+describe("rollupScheduleMxPlansToAssets", () => {
+  it("rolls two plans into one asset with worst summary and per-bucket counts", () => {
+    const rows = [
+      smxPlanRow({
+        assetId: "AF01",
+        planRowKey: "A",
+        planName: "Oil",
+        scheduleMxBucket: "ok",
+      }),
+      smxPlanRow({
+        assetId: "AF01",
+        planRowKey: "B",
+        planName: "Brakes",
+        scheduleMxBucket: "overdue",
+      }),
+    ];
+    const rolled = sortScheduleMxAssetRows(rollupScheduleMxPlansToAssets(rows));
+    expect(rolled.length).toBe(1);
+    expect(rolled[0]!.assetId).toBe("AF01");
+    expect(rolled[0]!.summaryKey).toBe("overdue");
+    expect(rolled[0]!.planCount).toBe(2);
+    expect(rolled[0]!.counts.overdue).toBe(1);
+    expect(rolled[0]!.counts.ok).toBe(1);
+  });
+
+  it("uses nce_critical when NCE asset has an overdue plan", () => {
+    const rows = [
+      smxPlanRow({
+        assetId: "AF02",
+        planRowKey: "P1",
+        nce: true,
+        nceStatus: "Certified",
+        scheduleMxBucket: "overdue",
+        scheduleMxNceCritical: true,
+      }),
+    ];
+    const rolled = rollupScheduleMxPlansToAssets(rows);
+    expect(rolled[0]!.summaryKey).toBe("nce_critical");
+    expect(rolled[0]!.counts.overdue).toBe(1);
   });
 });
 

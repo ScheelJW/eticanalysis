@@ -18,6 +18,8 @@ import {
   getWatchRowByIdForDate,
   getWatchRowsForDate,
   getScheduleMxFleetForDate,
+  rollupScheduleMxPlansToAssets,
+  sortScheduleMxAssetRows,
   getLatestScheduleMxExtractDateKey,
   listScheduleMxExtractDateKeysDesc,
   getWatchRowsLatest,
@@ -4853,8 +4855,8 @@ async function handleScheduleMxApi(env: Env, request: Request): Promise<Response
       { status: 404, headers: cacheHeaders() },
     );
   }
-  const rows = await getScheduleMxFleetForDate(env, dateKey);
-  if (rows.length === 0) {
+  const planRows = await getScheduleMxFleetForDate(env, dateKey);
+  if (planRows.length === 0) {
     return Response.json(
       {
         error: "No Schedule Mx rows stored for that date.",
@@ -4866,17 +4868,22 @@ async function handleScheduleMxApi(env: Env, request: Request): Promise<Response
       { status: 404, headers: cacheHeaders() },
     );
   }
-  const distinctAssets = new Set(rows.map((r) => r.assetId)).size;
+  const rows = sortScheduleMxAssetRows(rollupScheduleMxPlansToAssets(planRows));
+  const distinctAssets = rows.length;
+  const nceCritical = rows.filter((r) => r.summaryKey === "nce_critical").length;
+  const overdueAssets = rows.filter(
+    (r) => r.summaryKey === "overdue" || r.summaryKey === "nce_critical",
+  ).length;
   const stats = {
-    planRows: rows.length,
+    planRows: planRows.length,
     distinctAssets,
     assets: distinctAssets,
-    missing: rows.filter((r) => r.scheduleMxBucket === "missing").length,
-    noDue: rows.filter((r) => r.scheduleMxBucket === "no_due").length,
-    overdue: rows.filter((r) => r.scheduleMxBucket === "overdue").length,
-    dueSoon: rows.filter((r) => r.scheduleMxBucket === "due_soon").length,
-    ok: rows.filter((r) => r.scheduleMxBucket === "ok").length,
-    nceCritical: rows.filter((r) => r.scheduleMxNceCritical).length,
+    missing: rows.filter((r) => r.summaryKey === "missing").length,
+    noDue: planRows.filter((r) => r.scheduleMxBucket === "no_due").length,
+    overdue: overdueAssets,
+    dueSoon: rows.filter((r) => r.summaryKey === "due_soon").length,
+    ok: rows.filter((r) => r.summaryKey === "ok").length,
+    nceCritical,
   };
   return Response.json(
     { dateKey, stats, rows, source: "prevmx_extract" },
@@ -13918,6 +13925,11 @@ function renderDashboardHtml(): string {
     .smx-stat.warn .v { color: var(--warn); }
     .smx-stat.crit .v { color: #7a1020; }
     .smx-toolbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 12px; }
+    .smx-reset-filters {
+      font: inherit; font-size: 0.82rem; padding: 6px 12px; border-radius: 8px;
+      border: 1px solid var(--border); background: var(--panel); color: var(--text); cursor: pointer;
+    }
+    .smx-reset-filters:hover { border-color: var(--muted); }
     .smx-search input {
       min-width: 220px; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border);
       background: var(--bg); font: inherit;
@@ -13944,7 +13956,18 @@ function renderDashboardHtml(): string {
     .smx-table tr.smx-row-nce-crit td { box-shadow: inset 3px 0 0 #8b1538; }
     .smx-table tr.smx-row-nce-crit { background: rgba(176,0,32,0.09); }
     .smx-table tr.smx-row-overdue { background: rgba(176,0,32,0.04); }
+    .smx-table tr.smx-row-due-soon { background: rgba(245,199,84,0.08); }
     .smx-table .asset-mono { font-family: var(--font-mono); font-weight: 700; }
+    .smx-plan-lines { margin: 0; padding-left: 1.1rem; color: var(--muted); font-size: 0.82rem; line-height: 1.45; }
+    .smx-plan-lines li { margin: 2px 0; }
+    .smx-nested summary {
+      cursor: pointer; font-size: 0.78rem; color: var(--muted); margin-top: 6px; user-select: none;
+    }
+    .smx-nested summary:hover { color: var(--text); }
+    .smx-nested .smx-nested-inner { margin-top: 8px; padding-left: 8px; border-left: 2px solid var(--border); }
+    .smx-mini-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; margin-top: 6px; }
+    .smx-mini-table th, .smx-mini-table td { padding: 6px 8px; border-top: 1px solid var(--border); text-align: left; vertical-align: top; }
+    .smx-mini-table th { color: var(--muted); font-weight: 600; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.06em; }
     .smx-pill {
       display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 0.72rem; font-weight: 700;
       text-transform: uppercase; letter-spacing: 0.04em;
@@ -14403,7 +14426,7 @@ function renderDashboardHtml(): string {
         <div class="smx-header">
           <div>
             <h2 class="smx-title">Schedule Maintenance Status</h2>
-            <p class="smx-sub">Each row is one <strong>maintenance plan</strong> per asset from the <strong>ELMS extract</strong> (email <code>prevmx@2t3.app</code>). Due/overdue uses <strong>next maint date</strong> and <strong>current meter</strong> vs <strong>next util qty</strong> when those columns exist. Same import date as Work Orders is only used for optional open WO counts. Sub work order tie-in (Plan ID) comes later.</p>
+            <p class="smx-sub">One row per <strong>asset</strong> from the <strong>ELMS extract</strong> (email <code>prevmx@2t3.app</code>). Counts roll up every maintenance plan on that asset; expand a row to see plan detail. Due/overdue uses next maint date and meter vs next util when present. Open WO counts use Work Orders on the same calendar date when available.</p>
           </div>
           <span class="smx-asof-pill" id="smx-asof-pill" title="Latest prevmx import date">Latest import</span>
           <label class="smx-search" style="margin-left:10px"><span class="sr-only">Import date</span>
@@ -14413,8 +14436,9 @@ function renderDashboardHtml(): string {
         <div class="smx-stats" id="smx-stats" role="status">Loading…</div>
         <div class="smx-toolbar">
           <label class="smx-search"><span class="sr-only">Filter rows</span>
-            <input type="text" id="smx-query" placeholder="Filter asset, plan, location…" autocomplete="off" />
+            <input type="text" id="smx-query" placeholder="Filter asset, mgmt code…" autocomplete="off" />
           </label>
+          <button type="button" class="smx-reset-filters" id="smx-reset-filters">Reset filters</button>
           <div class="smx-filters" id="smx-filters" role="tablist" aria-label="Schedule maintenance filters">
             <button type="button" class="smx-filter-btn active" data-smx-filter="all">All <span class="smx-n" data-smx-c="all">0</span></button>
             <button type="button" class="smx-filter-btn" data-smx-filter="nce_critical"><span class="nce-inline">NCE</span> overdue <span class="smx-n" data-smx-c="nce_critical">0</span></button>
@@ -14424,18 +14448,17 @@ function renderDashboardHtml(): string {
           </div>
         </div>
         <div class="smx-table-wrap">
-          <table class="smx-table" aria-label="Schedule maintenance by plan">
+          <table class="smx-table" aria-label="Schedule maintenance by asset">
             <thead>
               <tr>
-                <th>Asset / plan</th>
-                <th>Last / next</th>
-                <th>Utilization</th>
+                <th>Asset</th>
+                <th>Plans</th>
+                <th>Summary</th>
                 <th>NCE</th>
-                <th>Status</th>
                 <th>State</th>
               </tr>
             </thead>
-            <tbody id="smx-tbody"><tr><td colspan="6">Loading…</td></tr></tbody>
+            <tbody id="smx-tbody"><tr><td colspan="5">Loading…</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -17439,7 +17462,7 @@ function renderDashboardHtml(): string {
       if (statsEl) {
         statsEl.innerHTML = "<span class='smx-stat'><span class='lbl'>Loading</span><span class='v'>…</span></span>";
       }
-      if (tbody) tbody.innerHTML = "<tr><td colspan='6'>Loading…</td></tr>";
+      if (tbody) tbody.innerHTML = "<tr><td colspan='5'>Loading…</td></tr>";
       try {
         const rd = await fetch("/api/schedule-mx?dates=1", { cache: "no-store" });
         const jd = await rd.json();
@@ -17460,7 +17483,7 @@ function renderDashboardHtml(): string {
         if (pill) pill.textContent = dk ? fmtKeyLong(dk) : "No imports";
         if (!dk) {
           if (statsEl) statsEl.textContent = "No Schedule Mx imports yet — send a CSV or XLSX to prevmx@2t3.app.";
-          if (tbody) tbody.innerHTML = "<tr><td colspan='6'>No data.</td></tr>";
+          if (tbody) tbody.innerHTML = "<tr><td colspan='5'>No data.</td></tr>";
           smxRows = [];
           smxStats = null;
           return;
@@ -17469,7 +17492,7 @@ function renderDashboardHtml(): string {
         const j = await r.json();
         if (!r.ok) {
           if (statsEl) statsEl.textContent = j.error || "Could not load schedule maintenance.";
-          if (tbody) tbody.innerHTML = "<tr><td colspan='6'>No rows for this date.</td></tr>";
+          if (tbody) tbody.innerHTML = "<tr><td colspan='5'>No rows for this date.</td></tr>";
           smxRows = [];
           smxStats = null;
           return;
@@ -17480,7 +17503,7 @@ function renderDashboardHtml(): string {
         renderScheduleMxTable();
       } catch (e) {
         if (statsEl) statsEl.textContent = "Could not load schedule maintenance.";
-        if (tbody) tbody.innerHTML = "<tr><td colspan='6'>Could not load.</td></tr>";
+        if (tbody) tbody.innerHTML = "<tr><td colspan='5'>Could not load.</td></tr>";
       }
     }
 
@@ -17607,25 +17630,26 @@ function renderDashboardHtml(): string {
 
     function smxMatchesFilter(row, f) {
       if (f === "all") return true;
-      if (f === "nce_critical") return row.scheduleMxNceCritical;
-      if (f === "overdue") return row.scheduleMxBucket === "overdue";
-      if (f === "due_soon") return row.scheduleMxBucket === "due_soon";
-      if (f === "missing") return row.scheduleMxBucket === "missing";
+      if (f === "nce_critical") return row.summaryKey === "nce_critical";
+      if (f === "overdue") return row.summaryKey === "overdue" || row.summaryKey === "nce_critical";
+      if (f === "due_soon") return row.summaryKey === "due_soon";
+      if (f === "missing") return row.summaryKey === "missing";
       return true;
     }
 
     function smxMatchesQuery(row, q) {
       if (!q) return true;
       const ql = q.toLowerCase();
-      return (
-        (row.assetId || "").toLowerCase().indexOf(ql) !== -1 ||
-        (row.planName || "").toLowerCase().indexOf(ql) !== -1 ||
-        (row.planId || "").toLowerCase().indexOf(ql) !== -1 ||
-        (row.location || "").toLowerCase().indexOf(ql) !== -1 ||
-        (row.mgmtCd || "").toLowerCase().indexOf(ql) !== -1 ||
-        (row.makeModel || "").toLowerCase().indexOf(ql) !== -1 ||
-        (row.scheduleMxStatus || "").toLowerCase().indexOf(ql) !== -1
-      );
+      if ((row.assetId || "").toLowerCase().indexOf(ql) !== -1) return true;
+      if ((row.mgmtCd || "").toLowerCase().indexOf(ql) !== -1) return true;
+      const plans = row.planRows || [];
+      for (var pi = 0; pi < plans.length; pi++) {
+        var p = plans[pi];
+        if ((p.planName || "").toLowerCase().indexOf(ql) !== -1) return true;
+        if ((p.planId || "").toLowerCase().indexOf(ql) !== -1) return true;
+        if ((p.scheduleMxStatus || "").toLowerCase().indexOf(ql) !== -1) return true;
+      }
+      return false;
     }
 
     function renderScheduleMxStats() {
@@ -17640,13 +17664,13 @@ function renderDashboardHtml(): string {
         );
       }
       box.innerHTML =
-        pill("planRows", "Plan rows", "") +
+        pill("planRows", "Maint plans (rows in file)", "") +
         pill("distinctAssets", "Assets", "") +
-        pill("nceCritical", "NCE overdue (critical)", "crit") +
-        pill("overdue", "Overdue", "bad") +
-        pill("dueSoon", "Due soon (≤30d)", "warn") +
-        pill("missing", "Missing sched data", "warn") +
-        pill("ok", "OK / current", "");
+        pill("nceCritical", "NCE + overdue (assets)", "crit") +
+        pill("overdue", "Overdue assets (any plan)", "bad") +
+        pill("dueSoon", "Due soon assets (≤30d)", "warn") +
+        pill("missing", "Missing data (assets)", "warn") +
+        pill("ok", "OK assets (all plans)", "");
     }
 
     function smxPillLabel(bucket) {
@@ -17654,6 +17678,59 @@ function renderDashboardHtml(): string {
       if (bucket === "no_due") return "No due date";
       if (bucket === "missing") return "Missing";
       return bucket || "—";
+    }
+
+    function smxAssetSummaryLine(row) {
+      const c = row.counts || { overdue: 0, dueSoon: 0, missing: 0, ok: 0, noDue: 0 };
+      const parts = [];
+      if (c.overdue) parts.push(c.overdue + " overdue");
+      if (c.dueSoon) parts.push(c.dueSoon + " due soon");
+      if (c.missing) parts.push(c.missing + " missing data");
+      if (c.ok) parts.push(c.ok + " OK");
+      if (c.noDue) parts.push(c.noDue + " no due");
+      return parts.length ? parts.join(" · ") : "—";
+    }
+
+    function smxAssetWorstPill(row) {
+      const sk = row.summaryKey || "ok";
+      if (sk === "nce_critical") return { cls: "overdue", label: "NCE overdue" };
+      if (sk === "overdue") return { cls: "overdue", label: "Overdue" };
+      if (sk === "due_soon") return { cls: "due_soon", label: "Due soon" };
+      if (sk === "missing") return { cls: "missing", label: "Missing data" };
+      return { cls: "ok", label: "OK" };
+    }
+
+    function smxRenderPlanMiniTable(plans) {
+      if (!plans || !plans.length) return "";
+      var head =
+        "<table class='smx-mini-table'><thead><tr>" +
+        "<th>Plan</th><th>Due / status</th><th>State</th>" +
+        "</tr></thead><tbody>";
+      var body = plans.map(function (p) {
+        var pname = (p.planName || "").trim();
+        var pid = (p.planId || "").trim();
+        var planLabel = pname ? esc(pname) + (pid ? " (" + esc(pid) + ")" : "") : (pid ? esc(pid) : "—");
+        var dueBit = p.scheduleMxDueIso ? fmtKeyShort(p.scheduleMxDueIso) : "—";
+        var overdueExtra = "";
+        if (p.scheduleMxOverdueByDays != null && p.scheduleMxOverdueByDays > 0) {
+          overdueExtra = " · " + p.scheduleMxOverdueByDays + " d late";
+        } else if (p.scheduleMxOverdueUtil) {
+          overdueExtra = " · util overdue";
+        }
+        var statusLine = esc(dueBit + overdueExtra);
+        if ((p.scheduleMxStatus || "").trim()) {
+          statusLine = statusLine + "<div class='remark-snippet'>" + esc(p.scheduleMxStatus) + "</div>";
+        }
+        return (
+          "<tr>" +
+          "<td>" + planLabel + "</td>" +
+          "<td>" + statusLine + "</td>" +
+          "<td><span class='smx-pill " + esc(p.scheduleMxBucket || "") + "'>" +
+          esc(smxPillLabel(p.scheduleMxBucket)) + "</span></td>" +
+          "</tr>"
+        );
+      }).join("");
+      return head + body + "</tbody></table>";
     }
 
     function renderScheduleMxTable() {
@@ -17671,51 +17748,37 @@ function renderDashboardHtml(): string {
         el.textContent = n;
       });
       if (!filtered.length) {
-        tbody.innerHTML = "<tr><td colspan='6'>No rows match.</td></tr>";
+        tbody.innerHTML = "<tr><td colspan='5'>No rows match.</td></tr>";
         return;
       }
       tbody.innerHTML = filtered.map(function (row) {
         const nce = row.nce
           ? ("<span class='nce-inline' title='" + esc(row.nceStatus || "NCE") + "'>NCE</span>")
           : "—";
-        const due = row.scheduleMxDueIso ? fmtKeyShort(row.scheduleMxDueIso) : "—";
-        const ov = row.scheduleMxOverdueByDays != null ? row.scheduleMxOverdueByDays + " d" : "—";
-        const pillCls = row.scheduleMxBucket || "";
+        const wp = smxAssetWorstPill(row);
         let trCls = "";
-        if (row.scheduleMxNceCritical) trCls = "smx-row-nce-crit";
-        else if (row.scheduleMxBucket === "overdue") trCls = "smx-row-overdue";
-        const mgmtLine = row.mgmtCd
-          ? ("Mgmt " + esc(row.mgmtCd) + " · " + row.workOrderCount + " WO")
-          : (String(row.workOrderCount) + " WO");
-        const lastNext =
-          (row.elmsLastMaintDateIso ? fmtKeyShort(row.elmsLastMaintDateIso) : "—") +
-          " → " +
-          (row.elmsNextMaintDateIso ? fmtKeyShort(row.elmsNextMaintDateIso) : due);
-        const ut = (row.elmsUtilType || "").trim();
-        const utilLine =
-          (row.elmsCurrentMeter != null ? esc(String(row.elmsCurrentMeter)) : "—") +
-          (ut ? " " + esc(ut) : "") +
-          " · next " +
-          (row.elmsNextUtilQty != null ? esc(String(row.elmsNextUtilQty)) : "—") +
-          (row.scheduleMxUtilRemaining != null
-            ? " (" + (row.scheduleMxUtilRemaining >= 0 ? "rem " : "over ") + Math.abs(row.scheduleMxUtilRemaining) + ")"
-            : "");
+        if (row.summaryKey === "nce_critical") trCls = "smx-row-nce-crit";
+        else if (row.summaryKey === "overdue") trCls = "smx-row-overdue";
+        else if (row.summaryKey === "due_soon") trCls = "smx-row-due-soon";
+        const mgmtWo =
+          (row.mgmtCd ? "Mgmt " + esc(row.mgmtCd) : "") +
+          (row.mgmtCd && row.workOrderCount ? " · " : "") +
+          (row.workOrderCount ? row.workOrderCount + " open WO" : "");
+        const plans = row.planRows || [];
+        const nested =
+          "<details class='smx-nested'>" +
+          "<summary>Show " + plans.length + " maint plan" + (plans.length === 1 ? "" : "s") + "</summary>" +
+          "<div class='smx-nested-inner'>" + smxRenderPlanMiniTable(plans) + "</div>" +
+          "</details>";
         return (
           "<tr" + (trCls ? " class='" + esc(trCls) + "'" : "") + ">" +
             "<td><span class='asset-mono'>" + esc(row.assetId) + "</span>" +
-              (row.planName ? "<div class='remark-snippet'><strong>" + esc(row.planName) + "</strong>" +
-                (row.planId ? " · Plan " + esc(row.planId) : "") + "</div>" : "") +
-              (row.location ? "<div class='remark-snippet'>" + esc(row.location) + "</div>" : "") +
-              (row.makeModel ? "<div class='remark-snippet'>" + esc(row.makeModel) + "</div>" : "") +
-              "<div class='remark-snippet'>" + mgmtLine + "</div>" +
+              (mgmtWo ? "<div class='remark-snippet'>" + mgmtWo + "</div>" : "") +
             "</td>" +
-            "<td><div class='remark-snippet'>" + esc(lastNext) + "</div>" +
-              (ov !== "—" ? "<div class='remark-snippet'>Overdue " + esc(ov) + "</div>" : "") +
-            "</td>" +
-            "<td><div class='remark-snippet'>" + utilLine + "</div></td>" +
+            "<td>" + String(row.planCount || plans.length) + "</td>" +
+            "<td>" + esc(smxAssetSummaryLine(row)) + "</td>" +
             "<td>" + nce + "</td>" +
-            "<td>" + esc(row.scheduleMxStatus || "—") + "</td>" +
-            "<td><span class='smx-pill " + esc(pillCls) + "'>" + esc(smxPillLabel(row.scheduleMxBucket)) + "</span></td>" +
+            "<td><span class='smx-pill " + esc(wp.cls) + "'>" + esc(wp.label) + "</span>" + nested + "</td>" +
           "</tr>"
         );
       }).join("");
@@ -19604,6 +19667,21 @@ function renderDashboardHtml(): string {
           smxFilt.querySelectorAll(".smx-filter-btn").forEach(function (x) {
             x.classList.toggle("active", x === b);
           });
+          renderScheduleMxTable();
+        });
+      }
+      const smxReset = document.getElementById("smx-reset-filters");
+      if (smxReset && !smxReset.dataset.wired) {
+        smxReset.dataset.wired = "1";
+        smxReset.addEventListener("click", function () {
+          smxFilter = "all";
+          const q = document.getElementById("smx-query");
+          if (q) q.value = "";
+          if (smxFilt) {
+            smxFilt.querySelectorAll(".smx-filter-btn").forEach(function (x) {
+              x.classList.toggle("active", x.getAttribute("data-smx-filter") === "all");
+            });
+          }
           renderScheduleMxTable();
         });
       }

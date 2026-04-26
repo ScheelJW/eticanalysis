@@ -998,6 +998,120 @@ export type ScheduleMxFleetRow = {
   scheduleMxUtilRemaining: number | null;
 } & ReturnType<typeof analyzeElmsScheduleMxFromRaw>;
 
+/** One dashboard row per asset; `planRows` holds per-plan detail for expand. */
+export type ScheduleMxAssetRollupRow = {
+  assetId: string;
+  mgmtCd: string;
+  workOrderCount: number;
+  nce: boolean;
+  nceStatus: string;
+  /** Worst problem across plans (mutually exclusive buckets for filtering). */
+  summaryKey: "nce_critical" | "overdue" | "due_soon" | "missing" | "ok";
+  planCount: number;
+  /** Counts by plan-level bucket (sum to planCount). */
+  counts: {
+    overdue: number;
+    dueSoon: number;
+    missing: number;
+    ok: number;
+    noDue: number;
+  };
+  planRows: ScheduleMxFleetRow[];
+};
+
+function smxPlanAttentionRank(r: ScheduleMxFleetRow): number {
+  if (r.scheduleMxNceCritical) return 0;
+  if (r.scheduleMxBucket === "overdue") return 1;
+  if (r.scheduleMxBucket === "due_soon") return 2;
+  if (r.scheduleMxBucket === "missing") return 3;
+  if (r.scheduleMxBucket === "no_due") return 4;
+  return 5;
+}
+
+function smxRankToSummaryKey(rank: number): ScheduleMxAssetRollupRow["summaryKey"] {
+  if (rank <= 0) return "nce_critical";
+  if (rank === 1) return "overdue";
+  if (rank === 2) return "due_soon";
+  if (rank === 3) return "missing";
+  return "ok";
+}
+
+/** Collapse plan-level rows to one row per asset with worst-case summary and per-bucket counts. */
+export function rollupScheduleMxPlansToAssets(
+  planRows: ScheduleMxFleetRow[],
+): ScheduleMxAssetRollupRow[] {
+  const byAsset = new Map<string, ScheduleMxFleetRow[]>();
+  for (const r of planRows) {
+    const aid = (r.assetId ?? "").trim();
+    if (!aid) continue;
+    let arr = byAsset.get(aid);
+    if (!arr) {
+      arr = [];
+      byAsset.set(aid, arr);
+    }
+    arr.push(r);
+  }
+  const out: ScheduleMxAssetRollupRow[] = [];
+  for (const [assetId, plans] of byAsset) {
+    const sortedPlans = sortScheduleMxRows(plans.slice());
+    let minRank = 99;
+    let mgmtCd = "";
+    let workOrderCount = 0;
+    let nce = false;
+    let nceStatus = "";
+    const counts = { overdue: 0, dueSoon: 0, missing: 0, ok: 0, noDue: 0 };
+    for (const p of sortedPlans) {
+      const rk = smxPlanAttentionRank(p);
+      if (rk < minRank) minRank = rk;
+      if (!mgmtCd && (p.mgmtCd ?? "").trim()) mgmtCd = (p.mgmtCd ?? "").trim();
+      workOrderCount = Math.max(workOrderCount, Number(p.workOrderCount) || 0);
+      if (p.nce) {
+        nce = true;
+        if (!nceStatus && (p.nceStatus ?? "").trim()) nceStatus = (p.nceStatus ?? "").trim();
+      }
+      const b = p.scheduleMxBucket;
+      if (b === "overdue") counts.overdue += 1;
+      else if (b === "due_soon") counts.dueSoon += 1;
+      else if (b === "missing") counts.missing += 1;
+      else if (b === "no_due") counts.noDue += 1;
+      else counts.ok += 1;
+    }
+    if (minRank > 5) minRank = 5;
+    out.push({
+      assetId,
+      mgmtCd,
+      workOrderCount,
+      nce,
+      nceStatus,
+      summaryKey: smxRankToSummaryKey(minRank),
+      planCount: sortedPlans.length,
+      counts,
+      planRows: sortedPlans,
+    });
+  }
+  return out;
+}
+
+export function sortScheduleMxAssetRows(rows: ScheduleMxAssetRollupRow[]): ScheduleMxAssetRollupRow[] {
+  function rankKey(a: ScheduleMxAssetRollupRow): number {
+    const m: Record<string, number> = {
+      nce_critical: 0,
+      overdue: 1,
+      due_soon: 2,
+      missing: 3,
+      ok: 4,
+    };
+    return m[a.summaryKey] ?? 9;
+  }
+  rows.sort(function (a, b) {
+    const ra = rankKey(a);
+    const rb = rankKey(b);
+    if (ra !== rb) return ra - rb;
+    return a.assetId.localeCompare(b.assetId);
+  });
+  return rows;
+}
+
 async function loadWoCountsPerAsset(
   env: { ETIC_SNAPSHOTS: D1Database },
   dateKey: string,
