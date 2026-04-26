@@ -18,6 +18,7 @@ import {
   getWatchRowByIdForDate,
   getWatchRowsForDate,
   getScheduleMxFleetForDate,
+  computeScheduleMxAssetStats,
   getLatestScheduleMxExtractDateKey,
   listScheduleMxExtractDateKeysDesc,
   getWatchRowsLatest,
@@ -4866,18 +4867,7 @@ async function handleScheduleMxApi(env: Env, request: Request): Promise<Response
       { status: 404, headers: cacheHeaders() },
     );
   }
-  const distinctAssets = new Set(rows.map((r) => r.assetId)).size;
-  const stats = {
-    planRows: rows.length,
-    distinctAssets,
-    assets: distinctAssets,
-    missing: rows.filter((r) => r.scheduleMxBucket === "missing").length,
-    noDue: rows.filter((r) => r.scheduleMxBucket === "no_due").length,
-    overdue: rows.filter((r) => r.scheduleMxBucket === "overdue").length,
-    dueSoon: rows.filter((r) => r.scheduleMxBucket === "due_soon").length,
-    ok: rows.filter((r) => r.scheduleMxBucket === "ok").length,
-    nceCritical: rows.filter((r) => r.scheduleMxNceCritical).length,
-  };
+  const stats = computeScheduleMxAssetStats(rows);
   return Response.json(
     { dateKey, stats, rows, source: "prevmx_extract" },
     { headers: cacheHeaders() },
@@ -18097,22 +18087,28 @@ function renderDashboardHtml(): string {
     function renderScheduleMxStats() {
       const box = document.getElementById("smx-stats");
       if (!box || !smxStats) return;
-      function pill(k, label, cls) {
+      function pill(k, label, cls, hint) {
+        const t = hint ? " title='" + esc(hint) + "'" : "";
         return (
-          "<div class='smx-stat " + cls + "'>" +
+          "<div class='smx-stat " + cls + "'" + t + ">" +
             "<span class='lbl'>" + esc(label) + "</span>" +
             "<span class='v'>" + esc(String(smxStats[k] ?? 0)) + "</span>" +
           "</div>"
         );
       }
       box.innerHTML =
-        pill("distinctAssets", "Assets", "") +
-        pill("planRows", "Plans", "") +
-        pill("nceCritical", "NCE overdue (critical)", "crit") +
-        pill("overdue", "Overdue", "bad") +
-        pill("dueSoon", "Due soon (≤30d)", "warn") +
-        pill("missing", "Missing sched data", "warn") +
-        pill("ok", "OK / current", "");
+        pill("distinctAssets", "Assets", "", "Vehicles in this import (one row per asset id)") +
+        pill("planRows", "Plans", "", "Total maintenance plan rows (multiple per asset)") +
+        pill(
+          "nceCritical",
+          "NCE overdue (critical)",
+          "crit",
+          "Assets with at least one NCE-critical overdue plan",
+        ) +
+        pill("overdue", "Overdue", "bad", "Assets whose worst plan is overdue") +
+        pill("dueSoon", "Due soon (≤30d)", "warn", "Assets whose worst plan is due soon") +
+        pill("missing", "Missing sched data", "warn", "Assets whose worst plan has missing schedule data") +
+        pill("ok", "OK / current", "", "Assets whose worst plan is current or no due date");
     }
 
     function smxPillLabel(bucket) {

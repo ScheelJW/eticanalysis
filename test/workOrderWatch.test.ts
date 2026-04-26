@@ -5,6 +5,7 @@ import {
   calendarDaysBetween,
   classifyMelTier,
   computeMelRecallHintForRow,
+  computeScheduleMxAssetStats,
   elmsPlanRowKeyFromRaw,
   getChangelogForDisplay,
   ingestWorkOrderSnapshot,
@@ -14,7 +15,7 @@ import {
   parseScheduleMxCsvToPlanRows,
   parseScheduleMxCsvToRawByAsset,
 } from "../src/workOrderWatch";
-import type { WatchRow } from "../src/workOrderWatch";
+import type { ScheduleMxFleetRow, WatchRow } from "../src/workOrderWatch";
 
 describe("classifyMelTier", () => {
   it("detects below / at / above from phrases", () => {
@@ -51,6 +52,50 @@ describe("parseCsvTextToRowArrays", () => {
     expect(rows.length).toBe(3);
     expect(rows[1]![1]).toContain("line1");
     expect(rows[1]![1]).toContain("line2");
+  });
+});
+
+describe("computeScheduleMxAssetStats", () => {
+  it("counts each asset once using worst plan (not plan-row totals)", () => {
+    const base = analyzeElmsScheduleMxFromRaw({}, "2026-04-25");
+    const mk = (
+      assetId: string,
+      key: string,
+      bucket: "overdue" | "ok" | "due_soon" | "missing" | "no_due",
+      nceCrit?: boolean,
+    ) =>
+      ({
+        assetId,
+        planRowKey: key,
+        planId: "",
+        planName: "",
+        planDesc: "",
+        maintenanceScheduleId: "",
+        itemDesc: "",
+        location: "",
+        makeModel: "",
+        mgmtCd: "",
+        workOrderCount: 0,
+        nce: false,
+        nceStatus: "",
+        scheduleMxNceCritical: !!nceCrit,
+        ...base,
+        scheduleMxBucket: bucket,
+      }) as ScheduleMxFleetRow;
+
+    const rows = [
+      mk("AF01", "p1", "ok"),
+      mk("AF01", "p2", "overdue"),
+      mk("AF02", "p3", "ok"),
+      mk("AF02", "p4", "ok"),
+    ];
+    const s = computeScheduleMxAssetStats(rows);
+    expect(s.distinctAssets).toBe(2);
+    expect(s.planRows).toBe(4);
+    expect(s.overdue).toBe(1);
+    expect(s.ok).toBe(1);
+    expect(s.dueSoon).toBe(0);
+    expect(s.missing).toBe(0);
   });
 });
 

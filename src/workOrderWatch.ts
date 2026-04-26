@@ -1015,23 +1015,79 @@ async function loadWoCountsPerAsset(
   return m;
 }
 
+/** Per-plan priority for roll-up: lower = worse (matches list sort). */
+function scheduleMxPlanWorstRank(row: ScheduleMxFleetRow): number {
+  if (row.scheduleMxNceCritical) return 0;
+  if (row.scheduleMxBucket === "overdue") return 1;
+  if (row.scheduleMxBucket === "due_soon") return 2;
+  if (row.scheduleMxBucket === "missing") return 3;
+  return 4;
+}
+
 function sortScheduleMxRows(out: ScheduleMxFleetRow[]): ScheduleMxFleetRow[] {
-  function rank(a: ScheduleMxFleetRow): number {
-    if (a.scheduleMxNceCritical) return 0;
-    if (a.scheduleMxBucket === "overdue") return 1;
-    if (a.scheduleMxBucket === "due_soon") return 2;
-    if (a.scheduleMxBucket === "missing") return 3;
-    return 4;
-  }
   out.sort(function (a, b) {
-    const ra = rank(a);
-    const rb = rank(b);
+    const ra = scheduleMxPlanWorstRank(a);
+    const rb = scheduleMxPlanWorstRank(b);
     if (ra !== rb) return ra - rb;
     const ac = a.assetId.localeCompare(b.assetId);
     if (ac !== 0) return ac;
     return a.planRowKey.localeCompare(b.planRowKey);
   });
   return out;
+}
+
+/**
+ * KPI counts by **asset** (vehicle): each asset is classified by its **worst** plan row.
+ * Matches sidebar card logic so tiles are not inflated by multiple plans per asset.
+ */
+export function computeScheduleMxAssetStats(rows: ScheduleMxFleetRow[]): {
+  planRows: number;
+  distinctAssets: number;
+  assets: number;
+  nceCritical: number;
+  overdue: number;
+  dueSoon: number;
+  missing: number;
+  ok: number;
+} {
+  const byAsset = new Map<string, ScheduleMxFleetRow[]>();
+  for (const row of rows) {
+    const aid = (row.assetId ?? "").trim() || "—";
+    let list = byAsset.get(aid);
+    if (!list) {
+      list = [];
+      byAsset.set(aid, list);
+    }
+    list.push(row);
+  }
+  let nceCritical = 0;
+  let overdue = 0;
+  let dueSoon = 0;
+  let missing = 0;
+  let ok = 0;
+  for (const plans of byAsset.values()) {
+    let worst = 4;
+    for (const p of plans) {
+      const r = scheduleMxPlanWorstRank(p);
+      if (r < worst) worst = r;
+    }
+    if (worst === 0) nceCritical++;
+    else if (worst === 1) overdue++;
+    else if (worst === 2) dueSoon++;
+    else if (worst === 3) missing++;
+    else ok++;
+  }
+  const distinctAssets = byAsset.size;
+  return {
+    planRows: rows.length,
+    distinctAssets,
+    assets: distinctAssets,
+    nceCritical,
+    overdue,
+    dueSoon,
+    missing,
+    ok,
+  };
 }
 
 function pickElmsFromRaw(raw: Record<string, string>, needleFragments: string[]): string {
