@@ -14359,6 +14359,9 @@ function renderDashboardHtml(): string {
       grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 6px 8px;
     }
+    .smx-schedule-metrics {
+      grid-template-columns: repeat(auto-fit, minmax(104px, 1fr));
+    }
     @media (max-width: 520px) {
       .smx-util-metrics { grid-template-columns: 1fr; }
     }
@@ -18586,38 +18589,6 @@ function renderDashboardHtml(): string {
     }
 
     function smxFactsHtmlForPlan(row) {
-      const eff = smxEffBucket(row);
-      const rawB = row.scheduleMxBucket || "";
-      const sched = [];
-      sched.push({ dt: "Source status", dd: esc(row.scheduleMxStatus || "—") });
-      sched.push({
-        dt: "Health (for triage)",
-        dd:
-          "<span class='smx-pill " + esc(eff) + "'>" +
-          esc(smxPillLabel(eff)) +
-          "</span>" +
-          (row.scheduleMxSuppressedByOpenWo && rawB !== eff
-            ? " <span class='facts-sub'>(Was " + esc(smxPillLabel(rawB)) + " — waived: open WO / in shop)</span>"
-            : ""),
-      });
-      const lastM = row.elmsLastMaintDateIso ? fmtKeyShort(row.elmsLastMaintDateIso) : "—";
-      const nextM = row.elmsNextMaintDateIso ? fmtKeyShort(row.elmsNextMaintDateIso) : "—";
-      sched.push({ dt: "Last maint", dd: esc(lastM) });
-      sched.push({ dt: "Next maint", dd: esc(nextM) });
-      if (row.location && String(row.location).trim()) {
-        sched.push({ dt: "Location", dd: esc(String(row.location).trim()) });
-      }
-      if (row.scheduleMxDueIso && row.scheduleMxDueIso !== row.elmsNextMaintDateIso) {
-        sched.push({ dt: "Computed due", dd: esc(fmtKeyShort(row.scheduleMxDueIso)) });
-      }
-      if (row.scheduleMxOverdueByDays != null) {
-        sched.push({ dt: "Overdue by", dd: esc(String(row.scheduleMxOverdueByDays) + " days") });
-      }
-      if (row.scheduleMxDaysUntil != null && eff === "due_soon") {
-        sched.push({ dt: "Days until due", dd: esc(String(row.scheduleMxDaysUntil)) });
-      }
-      var plainCal = smxPlainDateLine(row);
-      if (plainCal) sched.push({ dt: "Calendar (plain language)", dd: esc(plainCal) });
       const plan = [];
       if (row.planDesc) plan.push({ dt: "What this plan is", dd: esc(row.planDesc) });
       function factPair(x) {
@@ -18632,11 +18603,7 @@ function renderDashboardHtml(): string {
           "</section>"
         );
       }
-      return (
-        factGroup("Schedule", sched) +
-        smxPlainUtilBlock(row) +
-        factGroup("This maintenance plan", plan)
-      );
+      return smxPlainScheduleBlock(row) + smxPlainUtilBlock(row) + factGroup("This maintenance plan", plan);
     }
 
     function renderSmxPlansWrap(plans) {
@@ -18961,11 +18928,96 @@ function renderDashboardHtml(): string {
     /** Human label for utilization type (avoid generic "units"). */
     function smxUtilUomLabel(utRaw) {
       const s = String(utRaw || "").toLowerCase().replace(/\s+/g, " ").trim();
-      if (!s) return "";
-      if (/\bmile|\bmi\b|mph/.test(s)) return "miles";
-      if (/\bhour|\bhr\b|hrs|operating hour/.test(s)) return "hours";
+      if (!s) return "miles";
+      if (/\bmile|\bmi\b|mph|odometer/.test(s)) return "miles";
+      if (/\bhour|\bhr\b|hrs|operating hour|engine hour/.test(s)) return "hours";
       if (/\bkm\b|kilometer|kilomet/.test(s)) return "km";
-      return s;
+      if (s.length <= 14) return s;
+      return "miles";
+    }
+
+    /** Calendar section: same boxed metric + progress pattern as service meter. */
+    function smxPlainScheduleBlock(row) {
+      const eff = smxEffBucket(row);
+      const src = row.scheduleMxStatus || "—";
+      const lastM = row.elmsLastMaintDateIso ? fmtKeyShort(row.elmsLastMaintDateIso) : "—";
+      const nextM = row.elmsNextMaintDateIso ? fmtKeyShort(row.elmsNextMaintDateIso) : "—";
+      var metrics =
+        "<div class='smx-util-metrics smx-schedule-metrics'>" +
+        "<div class='smx-util-metric'><span class='smx-util-m-lbl'>Source status</span><span class='smx-util-m-val'>" +
+        esc(src) +
+        "</span></div>" +
+        "<div class='smx-util-metric'><span class='smx-util-m-lbl'>Last maint</span><span class='smx-util-m-val'>" +
+        esc(lastM) +
+        "</span></div>" +
+        "<div class='smx-util-metric'><span class='smx-util-m-lbl'>Next maint</span><span class='smx-util-m-val'>" +
+        esc(nextM) +
+        "</span></div>";
+      if (row.scheduleMxDueIso && row.scheduleMxDueIso !== row.elmsNextMaintDateIso) {
+        metrics +=
+          "<div class='smx-util-metric'><span class='smx-util-m-lbl'>Computed due</span><span class='smx-util-m-val'>" +
+          esc(fmtKeyShort(row.scheduleMxDueIso)) +
+          "</span></div>";
+      }
+      if (row.scheduleMxOverdueByDays != null) {
+        metrics +=
+          "<div class='smx-util-metric'><span class='smx-util-m-lbl'>Overdue by</span><span class='smx-util-m-val'>" +
+          esc(String(row.scheduleMxOverdueByDays) + " days") +
+          "</span></div>";
+      } else if (row.scheduleMxDaysUntil != null && eff === "due_soon") {
+        metrics +=
+          "<div class='smx-util-metric'><span class='smx-util-m-lbl'>Days until due</span><span class='smx-util-m-val'>" +
+          esc(String(row.scheduleMxDaysUntil)) +
+          "</span></div>";
+      }
+      metrics += "</div>";
+      var lastIso = row.elmsLastMaintDateIso;
+      var nextIso = row.elmsNextMaintDateIso;
+      var barW = 0;
+      var barCls = "";
+      var showDateBar = false;
+      var lead = smxPlainDateLine(row);
+      if (lastIso && nextIso) {
+        var t0 = Date.parse(String(lastIso).slice(0, 10) + "T12:00:00.000Z");
+        var t1 = Date.parse(String(nextIso).slice(0, 10) + "T12:00:00.000Z");
+        var now = Date.now();
+        if (Number.isFinite(t0) && Number.isFinite(t1) && t1 > t0) {
+          showDateBar = true;
+          var frac = (now - t0) / (t1 - t0);
+          if (eff === "overdue") {
+            barW = 100;
+            barCls = "danger";
+          } else {
+            barW = Math.max(now > t0 && frac * 100 < 2 ? 2 : 0, Math.min(100, Math.round(frac * 100)));
+            if (frac >= 1) barCls = "danger";
+            else if (frac >= 0.92) barCls = "warn";
+          }
+        }
+      }
+      if (!lead && eff === "missing") lead = "Not enough schedule data on this plan.";
+      var leadCls = "smx-plain-lead" + (eff === "overdue" ? " smx-plain-lead--warn" : "");
+      var calloutCls = "smx-plain-callout smx-plain-callout--compact" + (eff === "overdue" ? " smx-plain-callout--warn" : "");
+      return (
+        "<section class='wo-facts-group smx-util-section' aria-label='Calendar schedule'>" +
+        "<h4 class='wo-facts-group-h'>Calendar</h4>" +
+        "<div class='" +
+        esc(calloutCls) +
+        "' role='status'>" +
+        metrics +
+        (showDateBar
+          ? "<div class='smx-util-progress-wrap'>" +
+            "<div class='smx-util-progress-label'>Progress to next date</div>" +
+            "<div class='smx-util-progress " +
+            esc(barCls) +
+            "'><i style='width:" +
+            barW +
+            "%'></i></div></div>"
+          : "") +
+        (lead
+          ? "<p class='" + esc(leadCls) + "'>" + esc(lead) + "</p>"
+          : "") +
+        "</div></section>"
+      );
     }
 
     /** Compact service-meter card: metrics + thin progress + one short line. */
@@ -18973,7 +19025,7 @@ function renderDashboardHtml(): string {
       const uom = smxUtilUomLabel(row.elmsUtilType);
       const cur = row.elmsCurrentMeter;
       const nxt = row.elmsNextUtilQty;
-      const uSuffix = uom ? " " + uom : "";
+      const uSuffix = " " + uom;
       if (cur == null || nxt == null) {
         return (
           "<section class='wo-facts-group smx-util-section' aria-label='Service meter'>" +
@@ -18992,7 +19044,7 @@ function renderDashboardHtml(): string {
       const curS = smxFmtNum(cur) + uSuffix;
       const nxtS = smxFmtNum(nxt) + uSuffix;
       const remS =
-        rem >= 0 ? smxFmtNum(rem) + uSuffix + " left" : smxFmtNum(Math.abs(rem)) + uSuffix + " over";
+        rem >= 0 ? smxFmtNum(rem) + " " + uom + " left" : smxFmtNum(Math.abs(rem)) + " " + uom + " over";
       var lead = "";
       var leadCls = "smx-plain-lead";
       if (overUtil) {
