@@ -18,6 +18,8 @@ import {
   getWatchRowByIdForDate,
   getWatchRowsForDate,
   getScheduleMxFleetForDate,
+  getLatestScheduleMxExtractDateKey,
+  listScheduleMxExtractDateKeysDesc,
   getWatchRowsLatest,
   getWorkOrderActions,
   getWorkOrderTimeline,
@@ -4822,21 +4824,41 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
 async function handleScheduleMxApi(env: Env, request: Request): Promise<Response> {
   if (request.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
   const url = new URL(request.url);
+  if (url.searchParams.get("dates") === "1") {
+    const dates = await listScheduleMxExtractDateKeysDesc(env);
+    const latest = dates[0] ?? null;
+    return Response.json({ dates, latest }, { headers: cacheHeaders() });
+  }
+
   let dateKey = url.searchParams.get("date")?.trim() ?? "";
   if (!dateKey) {
-    const history = await mergeHistoryWithActiveSnapshots(env, await loadHistory(env));
-    const latest = history.entries.length
-      ? [...history.entries].sort((a, b) => b.dateKey.localeCompare(a.dateKey))[0]
-      : null;
-    dateKey = latest?.dateKey ?? "";
+    dateKey = (await getLatestScheduleMxExtractDateKey(env)) ?? "";
   }
   if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) {
     return Response.json(
-      { error: "date=YYYY-MM-DD required, or ingest a snapshot first." },
-      { status: 400, headers: cacheHeaders() },
+      {
+        error: "No Schedule Mx import for that date. Send a CSV or XLSX to prevmx@2t3.app, or pass date=YYYY-MM-DD.",
+        dateKey: null,
+        stats: null,
+        rows: [],
+        availableDates: await listScheduleMxExtractDateKeysDesc(env),
+      },
+      { status: 404, headers: cacheHeaders() },
     );
   }
   const rows = await getScheduleMxFleetForDate(env, dateKey);
+  if (rows.length === 0) {
+    return Response.json(
+      {
+        error: "No Schedule Mx rows stored for that date.",
+        dateKey,
+        stats: null,
+        rows: [],
+        availableDates: await listScheduleMxExtractDateKeysDesc(env),
+      },
+      { status: 404, headers: cacheHeaders() },
+    );
+  }
   const stats = {
     assets: rows.length,
     missing: rows.filter((r) => r.scheduleMxBucket === "missing").length,
@@ -4846,7 +4868,10 @@ async function handleScheduleMxApi(env: Env, request: Request): Promise<Response
     ok: rows.filter((r) => r.scheduleMxBucket === "ok").length,
     nceCritical: rows.filter((r) => r.scheduleMxNceCritical).length,
   };
-  return Response.json({ dateKey, stats, rows }, { headers: cacheHeaders() });
+  return Response.json(
+    { dateKey, stats, rows, source: "prevmx_extract" },
+    { headers: cacheHeaders() },
+  );
 }
 
 async function handleAuthzManagerApi(env: Env, request: Request): Promise<Response> {
@@ -14368,9 +14393,12 @@ function renderDashboardHtml(): string {
         <div class="smx-header">
           <div>
             <h2 class="smx-title">Schedule Maintenance Status</h2>
-            <p class="smx-sub">Per-asset schedule maintenance from the Fleet (P&amp;A) sheet on the ETIC workbook (all fleet assets). <strong>Overdue</strong> uses the <strong>Schedule Mx Slicer</strong> cell only—scheduled/call-in dates are for planning, not overdue unless the slicer says overdue. Open work-order counts are shown when present for that snapshot date. Same snapshot date as <strong>Work orders</strong>. Overdue on <span class="nce-inline">NCE</span> is treated as critical.</p>
+            <p class="smx-sub">Per-asset schedule maintenance from the <strong>ELMS / Schedule Mx extract</strong> (email <code>prevmx@2t3.app</code> with a CSV or XLSX). This feed is separate from the Vehicle ETIC workbook. <strong>Overdue</strong> follows the <strong>Schedule Mx Slicer</strong> column when present. Open work-order counts (if shown) use the same calendar date when an ETIC snapshot exists. Overdue on <span class="nce-inline">NCE</span> is treated as critical.</p>
           </div>
-          <span class="smx-asof-pill" id="smx-asof-pill" title="Matches latest ETIC snapshot">Latest</span>
+          <span class="smx-asof-pill" id="smx-asof-pill" title="Latest prevmx import date">Latest import</span>
+          <label class="smx-search" style="margin-left:10px"><span class="sr-only">Import date</span>
+            <select id="smx-date-select" aria-label="Schedule Mx import date"></select>
+          </label>
         </div>
         <div class="smx-stats" id="smx-stats" role="status">Loading…</div>
         <div class="smx-toolbar">
@@ -17390,25 +17418,52 @@ function renderDashboardHtml(): string {
     var smxRows = [];
     var smxStats = null;
     var smxFilter = "all";
+    /** Selected prevmx import date (YYYY-MM-DD); null = use latest from server. */
+    var smxSelectedDateKey = null;
 
     async function loadScheduleMxTab() {
       const pill = document.getElementById("smx-asof-pill");
-      const dk = woAsOfDate();
-      if (pill) pill.textContent = dk ? fmtKeyLong(dk) : "—";
+      const dateSel = document.getElementById("smx-date-select");
       const statsEl = document.getElementById("smx-stats");
       const tbody = document.getElementById("smx-tbody");
       if (statsEl) {
         statsEl.innerHTML = "<span class='smx-stat'><span class='lbl'>Loading</span><span class='v'>…</span></span>";
       }
       if (tbody) tbody.innerHTML = "<tr><td colspan='6'>Loading…</td></tr>";
-      if (!dk) {
-        if (statsEl) statsEl.textContent = "No snapshot date — ingest an ETIC workbook first.";
-        if (tbody) tbody.innerHTML = "<tr><td colspan='6'>No data.</td></tr>";
-        return;
-      }
       try {
+        const rd = await fetch("/api/schedule-mx?dates=1", { cache: "no-store" });
+        const jd = await rd.json();
+        const dates = Array.isArray(jd.dates) ? jd.dates : [];
+        const latest = jd.latest || (dates[0] || "");
+        if (dateSel) {
+          var keep = smxSelectedDateKey;
+          if (!keep || dates.indexOf(keep) < 0) keep = latest || null;
+          smxSelectedDateKey = keep;
+          dateSel.innerHTML = dates.length
+            ? dates.map(function (d) {
+                return "<option value='" + esc(d) + "'" + (d === smxSelectedDateKey ? " selected" : "") + ">" + esc(fmtKeyLong(d)) + "</option>";
+              }).join("")
+            : "";
+          dateSel.disabled = dates.length === 0;
+        }
+        var dk = smxSelectedDateKey || latest || "";
+        if (pill) pill.textContent = dk ? fmtKeyLong(dk) : "No imports";
+        if (!dk) {
+          if (statsEl) statsEl.textContent = "No Schedule Mx imports yet — send a CSV or XLSX to prevmx@2t3.app.";
+          if (tbody) tbody.innerHTML = "<tr><td colspan='6'>No data.</td></tr>";
+          smxRows = [];
+          smxStats = null;
+          return;
+        }
         const r = await fetch("/api/schedule-mx?date=" + encodeURIComponent(dk), { cache: "no-store" });
         const j = await r.json();
+        if (!r.ok) {
+          if (statsEl) statsEl.textContent = j.error || "Could not load schedule maintenance.";
+          if (tbody) tbody.innerHTML = "<tr><td colspan='6'>No rows for this date.</td></tr>";
+          smxRows = [];
+          smxStats = null;
+          return;
+        }
         smxRows = Array.isArray(j.rows) ? j.rows : [];
         smxStats = j.stats || null;
         renderScheduleMxStats();
@@ -19522,6 +19577,14 @@ function renderDashboardHtml(): string {
       }
       const smxQ = document.getElementById("smx-query");
       if (smxQ) smxQ.addEventListener("input", function () { renderScheduleMxTable(); });
+      const smxDateSel = document.getElementById("smx-date-select");
+      if (smxDateSel && !smxDateSel.dataset.wired) {
+        smxDateSel.dataset.wired = "1";
+        smxDateSel.addEventListener("change", function () {
+          smxSelectedDateKey = smxDateSel.value || null;
+          loadScheduleMxTab();
+        });
+      }
       const melTabBtn = document.getElementById("tab-mel");
       if (melTabBtn) melTabBtn.addEventListener("click", function () { setMainTab("mel"); syncDashboardQuery("mel"); });
       const meetTabBtn = document.getElementById("tab-meeting");

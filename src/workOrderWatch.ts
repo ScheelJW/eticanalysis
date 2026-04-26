@@ -1051,72 +1051,6 @@ function buildScheduleMxRowsFromFleetSheet(
   return sortScheduleMxRows(out);
 }
 
-/** Fallback when the workbook is missing from R2 or has no Fleet sheet. */
-async function scheduleMxFleetRowsFromWorkOrderSnapshotsOnly(
-  env: { ETIC_SNAPSHOTS: D1Database },
-  dateKey: string,
-): Promise<ScheduleMxFleetRow[]> {
-  const r = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT asset_id, raw_row_json, make_model, mgmt_cd
-       FROM work_order_snapshot
-      WHERE snapshot_date_key = ?`,
-  )
-    .bind(dateKey)
-    .all<{ asset_id: string; raw_row_json: string | null; make_model: string | null; mgmt_cd: string | null }>();
-
-  type Agg = { raws: Record<string, string>[]; make: string; mgmt: string; woCount: number };
-  const byAsset = new Map<string, Agg>();
-  for (const row of r.results ?? []) {
-    const aid = (row.asset_id ?? "").trim();
-    if (!aid) continue;
-    const parsed = readRawColumns(row.raw_row_json);
-    let g = byAsset.get(aid);
-    if (!g) {
-      g = {
-        raws: [],
-        make: (row.make_model ?? "").trim(),
-        mgmt: (row.mgmt_cd ?? "").trim(),
-        woCount: 0,
-      };
-      byAsset.set(aid, g);
-    }
-    g.raws.push(parsed);
-    g.woCount += 1;
-    if (!g.make && row.make_model) g.make = row.make_model.trim();
-    if (!g.mgmt && row.mgmt_cd) g.mgmt = row.mgmt_cd.trim();
-  }
-
-  const out: ScheduleMxFleetRow[] = [];
-  for (const [assetId, g] of byAsset) {
-    const merged: Record<string, string> = {};
-    for (const rr of g.raws) {
-      for (const [k, v] of Object.entries(rr)) {
-        if (v && String(v).trim()) merged[k] = String(v).trim();
-      }
-    }
-    const nceStatus = pickRawValue(merged, [
-      "fleet.nce vehicle listing.status",
-      "fleet.nce vehicle listing status",
-      "fleet.nce status",
-      "fleet.nce",
-    ]);
-    const nce = !!nceStatus;
-    const smx = analyzeScheduleMxFromRaw(merged, dateKey);
-    const scheduleMxNceCritical = nce && smx.scheduleMxBucket === "overdue";
-    out.push({
-      assetId,
-      makeModel: g.make,
-      mgmtCd: g.mgmt,
-      workOrderCount: g.woCount,
-      nce,
-      nceStatus,
-      scheduleMxNceCritical,
-      ...smx,
-    });
-  }
-  return sortScheduleMxRows(out);
-}
-
 /** True when mail was addressed to prevmx@ (Schedule Mx / ELMS extract ingest). */
 export function isPrevmxScheduleMxInbox(toHeader: string): boolean {
   const raw = toHeader.replace(/[<>]/g, " ").toLowerCase();
@@ -1297,26 +1231,6 @@ export async function ingestScheduleMxExtractFromAttachment(
   return { rowCount: rawByAsset.size, dateKey: opts.dateKey };
 }
 
-function mergeFleetRawByAsset(
-  base: Map<string, Record<string, string>>,
-  overlay: Map<string, Record<string, string>>,
-): Map<string, Record<string, string>> {
-  const out = new Map<string, Record<string, string>>();
-  for (const [aid, raw] of base) {
-    out.set(aid, { ...raw });
-  }
-  for (const [aid, extra] of overlay) {
-    const cur = out.get(aid) ?? {};
-    const merged = { ...cur };
-    for (const [k, v] of Object.entries(extra)) {
-      const t = String(v ?? "").trim();
-      if (t) merged[k] = t;
-    }
-    out.set(aid, merged);
-  }
-  return out;
-}
-
 async function loadScheduleMxExtractForDate(
   env: { ETIC_SNAPSHOTS: D1Database },
   dateKey: string,
@@ -1341,48 +1255,36 @@ async function loadScheduleMxExtractForDate(
   return out;
 }
 
+/** Latest `snapshot_date_key` in schedule_mx_extract_snapshot (prevmx imports), or null. */
+export async function getLatestScheduleMxExtractDateKey(env: { ETIC_SNAPSHOTS: D1Database }): Promise<string | null> {
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT MAX(snapshot_date_key) AS k FROM schedule_mx_extract_snapshot`,
+  ).first<{ k: string | null }>();
+  const k = r?.k?.trim() ?? "";
+  return k || null;
+}
+
+/** Distinct import dates (newest first) for Schedule Mx history picker. */
+export async function listScheduleMxExtractDateKeysDesc(env: { ETIC_SNAPSHOTS: D1Database }): Promise<string[]> {
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT DISTINCT snapshot_date_key AS k FROM schedule_mx_extract_snapshot ORDER BY k DESC`,
+  ).all<{ k: string }>();
+  return (r.results ?? []).map((row) => (row.k ?? "").trim()).filter(Boolean);
+}
+
 /**
- * Full Fleet (P&A) fleet: reads the stored ETIC workbook from R2 and parses the Fleet sheet
- * so every asset row appears (not only assets with open work orders). WO counts are joined from
- * `work_order_snapshot` when present.
- * Rows from `schedule_mx_extract_snapshot` (prevmx@ email) for the same date are merged on top
- * so ELMS exports override workbook Fleet cells for schedule-maintenance fields.
+ * Schedule Mx tab: **only** `schedule_mx_extract_snapshot` rows (prevmx@ CSV/XLSX). Independent of ETIC workbooks.
+ * Open WO counts on the same calendar date are joined from `work_order_snapshot` when present (optional context only).
  */
 export async function getScheduleMxFleetForDate(
-  env: { ETIC_SNAPSHOTS: D1Database; ETIC_BUCKET: R2Bucket },
+  env: { ETIC_SNAPSHOTS: D1Database },
   dateKey: string,
 ): Promise<ScheduleMxFleetRow[]> {
+  const extractOnly = await loadScheduleMxExtractForDate(env, dateKey);
+  if (extractOnly.size === 0) return [];
   const woCounts = await loadWoCountsPerAsset(env, dateKey);
-  const extractOverlay = await loadScheduleMxExtractForDate(env, dateKey);
-
-  const snap = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT workbook_key FROM etic_snapshots WHERE date_key = ? AND deleted_at_iso IS NULL`,
-  )
-    .bind(dateKey)
-    .first<{ workbook_key: string | null }>();
-
-  if (snap?.workbook_key) {
-    const obj = await env.ETIC_BUCKET.get(snap.workbook_key);
-    if (obj) {
-      try {
-        const bytes = await obj.arrayBuffer();
-        const ex = await extractFleetMapsFromBinary(bytes);
-        if (ex && ex.rawByAsset.size > 0) {
-          const rawByAsset = mergeFleetRawByAsset(ex.rawByAsset, extractOverlay);
-          return buildScheduleMxRowsFromFleetSheet(rawByAsset, ex.byAsset, woCounts, dateKey);
-        }
-      } catch (err) {
-        console.error("getScheduleMxFleetForDate: fleet extract failed", err);
-      }
-    }
-  }
-
-  if (extractOverlay.size > 0) {
-    const emptyTyped = new Map<string, FleetRecord>();
-    return buildScheduleMxRowsFromFleetSheet(extractOverlay, emptyTyped, woCounts, dateKey);
-  }
-
-  return scheduleMxFleetRowsFromWorkOrderSnapshotsOnly(env, dateKey);
+  const emptyTyped = new Map<string, FleetRecord>();
+  return buildScheduleMxRowsFromFleetSheet(extractOnly, emptyTyped, woCounts, dateKey);
 }
 
 async function getEarliestSnapshotDate(env: { ETIC_SNAPSHOTS: D1Database }): Promise<string> {
