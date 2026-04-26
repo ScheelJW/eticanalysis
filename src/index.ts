@@ -14011,6 +14011,61 @@ function renderDashboardHtml(): string {
       color: var(--muted);
       margin-top: 4px;
     }
+    .smx-layman-strip {
+      margin: 12px 0 4px;
+      padding: 12px 14px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: linear-gradient(180deg, rgba(0,58,140,0.06) 0%, rgba(15,30,60,0.03) 100%);
+      font-size: 0.9rem;
+      line-height: 1.5;
+      color: var(--text);
+    }
+    .smx-layman-strip .smx-layman-lead {
+      font-weight: 700;
+      margin-bottom: 6px;
+      color: var(--text);
+    }
+    .smx-layman-strip .smx-layman-sub {
+      font-size: 0.82rem;
+      color: var(--muted);
+      margin: 0;
+    }
+    .smx-plain-callout {
+      margin: 0 0 10px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      background: rgba(0,58,140,0.06);
+      border: 1px solid rgba(0,58,140,0.15);
+      font-size: 0.86rem;
+      line-height: 1.45;
+      color: var(--text);
+    }
+    .smx-plain-callout .smx-util-progress-wrap {
+      margin-top: 8px;
+    }
+    .smx-plain-callout .smx-util-progress-label {
+      font-size: 0.68rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .smx-util-progress {
+      height: 8px;
+      border-radius: 999px;
+      background: var(--border);
+      overflow: hidden;
+    }
+    .smx-util-progress > i {
+      display: block;
+      height: 100%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, var(--accent) 0%, var(--accent-strong) 100%);
+      max-width: 100%;
+    }
+    .smx-util-progress.warn > i { background: linear-gradient(90deg, var(--warn) 0%, #c98a00 100%); }
+    .smx-util-progress.danger > i { background: linear-gradient(90deg, var(--danger) 0%, #8b1538 100%); }
     .smx-pill {
       display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.62rem; font-weight: 700;
       text-transform: uppercase; letter-spacing: 0.04em;
@@ -17762,6 +17817,7 @@ function renderDashboardHtml(): string {
         "<div class='wo-hero-id'>" + esc(assetId) + "</div>" +
         chips.join("") +
         "</div>" +
+        smxAssetLaymanSummary(plans) +
         "<div class='wo-hero-sub wo-hero-sub-primary'>" +
         renderSightingBadge(assetId) +
         " " +
@@ -17800,6 +17856,8 @@ function renderDashboardHtml(): string {
       if (row.scheduleMxDaysUntil != null && eff === "due_soon") {
         sched.push({ dt: "Days until due", dd: esc(String(row.scheduleMxDaysUntil)) });
       }
+      var plainCal = smxPlainDateLine(row);
+      if (plainCal) sched.push({ dt: "Plain language (calendar)", dd: esc(plainCal) });
       const util = [];
       const ut = (row.elmsUtilType || "").trim();
       util.push({
@@ -17862,6 +17920,7 @@ function renderDashboardHtml(): string {
       }
       return (
         factGroup("Schedule", sched) +
+        smxPlainUtilBlock(row) +
         factGroup("Utilization", util) +
         factGroup("Plan", plan) +
         factGroup("Organization", org)
@@ -18179,6 +18238,147 @@ function renderDashboardHtml(): string {
       if (bucket === "no_due") return "No due date";
       if (bucket === "missing") return "Missing";
       return bucket || "—";
+    }
+
+    function smxFmtNum(n) {
+      try {
+        return Number(n).toLocaleString("en-US");
+      } catch (e) {
+        return String(n);
+      }
+    }
+
+    /** Plain English + optional progress bar for meter vs next util qty. */
+    function smxPlainUtilBlock(row) {
+      const ut = (row.elmsUtilType || "").trim();
+      const utPhrase = ut ? ut : "units";
+      const cur = row.elmsCurrentMeter;
+      const nxt = row.elmsNextUtilQty;
+      if (cur == null || nxt == null) {
+        return (
+          "<p class='smx-plain-callout'><strong>Utilization</strong> — This extract does not show both a current reading and a next target for this plan, so we cannot say how far along the interval you are.</p>"
+        );
+      }
+      if (row.scheduleMxOverdueUtil || (row.scheduleMxUtilRemaining != null && row.scheduleMxUtilRemaining < 0)) {
+        const over = row.scheduleMxUtilRemaining != null ? Math.abs(row.scheduleMxUtilRemaining) : 0;
+        return (
+          "<p class='smx-plain-callout'><strong>Over the service interval.</strong> The reading is at or past the next target (" +
+          smxFmtNum(cur) +
+          " vs " +
+          smxFmtNum(nxt) +
+          " " +
+          esc(utPhrase) +
+          ")." +
+          (over ? " About " + smxFmtNum(over) + " " + esc(utPhrase) + " past that target." : "") +
+          "</p>"
+        );
+      }
+      const span = Math.max(1, nxt);
+      const pct = Math.min(100, Math.max(0, Math.round((cur / span) * 100)));
+      const rem = row.scheduleMxUtilRemaining != null ? row.scheduleMxUtilRemaining : nxt - cur;
+      const barCls = pct >= 95 ? "danger" : pct >= 85 ? "warn" : "";
+      return (
+        "<div class='smx-plain-callout' role='status'>" +
+        "<strong>How close to the next service reading?</strong> " +
+        "You are about <strong>" +
+        pct +
+        "%</strong> of the way from zero to the next target reading " +
+        "(" +
+        smxFmtNum(cur) +
+        " of " +
+        smxFmtNum(nxt) +
+        " " +
+        esc(utPhrase) +
+        "). " +
+        "Roughly <strong>" +
+        smxFmtNum(Math.max(0, rem)) +
+        " " +
+        esc(utPhrase) +
+        "</strong> left before you reach that reading." +
+        "<div class='smx-util-progress-wrap'>" +
+        "<div class='smx-util-progress-label'>Progress toward next util target</div>" +
+        "<div class='smx-util-progress " +
+        esc(barCls) +
+        "' title='" +
+        esc(String(pct) + "% of interval used") +
+        "'><i style='width:" +
+        pct +
+        "%'></i></div></div></div>"
+      );
+    }
+
+    function smxPlainDateLine(row) {
+      const eff = smxEffBucket(row);
+      if (eff === "missing") {
+        return "ELMS does not show enough schedule data on this plan to judge it — check the extract or fleet system.";
+      }
+      const nextM = row.elmsNextMaintDateIso ? fmtKeyShort(row.elmsNextMaintDateIso) : "";
+      if (!nextM) {
+        if (eff === "ok" || eff === "no_due") return "No next calendar service date is listed in ELMS for this plan.";
+        return "";
+      }
+      if (eff === "overdue") {
+        const d = row.scheduleMxOverdueByDays != null ? row.scheduleMxOverdueByDays + " day" + (row.scheduleMxOverdueByDays === 1 ? "" : "s") : "some time";
+        return "Next calendar service date was " + nextM + " (" + d + " past that date).";
+      }
+      if (eff === "due_soon" && row.scheduleMxDaysUntil != null) {
+        return "Next calendar service date is " + nextM + " (about " + row.scheduleMxDaysUntil + " day" + (row.scheduleMxDaysUntil === 1 ? "" : "s") + " away).";
+      }
+      if (eff === "ok" || eff === "no_due") {
+        return "Next calendar service date in ELMS: " + nextM + ".";
+      }
+      return "";
+    }
+
+    function smxAssetLaymanSummary(plans) {
+      var od = 0;
+      var ds = 0;
+      var miss = 0;
+      var waived = 0;
+      var okish = 0;
+      for (var i = 0; i < plans.length; i++) {
+        var p = plans[i];
+        var e = smxEffBucket(p);
+        if (e === "overdue") od++;
+        else if (e === "due_soon") ds++;
+        else if (e === "missing") miss++;
+        else okish++;
+        if (p.scheduleMxSuppressedByOpenWo) waived++;
+      }
+      var wo = plans[0] && plans[0].workOrderCount != null ? plans[0].workOrderCount : 0;
+      var needAttention = od + ds + miss;
+      var lead = "";
+      if (needAttention === 0) {
+        lead = "No plans on this asset need attention right now (after open-WO / shop rules).";
+      } else {
+        var bits = [];
+        if (od) bits.push(od + " overdue");
+        if (ds) bits.push(ds + " due soon");
+        if (miss) bits.push(miss + " missing schedule data");
+        lead = "This asset needs attention on " + needAttention + " maintenance plan" + (needAttention === 1 ? "" : "s") + " (" + bits.join(", ") + ").";
+      }
+      var subParts = [];
+      if (waived) {
+        subParts.push(
+          waived +
+            " plan" +
+            (waived === 1 ? " looks" : "s look") +
+            " overdue or due soon in ELMS but " +
+            (waived === 1 ? "is" : "are") +
+            " treated as OK while the truck has an open work order or in-shop parts status. When you can tie plans to sub-WOs, confirm the right plan is on the WO.",
+        );
+      }
+      if (wo === 0 && (od > 0 || ds > 0)) {
+        subParts.push("Latest ETIC shows no open work order — consider opening one for the overdue or due-soon work.");
+      }
+      return (
+        "<div class='smx-layman-strip'>" +
+        "<div class='smx-layman-lead'>" +
+        esc(lead) +
+        "</div>" +
+        (subParts.length ? "<p class='smx-layman-sub'>" + esc(subParts.join(" ")) + "</p>" : "") +
+        "</div>"
+      );
     }
 
     function renderScheduleMxList() {
