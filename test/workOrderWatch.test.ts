@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 import type { RawWorkOrder } from "../src/yardCheck";
 import {
   analyzeElmsScheduleMxFromRaw,
+  applyScheduleMxFleetUtilizationTypeFromD1,
   calendarDaysBetween,
   classifyMelTier,
+  scheduleMxMeterDueSoonMaxRemaining,
+  utilizationTypeFromFleetRawJson,
   computeMelRecallHintForRow,
   computeScheduleMxAssetStats,
   computeScheduleMxCommanderSummary,
@@ -17,6 +20,7 @@ import {
   parseEticDate,
   parseScheduleMxCsvToPlanRows,
   parseScheduleMxCsvToRawByAsset,
+  parseOswoCsvToRows,
 } from "../src/workOrderWatch";
 import type { ScheduleMxFleetRow, WatchRow } from "../src/workOrderWatch";
 
@@ -42,6 +46,31 @@ describe("parseEticDate", () => {
   it("parses ISO prefix and US dates", () => {
     expect(parseEticDate("2026-04-20")).toBe("2026-04-20");
     expect(parseEticDate("4/20/2026")).toBe("2026-04-20");
+  });
+});
+
+describe("parseOswoCsvToRows", () => {
+  it("parses Work Order Id / Sub Work Order Id and drops RQST-Open state rows", () => {
+    const csv =
+      "Work Order Id,Sub Work Order Id,Sub Work Order State Cd,Item Desc,Work Plan Type Cd\n" +
+      "WO123,SW01,INPR-In Progress,Replace filter,TYPE-A\n" +
+      "WO123,SW02,RQST-Open,Should drop,\n" +
+      "WO456,SW09,CLSD-Closed,Brake work,TYPE-B\n";
+    const rows = parseOswoCsvToRows(csv);
+    expect(rows.length).toBe(2);
+    expect(rows[0]!.parentWorkOrderId).toBe("WO123");
+    expect(rows[0]!.subWorkOrderId).toBe("SW01");
+    expect(rows[0]!.raw["oswo.sub work order state cd"]).toBe("INPR-In Progress");
+    expect(rows[1]!.parentWorkOrderId).toBe("WO456");
+  });
+
+  it("parses legacy Open Work Order style headers", () => {
+    const csv =
+      "Open Work Order,Sub Work Order,Sub Work Order State Cd,Work Plan\n" +
+      "WO123,SW01,OPEN,Replace filter\n" +
+      "WO123,SW02,Inspect brakes,REQ\n";
+    const rows = parseOswoCsvToRows(csv);
+    expect(rows.length).toBe(2);
   });
 });
 
@@ -101,6 +130,7 @@ describe("enrichScheduleMxRowsWithLatestEtic", () => {
           nceStatus: "Active",
           inMaintenance: false,
           nmcOnOpenWorkOrder: false,
+          fleetUtilizationType: "",
         },
       ],
     ]);
@@ -154,6 +184,7 @@ describe("enrichScheduleMxRowsWithLatestEtic", () => {
           nceStatus: "",
           inMaintenance: false,
           nmcOnOpenWorkOrder: false,
+          fleetUtilizationType: "",
         },
       ],
     ]);
@@ -228,6 +259,129 @@ describe("computeScheduleMxAssetStats", () => {
   });
 });
 
+describe("utilization type and meter due soon", () => {
+  it("uses 50h vs 1500 mi thresholds", () => {
+    expect(scheduleMxMeterDueSoonMaxRemaining("Hours")).toBe(50);
+    expect(scheduleMxMeterDueSoonMaxRemaining("ODOM  Miles")).toBe(1500);
+  });
+
+  it("parses utilization type from Fleet P&A / D1 style JSON", () => {
+    const j = JSON.stringify({ "fleet.utilization type": "Engine HOURS" });
+    expect(utilizationTypeFromFleetRawJson(j)).toBe("Engine HOURS");
+  });
+
+  it("matches SMR UoM / track column headers, not only utilization type", () => {
+    const j = JSON.stringify({ "fleet.smr uom": "Hrs" });
+    expect(utilizationTypeFromFleetRawJson(j)).toBe("Hrs");
+  });
+
+  it("ignores a numeric smr uom / uom match and uses scored utilization type", () => {
+    const j = JSON.stringify({
+      "fleet.smr uom": "598.00",
+      "utilization type": "Hours",
+    });
+    expect(utilizationTypeFromFleetRawJson(j)).toBe("Hours");
+  });
+
+  it("hour-meter: 274h remaining to target is not meter due soon (274 > 50)", () => {
+    const raw: Record<string, string> = {
+      "x.next util": "872",
+      "y.current meter reading": "598",
+      "z.utilization type": "Hours",
+    };
+    const a = analyzeElmsScheduleMxFromRaw(raw, "2026-04-26");
+    expect(a.scheduleMxUtilRemaining).toBe(274);
+    expect(a.scheduleMxBucket).toBe("ok");
+  });
+
+  it("rejects a numeric UoM cell and uses real utilization type (no 598+598.00 style labels)", () => {
+    const raw: Record<string, string> = {
+      "fleet.smr uom": "598.00",
+      "utilization type": "Hours",
+      "next util": "872",
+      "current meter reading": "598",
+    };
+    const a = analyzeElmsScheduleMxFromRaw(raw, "2026-04-26");
+    expect(a.elmsUtilType).toBe("hours");
+    expect(a.elmsCurrentMeter).toBe(598);
+    expect(a.elmsNextUtilQty).toBe(872);
+    expect(a.scheduleMxUtilRemaining).toBe(274);
+  });
+
+  it("prefers current meter reading over a looser current meter column", () => {
+    const raw: Record<string, string> = {
+      "fleet.lead current meter": "500",
+      "fleet.current meter reading": "598.00",
+      "fleet.next util qty": "872",
+      "z.utilization type": "Hours",
+    };
+    const a = analyzeElmsScheduleMxFromRaw(raw, "2026-04-26");
+    expect(a.elmsCurrentMeter).toBe(598);
+    expect(a.elmsUtilType).toBe("hours");
+    expect(a.scheduleMxUtilRemaining).toBe(274);
+  });
+
+  it("mile/unknown: 274 left is meter due soon (274 within 1500)", () => {
+    const raw: Record<string, string> = {
+      "a.next util": "872",
+      "b.current meter reading": "598",
+    };
+    const a = analyzeElmsScheduleMxFromRaw(raw, "2026-04-26");
+    expect(a.elmsUtilType).toBe("");
+    expect(a.scheduleMxBucket).toBe("due_soon");
+  });
+
+  it("overrides plan util type with Fleet (D1) and recomputes bucket", () => {
+    const base = analyzeElmsScheduleMxFromRaw(
+      { "n.next util": "872", "c.current meter reading": "598" },
+      "2026-04-26",
+    );
+    const row = {
+      assetId: "AF00C00832",
+      planRowKey: "p1",
+      planId: "",
+      planName: "",
+      planDesc: "",
+      maintenanceScheduleId: "",
+      itemDesc: "",
+      location: "",
+      makeModel: "",
+      mgmtCd: "",
+      workOrderCount: 0,
+      nce: false,
+      nceStatus: "",
+      scheduleMxNceCritical: false,
+      owningUnit: "69 BGS",
+      vehNomen: "",
+      eticSnapshotDateKey: "2026-04-20",
+      eticOpenWorkOrderIds: "",
+      eticOpenInMaintenance: false,
+      eticOpenNmc: false,
+      scheduleMxPlanEffectiveBucket: base.scheduleMxBucket,
+      scheduleMxPlanEffectiveNceCritical: false,
+      scheduleMxSuppressedByOpenWo: false,
+      scheduleMxPlanMissingFromOpenWo: false,
+      ...base,
+    } as ScheduleMxFleetRow;
+    const m = new Map();
+    m.set("AF00C00832", {
+      workOrderIds: [],
+      owningUnit: "69 BGS",
+      makeModel: "x",
+      vehNomen: "y",
+      mgmtCd: "z",
+      nce: false,
+      nceStatus: "",
+      inMaintenance: false,
+      nmcOnOpenWorkOrder: false,
+      fleetUtilizationType: "Hours",
+    });
+    const out = applyScheduleMxFleetUtilizationTypeFromD1([row], m, "2026-04-26");
+    expect(out[0]!.elmsUtilType).toBe("hours");
+    expect(out[0]!.scheduleMxBucket).toBe("ok");
+  });
+});
+
 describe("computeScheduleMxCommanderSummary", () => {
   it("rolls up by owning unit and counts NCE overdue separately", () => {
     const base = analyzeElmsScheduleMxFromRaw({}, "2026-04-25");
@@ -275,7 +429,7 @@ describe("computeScheduleMxCommanderSummary", () => {
     ];
     const c = computeScheduleMxCommanderSummary(rows);
     expect(c.wing.totalVehicles).toBe(4);
-    expect(c.wing.overdue).toBe(2);
+    expect(c.wing.overdue).toBe(1);
     expect(c.wing.nceOverdue).toBe(1);
     expect(c.wing.notOverdue).toBe(2);
     const u91 = c.units.find((x) => x.unit === "91 MW");
@@ -286,10 +440,10 @@ describe("computeScheduleMxCommanderSummary", () => {
     expect(u5?.overdue).toBe(1);
     const u791 = c.units.find((x) => x.unit === "791 MXS");
     expect(u791?.nceOverdue).toBe(1);
-    expect(u791?.overdue).toBe(1);
+    expect(u791?.overdue).toBe(0);
   });
 
-  it("counts raw extract overdue even when triage waives effective bucket", () => {
+  it("matches effective triage: raw overdue is not in wing stats when an open WO waives the plan to OK", () => {
     const base = analyzeElmsScheduleMxFromRaw({}, "2026-04-25");
     const row: ScheduleMxFleetRow = {
       assetId: "AF99",
@@ -315,15 +469,17 @@ describe("computeScheduleMxCommanderSummary", () => {
       scheduleMxPlanEffectiveBucket: "ok",
       scheduleMxPlanEffectiveNceCritical: false,
       scheduleMxSuppressedByOpenWo: true,
+      scheduleMxPlanMissingFromOpenWo: false,
       ...base,
       scheduleMxBucket: "overdue",
     };
     const c = computeScheduleMxCommanderSummary([row]);
     expect(c.wing.totalVehicles).toBe(1);
-    expect(c.wing.overdue).toBe(1);
+    expect(c.wing.overdue).toBe(0);
+    expect(c.wing.notOverdue).toBe(1);
   });
 
-  it("excludes NMC open WOs from commander raw overdue (in maintenance, not in use)", () => {
+  it("excludes NMC open WOs from commander overdue and NCE columns (in maintenance, not in use)", () => {
     const base = analyzeElmsScheduleMxFromRaw({}, "2026-04-25");
     const row: ScheduleMxFleetRow = {
       assetId: "AF99",
@@ -349,6 +505,7 @@ describe("computeScheduleMxCommanderSummary", () => {
       scheduleMxPlanEffectiveBucket: "overdue",
       scheduleMxPlanEffectiveNceCritical: true,
       scheduleMxSuppressedByOpenWo: false,
+      scheduleMxPlanMissingFromOpenWo: false,
       ...base,
       scheduleMxBucket: "overdue",
     };
@@ -385,6 +542,7 @@ describe("computeScheduleMxCommanderSummary", () => {
       scheduleMxPlanEffectiveBucket: "ok",
       scheduleMxPlanEffectiveNceCritical: false,
       scheduleMxSuppressedByOpenWo: false,
+      scheduleMxPlanMissingFromOpenWo: false,
       ...base,
       scheduleMxBucket: "ok",
     };

@@ -50,3 +50,7 @@ tmp/
 
 # One-off local scraper deps (run npm install inside the folder)
 scripts/pats-waiver-scrape/node_modules/
+
+# --- D1/site backups (large local snapshots, not for git) ---
+backups/d1-*.sql
+backups/site-snapshots/

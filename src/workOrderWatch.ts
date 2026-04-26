@@ -1024,7 +1024,34 @@ export type ScheduleMxFleetRow = {
   scheduleMxOverdueUtil: boolean;
   /** nextUtil - currentMeter when both numeric (positive = units until due). */
   scheduleMxUtilRemaining: number | null;
+  /**
+   * ELMS plan id is set, this asset has open WOs on the latest ETIC book, and
+   * that Plan Id does not appear on any OSWO sub line for those parent WOs
+   * (or there are no OSWO lines for them). False when not applicable or no OSWO import.
+   */
+  scheduleMxPlanMissingFromOpenWo: boolean;
 } & ReturnType<typeof analyzeElmsScheduleMxFromRaw>;
+
+/** Overlap several D1 round-trips without unbounded fan-out (D1 limits / latency). */
+const SCHEDULE_MX_D1_BATCH_CONCURRENCY = 8;
+
+async function runAssetIdBatchesInParallel<T>(
+  ids: string[],
+  batchSize: number,
+  runBatch: (chunk: string[]) => Promise<T[]>,
+): Promise<T[]> {
+  const chunks: string[][] = [];
+  for (let i = 0; i < ids.length; i += batchSize) {
+    chunks.push(ids.slice(i, i + batchSize));
+  }
+  const flat: T[] = [];
+  for (let i = 0; i < chunks.length; i += SCHEDULE_MX_D1_BATCH_CONCURRENCY) {
+    const wave = chunks.slice(i, i + SCHEDULE_MX_D1_BATCH_CONCURRENCY);
+    const parts = await Promise.all(wave.map((ch) => runBatch(ch)));
+    for (const p of parts) flat.push(...p);
+  }
+  return flat;
+}
 
 async function loadWoCountsPerAsset(
   env: { ETIC_SNAPSHOTS: D1Database },
@@ -1102,7 +1129,20 @@ export type ScheduleMxEticAssetContext = {
   inMaintenance: boolean;
   /** At least one open WO on latest ETIC shows NMC. */
   nmcOnOpenWorkOrder: boolean;
+  /** From Fleet P&A, else first WO line on same snapshot — see {@link utilizationTypeFromFleetRawJson}. */
+  fleetUtilizationType: string;
 };
+
+function collectDistinctOpenWorkOrderIdsForOswo(byAsset: Map<string, ScheduleMxEticAssetContext>): string[] {
+  const s = new Set<string>();
+  for (const ctx of byAsset.values()) {
+    for (const wid of ctx.workOrderIds) {
+      const w = (wid ?? "").trim();
+      if (w) s.add(w);
+    }
+  }
+  return [...s];
+}
 
 /**
  * Per-asset context from the **latest** ETIC workbook: **Fleet P&A** row for unit /
@@ -1132,22 +1172,16 @@ export async function loadScheduleMxEticContextByAsset(
     raw_row_json: string | null;
   };
   const fleetByAsset = new Map<string, FleetPaRow>();
-  for (let i = 0; i < ids.length; i += batchSize) {
-    const chunk = ids.slice(i, i + batchSize);
-    const ph = chunk.map(() => "?").join(",");
-    const r = await env.ETIC_SNAPSHOTS.prepare(
-      `SELECT asset_id, owning_unit, make_model, veh_nomen, mgmt_cd, raw_row_json
-       FROM fleet_p_a_snapshot
-       WHERE snapshot_date_key = ? AND asset_id IN (${ph})`,
-    )
-      .bind(eticDateKey, ...chunk)
-      .all<FleetPaRow>();
-    for (const row of r.results ?? []) {
-      const aid = (row.asset_id ?? "").trim();
-      if (aid) fleetByAsset.set(aid, row);
-    }
-  }
-
+  type WoSnapRow = {
+    asset_id: string;
+    work_order_id: string;
+    parts_status: string | null;
+    owning_unit: string | null;
+    make_model: string | null;
+    veh_nomen: string | null;
+    mgmt_cd: string | null;
+    raw_row_json: string | null;
+  };
   type WoAgg = {
     workOrderIds: string[];
     inMaintenance: boolean;
@@ -1158,64 +1192,81 @@ export async function loadScheduleMxEticContextByAsset(
     mgmtCd: string;
     nce: boolean;
     nceStatus: string;
+    /** First non-empty utilization UoM from any WO `raw_row_json` (hours vs miles). */
+    utilizationType: string;
   };
   const woByAsset = new Map<string, WoAgg>();
-  for (let i = 0; i < ids.length; i += batchSize) {
-    const chunk = ids.slice(i, i + batchSize);
-    const ph = chunk.map(() => "?").join(",");
-    const r = await env.ETIC_SNAPSHOTS.prepare(
-      `SELECT asset_id, work_order_id, parts_status, owning_unit, make_model, veh_nomen, mgmt_cd, raw_row_json
-       FROM work_order_snapshot
-       WHERE snapshot_date_key = ? AND asset_id IN (${ph})
-       ORDER BY asset_id, work_order_id`,
-    )
-      .bind(eticDateKey, ...chunk)
-      .all<{
-        asset_id: string;
-        work_order_id: string;
-        parts_status: string | null;
-        owning_unit: string | null;
-        make_model: string | null;
-        veh_nomen: string | null;
-        mgmt_cd: string | null;
-        raw_row_json: string | null;
-      }>();
-    for (const row of r.results ?? []) {
-      const aid = (row.asset_id ?? "").trim();
-      if (!aid) continue;
-      let ctx = woByAsset.get(aid);
-      if (!ctx) {
-        ctx = {
-          workOrderIds: [],
-          inMaintenance: false,
-          nmcOnOpenWorkOrder: false,
-          owningUnit: "",
-          makeModel: "",
-          vehNomen: "",
-          mgmtCd: "",
-          nce: false,
-          nceStatus: "",
-        };
-        woByAsset.set(aid, ctx);
-      }
-      const wid = (row.work_order_id ?? "").trim();
-      if (wid && !ctx.workOrderIds.includes(wid)) ctx.workOrderIds.push(wid);
-      const ps = (row.parts_status ?? "").trim();
-      if (partsStatusLooksInMaintenance(ps)) ctx.inMaintenance = true;
-      if (workOrderRowLooksNmc(ps, row.raw_row_json)) ctx.nmcOnOpenWorkOrder = true;
-      const ou = (row.owning_unit ?? "").trim();
-      if (ou && !ctx.owningUnit) ctx.owningUnit = ou;
-      const mm = (row.make_model ?? "").trim();
-      if (mm && !ctx.makeModel) ctx.makeModel = mm;
-      const vn = (row.veh_nomen ?? "").trim();
-      if (vn && !ctx.vehNomen) ctx.vehNomen = vn;
-      const mg = (row.mgmt_cd ?? "").trim();
-      if (mg && !ctx.mgmtCd) ctx.mgmtCd = mg;
-      const ni = nceInfoFromSnapshotRawJson(row.raw_row_json);
-      if (ni.nce) {
-        ctx.nce = true;
-        if (ni.nceStatus && !ctx.nceStatus) ctx.nceStatus = ni.nceStatus;
-      }
+
+  const [fleetRowsFlat, woRowsFlat] = await Promise.all([
+    runAssetIdBatchesInParallel(ids, batchSize, async (chunk) => {
+      const ph = chunk.map(() => "?").join(",");
+      const r = await env.ETIC_SNAPSHOTS.prepare(
+        `SELECT asset_id, owning_unit, make_model, veh_nomen, mgmt_cd, raw_row_json
+         FROM fleet_p_a_snapshot
+         WHERE snapshot_date_key = ? AND asset_id IN (${ph})`,
+      )
+        .bind(eticDateKey, ...chunk)
+        .all<FleetPaRow>();
+      return r.results ?? [];
+    }),
+    runAssetIdBatchesInParallel(ids, batchSize, async (chunk) => {
+      const ph = chunk.map(() => "?").join(",");
+      const r = await env.ETIC_SNAPSHOTS.prepare(
+        `SELECT asset_id, work_order_id, parts_status, owning_unit, make_model, veh_nomen, mgmt_cd, raw_row_json
+         FROM work_order_snapshot
+         WHERE snapshot_date_key = ? AND asset_id IN (${ph})
+         ORDER BY asset_id, work_order_id`,
+      )
+        .bind(eticDateKey, ...chunk)
+        .all<WoSnapRow>();
+      return r.results ?? [];
+    }),
+  ]);
+
+  for (const row of fleetRowsFlat) {
+    const aid = (row.asset_id ?? "").trim();
+    if (aid) fleetByAsset.set(aid, row);
+  }
+  for (const row of woRowsFlat) {
+    const aid = (row.asset_id ?? "").trim();
+    if (!aid) continue;
+    let ctx = woByAsset.get(aid);
+    if (!ctx) {
+      ctx = {
+        workOrderIds: [],
+        inMaintenance: false,
+        nmcOnOpenWorkOrder: false,
+        owningUnit: "",
+        makeModel: "",
+        vehNomen: "",
+        mgmtCd: "",
+        nce: false,
+        nceStatus: "",
+        utilizationType: "",
+      };
+      woByAsset.set(aid, ctx);
+    }
+    const wid = (row.work_order_id ?? "").trim();
+    if (wid && !ctx.workOrderIds.includes(wid)) ctx.workOrderIds.push(wid);
+    const ps = (row.parts_status ?? "").trim();
+    if (partsStatusLooksInMaintenance(ps)) ctx.inMaintenance = true;
+    if (workOrderRowLooksNmc(ps, row.raw_row_json)) ctx.nmcOnOpenWorkOrder = true;
+    const ou = (row.owning_unit ?? "").trim();
+    if (ou && !ctx.owningUnit) ctx.owningUnit = ou;
+    const mm = (row.make_model ?? "").trim();
+    if (mm && !ctx.makeModel) ctx.makeModel = mm;
+    const vn = (row.veh_nomen ?? "").trim();
+    if (vn && !ctx.vehNomen) ctx.vehNomen = vn;
+    const mg = (row.mgmt_cd ?? "").trim();
+    if (mg && !ctx.mgmtCd) ctx.mgmtCd = mg;
+    const ni = nceInfoFromSnapshotRawJson(row.raw_row_json);
+    if (ni.nce) {
+      ctx.nce = true;
+      if (ni.nceStatus && !ctx.nceStatus) ctx.nceStatus = ni.nceStatus;
+    }
+    if (!ctx.utilizationType) {
+      const ut = utilizationTypeFromFleetRawJson(row.raw_row_json);
+      if (ut) ctx.utilizationType = ut;
     }
   }
 
@@ -1236,6 +1287,11 @@ export async function loadScheduleMxEticContextByAsset(
       nceStatus,
       inMaintenance: w?.inMaintenance ?? false,
       nmcOnOpenWorkOrder: w?.nmcOnOpenWorkOrder ?? false,
+      fleetUtilizationType: (() => {
+        const fromFleet = f ? utilizationTypeFromFleetRawJson(f.raw_row_json) : "";
+        if (fromFleet) return fromFleet;
+        return (w?.utilizationType ?? "").trim();
+      })(),
     });
   }
   return { eticDateKey, byAsset };
@@ -1357,33 +1413,12 @@ function scheduleMxAssetWorstRank(plans: ScheduleMxFleetRow[]): number {
 }
 
 /**
- * Raw ELMS / extract bucket only (no open-WO triage waiver). Matches wing commander-style
- * compliance reports; can be higher than triage "effective" overdue counts.
+ * Wing / commander table: same per-plan / per-asset logic as the Schedule Mx stat tiles
+ * ({@link scheduleMxPlanWorstRank} / open-WO triage). If the vehicle has an open **NMC** WO on
+ * the latest ETIC, treat as not in the overdue bucket for the wing (in maintenance, not in use).
  */
-function scheduleMxPlanRawWorstRank(row: ScheduleMxFleetRow): number {
-  const b = row.scheduleMxBucket;
-  if (row.nce && b === "overdue") return 0;
-  if (b === "overdue") return 1;
-  if (b === "due_soon") return 2;
-  if (b === "missing") return 3;
-  return 4;
-}
-
-function scheduleMxAssetRawWorstRank(plans: ScheduleMxFleetRow[]): number {
-  let worst = 4;
-  for (const p of plans) {
-    const r = scheduleMxPlanRawWorstRank(p);
-    if (r < worst) worst = r;
-  }
-  return worst;
-}
-
-/**
- * Commander rollup: same raw ELMS extract as {@link scheduleMxAssetRawWorstRank}, but assets with
- * an open **NMC** work order on latest ETIC are treated as in maintenance (not in wing overdue / NCE od).
- */
-function scheduleMxAssetCommanderRawWorstRank(plans: ScheduleMxFleetRow[]): number {
-  const wr = scheduleMxAssetRawWorstRank(plans);
+function scheduleMxAssetWingReportRank(plans: ScheduleMxFleetRow[]): number {
+  const wr = scheduleMxAssetWorstRank(plans);
   const inMaintNmc = plans.some((p) => p.eticOpenNmc && p.workOrderCount > 0);
   if (inMaintNmc && wr <= 1) return 4;
   return wr;
@@ -1391,7 +1426,8 @@ function scheduleMxAssetCommanderRawWorstRank(plans: ScheduleMxFleetRow[]): numb
 
 /**
  * Commander summary: one row per owning unit + wing totals.
- * Overdue / NCE overdue use **raw** extract, adjusted so open **NMC** WOs (latest ETIC) are not counted overdue.
+ * `overdue` = assets whose worst plan is **non-NCE** overdue; `nceOverdue` = NCE critical (separate, same
+ * as {@link computeScheduleMxAssetStats}). Excludes in-shop NMC (see {@link scheduleMxAssetWingReportRank}).
  */
 export function computeScheduleMxCommanderSummary(rows: ScheduleMxFleetRow[]): ScheduleMxCommanderSummary {
   const byAssetInUnit = new Map<string, Map<string, ScheduleMxFleetRow[]>>();
@@ -1423,11 +1459,11 @@ export function computeScheduleMxCommanderSummary(rows: ScheduleMxFleetRow[]): S
     let nceOverdue = 0;
     for (const [, plans] of am) {
       total += 1;
-      const wr = scheduleMxAssetCommanderRawWorstRank(plans);
-      if (wr <= 1) overdue += 1;
+      const wr = scheduleMxAssetWingReportRank(plans);
       if (wr === 0) nceOverdue += 1;
+      else if (wr === 1) overdue += 1;
     }
-    const notOverdue = total - overdue;
+    const notOverdue = total - nceOverdue - overdue;
     const pct = total > 0 ? Math.round((notOverdue / total) * 10000) / 100 : 0;
     units.push({
       unit,
@@ -1464,6 +1500,8 @@ export function computeScheduleMxAssetStats(rows: ScheduleMxFleetRow[]): {
   dueSoon: number;
   missing: number;
   ok: number;
+  /** Distinct assets with at least one plan row where ELMS plan is not on OSWO for open WOs. */
+  planNotOnOpenWo: number;
 } {
   const byAsset = new Map<string, ScheduleMxFleetRow[]>();
   for (const row of rows) {
@@ -1480,17 +1518,15 @@ export function computeScheduleMxAssetStats(rows: ScheduleMxFleetRow[]): {
   let dueSoon = 0;
   let missing = 0;
   let ok = 0;
+  let planNotOnOpenWo = 0;
   for (const plans of byAsset.values()) {
-    let worst = 4;
-    for (const p of plans) {
-      const r = scheduleMxPlanWorstRank(p);
-      if (r < worst) worst = r;
-    }
+    const worst = scheduleMxAssetWingReportRank(plans);
     if (worst === 0) nceCritical++;
     else if (worst === 1) overdue++;
     else if (worst === 2) dueSoon++;
     else if (worst === 3) missing++;
     else ok++;
+    if (plans.some((p) => p.scheduleMxPlanMissingFromOpenWo)) planNotOnOpenWo++;
   }
   const distinctAssets = byAsset.size;
   return {
@@ -1502,6 +1538,7 @@ export function computeScheduleMxAssetStats(rows: ScheduleMxFleetRow[]): {
     dueSoon,
     missing,
     ok,
+    planNotOnOpenWo,
   };
 }
 
@@ -1517,13 +1554,52 @@ function pickElmsFromRaw(raw: Record<string, string>, needleFragments: string[])
   return "";
 }
 
+/**
+ * Like {@link pickElmsFromRaw} but when several columns match, choose the one whose header
+ * matches the **longest** needle fragment (e.g. "current meter reading" over "current meter").
+ */
+function pickElmsFromRawBestFragment(raw: Record<string, string>, needleFragments: string[]): string {
+  if (!needleFragments.length) return "";
+  const frags = [...new Set(needleFragments.map((f) => f.toLowerCase().trim()).filter(Boolean))].sort(
+    (a, b) => b.length - a.length,
+  );
+  let bestVal = "";
+  let bestScore = -1;
+  let bestKey = "";
+
+  for (const [k, v] of Object.entries(raw)) {
+    const vv = (v ?? "").trim();
+    if (!vv) continue;
+    const kn = k.toLowerCase().replace(/^fleet\./, "");
+    let score = 0;
+    for (const frag of frags) {
+      if (kn.includes(frag)) score = Math.max(score, frag.length);
+    }
+    if (score === 0) continue;
+    if (score > bestScore || (score === bestScore && k.length > bestKey.length)) {
+      bestScore = score;
+      bestVal = vv;
+      bestKey = k;
+    } else if (score === bestScore && k.length === bestKey.length && k < bestKey) {
+      bestVal = vv;
+      bestKey = k;
+    }
+  }
+  return bestVal;
+}
+
+/** True if the cell looks like a lone reading (digits + optional decimal), not a UOM label. */
+function looksLikePureNumberToken(s: string): boolean {
+  const t = s.trim().replace(/,/g, "");
+  if (!t) return false;
+  return /^-?\d+(?:\.\d+)?$/.test(t);
+}
+
 function parseUtilNumber(s: string): number | null {
-  const t = String(s ?? "")
-    .replace(/,/g, "")
-    .replace(/[^\d.-]/g, "")
-    .trim();
-  if (!t) return null;
-  const n = Number.parseFloat(t);
+  const t = String(s ?? "").replace(/,/g, "");
+  const m = t.match(/-?\d+(?:\.\d+)?/);
+  if (!m) return null;
+  const n = Number.parseFloat(m[0]!);
   return Number.isFinite(n) ? n : null;
 }
 
@@ -1550,6 +1626,209 @@ export function elmsPlanRowKeyFromRaw(raw: Record<string, string>, assetId: stri
 
 const DUE_SOON_DAYS_ELMS = 30;
 
+/** Max remaining **meter** distance for "due soon" (miles, km, or unknown odometer-style). */
+export const SCHEDULE_MX_DUE_SOON_METER_MILES = 1500;
+/** Max remaining **hours** for "due soon" on hour-meter assets. */
+export const SCHEDULE_MX_DUE_SOON_METER_HOURS = 50;
+
+/**
+ * How close the next utilization target must be (remaining units) to count as meter "due soon".
+ * Fleet P&A in D1 is the preferred source of hour vs mile; see {@link utilizationTypeFromFleetRawJson}.
+ */
+export function scheduleMxMeterDueSoonMaxRemaining(elmsUtilType: string): number {
+  const t = (elmsUtilType || "").toLowerCase().replace(/\s+/g, " ").trim();
+  if (/\bhr|hour|eng\b|operating hour|engine hour|meter type:\s*hour/.test(t)) {
+    return SCHEDULE_MX_DUE_SOON_METER_HOURS;
+  }
+  if (/\bkm\b|kilometer|kilomet/.test(t)) {
+    return SCHEDULE_MX_DUE_SOON_METER_MILES;
+  }
+  // Miles, odometer, or unknown — treat as miles (matches dashboard default label).
+  return SCHEDULE_MX_DUE_SOON_METER_MILES;
+}
+
+function scheduleMxUtilMeterIsDueSoon(
+  elmsUtilType: string,
+  scheduleMxOverdueUtil: boolean,
+  scheduleMxUtilRemaining: number | null,
+  elmsNextUtilQty: number | null,
+): boolean {
+  if (scheduleMxOverdueUtil) return false;
+  if (scheduleMxUtilRemaining == null || scheduleMxUtilRemaining <= 0) return false;
+  if (elmsNextUtilQty == null || elmsNextUtilQty <= 0) return false;
+  return scheduleMxUtilRemaining <= scheduleMxMeterDueSoonMaxRemaining(elmsUtilType);
+}
+
+/**
+ * Header fragments for scoring — real workbooks use "U/M", "Track", "SMR UoM", etc.
+ * (Fleet P&A + WO Inquiry `raw_row_json` share the same normalized key pattern.)
+ */
+const UTIL_TYPE_HEADER_SYNONYMS: Record<"utilType", string[]> = {
+  utilType: [
+    "utilization type",
+    "util type",
+    "utilization",
+    "util uom",
+    "utilization uom",
+    "track by",
+    "track util",
+    "track uom",
+    "track um",
+    "unit of measure",
+    "uom",
+    "u/m",
+    "u m",
+    "um",
+    "hrs/mi",
+    "mi/hrs",
+    "hours/miles",
+    "miles/hours",
+    "hrs / mi",
+    "mi / hrs",
+    "odometer type",
+    "meter uom",
+    "service meter uom",
+    "smr uom",
+    "smr",
+    "eng hour",
+    "engine hour",
+    "engine hours",
+    "vehicle utilization",
+    "pm uom",
+    "sched uom",
+    "maintenance uom",
+    "utilization unit",
+    "reading type",
+    "miles or hours",
+    "hour or mile",
+    "hour/mile",
+    "mile/hour",
+    "odo or hours",
+  ],
+};
+
+/**
+ * Read utilization type (hours vs miles) from a D1 `raw_row_json` blob (Fleet P&A or Work Order line).
+ * Uses substring pick, then `scoreHeaderMatch` so odd column names still match.
+ */
+export function utilizationTypeFromFleetRawJson(rawRowJson: string | null | undefined): string {
+  if (!rawRowJson || !String(rawRowJson).trim()) return "";
+  let raw: Record<string, string> = {};
+  try {
+    raw = JSON.parse(rawRowJson) as Record<string, string>;
+  } catch {
+    return "";
+  }
+  const t0 = pickElmsFromRaw(raw, [
+    "utilization type",
+    "util type",
+    "meter type",
+    "uom",
+    "track by",
+    "service meter uom",
+    "vehicle utilization",
+  ]);
+  if (t0.trim() && !looksLikePureNumberToken(t0)) return t0.replace(/\s+/g, " ").trim();
+
+  let bestScore = 0;
+  let bestVal = "";
+  for (const [k, v] of Object.entries(raw)) {
+    const vv = (v ?? "").trim();
+    if (!vv) continue;
+    const header = k
+      .toLowerCase()
+      .replace(/^fleet\./, "")
+      .replace(/^wo\./, "");
+    const m = scoreHeaderMatch(header, UTIL_TYPE_HEADER_SYNONYMS);
+    if (m && m.score > bestScore) {
+      bestScore = m.score;
+      bestVal = vv;
+    }
+  }
+  if (bestVal) return bestVal.replace(/\s+/g, " ").trim();
+
+  for (const [k, v] of Object.entries(raw)) {
+    const vv = (v ?? "").trim();
+    if (!vv) continue;
+    const kn = k
+      .toLowerCase()
+      .replace(/^fleet\./, "")
+      .replace(/^wo\./, "");
+    if (!/(util|uom|track|meter|smr|sched|odo|hour|mile|eng|read)/.test(kn)) continue;
+    if (
+      /^(hrs?|hours?|h|eng(\s+hours?)?|engine(\s+hours?)?|mi|miles?|m|odo(meter)?|km)$/i.test(vv) ||
+      /\b(hour|hr|eng|engine|mi|mile|odo|miles|odometer)\b/i.test(vv)
+    ) {
+      return vv;
+    }
+  }
+  return "";
+}
+
+/**
+ * Re-run ELMS schedule classification after merging Fleet (D1) utilization type on top of
+ * the ELMS plan row. Keeps one code path: {@link analyzeElmsScheduleMxFromRaw}.
+ */
+function reanalyzeScheduleMxRowWithMergedUtilType(
+  row: ScheduleMxFleetRow,
+  dateKey: string,
+  mergedUtilType: string,
+): ScheduleMxFleetRow {
+  const syn: Record<string, string> = {};
+  if (row.elmsLastMaintDateIso) {
+    syn["last maintenance"] = row.elmsLastMaintDateIso;
+  }
+  if (row.elmsNextMaintDateIso) {
+    syn["next maintenance"] = row.elmsNextMaintDateIso;
+  }
+  if (row.elmsLastUtilQty != null) {
+    syn["last utilization"] = String(row.elmsLastUtilQty);
+  }
+  if (row.elmsNextUtilQty != null) {
+    syn["next utilization"] = String(row.elmsNextUtilQty);
+  }
+  if (row.elmsCurrentMeter != null) {
+    syn["current meter reading"] = String(row.elmsCurrentMeter);
+  }
+  syn["utilization type"] = mergedUtilType;
+  const smx = analyzeElmsScheduleMxFromRaw(syn, dateKey);
+  const nceCrit = row.nce && smx.scheduleMxBucket === "overdue";
+  return {
+    ...row,
+    ...smx,
+    elmsUtilType: mergedUtilType,
+    scheduleMxNceCritical: nceCrit,
+    scheduleMxPlanEffectiveBucket: smx.scheduleMxBucket,
+    scheduleMxPlanEffectiveNceCritical: nceCrit,
+    scheduleMxSuppressedByOpenWo: false,
+  };
+}
+
+/**
+ * For each plan row, if the latest Fleet P&A snapshot has a non-empty utilization type for the
+ * asset, use it (authoritative) and recompute status buckets so meter "due soon" uses hour vs
+ * mile thresholds consistently.
+ */
+function normScheduleMxUtilType(s: string): string {
+  return (s || "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+export function applyScheduleMxFleetUtilizationTypeFromD1(
+  rows: ScheduleMxFleetRow[],
+  byAsset: Map<string, ScheduleMxEticAssetContext>,
+  dateKey: string,
+): ScheduleMxFleetRow[] {
+  return rows.map((row) => {
+    const aid = (row.assetId ?? "").trim();
+    const u = aid ? byAsset.get(aid)?.fleetUtilizationType : undefined;
+    if (!u) return row;
+    const merged = u.replace(/\s+/g, " ").trim().toLowerCase();
+    if (!merged) return row;
+    if (normScheduleMxUtilType(merged) === normScheduleMxUtilType(row.elmsUtilType)) return row;
+    return reanalyzeScheduleMxRowWithMergedUtilType(row, dateKey, merged);
+  });
+}
+
 /**
  * Merge ELMS date/util signals with legacy Fleet (P&A) schedule fields when present in raw JSON.
  */
@@ -1572,25 +1851,36 @@ export function analyzeElmsScheduleMxFromRaw(
   scheduleMxOverdueUtil: boolean;
   scheduleMxUtilRemaining: number | null;
 } {
-  const lastMaintText = pickElmsFromRaw(raw, ["last maint", "last maintenance", "last maint dt"]);
-  const nextMaintText = pickElmsFromRaw(raw, ["next maint", "next maintenance", "next maint date", "next due"]);
-  const lastUtilText = pickElmsFromRaw(raw, ["last util", "last utilization"]);
-  const nextUtilText = pickElmsFromRaw(raw, ["next util", "next utilization"]);
-  const meterText = pickElmsFromRaw(raw, [
+  const lastMaintText = pickElmsFromRawBestFragment(raw, [
+    "last maintenance",
+    "last maint dt",
+    "last maint",
+  ]);
+  const nextMaintText = pickElmsFromRawBestFragment(raw, [
+    "next maintenance",
+    "next maint date",
+    "next due",
+    "next maint",
+  ]);
+  const lastUtilText = pickElmsFromRawBestFragment(raw, ["last utilization", "last util"]);
+  const nextUtilText = pickElmsFromRawBestFragment(raw, ["next utilization", "next util"]);
+  const meterText = pickElmsFromRawBestFragment(raw, [
     "current meter reading",
     "current meter",
     "meter reading",
     "current reading",
     "curr meter",
   ]);
-  const utilTypeRaw = pickElmsFromRaw(raw, ["utilization type", "util type", "meter type", "uom"]);
+  const elmsUtilType = utilizationTypeFromFleetRawJson(JSON.stringify(raw))
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
 
   let elmsLastMaintDateIso = parseEticDate(lastMaintText);
   let elmsNextMaintDateIso = parseEticDate(nextMaintText);
   const elmsLastUtilQty = parseUtilNumber(lastUtilText);
   const elmsNextUtilQty = parseUtilNumber(nextUtilText);
   const elmsCurrentMeter = parseUtilNumber(meterText);
-  const elmsUtilType = utilTypeRaw.replace(/\s+/g, " ").trim().toLowerCase();
 
   let dateOverdue = false;
   let dateOverdueByDays: number | null = null;
@@ -1631,11 +1921,12 @@ export function analyzeElmsScheduleMxFromRaw(
     /** Due if **either** next maint date is past (calendar) **or** meter is at/past next util (OR). Meter before target does not cancel calendar overdue. */
     const overdue = dateOverdue || scheduleMxOverdueUtil;
     const dateDueSoon = !dateOverdue && elmsNextMaintDateIso != null && daysUntil != null && daysUntil >= 0 && daysUntil <= DUE_SOON_DAYS_ELMS;
-    let utilDueSoon = false;
-    if (!scheduleMxOverdueUtil && scheduleMxUtilRemaining != null && scheduleMxUtilRemaining > 0 && elmsNextUtilQty != null && elmsNextUtilQty > 0) {
-      const pct = scheduleMxUtilRemaining / elmsNextUtilQty;
-      utilDueSoon = pct <= 0.05;
-    }
+    const utilDueSoon = scheduleMxUtilMeterIsDueSoon(
+      elmsUtilType,
+      scheduleMxOverdueUtil,
+      scheduleMxUtilRemaining,
+      elmsNextUtilQty,
+    );
     if (overdue) {
       bucket = "overdue";
       scheduleMxOverdueByDays = dateOverdueByDays ?? (scheduleMxOverdueUtil ? 0 : null);
@@ -1743,6 +2034,7 @@ function buildScheduleMxRowsFromFleetSheet(
       scheduleMxPlanEffectiveBucket: smx.scheduleMxBucket,
       scheduleMxPlanEffectiveNceCritical: scheduleMxNceCritical,
       scheduleMxSuppressedByOpenWo: false,
+      scheduleMxPlanMissingFromOpenWo: false,
     });
   }
   return sortScheduleMxRows(out);
@@ -1795,15 +2087,22 @@ function buildScheduleMxRowsFromPlanRows(
       scheduleMxPlanEffectiveBucket: smx.scheduleMxBucket,
       scheduleMxPlanEffectiveNceCritical: scheduleMxNceCritical,
       scheduleMxSuppressedByOpenWo: false,
+      scheduleMxPlanMissingFromOpenWo: false,
     });
   }
-  return sortScheduleMxRows(out);
+  return out;
 }
 
 /** True when mail was addressed to prevmx@ (Schedule Mx / ELMS extract ingest). */
 export function isPrevmxScheduleMxInbox(toHeader: string): boolean {
   const raw = toHeader.replace(/[<>]/g, " ").toLowerCase();
   return /\bprevmx@/.test(raw);
+}
+
+/** True when mail was addressed to oswo@ (open sub work order / work-plan extract ingest). */
+export function isOswoSubWorkOrderInbox(toHeader: string): boolean {
+  const raw = toHeader.replace(/[<>]/g, " ").toLowerCase();
+  return /\boswo@/.test(raw);
 }
 
 function parseCsvSegment(seg: string): string {
@@ -2110,6 +2409,473 @@ export async function ingestScheduleMxExtractFromAttachment(
   return { rowCount: assetSet.size, planRows: planRows.length, dateKey: opts.dateKey };
 }
 
+export type OswoParseRow = {
+  rowKey: string;
+  parentWorkOrderId: string;
+  subWorkOrderId: string;
+  raw: Record<string, string>;
+};
+
+export type OpenSubWorkOrderRow = {
+  rowKey: string;
+  parentWorkOrderId: string;
+  subWorkOrderId: string;
+  /** Sub work order state (e.g. from Sub Work Order State Cd). */
+  subWorkOrderStateCd: string;
+  /** Best-effort label from work plan / item / type columns. */
+  workPlanLabel: string;
+  raw: Record<string, string>;
+};
+
+function normOswoWoId(s: string): string {
+  return s.replace(/\s+/g, " ").trim();
+}
+
+/** ELMS export: skip rows still in the request/open queue; everything else is kept. */
+const OSWO_EXCLUDED_STATE_NORMALIZED = "rqst-open";
+
+function findSubWorkOrderColumnIndexForOswo(headers: string[]): number {
+  for (let i = 0; i < headers.length; i++) {
+    if (normalizeHeaderKey(headers[i] ?? "") === "sub work order id") return i;
+  }
+  for (let i = 0; i < headers.length; i++) {
+    const n = normalizeHeaderKey(headers[i] ?? "");
+    if (!n) continue;
+    if (n.includes("sub") && (n.includes("work") || n.includes("wo") || n.includes("order"))) return i;
+    if (n === "swo" || n === "swos" || n.includes("sub wo") || n.includes("subwo")) return i;
+  }
+  return -1;
+}
+
+function findParentWorkOrderColumnIndexForOswo(headers: string[], subIdx: number): number {
+  for (let i = 0; i < headers.length; i++) {
+    if (i === subIdx) continue;
+    if (normalizeHeaderKey(headers[i] ?? "") === "work order id") return i;
+  }
+  const scored: { i: number; score: number }[] = [];
+  for (let i = 0; i < headers.length; i++) {
+    if (i === subIdx) continue;
+    const n = normalizeHeaderKey(headers[i] ?? "");
+    if (!n) continue;
+    if (n.includes("sub") && (n.includes("work") || n.includes("wo"))) continue;
+    let score = 0;
+    if (n.includes("parent") && n.includes("work")) score = 100;
+    else if (n.includes("open") && n.includes("work")) score = 95;
+    else if (n.includes("work order") && n.includes("id")) score = 88;
+    else if (n === "wo" || n === "wo id" || n === "workorderid" || n === "work order") score = 85;
+    else if (n.includes("work order") && !n.includes("plan")) score = 72;
+    else if (n.includes("work") && n.includes("order") && !n.includes("plan")) score = 65;
+    if (score > 0) scored.push({ i, score });
+  }
+  if (!scored.length) return -1;
+  scored.sort((a, b) => b.score - a.score || a.i - b.i);
+  return scored[0]!.i;
+}
+
+function pickOswoSubWorkOrderState(raw: Record<string, string>): string {
+  return pickRawValue(raw, [
+    "oswo.sub work order state cd",
+    "oswo.sub work order state",
+    "sub work order state cd",
+  ]);
+}
+
+function isOswoSubWorkOrderStateExcluded(stateText: string): boolean {
+  const t = stateText.replace(/\s+/g, " ").trim().toLowerCase();
+  return t === OSWO_EXCLUDED_STATE_NORMALIZED;
+}
+
+function pickOswoWorkPlanLabel(raw: Record<string, string>): string {
+  return pickRawValue(raw, [
+    "oswo.work plan type cd",
+    "oswo.item desc",
+    "oswo.work order desc",
+    "oswo.work order reason",
+    "oswo.work plan",
+    "oswo.workplan",
+    "oswo.plan",
+    "oswo.task",
+    "work plan",
+    "workplan",
+    "plan name",
+    "plan id",
+    "work plan type cd",
+    "item desc",
+    "maintenance plan",
+    "task",
+    "description",
+  ]);
+}
+
+function buildOswoRowsFromTable(headers: string[], dataRows: string[][]): OswoParseRow[] {
+  const subIdx = findSubWorkOrderColumnIndexForOswo(headers);
+  const parentIdx = findParentWorkOrderColumnIndexForOswo(headers, subIdx);
+  if (parentIdx < 0) {
+    const preview = headers
+      .filter((h) => (h ?? "").trim())
+      .slice(0, 24)
+      .join(" | ");
+    throw new Error(
+      "oswo: no parent work order column matched (expected Open work order, Work order id, WO, etc.). Headers: " +
+        (preview || "(none)"),
+    );
+  }
+  const headerPref = headers.map((h) => `oswo.${normalizeHeaderKey(h)}`);
+  const out: OswoParseRow[] = [];
+  let rowIndex = 0;
+  for (const cells of dataRows) {
+    if (cells.length <= parentIdx) continue;
+    const parentWo = normOswoWoId(cells[parentIdx] ?? "");
+    if (!parentWo) continue;
+    const subWo =
+      subIdx >= 0 && cells.length > subIdx ? normOswoWoId(cells[subIdx] ?? "") : "";
+    const raw: Record<string, string> = {};
+    for (let i = 0; i < headers.length; i++) {
+      const v = (cells[i] ?? "").trim();
+      if (!v) continue;
+      raw[headerPref[i] ?? `oswo.col${i}`] = v;
+    }
+    if (isOswoSubWorkOrderStateExcluded(pickOswoSubWorkOrderState(raw))) continue;
+    const baseKey = normalizeHeaderKey(parentWo) + "|" + normalizeHeaderKey(subWo) + "|" + String(rowIndex);
+    rowIndex += 1;
+    out.push({ rowKey: baseKey, parentWorkOrderId: parentWo, subWorkOrderId: subWo, raw });
+  }
+  return dedupeOswoRowKeys(out);
+}
+
+function dedupeOswoRowKeys(rows: OswoParseRow[]): OswoParseRow[] {
+  const counts = new Map<string, number>();
+  return rows.map((r) => {
+    const base = r.rowKey;
+    const n = counts.get(base) ?? 0;
+    counts.set(base, n + 1);
+    if (n === 0) return r;
+    return { ...r, rowKey: base + "#" + String(n) };
+  });
+}
+
+/** Parse open sub-WO CSV / XLSX export: one row per line; parent WO column required. */
+export function parseOswoCsvToRows(csvText: string): OswoParseRow[] {
+  const table = parseCsvTextToRowArrays(csvText);
+  if (table.length < 2) return [];
+  const headers = table[0]!.map((h) => h.trim());
+  const dataRows = table.slice(1);
+  return buildOswoRowsFromTable(headers, dataRows);
+}
+
+async function parseOswoXlsxToRows(bytes: ArrayBuffer): Promise<OswoParseRow[]> {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(bytes);
+  const sheet = wb.worksheets[0];
+  if (!sheet) return [];
+  const headerRow = sheet.getRow(1);
+  const colCount = Math.max(headerRow.cellCount, sheet.columnCount ?? 0, 1);
+  const headers: string[] = [];
+  for (let c = 1; c <= colCount; c++) {
+    const v = headerRow.getCell(c).value;
+    headers.push(v == null ? "" : String(v).trim());
+  }
+  while (headers.length && !headers[headers.length - 1]) headers.pop();
+  const dataRows: string[][] = [];
+  const last = sheet.rowCount || 1;
+  for (let r = 2; r <= last; r++) {
+    const row = sheet.getRow(r);
+    const cells: string[] = [];
+    let any = false;
+    for (let c = 1; c <= headers.length; c++) {
+      const v = row.getCell(c).value;
+      const t = v == null ? "" : String(v).trim();
+      if (t) any = true;
+      cells.push(t);
+    }
+    if (any) dataRows.push(cells);
+  }
+  return buildOswoRowsFromTable(headers, dataRows);
+}
+
+/**
+ * Store open sub-WO extract (CSV or XLSX) from oswo@ email, keyed by snapshot_date_key.
+ */
+export async function ingestOswoExtractFromAttachment(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  opts: {
+    bytes: ArrayBuffer;
+    fileName: string;
+    dateKey: string;
+    receivedAtIso: string;
+    from: string;
+    to: string;
+  },
+): Promise<{ rowCount: number; dateKey: string }> {
+  const lower = opts.fileName.toLowerCase();
+  let rows: OswoParseRow[];
+  if (lower.endsWith(".csv")) {
+    const text = new TextDecoder("utf-8", { fatal: false }).decode(new Uint8Array(opts.bytes));
+    rows = parseOswoCsvToRows(text);
+  } else if (lower.endsWith(".xlsx")) {
+    rows = await parseOswoXlsxToRows(opts.bytes);
+  } else {
+    throw new Error("oswo: attachment must be .csv or .xlsx");
+  }
+  if (rows.length === 0) {
+    await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM oswo_sub_work_order_snapshot WHERE snapshot_date_key = ?`)
+      .bind(opts.dateKey)
+      .run();
+    console.log(
+      JSON.stringify({
+        level: "warn",
+        message: "oswo_sub_wo_ingest_empty",
+        dateKey: opts.dateKey,
+        fileName: opts.fileName,
+        note: "No rows after parse/state filter (e.g. all Sub Work Order State Cd = RQST-Open or no parent WO ids).",
+      }),
+    );
+    return { rowCount: 0, dateKey: opts.dateKey };
+  }
+
+  await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM oswo_sub_work_order_snapshot WHERE snapshot_date_key = ?`)
+    .bind(opts.dateKey)
+    .run();
+
+  const stmt = env.ETIC_SNAPSHOTS.prepare(
+    `INSERT INTO oswo_sub_work_order_snapshot (
+       snapshot_date_key, row_key, parent_work_order_id, sub_work_order_id, raw_row_json, source_filename, received_at_iso
+     ) VALUES (?,?,?,?,?,?,?)
+     ON CONFLICT(snapshot_date_key, row_key) DO UPDATE SET
+       parent_work_order_id = excluded.parent_work_order_id,
+       sub_work_order_id = excluded.sub_work_order_id,
+       raw_row_json = excluded.raw_row_json,
+       source_filename = excluded.source_filename,
+       received_at_iso = excluded.received_at_iso`,
+  );
+  const BATCH = 50;
+  for (let i = 0; i < rows.length; i += BATCH) {
+    const chunk = rows.slice(i, i + BATCH);
+    await env.ETIC_SNAPSHOTS.batch(
+      chunk.map((row) =>
+        stmt.bind(
+          opts.dateKey,
+          row.rowKey,
+          row.parentWorkOrderId,
+          row.subWorkOrderId,
+          JSON.stringify(row.raw),
+          opts.fileName,
+          opts.receivedAtIso,
+        ),
+      ),
+    );
+  }
+  const parentSet = new Set(rows.map((r) => r.parentWorkOrderId));
+  console.log(
+    JSON.stringify({
+      level: "info",
+      message: "oswo_sub_wo_ingested",
+      dateKey: opts.dateKey,
+      rows: rows.length,
+      distinctParentWos: parentSet.size,
+      fileName: opts.fileName,
+      from: opts.from,
+      to: opts.to,
+    }),
+  );
+  return { rowCount: rows.length, dateKey: opts.dateKey };
+}
+
+async function resolveOswoSnapshotDateKeyForAsOf(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  asOfDateKey: string,
+): Promise<string | null> {
+  const ex = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT 1 AS o FROM oswo_sub_work_order_snapshot WHERE snapshot_date_key = ? LIMIT 1`,
+  )
+    .bind(asOfDateKey)
+    .first<{ o: number }>();
+  if (ex) return asOfDateKey;
+  const before = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT MAX(snapshot_date_key) AS k FROM oswo_sub_work_order_snapshot WHERE snapshot_date_key <= ?`,
+  )
+    .bind(asOfDateKey)
+    .first<{ k: string | null }>();
+  const k1 = (before?.k ?? "").trim();
+  if (k1) return k1;
+  const any = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT MAX(snapshot_date_key) AS k FROM oswo_sub_work_order_snapshot`,
+  ).first<{ k: string | null }>();
+  const k2 = (any?.k ?? "").trim();
+  return k2 || null;
+}
+
+/** Sub-WO / work-plan lines for a parent work order from the best-matching OSWO import for this as-of date. */
+export async function getOpenSubWorkOrdersForWorkOrder(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  workOrderId: string,
+  asOfDateKey: string,
+): Promise<{ snapshotDateKey: string | null; rows: OpenSubWorkOrderRow[] }> {
+  const sk = await resolveOswoSnapshotDateKeyForAsOf(env, asOfDateKey);
+  if (!sk) return { snapshotDateKey: null, rows: [] };
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT row_key, parent_work_order_id, sub_work_order_id, raw_row_json
+     FROM oswo_sub_work_order_snapshot
+     WHERE snapshot_date_key = ? AND UPPER(TRIM(parent_work_order_id)) = UPPER(TRIM(?))
+     ORDER BY row_key ASC`,
+  )
+    .bind(sk, workOrderId)
+    .all<{
+      row_key: string;
+      parent_work_order_id: string;
+      sub_work_order_id: string;
+      raw_row_json: string;
+    }>();
+  const rows: OpenSubWorkOrderRow[] = [];
+  for (const row of r.results ?? []) {
+    let raw: Record<string, string> = {};
+    try {
+      raw = JSON.parse(row.raw_row_json || "{}") as Record<string, string>;
+    } catch {
+      raw = {};
+    }
+    rows.push({
+      rowKey: row.row_key,
+      parentWorkOrderId: row.parent_work_order_id,
+      subWorkOrderId: (row.sub_work_order_id ?? "").trim(),
+      subWorkOrderStateCd: pickOswoSubWorkOrderState(raw),
+      workPlanLabel: pickOswoWorkPlanLabel(raw),
+      raw,
+    });
+  }
+  return { snapshotDateKey: sk, rows };
+}
+
+function normScheduleMxPlanIdForCompare(s: string): string {
+  return (s ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+type OswoParentAgg = { planKeys: Set<string>; rowCount: number };
+
+/** All OSWO sub lines for one import, keyed by lowercased parent work order id. */
+export async function loadOswoParentAggregatesForSnapshot(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  snapshotKey: string,
+): Promise<Map<string, OswoParentAgg>> {
+  const byLower = new Map<string, OswoParentAgg>();
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT parent_work_order_id, raw_row_json FROM oswo_sub_work_order_snapshot WHERE snapshot_date_key = ?`,
+  )
+    .bind(snapshotKey)
+    .all<{ parent_work_order_id: string; raw_row_json: string }>();
+  for (const row of r.results ?? []) {
+    accumulateOswoSnapshotRowIntoParentAgg(byLower, row);
+  }
+  return byLower;
+}
+
+function accumulateOswoSnapshotRowIntoParentAgg(
+  byLower: Map<string, OswoParentAgg>,
+  row: { parent_work_order_id: string; raw_row_json: string },
+): void {
+  const p = (row.parent_work_order_id ?? "").trim();
+  if (!p) return;
+  const kl = p.toLowerCase();
+  if (!byLower.has(kl)) {
+    byLower.set(kl, { planKeys: new Set(), rowCount: 0 });
+  }
+  const agg = byLower.get(kl)!;
+  agg.rowCount += 1;
+  let raw: Record<string, string> = {};
+  try {
+    raw = JSON.parse(row.raw_row_json || "{}") as Record<string, string>;
+  } catch {
+    return;
+  }
+  const pl = normScheduleMxPlanIdForCompare(
+    pickRawValue(raw, ["oswo.plan id", "oswo.planid", "oswo.plan  id", "oswo.plan#"]),
+  );
+  if (pl) agg.planKeys.add(pl);
+}
+
+/**
+ * Same aggregates as {@link loadOswoParentAggregatesForSnapshot} but only for the given
+ * parent work order ids (Schedule Mx needs open WOs only — avoids a full-table scan).
+ */
+export async function loadOswoParentAggregatesForParentIds(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  snapshotKey: string,
+  parentIds: string[],
+): Promise<Map<string, OswoParentAgg>> {
+  const byLower = new Map<string, OswoParentAgg>();
+  const uniqLower = [...new Set(parentIds.map((p) => (p ?? "").trim().toLowerCase()).filter(Boolean))];
+  if (!uniqLower.length) return byLower;
+  const batchSize = 90;
+  const flat = await runAssetIdBatchesInParallel(uniqLower, batchSize, async (chunk) => {
+    const ph = chunk.map(() => "?").join(",");
+    const r = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT parent_work_order_id, raw_row_json FROM oswo_sub_work_order_snapshot
+       WHERE snapshot_date_key = ? AND lower(trim(parent_work_order_id)) IN (${ph})`,
+    )
+      .bind(snapshotKey, ...chunk)
+      .all<{ parent_work_order_id: string; raw_row_json: string }>();
+    return r.results ?? [];
+  });
+  for (const row of flat) {
+    accumulateOswoSnapshotRowIntoParentAgg(byLower, row);
+  }
+  return byLower;
+}
+
+/** Apply precomputed OSWO plan-key aggregates (see {@link loadOswoParentAggregatesForParentIds}). */
+export function applyScheduleMxOswoPlanGapsWithAgg(
+  rows: ScheduleMxFleetRow[],
+  byAsset: Map<string, ScheduleMxEticAssetContext>,
+  agg: Map<string, OswoParentAgg>,
+): ScheduleMxFleetRow[] {
+  return rows.map((row) => {
+    const aid = (row.assetId ?? "").trim();
+    const ctx = aid ? byAsset.get(aid) : undefined;
+    const planKey = normScheduleMxPlanIdForCompare(row.planId);
+    if (!ctx || !ctx.workOrderIds.length || !planKey) {
+      return { ...row, scheduleMxPlanMissingFromOpenWo: false };
+    }
+    const union = new Set<string>();
+    let totalSubRows = 0;
+    for (const wid of ctx.workOrderIds) {
+      const a = agg.get(wid.toLowerCase().trim());
+      if (a) {
+        totalSubRows += a.rowCount;
+        a.planKeys.forEach((k) => union.add(k));
+      }
+    }
+    const missing = totalSubRows === 0 ? true : !union.has(planKey);
+    return { ...row, scheduleMxPlanMissingFromOpenWo: missing };
+  });
+}
+
+/**
+ * For each plan row: if the asset has open WOs on the ETIC book and the ELMS Plan Id
+ * is not found on any OSWO sub line for those parent work orders, set
+ * `scheduleMxPlanMissingFromOpenWo` (requires a matching OSWO import for `eticDateKey`).
+ */
+export async function applyScheduleMxOswoPlanGaps(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  rows: ScheduleMxFleetRow[],
+  byAsset: Map<string, ScheduleMxEticAssetContext>,
+  eticDateKey: string | null,
+): Promise<ScheduleMxFleetRow[]> {
+  if (!rows.length) return rows;
+  if (!eticDateKey) {
+    return rows.map((r) => ({ ...r, scheduleMxPlanMissingFromOpenWo: false }));
+  }
+  const oswoKey = await resolveOswoSnapshotDateKeyForAsOf(env, eticDateKey);
+  if (!oswoKey) {
+    return rows.map((r) => ({ ...r, scheduleMxPlanMissingFromOpenWo: false }));
+  }
+  const parentIds = collectDistinctOpenWorkOrderIdsForOswo(byAsset);
+  const agg =
+    parentIds.length > 0
+      ? await loadOswoParentAggregatesForParentIds(env, oswoKey, parentIds)
+      : new Map<string, OswoParentAgg>();
+  return applyScheduleMxOswoPlanGapsWithAgg(rows, byAsset, agg);
+}
+
 async function loadScheduleMxPlanRowsForDate(
   env: { ETIC_SNAPSHOTS: D1Database },
   dateKey: string,
@@ -2155,18 +2921,44 @@ export async function listScheduleMxExtractDateKeysDesc(env: { ETIC_SNAPSHOTS: D
 /**
  * Schedule Mx tab: **only** `schedule_mx_plan_snapshot` rows (prevmx@ CSV/XLSX), one row per maintenance plan.
  * Open WO counts on the same calendar date are joined from `work_order_snapshot` when present (optional context only).
+ *
+ * @param opts.includeOswoGaps When false, skips OSWO D1 reads; `scheduleMxPlanMissingFromOpenWo` is always false
+ *   (use `GET /api/schedule-mx?gaps=0` for a faster load when the badge is not needed).
  */
 export async function getScheduleMxFleetForDate(
   env: { ETIC_SNAPSHOTS: D1Database },
   dateKey: string,
+  opts?: { includeOswoGaps?: boolean },
 ): Promise<ScheduleMxFleetRow[]> {
-  const planRows = await loadScheduleMxPlanRowsForDate(env, dateKey);
+  const includeOswoGaps = opts?.includeOswoGaps !== false;
+  const [planRows, woCounts] = await Promise.all([
+    loadScheduleMxPlanRowsForDate(env, dateKey),
+    loadWoCountsPerAsset(env, dateKey),
+  ]);
   if (planRows.length === 0) return [];
-  const woCounts = await loadWoCountsPerAsset(env, dateKey);
   const rows = buildScheduleMxRowsFromPlanRows(planRows, woCounts, dateKey);
   const assetIds = [...new Set(rows.map((r) => (r.assetId ?? "").trim()).filter(Boolean))];
   const { eticDateKey, byAsset } = await loadScheduleMxEticContextByAsset(env, assetIds);
-  return sortScheduleMxRows(enrichScheduleMxRowsWithLatestEtic(rows, eticDateKey, byAsset));
+
+  let oswoAggPromise: Promise<Map<string, OswoParentAgg>> = Promise.resolve(new Map<string, OswoParentAgg>());
+  if (includeOswoGaps && eticDateKey) {
+    const parentIds = collectDistinctOpenWorkOrderIdsForOswo(byAsset);
+    if (parentIds.length > 0) {
+      oswoAggPromise = (async () => {
+        const oswoKey = await resolveOswoSnapshotDateKeyForAsOf(env, eticDateKey);
+        if (!oswoKey) return new Map<string, OswoParentAgg>();
+        return loadOswoParentAggregatesForParentIds(env, oswoKey, parentIds);
+      })();
+    }
+  }
+
+  const withFleetU = applyScheduleMxFleetUtilizationTypeFromD1(rows, byAsset, dateKey);
+  const enriched = enrichScheduleMxRowsWithLatestEtic(withFleetU, eticDateKey, byAsset);
+  const agg = await oswoAggPromise;
+  const withGaps = includeOswoGaps
+    ? applyScheduleMxOswoPlanGapsWithAgg(enriched, byAsset, agg)
+    : enriched.map((r) => ({ ...r, scheduleMxPlanMissingFromOpenWo: false }));
+  return sortScheduleMxRows(withGaps);
 }
 
 async function getEarliestSnapshotDate(env: { ETIC_SNAPSHOTS: D1Database }): Promise<string> {

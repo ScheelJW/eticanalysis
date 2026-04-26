@@ -1,0 +1,2384 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="theme-color" content="#003a8c" />
+  <meta name="color-scheme" content="light" />
+  <link rel="manifest" href="/yard/manifest.webmanifest" />
+  <title>Minot AFB Vehicle Management · Yard Check</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f3f5f8;
+      --bg1: #ffffff;
+      --bg2: #eef2f7;
+      --bg3: #e0e6ee;
+      --border: #d3d9e2;
+      --text: #0a1a3a;
+      --muted: #5b6675;
+      --muted2: #8a94a4;
+      --accent: #003a8c;
+      --accent-strong: #00276b;
+      --accent-fg: #ffffff;
+      --ok: #157f3a;
+      --warn: #a0670a;
+      --danger: #b00020;
+      --due: #c75b00;
+      --never: #6a3fb8;
+      --text-dim: #2c3a55;
+      --safe-top: env(safe-area-inset-top, 0px);
+      --safe-bottom: env(safe-area-inset-bottom, 0px);
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--text); }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      font-size: 16px; line-height: 1.4;
+      overscroll-behavior-y: none;
+      -webkit-font-smoothing: antialiased;
+    }
+    button, input, textarea, select { font: inherit; color: inherit; }
+    button { background: none; border: none; cursor: pointer; padding: 0; }
+    input, textarea, select {
+      background: var(--bg2); border: 1px solid var(--border); color: var(--text);
+      border-radius: 10px; padding: 12px 14px; width: 100%; font-size: 16px;
+    }
+    input:focus, textarea:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+    textarea { resize: vertical; min-height: 84px; }
+    a { color: var(--accent); }
+    .hidden { display: none !important; }
+
+    .yard-mobile-only { display: block; }
+    .yard-desktop-only { display: none; }
+
+    /* App shell */
+    #app { display: flex; flex-direction: column; min-height: 100dvh; }
+    /* Sticky stack: topbar (with search) -> chiprow. Both stay pinned so the
+       walker can search and re-filter without scrolling back to the top. */
+    .topbar {
+      position: sticky; top: 0; z-index: 30;
+      padding: calc(var(--safe-top) + 8px) 12px 10px;
+      background: var(--accent);
+      color: #ffffff;
+      border-bottom: 3px solid var(--accent-strong);
+    }
+    .topbar-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      min-height: 30px;
+    }
+    .topbar-lead { display: flex; align-items: center; gap: 10px; min-width: 0; }
+    .brand { font-weight: 700; font-size: 17px; letter-spacing: 0.2px; color: #ffffff; }
+    .topbar-apps {
+      margin-left: auto; font-size: 12px; font-weight: 600; color: #ffffff;
+      text-decoration: none; padding: 6px 10px; border-radius: 6px;
+      border: 1px solid rgba(255,255,255,0.35); background: rgba(255,255,255,0.10);
+    }
+    .topbar-apps:active { background: rgba(255,255,255,0.20); color: #ffffff; }
+    .stats { margin-left: 8px; font-size: 12px; color: rgba(255,255,255,0.85); display: flex; gap: 6px; }
+    .stat-pill { padding: 3px 9px; border-radius: 999px; background: rgba(255,255,255,0.14); border: 1px solid rgba(255,255,255,0.30); color: #ffffff; }
+    .stat-pill b { color: #ffffff; font-weight: 700; }
+
+    .topbar .search-row { margin-top: 8px; padding: 0; }
+    .search-row { position: relative; }
+    .search-row input {
+      padding-left: 38px; padding-right: 84px; height: 42px; padding-top: 0; padding-bottom: 0;
+      background-color: #ffffff; color: var(--text); border-color: var(--border);
+      background-image:
+        url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='18' height='18' viewBox='0 0 24 24' fill='none' stroke='%235b6675' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><circle cx='11' cy='11' r='7'/><path d='m20 20-3-3'/></svg>");
+      background-repeat: no-repeat; background-position: 12px center;
+    }
+    /* "+ Find" button lives inside the search row to save vertical space */
+    .find-btn {
+      position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+      padding: 7px 12px; border-radius: 6px;
+      background: var(--accent-strong); color: #ffffff;
+      font-size: 13px; font-weight: 700; line-height: 1;
+      border: 1px solid rgba(255,255,255,0.30);
+    }
+
+    .walker-row { margin-top: 6px; display: flex; gap: 8px; align-items: center; font-size: 12px; color: rgba(255,255,255,0.85); }
+    .walker-row.input { display: block; }
+    .walker-row.input input { height: 36px; background: #ffffff; color: var(--text); border-color: var(--border); }
+    .walker-row b { color: #ffffff; }
+    .walker-row a { font-size: 12px; color: #ffffff; }
+
+    .chiprow {
+      display: flex; gap: 6px; padding: 8px 12px; overflow-x: auto;
+      -webkit-overflow-scrolling: touch; scrollbar-width: none;
+      position: sticky; z-index: 25;
+      /* Will be set by JS once topbar height is measured. */
+      top: calc(var(--safe-top) + 110px);
+      background: #ffffff;
+      border-bottom: 1px solid var(--border);
+      box-shadow: 0 1px 2px rgba(15,30,60,0.04);
+    }
+    .chiprow::-webkit-scrollbar { display: none; }
+    .chip {
+      flex: 0 0 auto; padding: 7px 13px; border-radius: 999px;
+      background: var(--bg1); border: 1px solid var(--border);
+      color: var(--text); font-size: 13px; white-space: nowrap;
+    }
+    .chip.active { background: var(--accent); color: #ffffff; border-color: var(--accent); font-weight: 700; }
+    .chip .count { opacity: 0.7; margin-left: 6px; font-size: 11px; }
+    .chip.active .count { opacity: 0.95; }
+
+    /* Asset list */
+    .list { flex: 1 1 auto; padding: 4px 10px 120px; }
+    .row {
+      display: flex; align-items: center; gap: 12px; padding: 14px 14px;
+      background: var(--bg1); border: 1px solid var(--border);
+      border-radius: 10px; margin-bottom: 8px; cursor: pointer;
+      box-shadow: 0 1px 2px rgba(15,30,60,0.04);
+    }
+    .row:active { background: var(--bg2); border-color: var(--accent); }
+    .row .id { font-weight: 700; font-size: 17px; }
+    .row .meta { color: var(--muted); font-size: 13px; margin-top: 2px; }
+    .row .row-loc {
+      margin-top: 8px; padding: 10px 12px; border-radius: 8px;
+      background: linear-gradient(180deg, #e8f0ff 0%, #dfe8f8 100%);
+      border: 1px solid rgba(0, 58, 140, 0.22);
+      font-size: 15px; font-weight: 700; color: var(--accent-strong);
+      line-height: 1.35; word-break: break-word;
+    }
+    .row .row-loc.muted {
+      background: var(--bg2); border-color: var(--border);
+      color: var(--muted); font-weight: 600; font-size: 14px;
+    }
+    .row .row-loc .row-loc-lbl {
+      display: block; font-size: 10px; font-weight: 700; letter-spacing: 0.06em;
+      text-transform: uppercase; color: var(--muted); margin-bottom: 4px;
+    }
+    .row .body { flex: 1 1 auto; min-width: 0; }
+    .row .body .meta { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .row .right { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; flex: 0 0 auto; }
+    .badges { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
+    .badge {
+      font-size: 10px; font-weight: 700; letter-spacing: 0.4px;
+      padding: 3px 7px; border-radius: 5px; text-transform: uppercase;
+      background: var(--bg3); color: var(--text); border: 1px solid var(--border);
+    }
+    .badge.fresh { background: #e6f4ec; color: var(--ok); border-color: #9bd6b1; }
+    .badge.due { background: #fff1dc; color: var(--due); border-color: #f0c98a; }
+    .badge.overdue { background: #fde8eb; color: var(--danger); border-color: #f1a3ab; }
+    .badge.never { background: #efe6fa; color: var(--never); border-color: #cdb8e8; }
+    .badge.nce { background: #e6efff; color: var(--accent); border-color: #9fbce0; }
+    .badge.below-mel { background: #fde8eb; color: var(--danger); border-color: #f1a3ab; }
+    .badge.new { background: #e6f4ec; color: var(--ok); border-color: #9bd6b1; }
+    .badge.unlisted { background: #fff4d6; color: var(--warn); border-color: #e7c779; }
+    .badge.photos { background: var(--bg2); color: var(--muted); border-color: var(--border); }
+    .badge.shop { background: var(--bg2); color: var(--muted); border-color: var(--border); }
+
+    .age { font-size: 13px; color: var(--ok); white-space: nowrap; font-weight: 600; }
+    .age.due { color: var(--due); font-weight: 700; }
+    .age.overdue { color: var(--danger); font-weight: 700; }
+    .age.never { color: var(--never); font-weight: 700; }
+
+    .empty {
+      text-align: center; padding: 60px 20px; color: var(--muted);
+    }
+    .empty .big { font-size: 48px; margin-bottom: 8px; }
+
+    /* Detail sheet */
+    .sheet {
+      position: fixed; inset: 0; z-index: 60;
+      background: var(--bg);
+      display: flex; flex-direction: column;
+      transform: translateY(100%); transition: transform 220ms ease;
+    }
+    .sheet.open { transform: translateY(0); }
+    .sheet-top {
+      position: sticky; top: 0; padding: calc(var(--safe-top) + 10px) 12px 10px;
+      display: flex; align-items: center; gap: 6px;
+      background: var(--accent); color: #ffffff;
+      border-bottom: 3px solid var(--accent-strong);
+      z-index: 5;
+    }
+    .iconbtn {
+      width: 40px; height: 40px; display: inline-flex; align-items: center; justify-content: center;
+      border-radius: 8px; background: rgba(255,255,255,0.14); color: #ffffff; font-size: 18px;
+      border: 1px solid rgba(255,255,255,0.30);
+    }
+    .iconbtn:active { background: rgba(255,255,255,0.24); }
+    .sheet-title { flex: 1 1 auto; font-weight: 700; font-size: 17px; min-width: 0; color: #ffffff;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    .sheet-body { flex: 1 1 auto; overflow-y: auto; padding: 12px 14px 140px; }
+    .yard-loc-hero {
+      background: linear-gradient(180deg, #f0f6ff 0%, #e4edfc 100%);
+      border: 1px solid rgba(0, 58, 140, 0.28); border-radius: 12px;
+      padding: 16px 14px 14px; margin-bottom: 12px;
+      box-shadow: 0 2px 8px rgba(0, 58, 140, 0.08);
+    }
+    .yard-loc-hero-label {
+      font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+      color: var(--muted); margin-bottom: 6px;
+    }
+    .yard-loc-hero-value {
+      font-size: 1.45rem; font-weight: 800; color: var(--accent-strong);
+      line-height: 1.25; word-break: break-word;
+    }
+    .yard-loc-hero-value.unknown { font-size: 1.1rem; font-weight: 700; color: var(--muted); }
+    .yard-loc-hero-sub { margin-top: 6px; font-size: 13px; color: var(--text-dim); }
+    .yard-loc-hero-meta { margin-top: 8px; font-size: 12px; color: var(--muted); line-height: 1.45; }
+    .yard-loc-hero-hint { margin: 10px 0 0; font-size: 12px; color: var(--muted); line-height: 1.4; }
+    .yard-log-section {
+      background: transparent; border: none; margin: 0; padding: 0;
+    }
+    .yard-log-section > summary {
+      list-style: none; cursor: pointer; user-select: none;
+      padding: 12px 14px; border-radius: 10px; border: 1px dashed var(--border);
+      background: var(--bg1); font-size: 14px; font-weight: 700; color: var(--accent);
+      margin-bottom: 12px;
+    }
+    .yard-log-section > summary::-webkit-details-marker { display: none; }
+    .yard-log-section[open] > summary { margin-bottom: 12px; border-style: solid; }
+    .card {
+      background: var(--bg1); border: 1px solid var(--border);
+      border-radius: 10px; padding: 14px; margin-bottom: 12px;
+      box-shadow: 0 1px 2px rgba(15,30,60,0.04);
+    }
+    .card h4 { margin: 0 0 8px; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+    .kv { display: grid; grid-template-columns: 110px 1fr; gap: 6px 12px; font-size: 14px; }
+    .kv dt { color: var(--muted); }
+    .kv dd { margin: 0; color: var(--text); word-break: break-word; }
+
+    .status-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .status-btn {
+      padding: 14px 8px; border-radius: 8px; text-align: center;
+      background: var(--bg1); border: 1px solid var(--border);
+      font-weight: 600; font-size: 14px; color: var(--text);
+    }
+    .status-btn .icon { display: block; font-size: 22px; margin-bottom: 4px; }
+    .status-btn.active.present { background: #e6f4ec; color: var(--ok); border-color: var(--ok); }
+    .status-btn.active.missing { background: #fde8eb; color: var(--danger); border-color: var(--danger); }
+    .status-btn.active.unknown { background: #efe6fa; color: var(--never); border-color: var(--never); }
+
+    .chip-pick { display: flex; flex-wrap: wrap; gap: 6px; }
+    .chip-pick .chip { font-size: 13px; padding: 7px 12px; }
+    .chip-pick .chip.on { background: var(--accent); color: #ffffff; border-color: var(--accent); }
+
+    .photos { display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 8px; margin-top: 8px; }
+    .photo {
+      position: relative; aspect-ratio: 1 / 1; border-radius: 8px; overflow: hidden;
+      background: #0a1a3a; border: 1px solid var(--border);
+    }
+    .photo img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .photo .yard-photo-view {
+      display: block; width: 100%; height: 100%; padding: 0; margin: 0; border: 0; background: transparent;
+      cursor: zoom-in; border-radius: inherit;
+    }
+    .yard-photo-lb-overlay {
+      z-index: 80;
+    }
+    .yard-photo-lb-overlay .modal.yard-photo-lb-inner {
+      position: relative;
+      max-width: min(94vw, 960px);
+      width: auto;
+      max-height: 92vh;
+      padding: 10px;
+      box-shadow: 0 12px 40px rgba(15,30,60,0.2);
+    }
+    .yard-photo-lb-overlay .yard-photo-lb-x {
+      position: absolute; top: 8px; right: 8px; z-index: 2;
+      width: 38px; height: 38px; border-radius: 8px; border: 1px solid var(--border);
+      background: var(--bg1); font-size: 20px; cursor: pointer; line-height: 1;
+    }
+    .yard-photo-lb-overlay #yard-photo-lb-img-m {
+      display: block; max-width: 100%; max-height: 86vh; width: auto; height: auto; margin: 0 auto;
+      object-fit: contain; border-radius: 8px;
+    }
+    .photo .meta { position: absolute; bottom: 0; left: 0; right: 0; padding: 4px 6px; font-size: 10px;
+      color: white; background: linear-gradient(180deg, transparent, rgba(0,0,0,0.7)); }
+    .photo .x {
+      position: absolute; top: 4px; right: 4px;
+      width: 24px; height: 24px; border-radius: 50%;
+      background: rgba(0,0,0,0.7); color: white; font-size: 14px;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .photo-add {
+      display: flex; align-items: center; justify-content: center;
+      aspect-ratio: 1 / 1; border-radius: 8px;
+      background: var(--bg2); border: 1px dashed var(--border);
+      color: var(--muted); flex-direction: column; gap: 4px;
+      font-size: 12px; cursor: pointer;
+    }
+    .photo-add svg { width: 28px; height: 28px; }
+    .photo-add input { display: none; }
+
+    .yard-upload-bar {
+      display: none; margin: 10px 0 0; padding: 10px 12px; border-radius: 8px;
+      background: var(--bg2); border: 1px solid var(--border);
+    }
+    .yard-upload-bar.show { display: block; }
+    .yard-upload-bar .yard-up-lbl { font-size: 11px; color: var(--muted); margin-bottom: 6px; font-weight: 600; }
+    .yard-upload-bar .yard-up-track {
+      height: 7px; border-radius: 999px; background: var(--bg3); overflow: hidden;
+    }
+    .yard-upload-bar .yard-up-fill {
+      height: 100%; width: 0%; background: var(--accent); border-radius: 999px;
+      transition: width 0.12s ease-out;
+    }
+    .find-upload-bar { margin-top: 10px; }
+
+    .history { font-size: 13px; padding: 0; margin: 0; }
+    .history li { padding: 8px 0; border-top: 1px solid var(--border); list-style: none; color: var(--muted); }
+    .history li:first-child { border-top: none; }
+    .history li b { color: var(--text); }
+    .history-actions { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .history-actions button, .yard-desk-edit-check {
+      font-size: 12px; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--border);
+      background: var(--bg1); color: var(--accent); cursor: pointer; font-weight: 600;
+    }
+    .yard-changelog {
+      font-size: 11px; color: var(--muted2); margin-top: 8px; padding: 8px 10px;
+      border-radius: 6px; background: var(--bg2); border: 1px solid var(--border);
+    }
+    .yard-changelog .cl-title { font-weight: 600; color: var(--muted); margin-bottom: 4px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; }
+    .yard-changelog .cl-line { margin: 3px 0; line-height: 1.35; }
+
+    /* Open WO panel inside the asset detail */
+    .wo {
+      padding: 10px 0; border-top: 1px solid var(--border);
+    }
+    .wo:first-child { border-top: none; padding-top: 0; }
+    .wo-head {
+      display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 13px;
+      margin-bottom: 4px;
+    }
+    .wo-head .id { font-weight: 700; font-family: ui-monospace, monospace; color: var(--text); }
+    .wo-head .pill {
+      font-size: 11px; padding: 2px 7px; border-radius: 5px;
+      background: var(--bg2); border: 1px solid var(--border); color: var(--muted);
+    }
+    .wo-head .pill.below { background: #fde8eb; color: var(--danger); border-color: #f1a3ab; }
+    .wo-head .pill.at { background: #fff1dc; color: var(--due); border-color: #f0c98a; }
+    .wo-head .pill.above { background: #e6f4ec; color: var(--ok); border-color: #9bd6b1; }
+    .wo-remark {
+      font-size: 13px; color: var(--text); white-space: pre-wrap; word-break: break-word;
+      margin-top: 2px;
+    }
+    .wo-meta { font-size: 11px; color: var(--muted2); margin-top: 4px; }
+
+    .unlisted-banner {
+      background: #fff4d6; border: 1px solid #e7c779; border-radius: 8px;
+      padding: 12px 14px; margin-bottom: 12px; color: var(--warn); font-size: 13px;
+    }
+    .unlisted-banner b { display: block; color: var(--text); font-size: 14px; margin-bottom: 4px; }
+
+    /* Find / floor-to-book modal */
+    .modal-overlay {
+      position: fixed; inset: 0; background: rgba(15,30,60,0.45);
+      z-index: 70; display: none; align-items: center; justify-content: center;
+      padding: 20px;
+    }
+    .modal-overlay.open { display: flex; }
+    .modal {
+      background: var(--bg1); border: 1px solid var(--border); border-radius: 12px;
+      padding: 18px; width: 100%; max-width: 460px;
+      box-shadow: 0 12px 32px rgba(15,30,60,0.18);
+    }
+    .modal h3 { margin: 0 0 4px; font-size: 17px; color: var(--text); }
+    .modal p.hint { margin: 0 0 12px; color: var(--muted); font-size: 13px; }
+    .modal label { display: block; margin-top: 10px; font-size: 12px; color: var(--muted); }
+    .modal label input, .modal label textarea, .modal label select { margin-top: 4px; }
+    .modal-actions { display: flex; gap: 8px; margin-top: 16px; }
+    .modal-actions .grow { flex: 1 1 auto; }
+    .modal-actions .secondary {
+      background: var(--bg1); border: 1px solid var(--border); color: var(--text);
+      padding: 12px; border-radius: 6px; flex: 0 0 auto;
+    }
+    .modal-actions .secondary.danger {
+      color: var(--danger); border-color: rgba(176, 0, 32, 0.45); background: #fff8f8;
+    }
+    .modal-actions .primary {
+      background: var(--accent); color: #ffffff; padding: 12px 16px;
+      border-radius: 6px; font-weight: 700; flex: 1 1 auto;
+      border: 1px solid var(--accent);
+    }
+    .modal-actions .primary:active { background: var(--accent-strong); border-color: var(--accent-strong); }
+
+    .save-bar {
+      position: fixed; left: 0; right: 0; bottom: 0;
+      padding: 10px 14px calc(var(--safe-bottom) + 12px);
+      background: var(--bg1);
+      border-top: 1px solid var(--border);
+      box-shadow: 0 -4px 14px rgba(15,30,60,0.08);
+      z-index: 65;
+    }
+    .save-bar-hint {
+      margin: 0 0 8px;
+      font-size: 12px;
+      line-height: 1.35;
+      color: var(--muted);
+      text-align: center;
+    }
+    .save-btn {
+      width: 100%; padding: 16px; border-radius: 8px;
+      background: var(--accent); color: #ffffff;
+      font-weight: 700; font-size: 16px;
+      border: 1px solid var(--accent);
+      box-shadow: 0 4px 14px rgba(0,58,140,0.25);
+    }
+    .save-btn:active { background: var(--accent-strong); border-color: var(--accent-strong); }
+    .save-btn:disabled { background: var(--bg3); color: var(--muted); border-color: var(--border); box-shadow: none; }
+    .save-btn.saving { opacity: 0.7; }
+
+    .toast {
+      position: fixed; bottom: calc(var(--safe-bottom) + 80px); left: 50%; transform: translateX(-50%);
+      background: #0a1a3a; color: #ffffff; padding: 10px 18px;
+      border-radius: 999px; font-weight: 600; font-size: 14px;
+      box-shadow: 0 6px 18px rgba(15,30,60,0.25); z-index: 100;
+      opacity: 0; transition: opacity 200ms ease;
+      pointer-events: none;
+    }
+    .toast.show { opacity: 1; }
+    .toast.err { background: var(--danger); color: white; }
+
+    @media (min-width: 720px) and (max-width: 959px) {
+      #app { max-width: 600px; margin: 0 auto; box-shadow: 0 0 0 1px var(--border), 0 6px 24px rgba(15,30,60,0.06); background: var(--bg); }
+      .sheet { max-width: 600px; left: 50%; transform: translate(-50%, 100%); box-shadow: 0 0 0 1px var(--border); }
+      .sheet.open { transform: translate(-50%, 0); }
+    }
+    /* Desktop: wide lookup table + detail (like MEL slide) */
+    @media (min-width: 960px) {
+      body { font-size: 14px; }
+      body.yard-desk-sheet-open::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        background: rgba(10, 26, 58, 0.28);
+        z-index: 59;
+      }
+      #app {
+        max-width: none;
+        margin: 0;
+        width: 100%;
+        min-height: 100dvh;
+        display: flex;
+        flex-direction: column;
+      }
+      .yard-mobile-only { display: none !important; }
+      .yard-desktop-only {
+        display: flex !important;
+        flex-direction: column;
+        flex-shrink: 0;
+        background: #e4e9f0;
+        border-bottom: 1px solid #b8c4d4;
+        box-shadow: inset 0 -1px 0 rgba(255,255,255,0.6);
+      }
+      .yard-desktop-top {
+        display: grid;
+        grid-template-columns: minmax(160px, 220px) minmax(200px, 1fr) minmax(120px, auto) auto minmax(100px, 200px);
+        gap: 12px 20px;
+        align-items: center;
+        padding: 8px 20px 10px;
+        background: linear-gradient(180deg, #f5f7fb 0%, #e8edf4 100%);
+        border-bottom: 1px solid #c5cedc;
+      }
+      .yard-desktop-brand {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        min-width: 0;
+      }
+      .yard-desktop-product {
+        font-family: "Segoe UI", system-ui, sans-serif;
+        font-size: 15px;
+        font-weight: 700;
+        color: #0a1a3a;
+        letter-spacing: -0.02em;
+      }
+      .yard-desktop-tagline {
+        font-size: 11px;
+        color: var(--muted);
+        font-weight: 500;
+      }
+      .yard-desktop-search {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-width: 0;
+      }
+      .yard-desktop-search input {
+        flex: 1 1 auto;
+        min-width: 0;
+        height: 34px;
+        padding: 0 12px;
+        border-radius: 4px;
+        border: 1px solid #a8b4c8;
+        background: #fff;
+        font-size: 13px;
+        box-shadow: inset 0 1px 2px rgba(15,30,60,0.06);
+      }
+      .yard-desktop-search input:focus {
+        outline: none;
+        border-color: var(--accent);
+        box-shadow: inset 0 1px 2px rgba(15,30,60,0.06), 0 0 0 2px rgba(0,58,140,0.15);
+      }
+      .yard-desktop-find {
+        flex: 0 0 auto;
+        height: 34px;
+        padding: 0 14px;
+        border-radius: 4px;
+        border: 1px solid #7a8aa3;
+        background: linear-gradient(180deg, #fff 0%, #eef1f6 100%);
+        font-size: 12px;
+        font-weight: 600;
+        color: #1a2a44;
+        cursor: pointer;
+      }
+      .yard-desktop-find:hover {
+        background: linear-gradient(180deg, #fff 0%, #e4e9f2 100%);
+      }
+      .yard-desktop-stats {
+        font-size: 12px;
+        color: #3a4a62;
+        white-space: nowrap;
+      }
+      .yard-desktop-stats b { color: var(--accent); font-weight: 700; }
+      .yard-desktop-apps {
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--accent);
+        text-decoration: none;
+        padding: 6px 12px;
+        border: 1px solid #a8b4c8;
+        border-radius: 4px;
+        background: #fff;
+      }
+      .yard-desktop-apps:hover { background: #f0f3f8; }
+      .yard-desktop-walker {
+        font-size: 12px;
+        justify-self: end;
+        max-width: 200px;
+        color: var(--muted);
+      }
+      .yard-desktop-walker b { color: var(--text); }
+      .yard-desktop-walker a { color: var(--accent); font-weight: 700; }
+      .yard-desktop-walker.walker-row.input { max-width: 200px; }
+      .yard-desktop-walker.walker-row.input input {
+        height: 32px;
+        font-size: 13px;
+        border-radius: 4px;
+      }
+      .yard-desktop-filterbar {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        padding: 0 16px 0 20px;
+        min-height: 40px;
+        background: #dce3ee;
+        border-bottom: 1px solid #b8c4d4;
+      }
+      .yard-desktop-filterbar .yard-desk-filters {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow-x: auto;
+      }
+      .yard-desktop-filterbar-label {
+        flex: 0 0 auto;
+        font-size: 11px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: #5a6578;
+        margin-right: 12px;
+      }
+      .yard-desk-filters {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: flex-end;
+        gap: 0;
+        min-height: 40px;
+      }
+      .yard-desk-filters .yard-filter-btn {
+        position: relative;
+        margin: 0;
+        padding: 10px 14px 8px;
+        border: none;
+        border-bottom: 3px solid transparent;
+        background: transparent;
+        color: #3a4a62;
+        font-size: 13px;
+        font-weight: 500;
+        cursor: pointer;
+        border-radius: 0;
+        font-family: inherit;
+      }
+      .yard-desk-filters .yard-filter-btn:hover {
+        color: var(--accent);
+        background: rgba(255,255,255,0.35);
+      }
+      .yard-desk-filters .yard-filter-btn.active {
+        color: var(--accent);
+        font-weight: 700;
+        border-bottom-color: var(--accent);
+        background: rgba(255,255,255,0.5);
+      }
+      .yard-ftab-n {
+        margin-left: 6px;
+        font-size: 11px;
+        font-weight: 600;
+        color: #6a7588;
+        font-variant-numeric: tabular-nums;
+      }
+      .yard-desk-filters .yard-filter-btn.active .yard-ftab-n { color: var(--accent); }
+
+      .yard-list-mobile { display: none !important; }
+      .yard-desk {
+        display: flex !important;
+        flex-direction: column;
+        flex: 1 1 auto;
+        min-height: 0;
+        padding: 14px 24px 20px;
+        background: var(--bg);
+      }
+      .yard-desk-hint {
+        font-size: 13px;
+        color: var(--muted);
+        margin-bottom: 12px;
+        letter-spacing: 0;
+      }
+      .yard-desk-split {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(300px, 400px);
+        gap: 20px;
+        align-items: start;
+        max-width: 1760px;
+        margin: 0 auto;
+        width: 100%;
+        min-height: 0;
+        flex: 1 1 auto;
+      }
+      .yard-desk-table-wrap {
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--bg1);
+        overflow: auto;
+        max-height: calc(100dvh - 168px);
+        box-shadow: 0 1px 0 rgba(15, 30, 60, 0.04);
+      }
+      .yard-desk-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; table-layout: fixed; }
+      .yard-desk-table thead th {
+        position: sticky; top: 0; z-index: 2; text-align: left; padding: 10px 12px;
+        background: var(--bg3); color: var(--muted); font-size: 0.65rem; font-weight: 700;
+        text-transform: uppercase; letter-spacing: 0.08em; border-bottom: 1px solid var(--border);
+      }
+      .yard-desk-table tbody td { padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+      .yard-desk-table tbody tr { cursor: pointer; transition: background 0.1s ease; }
+      .yard-desk-table tbody tr:hover { background: rgba(0,58,140,0.04); }
+      .yard-desk-table tbody tr.yard-desk-active { background: rgba(0,58,140,0.10); outline: 1px solid rgba(0,58,140,0.35); outline-offset: -1px; }
+      .yard-desk-table .col-asset { font-family: ui-monospace, monospace; font-weight: 700; font-size: 0.9rem; }
+      .yard-desk-table .col-loc { color: var(--text); word-break: break-word; font-size: 0.95rem; font-weight: 700; line-height: 1.35; }
+      .yard-desk-table .col-loc .yard-desk-loc-unknown { color: var(--muted); font-weight: 600; font-size: 0.88rem; }
+      .yard-desk-table .col-notes { color: var(--muted); font-size: 0.82rem; line-height: 1.35; }
+      .yard-desk-table .col-meta { font-size: 0.78rem; color: var(--muted); white-space: nowrap; }
+      .yard-desk-table .yard-pill {
+        display: inline-block; font-size: 0.58rem; font-weight: 700; padding: 2px 6px; border-radius: 4px;
+        text-transform: uppercase; letter-spacing: 0.04em; margin-right: 4px;
+      }
+      .yard-pill-fresh { background: #e6f4ec; color: var(--ok); }
+      .yard-pill-due { background: #fff1dc; color: var(--due); }
+      .yard-pill-overdue { background: #fde8eb; color: var(--danger); }
+      .yard-pill-never { background: #efe6fa; color: var(--never); }
+      .yard-desk-aside {
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--bg1);
+        padding: 16px 18px;
+        max-height: calc(100dvh - 168px);
+        overflow: auto;
+        box-shadow: 0 1px 0 rgba(15, 30, 60, 0.04);
+      }
+      .yard-desk-empty { color: var(--muted); font-size: 0.92rem; line-height: 1.5; text-align: center; padding: 32px 12px; }
+      .yard-desk-aside .lbl {
+        display: block; font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); margin-bottom: 6px;
+      }
+      .yard-desk-loc-callout {
+        margin-top: 4px; padding: 14px 16px; border-radius: 12px;
+        background: linear-gradient(180deg, #f0f6ff 0%, #e4edfc 100%);
+        border: 1px solid rgba(0, 58, 140, 0.22);
+        box-shadow: 0 2px 8px rgba(0, 58, 140, 0.06);
+      }
+      .yard-desk-loc-big {
+        font-size: 1.45rem; font-weight: 800; color: var(--accent-strong); line-height: 1.25; word-break: break-word;
+      }
+      .yard-desk-loc-big.muted { font-size: 1.15rem; font-weight: 700; color: var(--muted); }
+      .yard-desk-loc-meta {
+        font-size: 0.82rem;
+        color: var(--muted);
+        margin-top: 6px;
+        line-height: 1.45;
+        word-break: break-word;
+      }
+      .yard-desk-notes-block {
+        margin-top: 14px; padding: 12px; background: var(--bg2); border-radius: 10px; font-size: 0.88rem; line-height: 1.45; color: var(--text); white-space: pre-wrap; word-break: break-word;
+      }
+      .yard-desk-hist-lbl { display: block; margin-top: 14px; }
+      .yard-desk-hist-lbl span { display: block; margin-bottom: 6px; font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+      .yard-desk-hist-lbl select { padding: 10px 12px; font-size: 0.86rem; }
+      .yard-hist-detail { margin-top: 10px; font-size: 0.84rem; color: var(--text-dim); line-height: 1.45; }
+      .yard-hist-detail .h-when { font-size: 0.78rem; color: var(--muted); margin-bottom: 6px; }
+      .yard-desk-check-photos {
+        display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px;
+      }
+      .yard-desk-check-photo {
+        padding: 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+        background: var(--bg2); cursor: pointer; width: 96px; height: 72px;
+      }
+      .yard-desk-check-photo img { width: 100%; height: 100%; object-fit: cover; display: block; }
+      .yard-hist-actions { margin-top: 10px; }
+      .yard-desk-open-full {
+        margin-top: 16px; width: 100%; padding: 12px; border-radius: 10px;
+        background: var(--accent); color: #fff; font-weight: 700; font-size: 0.92rem; border: 1px solid var(--accent-strong);
+      }
+      .yard-desk-open-full:hover { filter: brightness(1.05); }
+      /* Check workflow: right-hand pane (not a tall phone bottom sheet). */
+      .sheet {
+        left: auto;
+        top: 0;
+        right: 0;
+        bottom: 0;
+        width: min(460px, 44vw);
+        max-width: 100%;
+        transform: translateX(100%);
+        transition: transform 240ms ease;
+        box-shadow: -8px 0 40px rgba(15, 30, 60, 0.14);
+        border-left: 1px solid var(--border);
+      }
+      .sheet.open { transform: translateX(0); }
+      .sheet-top {
+        background: var(--bg1);
+        color: var(--text);
+        border-bottom: 1px solid var(--border);
+      }
+      .iconbtn {
+        background: var(--bg2);
+        color: var(--text);
+        border-color: var(--border);
+      }
+      .sheet-title { color: var(--text); }
+      .save-bar {
+        left: auto;
+        right: 0;
+        width: min(460px, 44vw);
+        max-width: 100%;
+        border-left: 1px solid var(--border);
+      }
+    }
+    .yard-desk { display: none; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div class="yard-mobile-only">
+    <header class="topbar" id="topbar">
+      <div class="topbar-head">
+        <div class="topbar-lead">
+          <div class="brand">Minot AFB Vehicle Management</div>
+          <a class="topbar-apps" href="/go">Apps</a>
+        </div>
+        <div class="stats">
+          <span class="stat-pill"><b data-stat="t-due">0</b> due</span>
+          <span class="stat-pill"><b data-stat="t-today">0</b> today</span>
+        </div>
+      </div>
+      <div class="search-row">
+        <input id="search" type="search" inputmode="search" placeholder="Search asset, VIN, shop, location…" autocomplete="off" />
+        <button class="find-btn" id="find-btn" aria-label="Found asset with no open work order">+ Find</button>
+      </div>
+      <div id="walker" class="walker-row"></div>
+    </header>
+
+    <nav class="chiprow" id="filters">
+      <button type="button" class="chip yard-filter-btn active" data-filter="all">All <span class="count" data-yc="all">0</span></button>
+      <button type="button" class="chip yard-filter-btn" data-filter="needs_action">Due for check <span class="count" data-yc="needs_action">0</span></button>
+      <button type="button" class="chip yard-filter-btn" data-filter="done">Done <span class="count" data-yc="done">0</span></button>
+    </nav>
+
+    <main class="list yard-list-mobile" id="list">
+      <div class="empty"><div class="big">⏳</div>Loading fleet…</div>
+    </main>
+    </div>
+
+    <div class="yard-desktop-only">
+      <div class="yard-desktop-top">
+        <div class="yard-desktop-brand">
+          <span class="yard-desktop-product">Minot AFB Vehicle Management</span>
+          <span class="yard-desktop-tagline">Yard Check · Fleet lookup</span>
+        </div>
+        <div class="yard-desktop-search">
+          <input id="search-desk" type="search" inputmode="search" placeholder="Search asset, VIN, shop, location…" autocomplete="off" />
+          <button type="button" class="yard-desktop-find" id="find-btn-desk">Found, no WO…</button>
+        </div>
+        <div class="yard-desktop-stats" aria-live="polite">
+          <b data-stat="t-due">0</b> due · <b data-stat="t-today">0</b> today
+        </div>
+        <a class="yard-desktop-apps" href="/go">Apps</a>
+        <div id="walker-desk" class="walker-row yard-desktop-walker"></div>
+      </div>
+      <div class="yard-desktop-filterbar">
+        <span class="yard-desktop-filterbar-label">Show</span>
+        <nav id="filters-desk" class="yard-desk-filters" aria-label="Fleet list filters">
+          <button type="button" class="yard-filter-btn active" data-filter="all">All <span class="yard-ftab-n" data-yc="all">0</span></button>
+          <button type="button" class="yard-filter-btn" data-filter="needs_action">Due for check <span class="yard-ftab-n" data-yc="needs_action">0</span></button>
+          <button type="button" class="yard-filter-btn" data-filter="done">Done <span class="yard-ftab-n" data-yc="done">0</span></button>
+        </nav>
+      </div>
+    </div>
+
+    <div class="yard-desk" id="yard-desk">
+      <p class="yard-desk-hint"><strong>Last parked at</strong> is the main column — search an asset to see where it was last seen. Expand &ldquo;Log a yard visit&rdquo; only when you are updating the record. <span style="color:var(--muted)">NCE and Below MEL tags are work-order context only. Items marked Found, no open WO need a work-order or records fix.</span></p>
+      <div class="yard-desk-split">
+        <div class="yard-desk-table-wrap">
+          <table class="yard-desk-table" aria-label="Yard vehicle lookup">
+            <colgroup>
+              <col style="width:22%" /><col style="width:26%" /><col style="width:32%" /><col style="width:20%" />
+            </colgroup>
+            <thead>
+              <tr>
+                <th>Asset</th>
+                <th>Last parked at</th>
+                <th>Notes</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="yard-desk-tbody"></tbody>
+          </table>
+        </div>
+        <aside class="yard-desk-aside" id="yard-desk-aside">
+          <div id="yard-desk-empty" class="yard-desk-empty">Select a vehicle in the table to see its last known location, notes, and location history.</div>
+          <div id="yard-desk-fill" class="hidden">
+            <div class="yard-desk-asset-id" id="yard-d-asset" style="font-family:ui-monospace,monospace;font-weight:700;font-size:1.1rem;margin-bottom:12px;"></div>
+            <div class="yard-desk-loc-callout">
+              <span class="lbl">Last parked at</span>
+              <div class="yard-desk-loc-big" id="yard-d-loc">—</div>
+              <div class="yard-desk-loc-meta" id="yard-d-loc-meta"></div>
+            </div>
+            <div style="margin-top:12px;">
+              <span class="lbl">Latest notes</span>
+              <div class="yard-desk-notes-block" id="yard-d-notes">—</div>
+            </div>
+            <label class="yard-desk-hist-lbl" for="yard-hist-sel">
+              <span>Location &amp; note history</span>
+              <select id="yard-hist-sel" aria-label="Past yard checks for this asset"></select>
+            </label>
+            <div id="yard-hist-detail" class="yard-hist-detail"></div>
+            <div class="yard-hist-actions">
+              <button type="button" class="yard-desk-edit-check" id="yard-desk-edit-check" disabled>Edit this check…</button>
+            </div>
+            <button type="button" class="yard-desk-open-full" id="yard-desk-open-full">Log check / photos / full detail</button>
+          </div>
+        </aside>
+      </div>
+    </div>
+  </div>
+
+  <div id="sheet" class="sheet" aria-hidden="true">
+    <div class="sheet-top">
+      <button class="iconbtn" id="sheet-back" aria-label="Back">←</button>
+      <div class="sheet-title" id="sheet-title">Asset</div>
+    </div>
+    <div class="sheet-body" id="sheet-body"></div>
+    <div id="yard-upload-bar" class="yard-upload-bar" aria-live="polite">
+      <div class="yard-up-lbl" id="yard-up-lbl">Uploading…</div>
+      <div class="yard-up-track"><div class="yard-up-fill" id="yard-up-fill"></div></div>
+    </div>
+    <div class="save-bar">
+      <p class="save-bar-hint">Only when logging a visit: set parking spot, then Save once.</p>
+      <button class="save-btn" id="save-btn">Save check</button>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <div class="modal-overlay" id="edit-check-modal" aria-hidden="true">
+    <div class="modal" role="dialog" aria-labelledby="edit-check-title">
+      <h3 id="edit-check-title">Edit yard check</h3>
+      <p class="hint">Correct location, notes, or status. The original walk time and walker stay on record; your name is logged in the changelog.</p>
+      <input type="hidden" id="edit-check-id" value="" />
+      <label>Location
+        <input id="edit-check-loc" type="text" list="loc-options" placeholder="Where it was parked" />
+      </label>
+      <label>Notes
+        <textarea id="edit-check-disc" rows="3" placeholder="Discrepancies / notes"></textarea>
+      </label>
+      <label>Status
+        <select id="edit-check-status">
+          <option value="present">Present / found</option>
+          <option value="missing">Missing</option>
+          <option value="unknown">Unknown</option>
+          <option value="not_applicable">Not applicable</option>
+        </select>
+      </label>
+      <div class="modal-actions">
+        <button type="button" class="secondary danger" id="edit-check-delete">Delete check</button>
+        <button type="button" class="secondary" id="edit-check-cancel">Cancel</button>
+        <button type="button" class="primary" id="edit-check-save">Save changes</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay yard-photo-lb-overlay" id="yard-photo-lb-m" aria-hidden="true">
+    <div class="modal yard-photo-lb-inner" role="dialog" aria-modal="true" aria-label="Photo">
+      <button type="button" class="yard-photo-lb-x" id="yard-photo-lb-x-m" aria-label="Close">×</button>
+      <img id="yard-photo-lb-img-m" alt="Yard photo" />
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="find-modal" aria-hidden="true">
+    <div class="modal" role="dialog" aria-labelledby="find-title">
+      <h3 id="find-title">Found, no open WO</h3>
+      <p class="hint">Log a vehicle you found in the yard that does not have an open work order in the latest ETIC. It will show in Needs Fix until a fleet manager opens a WO or corrects the record.</p>
+      <label>Asset / tail / bumper number
+        <input id="find-asset-id" type="text" inputmode="text" autocapitalize="characters" placeholder="e.g. L-3157" />
+      </label>
+      <label>Location
+        <input id="find-location" type="text" list="loc-options" placeholder="Where is it?" />
+      </label>
+      <label>Notes (optional)
+        <textarea id="find-notes" rows="2" placeholder="Anything notable about it?"></textarea>
+      </label>
+      <label>Photos (optional)
+        <input id="find-photos-input" type="file" accept="image/*" multiple />
+      </label>
+      <div id="find-upload-bar" class="yard-upload-bar find-upload-bar" aria-live="polite">
+        <div class="yard-up-lbl" id="find-up-lbl">Uploading…</div>
+        <div class="yard-up-track"><div class="yard-up-fill" id="find-up-fill"></div></div>
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="secondary" id="find-cancel">Cancel</button>
+        <button type="button" class="primary" id="find-save">Log it</button>
+      </div>
+    </div>
+  </div>
+
+  <datalist id="loc-options"></datalist>
+
+  <script>
+  (function(){
+    var QUICK_CHIPS = [
+      "Windows down","Door unlocked","Flat tire","Fluid leak",
+      "Lights on","Wrong spot","Damaged","Missing fuel cap",
+      "Battery dead","Needs cleaning","No keys","Unsecured cargo"
+    ];
+    var BASIC_LOCATION_CHIPS = [
+      "AT INSIDE",
+      "AT OUTSIDE",
+      "CSC INSIDE",
+      "CSC OUTSIDE",
+      "FARM",
+      "FM&A OUTSIDE",
+      "FM&A PEN",
+      "GP INSIDE",
+      "GPL INSIDE",
+      "GP OUTSIDE",
+      "GPL OUTSIDE",
+      "GRAVEL LEFT",
+      "GRAVEL MIDDLE",
+      "GRAVEL RIGHT",
+      "MOS",
+      "RAILHEAD",
+      "READY LINE",
+      "SP INSIDE",
+      "SP OUTSIDE",
+      "TIRE SHOP"
+    ];
+    // Walker only ever logs what they actually see. "Not here" used to be a
+    // button, but the walker has no way of knowing what *should* be parked in
+    // any given lot, so asking them to declare absence was busy-work and
+    // produced bad findings. Absence is now derived on the FM&A side from
+    // "asset is on the ETIC roster but no walker has confirmed it in N days."
+    // If the walker isn't sure about an asset, they leave it untagged.
+    var STATUS = [
+      { id: "present", label: "Found it", icon: "✓" }
+    ];
+
+    var state = {
+      roster: null,
+      assets: [],
+      locations: [],
+      filter: "all",
+      search: "",
+      walker: localStorage.getItem("yard.walker") || "",
+      openId: null,
+      detail: null,
+      draft: { status: "present", location: "", discrepancies: "" },
+      saving: false,
+      photoCache: {}, // assetId -> photos[]
+      deskSelectedId: null,
+      deskDetailById: {},
+      deskHistChecks: null,
+      deskHistEdits: null
+    };
+
+    var $ = function(id){ return document.getElementById(id); };
+
+    function fmtAge(days, never){
+      if (never) return "Never";
+      if (days === 0) return "Today";
+      if (days === 1) return "1 day ago";
+      return days + " days ago";
+    }
+    function ageClass(a){
+      if (a.isNeverChecked) return "age never";
+      if (a.rollingState === "overdue") return "age overdue";
+      if (a.rollingState === "due") return "age due";
+      return "age";
+    }
+
+    function showToast(msg, isErr){
+      var t = $("toast");
+      t.textContent = msg;
+      t.className = "toast show" + (isErr ? " err" : "");
+      clearTimeout(t._h);
+      t._h = setTimeout(function(){ t.className = "toast"; }, 2200);
+    }
+
+    function requireWalkerName(){
+      if ((state.walker || "").trim()) return true;
+      showToast("Enter your name before saving", true);
+      var inp = document.querySelector(".walker-name-input");
+      if (inp) inp.focus();
+      return false;
+    }
+
+    function renderWalker(){
+      var htmlNamed = state.walker
+        ? ("Walking as <b>" + escapeHtml(state.walker) + "</b> &middot; <a href='#' class='walker-edit'>change</a>")
+        : ("<input class='walker-name-input' type='text' placeholder='Your name (required)' autocomplete='name' />");
+      [["walker", "walker-row"], ["walker-desk", "walker-row yard-desktop-walker"]].forEach(function(pair){
+        var w = $(pair[0]);
+        if (!w) return;
+        w.className = pair[1] + (state.walker ? "" : " input");
+        w.innerHTML = htmlNamed;
+      });
+      document.querySelectorAll(".walker-name-input").forEach(function(inp){
+        inp.value = state.walker || "";
+        if (inp._yardSave) {
+          inp.removeEventListener("change", inp._yardSave);
+          inp.removeEventListener("blur", inp._yardSave);
+        }
+        inp._yardSave = function(){
+          var v = inp.value.trim();
+          if (!v) return;
+          state.walker = v;
+          localStorage.setItem("yard.walker", v);
+          renderWalker();
+          if (typeof syncChiprowOffset === "function") syncChiprowOffset();
+        };
+        inp.addEventListener("change", inp._yardSave);
+        inp.addEventListener("blur", inp._yardSave);
+      });
+    }
+
+    function escapeHtml(s){
+      return String(s == null ? "" : s)
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    }
+    var YM = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
+    function fmtYardSnapshotKey(k){
+      if (k == null || k === "") return "";
+      var m = String(k).match(/^(d{4})-(d{2})-(d{2})/);
+      if (!m) return String(k);
+      var d = new Date(Date.UTC(parseInt(m[1], 10), parseInt(m[2], 10) - 1, parseInt(m[3], 10)));
+      if (isNaN(d.getTime())) return String(k);
+      var dd = String(d.getUTCDate()).padStart(2, "0");
+      return dd + " " + YM[d.getUTCMonth()] + " " + String(d.getUTCFullYear()).slice(-2);
+    }
+    function normYardAsset(s){
+      return String(s == null ? "" : s).trim().toUpperCase();
+    }
+    function normLoc(s){
+      return String(s == null ? "" : s).trim().toUpperCase();
+    }
+
+    /** Due means latest-ingest open WO plus no present check inside the yard interval. */
+    function yardDueForCheck(a){
+      if (a.isUnlisted) return false;
+      if (!(Number(a.openWoCount) > 0)) return false;
+      if (!a.lastCheckedAtIso) return true;
+      return Number(a.daysSinceLastCheck) >= Number((state.roster && state.roster.intervalDays) || 7);
+    }
+
+    function applyFilter(){
+      var q = state.search.trim().toLowerCase();
+      var filt = state.filter;
+      return state.assets.filter(function(a){
+        if (filt === "needs_action" && !yardDueForCheck(a)) return false;
+        if (filt === "done" && a.rollingState !== "fresh") return false;
+        if (!q) return true;
+        var hay = (a.assetId + " " + (a.vinSerial||"") + " " + (a.makeModel||"") + " " +
+          (a.owningUnit||"") + " " + (a.shop||"") + " " + (a.lastLocation||"")).toLowerCase();
+        return hay.indexOf(q) !== -1;
+      });
+    }
+
+    function refreshCounts(){
+      if (!state.roster) return;
+      var t = state.roster.totals || {};
+      var dueSum = (t.due||0) + (t.overdue||0) + (t.never||0);
+      document.querySelectorAll("[data-stat='t-due']").forEach(function(el){ el.textContent = String(dueSum); });
+      document.querySelectorAll("[data-stat='t-today']").forEach(function(el){ el.textContent = String(t.checkedToday || 0); });
+      function yc(key, val){
+        document.querySelectorAll("[data-yc='" + key + "']").forEach(function(el){ el.textContent = String(val); });
+      }
+      yc("all", state.assets.length);
+      yc("needs_action", state.assets.filter(yardDueForCheck).length);
+      yc("done", state.assets.filter(function(a){ return a.rollingState === "fresh"; }).length);
+    }
+
+    function yardListLocBlock(a){
+      var raw = (a.lastLocation || "").trim();
+      if (raw) {
+        return '<div class="row-loc"><span class="row-loc-lbl">Last parked at</span>' + escapeHtml(raw) + '</div>';
+      }
+      return '<div class="row-loc muted"><span class="row-loc-lbl">Last parked at</span>No location logged yet</div>';
+    }
+    function renderList(){
+      var rows = applyFilter();
+      var list = $("list");
+      if (!rows.length) {
+        list.innerHTML = '<div class="empty"><div class="big">✨</div>' +
+          (state.assets.length ? "No assets match." : "No assets in fleet.") + '</div>';
+        return;
+      }
+      var html = "";
+      for (var i = 0; i < rows.length; i++) {
+        var a = rows[i];
+        var sub = [];
+        if (a.shop) sub.push("🔧 " + escapeHtml(a.shop));
+        else if (a.owningUnit) sub.push(escapeHtml(a.owningUnit));
+        if (a.makeModel) sub.push(escapeHtml(a.makeModel));
+        // Badges = orthogonal flags only. The colored age line below already
+        // conveys never/due/overdue/done, so we don't repeat it here.
+        var badges = "";
+        if (a.isUnlisted) badges += '<span class="badge unlisted">Found, no WO</span>';
+        if (a.isNewAsset) badges += '<span class="badge new">NEW</span>';
+        if (a.isNce) badges += '<span class="badge nce">NCE</span>';
+        if (a.isBelowMel) badges += '<span class="badge below-mel">Below MEL</span>';
+        if (a.photoCount > 0) badges += '<span class="badge photos">📷 ' + a.photoCount + '</span>';
+        html += '<div class="row" data-id="' + escapeHtml(a.assetId) + '">' +
+          '<div class="body">' +
+            '<div class="id">' + escapeHtml(a.assetId) + '</div>' +
+            yardListLocBlock(a) +
+            (sub.length ? '<div class="meta">' + sub.join(" · ") + '</div>' : '') +
+          '</div>' +
+          '<div class="right">' +
+            '<div class="badges">' + badges + '</div>' +
+            '<div class="' + ageClass(a) + '">' + fmtAge(a.daysSinceLastCheck, a.isNeverChecked) + '</div>' +
+          '</div>' +
+        '</div>';
+      }
+      list.innerHTML = html;
+      if (state.deskSelectedId && !rows.some(function(r){ return r.assetId === state.deskSelectedId; })) {
+        state.deskSelectedId = null;
+        var yde = document.getElementById("yard-desk-empty");
+        var ydf = document.getElementById("yard-desk-fill");
+        if (yde) yde.classList.remove("hidden");
+        if (ydf) ydf.classList.add("hidden");
+      }
+      renderDeskTable();
+    }
+
+    function truncDeskHtml(s, n){
+      s = String(s == null ? "" : s);
+      if (s.length <= n) return escapeHtml(s);
+      return escapeHtml(s.slice(0, n)) + "…";
+    }
+    function deskRollPillHtml(a){
+      if (a.isNeverChecked) return "<span class=\"yard-pill yard-pill-never\">Never</span>";
+      if (a.rollingState === "overdue") return "<span class=\"yard-pill yard-pill-overdue\">Overdue</span>";
+      if (a.rollingState === "due") return "<span class=\"yard-pill yard-pill-due\">Due</span>";
+      return "<span class=\"yard-pill yard-pill-fresh\">OK</span>";
+    }
+    function renderDeskTable(){
+      var tb = document.getElementById("yard-desk-tbody");
+      if (!tb) return;
+      var rows = applyFilter();
+      if (!rows.length) {
+        tb.innerHTML = "<tr><td colspan=\"4\" style=\"text-align:center;color:var(--muted);padding:24px\">No vehicles match.</td></tr>";
+        return;
+      }
+      var h = "";
+      for (var i = 0; i < rows.length; i++) {
+        var a = rows[i];
+        var loc = a.lastLocation
+          ? escapeHtml(a.lastLocation)
+          : '<span class="yard-desk-loc-unknown">No location yet</span>';
+        var notesRaw = (a.lastNotes || "").trim();
+        var notesCell = notesRaw ? truncDeskHtml(notesRaw, 160) : "<span style=\"color:var(--subtle)\">—</span>";
+        var active = state.deskSelectedId === a.assetId ? " yard-desk-active" : "";
+        h += "<tr class=\"yard-desk-tr" + active + "\" data-id=\"" + escapeHtml(a.assetId) + "\">" +
+          "<td class=\"col-asset\">" + escapeHtml(a.assetId) + "</td>" +
+          "<td class=\"col-loc\">" + loc + "</td>" +
+          "<td class=\"col-notes\">" + notesCell + "</td>" +
+          "<td class=\"col-meta\">" + deskRollPillHtml(a) +
+          (a.isNeverChecked ? "" : (" <span style=\"color:var(--subtle)\">" + escapeHtml(fmtAge(a.daysSinceLastCheck, false)) + "</span>")) +
+          "</td>" +
+          "</tr>";
+      }
+      tb.innerHTML = h;
+    }
+    function formatLastParkedMeta(a){
+      if (!a) return "";
+      if (a.isNeverChecked) {
+        return "No yard check location recorded yet.";
+      }
+      var iso = a.lastCheckedAtIso;
+      var by = (a.lastCheckedBy || "").trim();
+      if (!iso) {
+        return by ? ("Logged by " + by + " (time unavailable)") : "";
+      }
+      var d = new Date(iso);
+      if (isNaN(d.getTime())) return by ? ("By " + by) : "";
+      var rel = fmtRel(iso);
+      var abs = d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+      var s = rel + " · " + abs;
+      if (by) s += " · by " + by;
+      return s;
+    }
+
+    function selectDeskAsset(assetId){
+      state.deskSelectedId = assetId;
+      renderDeskTable();
+      var a = state.assets.find(function(x){ return x.assetId === assetId; });
+      var empty = document.getElementById("yard-desk-empty");
+      var fill = document.getElementById("yard-desk-fill");
+      if (!a || !empty || !fill) return;
+      empty.classList.add("hidden");
+      fill.classList.remove("hidden");
+      var elAsset = document.getElementById("yard-d-asset");
+      var elLoc = document.getElementById("yard-d-loc");
+      var elLocMeta = document.getElementById("yard-d-loc-meta");
+      var elNotes = document.getElementById("yard-d-notes");
+      if (elAsset) elAsset.textContent = a.assetId;
+      if (elLoc) {
+        elLoc.textContent = a.lastLocation || "No location logged yet";
+        elLoc.classList.toggle("muted", !((a.lastLocation || "").trim()));
+      }
+      if (elLocMeta) elLocMeta.textContent = formatLastParkedMeta(a);
+      if (elNotes) elNotes.textContent = (a.lastNotes || "").trim() || "(no notes on last check)";
+      loadDeskDetail(assetId);
+    }
+    function fillDeskHistory(d){
+      var sel = document.getElementById("yard-hist-sel");
+      var detailBox = document.getElementById("yard-hist-detail");
+      var deskEdit = document.getElementById("yard-desk-edit-check");
+      if (!sel) return;
+      var checks = (d && d.checks) ? d.checks.slice() : [];
+      checks.sort(function(a, b){ return (b.checkedAtIso || "").localeCompare(a.checkedAtIso || ""); });
+      state.deskHistChecks = checks;
+      state.deskHistEdits = (d && d.checkEdits) ? d.checkEdits.slice() : [];
+      if (!checks.length) {
+        sel.innerHTML = "<option value=\"\">No past checks</option>";
+        sel.disabled = true;
+        if (detailBox) detailBox.innerHTML = "<p style=\"color:var(--muted);margin:0\">No check history yet.</p>";
+        if (deskEdit) { deskEdit.disabled = true; deskEdit.removeAttribute("data-edit-check"); }
+        return;
+      }
+      sel.disabled = false;
+      var opts = [];
+      for (var i = 0; i < checks.length; i++) {
+        var c = checks[i];
+        var loc = (c.location || "").trim() || "—";
+        var t = fmtRel(c.checkedAtIso) + " · " + loc;
+        opts.push("<option value=\"" + i + "\">" + escapeHtml(t) + "</option>");
+      }
+      sel.innerHTML = opts.join("");
+      sel.selectedIndex = 0;
+      renderDeskHistDetail();
+    }
+    function renderDeskHistDetail(){
+      var sel = document.getElementById("yard-hist-sel");
+      var box = document.getElementById("yard-hist-detail");
+      var deskEdit = document.getElementById("yard-desk-edit-check");
+      if (!sel || !box || !state.deskHistChecks || !state.deskHistChecks.length) return;
+      var idx = parseInt(sel.value, 10);
+      if (!Number.isFinite(idx) || !state.deskHistChecks[idx]) {
+        box.innerHTML = "";
+        if (deskEdit) { deskEdit.disabled = true; deskEdit.removeAttribute("data-edit-check"); }
+        return;
+      }
+      var c = state.deskHistChecks[idx];
+      var when = fmtRel(c.checkedAtIso) + (c.checkedBy ? " · " + escapeHtml(c.checkedBy) : "");
+      var loc = (c.location || "").trim() || "—";
+      var disc = (c.discrepancies || "").trim();
+      var purls = c.checkPhotoUrls && c.checkPhotoUrls.length ? c.checkPhotoUrls : [];
+      var photoBlock = "";
+      if (purls.length) {
+        photoBlock =
+          '<div style="margin-top:10px"><strong>Photos from this check</strong></div>' +
+          '<div class="yard-desk-check-photos">' +
+          purls
+            .map(function (u) {
+              return (
+                '<button type="button" class="yard-desk-check-photo" data-yard-photo-url="' +
+                escapeHtml(u) +
+                '" aria-label="View full size photo">' +
+                '<img src="' +
+                escapeHtml(u) +
+                '" alt="" loading="lazy" decoding="async" /></button>'
+              );
+            })
+            .join("") +
+          "</div>";
+      }
+      var chg = changelogBlockForCheck(c.id, state.deskHistEdits);
+      var wob2 = {};
+      if (state.deskSelectedId && state.deskDetailById && state.deskDetailById[state.deskSelectedId]) {
+        wob2 = state.deskDetailById[state.deskSelectedId].workOrdersByCheckSourceDate || {};
+      }
+      var sk0 = (c.sourceDateKey || "").trim();
+      var eticBlock2 = "";
+      if (sk0) {
+        var wAt0 = wob2[sk0] || [];
+        if (wAt0.length) {
+          var lines0 = wAt0.map(function(w){
+            var rmk = (w.remarks || "").trim();
+            return "<div class=\"wo-mini\"><strong>WO " + escapeHtml(String(w.workOrderId)) + "</strong>" +
+              (w.shop ? " · " + escapeHtml(w.shop) : "") +
+              (rmk ? "<div class=\"wo-rmk\">" + escapeHtml(rmk) + "</div>" : "") + "</div>";
+          }).join("");
+          eticBlock2 = "<div style=\"margin-top:10px\"><strong>ETIC book (when checked)</strong> " + escapeHtml(fmtYardSnapshotKey(sk0)) + "</div>" + lines0;
+        } else {
+          eticBlock2 = "<div style=\"margin-top:10px;color:var(--muted);\">ETIC snapshot " + escapeHtml(fmtYardSnapshotKey(sk0)) + " had no open work orders for this asset in the book.</div>";
+        }
+      }
+      box.innerHTML =
+        "<div class=\"h-when\">" + escapeHtml(when) + "</div>" +
+        "<div><strong>Location:</strong> " + escapeHtml(loc) + "</div>" +
+        (disc ? "<div style=\"margin-top:8px;white-space:pre-wrap\"><strong>Notes:</strong> " + escapeHtml(disc) + "</div>" : "") +
+        photoBlock +
+        eticBlock2 +
+        (chg || "");
+      if (deskEdit) {
+        deskEdit.disabled = false;
+        deskEdit.setAttribute("data-edit-check", String(c.id));
+      }
+    }
+    function loadDeskDetail(assetId){
+      var sel = document.getElementById("yard-hist-sel");
+      var detailBox = document.getElementById("yard-hist-detail");
+      if (sel) {
+        sel.innerHTML = "<option value=\"\">Loading history…</option>";
+        sel.disabled = true;
+      }
+      if (detailBox) detailBox.textContent = "";
+      state.deskHistChecks = null;
+      state.deskHistEdits = null;
+      var deskEdit = document.getElementById("yard-desk-edit-check");
+      if (deskEdit) { deskEdit.disabled = true; deskEdit.removeAttribute("data-edit-check"); }
+      if (state.deskDetailById && state.deskDetailById[assetId]) {
+        fillDeskHistory(state.deskDetailById[assetId]);
+        return;
+      }
+      fetch("/api/yard/asset/" + encodeURIComponent(assetId), { cache: "no-store" })
+        .then(function(r){ return r.json(); })
+        .then(function(d){
+          if (state.deskSelectedId !== assetId) return;
+          state.deskDetailById = state.deskDetailById || {};
+          state.deskDetailById[assetId] = d;
+          fillDeskHistory(d);
+        })
+        .catch(function(){
+          if (state.deskSelectedId !== assetId) return;
+          if (sel) {
+            sel.innerHTML = "<option value=\"\">Could not load history</option>";
+            sel.disabled = true;
+          }
+          if (detailBox) detailBox.innerHTML = "<p style=\"color:var(--danger);margin:0\">Could not load history.</p>";
+        });
+    }
+    function wireYardDesk(){
+      var tb = document.getElementById("yard-desk-tbody");
+      if (tb && !tb._yardDesk) {
+        tb._yardDesk = true;
+        tb.addEventListener("click", function(e){
+          var tr = e.target.closest(".yard-desk-tr");
+          if (!tr) return;
+          var id = tr.getAttribute("data-id");
+          if (id) selectDeskAsset(id);
+        });
+      }
+      var btn = document.getElementById("yard-desk-open-full");
+      if (btn && !btn._yardDesk) {
+        btn._yardDesk = true;
+        btn.addEventListener("click", function(){
+          if (state.deskSelectedId) openSheet(state.deskSelectedId);
+        });
+      }
+      var hsel = document.getElementById("yard-hist-sel");
+      if (hsel && !hsel._yardDesk) {
+        hsel._yardDesk = true;
+        hsel.addEventListener("change", function(){ renderDeskHistDetail(); });
+      }
+      var hdet = document.getElementById("yard-hist-detail");
+      if (hdet && !hdet._yardDeskPhoto) {
+        hdet._yardDeskPhoto = true;
+        hdet.addEventListener("click", function (e) {
+          var pv = e.target.closest("[data-yard-photo-url]");
+          if (!pv) return;
+          e.preventDefault();
+          var u = pv.getAttribute("data-yard-photo-url");
+          if (u) openYardPhotoLbMob(u);
+        });
+      }
+    }
+
+    function rebuildLocations(){
+      var dl = $("loc-options");
+      var parts = [];
+      for (var i = 0; i < state.locations.length; i++) {
+        parts.push('<option value="' + escapeHtml(state.locations[i]) + '"></option>');
+      }
+      dl.innerHTML = parts.join("");
+    }
+
+    /** Load the rolling roster from the API. */
+    function loadRoster(){
+      return fetch("/api/yard/roster", { cache: "no-store" })
+        .then(function(r){ return r.json(); })
+        .then(function(data){
+          state.roster = data;
+          state.assets = data.assets || [];
+          state.locations = data.locations || [];
+          state.deskDetailById = {};
+          rebuildLocations();
+          refreshCounts();
+          renderList();
+          wireYardDesk();
+          if (state.deskSelectedId) {
+            var stillHere = state.assets.some(function(x){ return x.assetId === state.deskSelectedId; });
+            if (stillHere) loadDeskDetail(state.deskSelectedId);
+            else {
+              state.deskSelectedId = null;
+              var yde = document.getElementById("yard-desk-empty");
+              var ydf = document.getElementById("yard-desk-fill");
+              if (yde) yde.classList.remove("hidden");
+              if (ydf) ydf.classList.add("hidden");
+            }
+          }
+        })
+        .catch(function(err){
+          console.error("roster load failed", err);
+          showToast("Couldn't load fleet list", true);
+        });
+    }
+
+    function openSheet(assetId){
+      hideYardUploadProgress("sheet");
+      state.openId = assetId;
+      var n = normYardAsset(assetId);
+      var asset = state.assets.find(function(a){ return normYardAsset(a.assetId) === n; });
+      // Do not reuse photoCache for a different asset: stale thumbnails from
+      // the previous vehicle showed until the network fetch completed.
+      if (state.photoCache && state.photoCache[assetId]) delete state.photoCache[assetId];
+      state.detail = { asset: asset, photos: [], checks: [], checkEdits: [], openWorkOrders: [], workOrdersByCheckSourceDate: {} };
+      state.draft = {
+        status: "present",
+        location: (asset && asset.lastLocation) || "",
+        discrepancies: ""
+      };
+      renderSheet();
+      $("sheet").classList.add("open");
+      $("sheet").setAttribute("aria-hidden", "false");
+      document.body.classList.add("yard-desk-sheet-open");
+      document.body.style.overflow = "hidden";
+      // Pull the live detail (history + photos) async.
+      fetch("/api/yard/asset/" + encodeURIComponent(assetId), { cache: "no-store" })
+        .then(function(r){ return r.json(); })
+        .then(function(d){
+          if (state.openId !== assetId) return;
+          state.detail = d;
+          state.photoCache[assetId] = d.photos || [];
+          renderSheet();
+        })
+        .catch(function(){});
+    }
+
+    function closeSheet(){
+      $("sheet").classList.remove("open");
+      $("sheet").setAttribute("aria-hidden", "true");
+      document.body.classList.remove("yard-desk-sheet-open");
+      document.body.style.overflow = "";
+      state.openId = null;
+      hideYardUploadProgress("sheet");
+    }
+
+    function showYardUploadProgress(which, pct, label) {
+      var bar = which === "find" ? $("find-upload-bar") : $("yard-upload-bar");
+      var fill = which === "find" ? $("find-up-fill") : $("yard-up-fill");
+      var lbl = which === "find" ? $("find-up-lbl") : $("yard-up-lbl");
+      if (!bar || !fill || !lbl) return;
+      bar.classList.add("show");
+      bar.removeAttribute("hidden");
+      fill.style.width = Math.max(0, Math.min(100, pct)) + "%";
+      lbl.textContent = label || "Uploading…";
+    }
+    function hideYardUploadProgress(which) {
+      var bar = which === "find" ? $("find-upload-bar") : $("yard-upload-bar");
+      var fill = which === "find" ? $("find-up-fill") : $("yard-up-fill");
+      if (bar) {
+        bar.classList.remove("show");
+        bar.setAttribute("hidden", "");
+      }
+      if (fill) fill.style.width = "0%";
+    }
+    function postYardPhotoMultipart(fd, which, fileLabel, onJson, onErr, onFinally) {
+      var xhr = new XMLHttpRequest();
+      xhr.open("POST", "/api/yard/photo");
+      xhr.upload.onprogress = function (ev) {
+        if (!ev.lengthComputable) {
+          showYardUploadProgress(which, 6, (fileLabel || "Photo") + " — sending…");
+          return;
+        }
+        var pct = ev.total ? Math.round((ev.loaded / ev.total) * 100) : 0;
+        showYardUploadProgress(which, pct, (fileLabel || "Photo") + " — " + pct + "%");
+      };
+      function done() {
+        if (typeof onFinally === "function") onFinally();
+      }
+      xhr.onload = function () {
+        hideYardUploadProgress(which);
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            onJson(JSON.parse(xhr.responseText || "{}"));
+          } catch (e) {
+            onErr(new Error("Invalid server response"));
+          }
+        } else {
+          try {
+            var j = JSON.parse(xhr.responseText || "{}");
+            onErr(new Error(j.error || ("HTTP " + xhr.status)));
+          } catch (e2) {
+            onErr(new Error("Upload failed (" + xhr.status + ")"));
+          }
+        }
+        done();
+      };
+      xhr.onerror = function () {
+        hideYardUploadProgress(which);
+        onErr(new Error("Network error"));
+        done();
+      };
+      xhr.send(fd);
+    }
+
+    function renderSheet(){
+      var d = state.detail;
+      if (!d || !d.asset) {
+        $("sheet-title").textContent = "Asset";
+        $("sheet-body").innerHTML = "<div class='empty'>Loading…</div>";
+        return;
+      }
+      var a = d.asset;
+      $("sheet-title").textContent = a.assetId;
+
+      // Quick chips section
+      var chips = state.draft.discrepancies.split(/\s*[;\n]\s*/).map(function(s){return s.trim();}).filter(Boolean);
+      var chipHtml = QUICK_CHIPS.map(function(c){
+        var on = chips.indexOf(c) !== -1;
+        return '<button class="chip ' + (on ? "on" : "") + '" data-chip="' + escapeHtml(c) + '">' + escapeHtml(c) + '</button>';
+      }).join("");
+      var curLocNorm = normLoc(state.draft.location);
+      var hasBasicLoc = BASIC_LOCATION_CHIPS.some(function(c){ return normLoc(c) === curLocNorm; });
+      var locChipHtml = BASIC_LOCATION_CHIPS.map(function(c){
+        var on = normLoc(c) === curLocNorm;
+        return '<button class="chip ' + (on ? "on" : "") + '" data-loc-chip="' + escapeHtml(c) + '">' + escapeHtml(c) + '</button>';
+      }).join("");
+      var customLoc = hasBasicLoc ? "" : (state.draft.location || "");
+
+      // STATUS is single-button now ("Found it") and isn't rendered as its
+      // own row anymore — the act of saving the sheet implies presence. We
+      // still send status:"present" on save so the API + downstream readers
+      // see a normal value. STATUS is kept around in case we ever need to
+      // reintroduce a per-asset state picker.
+      void STATUS;
+
+      var photos = d.photos || [];
+      var photoHtml = "";
+      for (var i = 0; i < photos.length; i++) {
+        var p = photos[i];
+        photoHtml += '<div class="photo" data-photo-id="' + p.id + '">' +
+          '<button type="button" class="yard-photo-view" data-yard-photo-url="' + escapeHtml(p.url) + '" aria-label="View full size">' +
+            '<img src="' + escapeHtml(p.url) + '" alt="" loading="lazy" />' +
+          '</button>' +
+          '<button class="x" data-del-photo="' + p.id + '" aria-label="Delete">×</button>' +
+          '<div class="meta">' + (p.uploadedBy ? escapeHtml(p.uploadedBy) + " · " : "") + fmtRel(p.uploadedAtIso) + '</div>' +
+        '</div>';
+      }
+      photoHtml += '<label class="photo-add" id="photo-add">' +
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg>' +
+        '<span>Take photo</span>' +
+        '<input type="file" id="photo-input" accept="image/*" capture="environment" />' +
+      '</label>';
+
+      var checks = d.checks || [];
+      var allEdits = d.checkEdits || [];
+      var historyHtml = "";
+      if (checks.length) {
+        var wob = d.workOrdersByCheckSourceDate || {};
+        historyHtml = '<ul class="history">';
+        for (var j = 0; j < Math.min(checks.length, 8); j++) {
+          var c = checks[j];
+          var det = [];
+          if (c.location) det.push("📍 " + escapeHtml(c.location));
+          if (c.status && c.status !== "present") det.push(escapeHtml(c.status));
+          if (c.discrepancies) det.push(escapeHtml(c.discrepancies));
+          var sk = (c.sourceDateKey || "").trim();
+          if (sk) {
+            var wAt = wob[sk];
+            if (wAt && wAt.length) {
+              var wparts = wAt.map(function(w){
+                var rmk = (w.remarks || "").trim();
+                return "WO " + w.workOrderId + (w.shop ? " (" + w.shop + ")" : "") + (rmk ? " — " + escapeHtml(rmk.length > 120 ? rmk.slice(0, 120) + "…" : rmk) : "");
+              });
+              det.push('<span class="history-etic">Book ' + escapeHtml(fmtYardSnapshotKey(sk)) + ':</span> ' + wparts.join("; "));
+            } else {
+              det.push('<span class="history-etic">ETIC ' + escapeHtml(fmtYardSnapshotKey(sk)) + ' — no open WOs on that snapshot for this ID.</span>');
+            }
+          }
+          var chg = changelogBlockForCheck(c.id, allEdits);
+          historyHtml += '<li><b>' + fmtRel(c.checkedAtIso) + '</b>' +
+            (c.checkedBy ? " by " + escapeHtml(c.checkedBy) : "") +
+            (det.length ? "<br/>" + det.join(" <br/> ") : "") +
+            (chg || "") +
+            '<div class="history-actions"><button type="button" data-edit-check="' + c.id + '">Edit</button></div>' +
+          '</li>';
+        }
+        historyHtml += '</ul>';
+      } else {
+        historyHtml = '<div style="color:var(--muted);font-size:13px;">No previous checks.</div>';
+      }
+
+      var lastSeen = a.isNeverChecked ? "Never checked" :
+        (fmtAge(a.daysSinceLastCheck, false) + (a.lastCheckedBy ? " by " + escapeHtml(a.lastCheckedBy) : ""));
+
+      var locRawHero = (a.lastLocation || "").trim();
+      var locHeroValClass = "yard-loc-hero-value" + (locRawHero ? "" : " unknown");
+      var locHeroValInner = locRawHero ? escapeHtml(locRawHero) : "No location logged yet";
+      var locHeroSubParts = [];
+      if (a.shop) locHeroSubParts.push(escapeHtml(a.shop));
+      if (a.makeModel) locHeroSubParts.push(escapeHtml(a.makeModel));
+      var locHeroSubBlock = locHeroSubParts.length
+        ? ('<div class="yard-loc-hero-sub">' + locHeroSubParts.join(" · ") + '</div>')
+        : "";
+      var locMetaStr = formatLastParkedMeta(a);
+      var locHeroMetaBlock = locMetaStr
+        ? ('<div class="yard-loc-hero-meta">' + escapeHtml(locMetaStr) + '</div>')
+        : "";
+      var locHeroBlock =
+        '<div class="yard-loc-hero">' +
+          '<div class="yard-loc-hero-label">Last known parking spot</div>' +
+          '<div class="' + locHeroValClass + '">' + locHeroValInner + '</div>' +
+          locHeroSubBlock +
+          locHeroMetaBlock +
+          '<p class="yard-loc-hero-hint">Open <strong>Log a yard visit</strong> below only when you are saving a new check, photo, or note.</p>' +
+        '</div>';
+
+      // Open work orders for this asset — the remarks fleet managers actually
+      // care about. Shows the most recently changed remark first.
+      var wos = d.openWorkOrders || [];
+      var wosHtml = "";
+      if (wos.length) {
+        for (var k = 0; k < wos.length; k++) {
+          var w = wos[k];
+          var tier = (w.melTier || "").toLowerCase();
+          var tierPill = tier ? '<span class="pill ' + escapeHtml(tier) + '">' + escapeHtml(tier.toUpperCase()) + ' MEL</span>' : '';
+          var partsPill = w.partsStatus ? '<span class="pill">Parts: ' + escapeHtml(w.partsStatus) + '</span>' : '';
+          var eticPill = w.eticRaw ? '<span class="pill">ETIC ' + escapeHtml(fmtEtic(w.eticRaw)) + '</span>' : '';
+          var pushPill = (w.eticPushCount || 0) > 0 ? '<span class="pill">' + w.eticPushCount + 'x pushed</span>' : '';
+          var remark = (w.remarks || "").trim();
+          var remarkAge = w.lastRemarkChangeDate ? "Remark updated " + fmtRel(w.lastRemarkChangeDate) : "";
+          wosHtml +=
+            '<div class="wo">' +
+              '<div class="wo-head">' +
+                '<span class="id">WO ' + escapeHtml(w.workOrderId) + '</span>' +
+                (w.shop ? '<span class="pill">' + escapeHtml(w.shop) + '</span>' : '') +
+                tierPill + partsPill + eticPill + pushPill +
+              '</div>' +
+              (remark
+                ? '<div class="wo-remark">' + escapeHtml(remark) + '</div>'
+                : '<div class="wo-remark" style="color:var(--muted2);font-style:italic;">(no remarks recorded)</div>') +
+              (remarkAge ? '<div class="wo-meta">' + remarkAge + '</div>' : '') +
+            '</div>';
+        }
+      }
+
+      var unlistedBanner = a.isUnlisted
+        ? '<div class="unlisted-banner">' +
+            '<b>Found, no open WO</b>' +
+            'A walker logged this asset, but it does not have an open work order in the latest ETIC. ' +
+            'Have a fleet manager open a WO or correct the record.' +
+          '</div>'
+        : '';
+
+      // FM&A action banner — surface the most recent follow-up action so the
+      // walker knows whether someone is on it, and what they should do (e.g.
+      // "this missing report was already actioned, look again before re-flagging").
+      var actions = d.actions || [];
+      var fmaBanner = "";
+      if (actions.length) {
+        var act = actions[0];
+        var resLabels = {
+          resolved: "Resolved", in_progress: "In progress", dismissed: "Dismissed",
+          wo_opened: "WO opened", retired: "Retired", reassigned: "Reassigned"
+        };
+        var kindLabels = { missing: "Missing", unlisted: "Found, no open WO", discrepancy: "Discrepancy", unknown: "Unknown" };
+        var label = resLabels[act.resolution] || act.resolution;
+        var kindLbl = kindLabels[act.kind] || act.kind;
+        var woTxt = act.woOpened ? " (WO #" + escapeHtml(act.woOpened) + ")" : "";
+        var noteTxt = act.note ? '<div style="margin-top:4px;font-style:italic;">“' + escapeHtml(act.note) + '”</div>' : "";
+        fmaBanner =
+          '<div class="unlisted-banner" style="background:#e6f4ec;border-color:#9bd6b1;color:#0a3318;">' +
+            '<b>FM&amp;A acknowledged</b>' +
+            kindLbl + ' → ' + escapeHtml(label) + woTxt +
+            ' · by ' + escapeHtml(act.resolvedBy || "(unknown)") +
+            ' · ' + fmtRel(act.resolvedAtIso) +
+            noteTxt +
+          '</div>';
+      }
+
+      var logVisitInner =
+        // Walker only logs assets they actually see. The "Status" row used to
+        // include a "Not here" button — see the comment above STATUS for why
+        // it was removed. The single "Found it" button now lives at the bottom
+        // (Save) implicitly: opening this sheet and tapping Save is the act of
+        // confirming presence.
+        '<div class="card">' +
+          '<h4>Parking spot (new check)</h4>' +
+          '<div class="chip-pick" id="loc-pick">' + locChipHtml + '</div>' +
+          '<input id="loc-input-other" list="loc-options" placeholder="Other location (optional)" value="' + escapeHtml(customLoc) + '" style="margin-top:8px;" />' +
+        '</div>' +
+        '<div class="card">' +
+          '<h4>Discrepancies</h4>' +
+          '<div class="chip-pick" id="chip-pick">' + chipHtml + '</div>' +
+          '<textarea id="disc-input" placeholder="Tap chips above or type custom notes (use ; or new line to separate)…" style="margin-top:8px;">' + escapeHtml(state.draft.discrepancies) + '</textarea>' +
+        '</div>' +
+        '<div class="card">' +
+          '<h4>Photos <span style="color:var(--muted2);font-weight:normal;">(' + photos.length + ')</span></h4>' +
+          '<div class="photos">' + photoHtml + '</div>' +
+        '</div>';
+
+      $("sheet-body").innerHTML =
+        fmaBanner +
+        unlistedBanner +
+        locHeroBlock +
+        '<div class="card">' +
+          '<h4>Vehicle details</h4>' +
+          '<dl class="kv">' +
+            '<dt>Asset ID</dt><dd>' + escapeHtml(a.assetId) + '</dd>' +
+            (a.shop ? '<dt>Shop</dt><dd>' + escapeHtml(a.shop) + '</dd>' : '') +
+            (a.owningUnit ? '<dt>Unit</dt><dd>' + escapeHtml(a.owningUnit) + '</dd>' : '') +
+            (a.makeModel ? '<dt>Make/Model</dt><dd>' + escapeHtml(a.makeModel) + '</dd>' : '') +
+            (a.vehNomen ? '<dt>Nomen</dt><dd>' + escapeHtml(a.vehNomen) + '</dd>' : '') +
+            (a.vinSerial ? '<dt>VIN/Serial</dt><dd style="font-family:ui-monospace,monospace;">' + escapeHtml(a.vinSerial) + '</dd>' : '') +
+            (a.openWoCount ? '<dt>Open WOs</dt><dd>' + a.openWoCount + '</dd>' : '') +
+            '<dt>Last seen</dt><dd>' + lastSeen + '</dd>' +
+          '</dl>' +
+        '</div>' +
+        (wos.length
+          ? ('<div class="card">' +
+              '<h4>Open work orders <span style="color:var(--muted2);font-weight:normal;">(' + wos.length + ')</span></h4>' +
+              wosHtml +
+             '</div>')
+          : '') +
+        '<details class="yard-log-section">' +
+          '<summary>Log a yard visit (location, notes, photos)</summary>' +
+          logVisitInner +
+        '</details>' +
+        '<div class="card">' +
+          '<h4>Check history</h4>' +
+          historyHtml +
+        '</div>';
+
+      bindSheetEvents();
+    }
+
+    function fmtRel(iso){
+      if (!iso) return "";
+      var d = new Date(iso);
+      if (isNaN(d.getTime())) return iso;
+      var diff = (Date.now() - d.getTime()) / 1000;
+      if (diff < 60) return "just now";
+      if (diff < 3600) return Math.floor(diff/60) + "m ago";
+      if (diff < 86400) return Math.floor(diff/3600) + "h ago";
+      var days = Math.floor(diff/86400);
+      if (days < 30) return days + "d ago";
+      return d.toLocaleDateString(undefined, { day: "2-digit", month: "short", year: "2-digit" });
+    }
+
+    function changelogBlockForCheck(checkId, allEdits){
+      var eds = (allEdits || []).filter(function(e){ return e.checkId === checkId; });
+      if (!eds.length) return "";
+      var lines = eds.map(function(e){
+        var parts = [];
+        if (e.before && e.after && e.before.location !== e.after.location) parts.push("location");
+        if (e.before && e.after && e.before.discrepancies !== e.after.discrepancies) parts.push("notes");
+        if (e.before && e.after && e.before.status !== e.after.status) {
+          parts.push("status (" + (e.before.status || "") + " → " + (e.after.status || "") + ")");
+        }
+        var summary = parts.length ? parts.join(", ") : "updated";
+        return '<div class="cl-line">' + escapeHtml(e.editedBy) + " · " + fmtRel(e.editedAtIso) + " — " + escapeHtml(summary) + "</div>";
+      });
+      return '<div class="yard-changelog"><div class="cl-title">Changelog</div>' + lines.join("") + "</div>";
+    }
+
+    function openEditCheckModal(check){
+      if (!check) return;
+      $("edit-check-id").value = String(check.id);
+      $("edit-check-loc").value = check.location || "";
+      $("edit-check-disc").value = check.discrepancies || "";
+      $("edit-check-status").value = check.status || "present";
+      var m = $("edit-check-modal");
+      m.classList.add("open");
+      m.setAttribute("aria-hidden", "false");
+    }
+    function closeEditCheckModal(){
+      var m = $("edit-check-modal");
+      m.classList.remove("open");
+      m.setAttribute("aria-hidden", "true");
+    }
+    function findCheckById(id){
+      var n = typeof id === "number" ? id : parseInt(String(id), 10);
+      if (!Number.isFinite(n)) return null;
+      var fromDesk = state.deskHistChecks && state.deskHistChecks.find(function(c){ return c.id === n; });
+      if (fromDesk) return fromDesk;
+      var fromDetail = state.detail && state.detail.checks && state.detail.checks.find(function(c){ return c.id === n; });
+      return fromDetail || null;
+    }
+    function saveEditCheck(){
+      if (!requireWalkerName()) return;
+      var raw = $("edit-check-id").value;
+      var id = parseInt(raw, 10);
+      if (!Number.isFinite(id)) return;
+      var st = $("edit-check-status").value;
+      var locEdit = ($("edit-check-loc").value || "").trim();
+      if (st === "present" && !locEdit) {
+        showToast("Enter location when status is Present / found.", true);
+        return;
+      }
+      var btn = $("edit-check-save");
+      btn.disabled = true;
+      fetch("/api/yard/check", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          checkId: id,
+          location: $("edit-check-loc").value,
+          discrepancies: $("edit-check-disc").value,
+          status: $("edit-check-status").value,
+          editedBy: (state.walker || "").trim()
+        })
+      })
+        .then(function(r){
+          if (!r.ok) return r.json().then(function(j){ throw new Error(j.error || "update failed"); });
+          return r.json();
+        })
+        .then(function(){
+          closeEditCheckModal();
+          showToast("Check updated");
+          var check = findCheckById(id);
+          var aid = check && check.assetId;
+          if (!aid) {
+            loadRoster();
+            return;
+          }
+          return fetch("/api/yard/asset/" + encodeURIComponent(aid), { cache: "no-store" })
+            .then(function(r){ return r.json(); })
+            .then(function(d){
+              if (state.openId === aid) {
+                state.detail = d;
+                state.photoCache[aid] = d.photos || [];
+                renderSheet();
+              }
+              if (state.deskSelectedId === aid) {
+                state.deskDetailById = state.deskDetailById || {};
+                state.deskDetailById[aid] = d;
+                fillDeskHistory(d);
+              }
+              loadRoster();
+            });
+        })
+        .catch(function(err){
+          showToast(err.message || "Update failed", true);
+        })
+        .finally(function(){
+          btn.disabled = false;
+        });
+    }
+
+    function deleteEditCheck(){
+      if (!requireWalkerName()) return;
+      var raw = $("edit-check-id").value;
+      var id = parseInt(raw, 10);
+      if (!Number.isFinite(id)) return;
+      var check = findCheckById(id);
+      var aid = check && check.assetId;
+      if (!confirm("Delete this yard check? This cannot be undone.")) return;
+      var delBtn = $("edit-check-delete");
+      var saveBtn = $("edit-check-save");
+      delBtn.disabled = true;
+      saveBtn.disabled = true;
+      fetch("/api/yard/check", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          checkId: id,
+          deletedBy: (state.walker || "").trim()
+        })
+      })
+        .then(function(r){
+          if (!r.ok) return r.json().then(function(j){ throw new Error(j.error || "delete failed"); });
+          return r.json();
+        })
+        .then(function(){
+          closeEditCheckModal();
+          showToast("Check deleted");
+          if (!aid) {
+            loadRoster();
+            return;
+          }
+          return fetch("/api/yard/asset/" + encodeURIComponent(aid), { cache: "no-store" })
+            .then(function(r){ return r.json(); })
+            .then(function(d){
+              if (state.openId === aid) {
+                state.detail = d;
+                state.photoCache[aid] = d.photos || [];
+                renderSheet();
+              }
+              if (state.deskSelectedId === aid) {
+                state.deskDetailById = state.deskDetailById || {};
+                state.deskDetailById[aid] = d;
+                fillDeskHistory(d);
+              }
+              loadRoster();
+            });
+        })
+        .catch(function(err){
+          showToast(err.message || "Delete failed", true);
+        })
+        .finally(function(){
+          delBtn.disabled = false;
+          saveBtn.disabled = false;
+        });
+    }
+
+    /* The ETIC raw cell can be either a real Excel date (parsed as ISO) or
+       free-text the unit typed in. Render dates compactly (e.g. "22 APR 26")
+       and pass anything else through untouched so weird notes still show. */
+    function fmtEtic(raw){
+      if (raw == null) return "";
+      var s = String(raw).trim();
+      if (!s) return "";
+      var iso = /^\d{4}-\d{2}-\d{2}/.test(s) ? s : "";
+      if (iso) {
+        var d = new Date(iso.length === 10 ? (iso + "T00:00:00Z") : iso);
+        if (!isNaN(d.getTime())) {
+          return d.toLocaleDateString("en-US", {
+            day: "2-digit", month: "short", year: "2-digit", timeZone: "UTC"
+          }).toUpperCase().replace(/,/g, "");
+        }
+      }
+      return s;
+    }
+
+    function bindSheetEvents(){
+      // No status row anymore — see comment above STATUS. Walker only logs
+      // assets they actually see, and "presence" is implicit in saving.
+      var cp = $("chip-pick");
+      if (cp) cp.addEventListener("click", function(e){
+        var btn = e.target.closest("[data-chip]");
+        if (!btn) return;
+        var chip = btn.getAttribute("data-chip");
+        var parts = state.draft.discrepancies.split(/\s*[;\n]\s*/).map(function(s){return s.trim();}).filter(Boolean);
+        var idx = parts.indexOf(chip);
+        if (idx === -1) parts.push(chip); else parts.splice(idx, 1);
+        state.draft.discrepancies = parts.join("; ");
+        renderSheet();
+      });
+      var lp = $("loc-pick");
+      if (lp) lp.addEventListener("click", function(e){
+        var btn = e.target.closest("[data-loc-chip]");
+        if (!btn) return;
+        state.draft.location = btn.getAttribute("data-loc-chip") || "";
+        renderSheet();
+      });
+      var locOther = $("loc-input-other");
+      if (locOther) locOther.addEventListener("input", function(){ state.draft.location = locOther.value; });
+      var disc = $("disc-input");
+      if (disc) disc.addEventListener("input", function(){ state.draft.discrepancies = disc.value; });
+      var pi = $("photo-input");
+      if (pi) pi.addEventListener("change", onPhotoPicked);
+      // Photo delete + edit check (delegate once — renderSheet runs often)
+      var sb = $("sheet-body");
+      if (sb && !sb._yardDelEv) {
+        sb._yardDelEv = true;
+        sb.addEventListener("click", function(e){
+          var pv = e.target.closest("[data-yard-photo-url]");
+          if (pv) {
+            e.preventDefault();
+            var u = pv.getAttribute("data-yard-photo-url");
+            if (u) openYardPhotoLbMob(u);
+            return;
+          }
+          var editB = e.target.closest("[data-edit-check]");
+          if (editB) {
+            e.preventDefault();
+            var cid = parseInt(editB.getAttribute("data-edit-check"), 10);
+            var ch = findCheckById(cid);
+            if (ch) openEditCheckModal(ch);
+            return;
+          }
+          var del = e.target.closest("[data-del-photo]");
+          if (del) {
+            e.preventDefault();
+            var pid = del.getAttribute("data-del-photo");
+            if (!confirm("Delete this photo?")) return;
+            fetch("/api/yard/photo/" + pid, { method: "DELETE" })
+              .then(function(){
+                if (!state.detail) return;
+                state.detail.photos = (state.detail.photos || []).filter(function(p){ return String(p.id) !== String(pid); });
+                if (state.openId) state.photoCache[state.openId] = state.detail.photos;
+                renderSheet();
+                showToast("Photo deleted");
+              })
+              .catch(function(){ showToast("Delete failed", true); });
+          }
+        });
+      }
+    }
+
+    function onPhotoPicked(e){
+      var input = e.target;
+      var file = input.files && input.files[0];
+      if (!file || !state.openId) return;
+      if (!requireWalkerName()) {
+        input.value = "";
+        return;
+      }
+      var fd = new FormData();
+      fd.append("assetId", state.openId);
+      fd.append("photo", file, file.name || "photo.jpg");
+      fd.append("uploadedBy", (state.walker || "").trim());
+      var btn = input.parentElement;
+      if (btn) btn.style.opacity = "0.5";
+      var label = (file.name || "photo") + " (" + Math.round(file.size / 1024) + " KB)";
+      showYardUploadProgress("sheet", 0, "Uploading " + label + "…");
+      postYardPhotoMultipart(fd, "sheet", label, function (j) {
+        if (!state.detail) state.detail = { asset: null, photos: [], checks: [], checkEdits: [] };
+        state.detail.photos = state.detail.photos || [];
+        if (j && j.photo) state.detail.photos.unshift(j.photo);
+        if (state.openId) state.photoCache[state.openId] = state.detail.photos;
+        var a = state.assets.find(function(x){ return x.assetId === state.openId; });
+        if (a) a.photoCount = (a.photoCount || 0) + 1;
+        renderSheet();
+        showToast("Photo uploaded");
+      }, function (err) {
+        showToast(err.message || "Upload failed", true);
+      }, function () {
+        if (btn) btn.style.opacity = "";
+        input.value = "";
+      });
+    }
+
+    function saveCheck(){
+      if (state.saving || !state.openId) return;
+      if (!requireWalkerName()) return;
+      var loc = (state.draft.location || "").trim();
+      if (!loc) {
+        showToast("Enter where the vehicle is parked, then save once.", true);
+        return;
+      }
+      state.saving = true;
+      var btn = $("save-btn");
+      btn.classList.add("saving");
+      btn.textContent = "Saving…";
+      fetch("/api/yard/check", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          assetId: state.openId,
+          location: state.draft.location,
+          discrepancies: state.draft.discrepancies,
+          status: "present",
+          checkedBy: (state.walker || "").trim()
+        })
+      })
+        .then(function(r){
+          if (!r.ok) return r.json().then(function(j){ throw new Error(j.error || "save failed"); });
+          return r.json();
+        })
+        .then(function(){
+          showToast("Check saved");
+          // Optimistic local update
+          var a = state.assets.find(function(x){ return x.assetId === state.openId; });
+          if (a) {
+            a.lastCheckedAtIso = new Date().toISOString();
+            a.lastCheckedBy = (state.walker || "").trim() || a.lastCheckedBy;
+            a.daysSinceLastCheck = 0;
+            a.rollingState = "fresh";
+            a.isNeverChecked = false;
+            if (state.draft.location) a.lastLocation = state.draft.location;
+            a.lastNotes = state.draft.discrepancies || "";
+          }
+          // Update totals quickly
+          if (state.roster && state.roster.totals) {
+            state.roster.totals.checkedToday = (state.roster.totals.checkedToday || 0) + 1;
+          }
+          refreshCounts();
+          renderList();
+          closeSheet();
+          // Background full refresh to pull authoritative totals.
+          loadRoster();
+        })
+        .catch(function(err){
+          showToast(err.message || "Save failed", true);
+        })
+        .finally(function(){
+          state.saving = false;
+          btn.classList.remove("saving");
+          btn.textContent = "Save check";
+        });
+    }
+
+    /* ----- find / needs-fix modal ----- */
+    function openYardPhotoLbMob(url) {
+      var m = $("yard-photo-lb-m");
+      var img = $("yard-photo-lb-img-m");
+      if (!m || !img || !url) return;
+      img.src = url;
+      m.classList.add("open");
+      m.setAttribute("aria-hidden", "false");
+    }
+    function closeYardPhotoLbMob() {
+      var m = $("yard-photo-lb-m");
+      var img = $("yard-photo-lb-img-m");
+      if (m) {
+        m.classList.remove("open");
+        m.setAttribute("aria-hidden", "true");
+      }
+      if (img) img.src = "";
+    }
+
+    function openFindModal(){
+      hideYardUploadProgress("find");
+      var m = $("find-modal");
+      m.classList.add("open");
+      m.setAttribute("aria-hidden", "false");
+      $("find-asset-id").value = "";
+      $("find-location").value = "";
+      $("find-notes").value = "";
+      var fp = $("find-photos-input");
+      if (fp) fp.value = "";
+      setTimeout(function(){ $("find-asset-id").focus(); }, 50);
+    }
+    function closeFindModal(){
+      hideYardUploadProgress("find");
+      var m = $("find-modal");
+      m.classList.remove("open");
+      m.setAttribute("aria-hidden", "true");
+    }
+    function saveFind(){
+      hideYardUploadProgress("find");
+      var id = ($("find-asset-id").value || "").trim();
+      if (!id) { showToast("Asset ID required", true); return; }
+      if (!requireWalkerName()) return;
+      var loc = ($("find-location").value || "").trim();
+      var notes = ($("find-notes").value || "").trim();
+      if (!loc) {
+        showToast("Enter where the vehicle is parked before logging.", true);
+        return;
+      }
+      var btn = $("find-save");
+      btn.disabled = true;
+      btn.textContent = "Saving…";
+      fetch("/api/yard/check", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          assetId: id, location: loc, discrepancies: notes,
+          status: "present", checkedBy: (state.walker || "").trim(),
+          fromFindUnlisted: true
+        })
+      })
+        .then(function(r){
+          if (!r.ok) return r.json().then(function(j){ throw new Error(j.error || "save failed"); });
+          return r.json();
+        })
+        .then(function(j){
+          var checkId = j && j.check && j.check.id;
+          var photoInp = $("find-photos-input");
+          var files = photoInp && photoInp.files ? Array.prototype.slice.call(photoInp.files) : [];
+          var by = (state.walker || "").trim();
+          function doneUi(msg){
+            showToast(msg);
+            closeFindModal();
+            if (photoInp) photoInp.value = "";
+            loadRoster();
+          }
+          if (!files.length) {
+            doneUi("Logged " + id);
+            return;
+          }
+          function uploadAt(index){
+            if (index >= files.length) {
+              hideYardUploadProgress("find");
+              doneUi("Logged " + id + " · " + files.length + " photo" + (files.length === 1 ? "" : "s"));
+              return;
+            }
+            var f = files[index];
+            var fd = new FormData();
+            fd.append("assetId", id);
+            fd.append("photo", f, f.name || "photo.jpg");
+            fd.append("uploadedBy", by);
+            if (checkId != null) fd.append("checkId", String(checkId));
+            var label = "Photo " + (index + 1) + "/" + files.length + ": " + (f.name || "photo") +
+              " (" + Math.round(f.size / 1024) + " KB)";
+            showYardUploadProgress("find", 0, "Uploading " + label + "…");
+            postYardPhotoMultipart(fd, "find", label, function () {
+              uploadAt(index + 1);
+            }, function (e) {
+              showToast(e.message || "Photo upload failed", true);
+              hideYardUploadProgress("find");
+              doneUi("Logged " + id);
+            });
+          }
+          uploadAt(0);
+        })
+        .catch(function(err){
+          showToast(err.message || "Save failed", true);
+        })
+        .finally(function(){
+          btn.disabled = false;
+          btn.textContent = "Log it";
+        });
+    }
+
+    /* ----- wire-up ----- */
+    document.addEventListener("click", function(e){
+      var eb = e.target.closest("[data-edit-check]");
+      if (eb && !eb.closest("#sheet-body")) {
+        var cid = parseInt(eb.getAttribute("data-edit-check"), 10);
+        if (Number.isFinite(cid)) {
+          var ch = findCheckById(cid);
+          if (ch) { openEditCheckModal(ch); return; }
+        }
+      }
+      var row = e.target.closest(".row[data-id]");
+      if (row) { openSheet(row.getAttribute("data-id")); return; }
+      var wedit = e.target.closest(".walker-edit");
+      if (wedit && (wedit.closest("#walker") || wedit.closest("#walker-desk"))) {
+        e.preventDefault();
+        state.walker = "";
+        renderWalker();
+        if (typeof syncChiprowOffset === "function") syncChiprowOffset();
+        return;
+      }
+      var chip = e.target.closest(".yard-filter-btn");
+      if (chip && chip.closest("#filters, #filters-desk")) {
+        var f = chip.getAttribute("data-filter") || "all";
+        document.querySelectorAll("#filters .yard-filter-btn, #filters-desk .yard-filter-btn").forEach(function(c){
+          c.classList.toggle("active", c.getAttribute("data-filter") === f);
+        });
+        state.filter = f;
+        renderList();
+        return;
+      }
+    });
+
+    $("sheet-back").addEventListener("click", closeSheet);
+    $("save-btn").addEventListener("click", saveCheck);
+    $("find-btn").addEventListener("click", openFindModal);
+    var findDesk = $("find-btn-desk");
+    if (findDesk) findDesk.addEventListener("click", openFindModal);
+    $("find-cancel").addEventListener("click", closeFindModal);
+    $("find-save").addEventListener("click", saveFind);
+    $("find-modal").addEventListener("click", function(e){
+      if (e.target === e.currentTarget) closeFindModal();
+    });
+    var yplbm = $("yard-photo-lb-m");
+    if (yplbm) {
+      yplbm.addEventListener("click", function (e) {
+        if (e.target === yplbm) closeYardPhotoLbMob();
+      });
+    }
+    var yplbx = $("yard-photo-lb-x-m");
+    if (yplbx) yplbx.addEventListener("click", function () { closeYardPhotoLbMob(); });
+    $("edit-check-cancel").addEventListener("click", closeEditCheckModal);
+    $("edit-check-delete").addEventListener("click", deleteEditCheck);
+    $("edit-check-save").addEventListener("click", saveEditCheck);
+    $("edit-check-modal").addEventListener("click", function(e){
+      if (e.target === e.currentTarget) closeEditCheckModal();
+    });
+
+    var searchTimer;
+    function wireSearchInput(el){
+      if (!el) return;
+      el.addEventListener("input", function(e){
+        var target = e.target;
+        clearTimeout(searchTimer);
+        searchTimer = setTimeout(function(){
+          state.search = target.value || "";
+          var other = target.id === "search" ? $("search-desk") : $("search");
+          if (other && other !== target) other.value = target.value;
+          renderList();
+        }, 120);
+      });
+    }
+    wireSearchInput($("search"));
+    wireSearchInput($("search-desk"));
+
+    // ESC key for desktop testing
+    document.addEventListener("keydown", function(e){
+      if (e.key === "Escape") {
+        if ($("yard-photo-lb-m") && $("yard-photo-lb-m").classList.contains("open")) { closeYardPhotoLbMob(); return; }
+        if ($("edit-check-modal").classList.contains("open")) { closeEditCheckModal(); return; }
+        if ($("find-modal").classList.contains("open")) { closeFindModal(); return; }
+        if (state.openId) closeSheet();
+      }
+    });
+
+    /**
+     * Pin the chiprow to the bottom of the topbar dynamically. The topbar's
+     * height changes when the walker name input collapses to a chip, so we
+     * can't hard-code it.
+     */
+    function syncChiprowOffset(){
+      var topbar = $("topbar");
+      var chiprow = document.querySelector(".chiprow");
+      if (!topbar || !chiprow) return;
+      if (window.matchMedia("(min-width: 960px)").matches) {
+        chiprow.style.top = "";
+        return;
+      }
+      var h = topbar.getBoundingClientRect().height;
+      chiprow.style.top = "calc(var(--safe-top) + " + Math.round(h) + "px)";
+    }
+    var ro = window.ResizeObserver ? new ResizeObserver(syncChiprowOffset) : null;
+    if (ro) ro.observe($("topbar"));
+    window.addEventListener("resize", syncChiprowOffset);
+
+    document.querySelectorAll("a.topbar-apps, a.yard-desktop-apps").forEach(function (el) {
+      el.addEventListener("click", function (e) {
+        e.preventDefault();
+        window.location.assign(el.href);
+      });
+    });
+
+    renderWalker();
+    loadRoster().then(function(){ syncChiprowOffset(); wireYardDesk(); });
+    setInterval(loadRoster, 30000);
+  })();
+  </script>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js/v8c78df7c7c0f484497ecbca7046644da1771523124516" integrity="sha512-8DS7rgIrAmghBFwoOTujcf6D9rXvH8xm8JQ1Ja01h9QX8EzXldiszufYa4IFfKdLUKTTrnSFXLDkUEOTrZQ8Qg==" data-cf-beacon='{"version":"2024.11.0","token":"3a3a3a6b85794d4d85a0c624556b419d","r":1,"server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
+</body>
+</html>

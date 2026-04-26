@@ -1,0 +1,869 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="theme-color" content="#003a8c" />
+  <meta name="color-scheme" content="light" />
+  <link rel="manifest" href="/waivers/manifest.webmanifest" />
+  <title>Minot AFB Vehicle Management · Waivers</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f3f5f8;
+      --bg1: #ffffff;
+      --bg2: #eef2f7;
+      --bg3: #e0e6ee;
+      --border: #d3d9e2;
+      --text: #0a1a3a;
+      --muted: #5b6675;
+      --muted2: #8a94a4;
+      --accent: #003a8c;
+      --accent-strong: #00276b;
+      --accent-fg: #ffffff;
+      --ok: #157f3a;
+      --warn: #a0670a;
+      --danger: #b00020;
+      --pending: #6a3fb8;
+      --safe-top: env(safe-area-inset-top, 0px);
+      --safe-bottom: env(safe-area-inset-bottom, 0px);
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { margin: 0; padding: 0; min-height: 100%; background: var(--bg); color: var(--text); }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      padding-top: var(--safe-top);
+      padding-bottom: calc(var(--safe-bottom) + 16px);
+      font-size: 16px;
+      line-height: 1.4;
+    }
+    header {
+      position: sticky; top: 0; z-index: 5;
+      background: var(--accent);
+      color: #ffffff;
+      border-bottom: 3px solid var(--accent-strong);
+      padding: 12px 16px 10px;
+      padding-top: calc(var(--safe-top) + 12px);
+    }
+    .h-row { display: flex; align-items: center; gap: 10px; }
+    .h-back {
+      background: rgba(255,255,255,0.14); border: 1px solid rgba(255,255,255,0.30); color: #ffffff;
+      width: 38px; height: 38px; border-radius: 8px; font-size: 20px; line-height: 1;
+      display: none; align-items: center; justify-content: center;
+    }
+    body.detail .h-back { display: inline-flex; }
+    .h-title { font-weight: 700; font-size: 1.05rem; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #ffffff; }
+    .h-sub { font-size: 0.78rem; color: rgba(255,255,255,0.78); margin-top: 2px; }
+    .h-switch {
+      flex: 0 0 auto; font-size: 0.72rem; font-weight: 600; color: #ffffff;
+      text-decoration: none; padding: 8px 10px; border-radius: 6px;
+      border: 1px solid rgba(255,255,255,0.35); background: rgba(255,255,255,0.10);
+    }
+    .h-switch:active { background: rgba(255,255,255,0.20); color: #ffffff; }
+    main { padding: 14px 16px 24px; max-width: 720px; margin: 0 auto; }
+    .lookup {
+      display: flex; gap: 8px; margin-top: 4px; align-items: flex-start;
+    }
+    .asset-ac { flex: 1; min-width: 0; position: relative; }
+    .lookup .asset-ac input {
+      width: 100%;
+      background: var(--bg1); border: 1px solid var(--border); color: var(--text);
+      border-radius: 12px; padding: 14px 14px; font-size: 1.05rem;
+      font-variant-numeric: tabular-nums;
+      box-sizing: border-box;
+    }
+    .lookup .asset-ac input:focus { outline: none; border-color: var(--accent); }
+    .asset-ac-hint {
+      margin-top: 8px; font-size: 0.76rem; color: var(--muted2); line-height: 1.35;
+    }
+    .asset-suggest {
+      position: absolute; left: 0; right: 0; top: calc(100% + 4px);
+      max-height: min(52vh, 360px); overflow-y: auto; -webkit-overflow-scrolling: touch;
+      background: var(--bg1); border: 1px solid var(--border); border-radius: 12px;
+      list-style: none; padding: 6px; margin: 0; z-index: 40;
+      box-shadow: 0 14px 44px rgba(0,0,0,0.5);
+    }
+    .asset-suggest li { margin: 0; padding: 0; }
+    .asset-suggest button {
+      width: 100%; text-align: left; padding: 12px 12px;
+      border: 0; border-radius: 10px; background: transparent; color: var(--text);
+      font-size: 0.98rem; font-variant-numeric: tabular-nums; cursor: pointer;
+    }
+    .asset-suggest button:active { background: var(--bg2); }
+    .btn {
+      background: var(--accent); color: var(--accent-fg); border: 0;
+      border-radius: 12px; padding: 14px 18px; font-size: 1rem; font-weight: 600;
+      display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    }
+    .btn.secondary { background: var(--bg2); color: var(--text); border: 1px solid var(--border); }
+    .btn.danger { background: var(--danger); color: var(--text); }
+    .btn.success { background: var(--ok); color: var(--accent-fg); }
+    .btn:disabled { opacity: 0.5; }
+    .btn.block { width: 100%; }
+    .btn-row { display: flex; gap: 8px; margin-top: 14px; }
+    .empty {
+      margin-top: 28px; text-align: center; color: var(--muted);
+      padding: 28px 16px; border: 1px dashed var(--border); border-radius: 14px;
+      background: var(--bg1);
+    }
+    .empty strong { color: var(--text); display: block; margin-bottom: 6px; }
+    .name-prompt {
+      margin-top: 16px; padding: 12px 14px; background: var(--bg1);
+      border: 1px solid var(--border); border-radius: 12px;
+    }
+    .name-prompt label { display: block; color: var(--muted); font-size: 0.78rem; margin-bottom: 6px; }
+    .name-prompt input {
+      width: 100%; background: var(--bg2); border: 1px solid var(--border); color: var(--text);
+      border-radius: 8px; padding: 10px 12px; font-size: 1rem;
+    }
+    .recent { margin-top: 18px; }
+    .recent .lbl { color: var(--muted); font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 6px; }
+    .recent .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+    .recent .chip {
+      background: var(--bg2); border: 1px solid var(--border); border-radius: 999px;
+      padding: 6px 12px; font-size: 0.86rem; color: var(--text); font-variant-numeric: tabular-nums;
+    }
+
+    .summary {
+      margin-top: 14px; padding: 14px;
+      background: var(--bg1); border: 1px solid var(--border); border-radius: 14px;
+      display: flex; align-items: center; gap: 14px;
+    }
+    .summary .asset {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 1.4rem; font-weight: 600; letter-spacing: -0.01em;
+    }
+    .summary .stat { color: var(--muted); font-size: 0.85rem; }
+    .summary .stat strong { color: var(--text); }
+
+    .wlist { margin-top: 14px; display: flex; flex-direction: column; gap: 10px; }
+    .wcard {
+      background: var(--bg1); border: 1px solid var(--border); border-radius: 10px;
+      overflow: hidden; box-shadow: 0 1px 2px rgba(15,30,60,0.04);
+    }
+    .wcard.pending { border-color: rgba(106,63,184,0.45); border-left: 3px solid var(--pending); }
+    .wcard.overdue { border-color: rgba(176,0,32,0.45); border-left: 3px solid var(--danger); }
+    .wcard.dueSoon { border-color: rgba(160,103,10,0.45); border-left: 3px solid var(--warn); }
+    .wcard-head {
+      padding: 12px 14px 6px;
+      display: flex; align-items: flex-start; gap: 10px;
+    }
+    .wcard-head .title { font-weight: 600; flex: 1; min-width: 0; }
+    .wcard-head .pill {
+      font-size: 0.7rem; padding: 2px 8px; border-radius: 999px;
+      border: 1px solid transparent; white-space: nowrap;
+      text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600;
+    }
+    .pill.approved { background: rgba(21,127,58,0.10); color: var(--ok); border-color: rgba(21,127,58,0.35); }
+    .pill.pending  { background: rgba(106,63,184,0.10); color: var(--pending); border-color: rgba(106,63,184,0.35); }
+    .pill.overdue  { background: rgba(176,0,32,0.08); color: var(--danger); border-color: rgba(176,0,32,0.40); }
+    .pill.dueSoon  { background: rgba(160,103,10,0.10); color: var(--warn); border-color: rgba(160,103,10,0.40); }
+    .wcard-body { padding: 0 14px 12px; color: var(--muted); font-size: 0.9rem; }
+    .wcard-body .desc { color: var(--text); margin-bottom: 6px; white-space: pre-wrap; }
+    .wcard-body .meta { font-size: 0.78rem; }
+    .wcard-photos {
+      display: flex; flex-wrap: wrap; gap: 8px;
+      padding: 10px 12px; border-top: 1px solid var(--border);
+      background: var(--bg2);
+    }
+    .wcard-photo {
+      display: block; width: calc(50% - 4px); max-width: 100%; min-width: 120px;
+      flex: 1 1 140px; max-height: 200px; object-fit: cover;
+      border-radius: 8px; border: 1px solid var(--border);
+      background: #0a1a3a;
+    }
+    .wcard-video {
+      display: block; width: calc(50% - 4px); max-width: 100%; min-width: 120px;
+      flex: 1 1 140px; max-height: 240px;
+      border-radius: 8px; border: 1px solid var(--border);
+      background: #0a1a3a;
+    }
+    @media (max-width: 420px) {
+      .wcard-photo { width: 100%; flex: 1 1 100%; max-height: 240px; }
+    }
+    .sub-preview-grid {
+      display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px;
+    }
+    .sub-preview-grid .sub-thumb {
+      width: 76px; height: 76px; object-fit: cover; border-radius: 8px;
+      border: 1px solid var(--border); background: #0a1a3a;
+    }
+    .sub-preview-grid .sub-video {
+      width: 76px; height: 76px; border-radius: 8px;
+      border: 1px solid var(--border); background: #0a1a3a;
+      object-fit: cover;
+    }
+    .wcard-actions {
+      display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 12px;
+      background: var(--bg2); border-top: 1px solid var(--border);
+    }
+    .wcard-actions .btn { flex: 1 1 120px; padding: 12px; font-size: 0.92rem; }
+    .wcard-actions .btn.danger { flex: 1 1 100px; }
+
+    .modal-back {
+      position: fixed; inset: 0; z-index: 20;
+      background: rgba(15,30,60,0.45); backdrop-filter: blur(2px);
+      display: none; align-items: flex-end; justify-content: center;
+    }
+    .modal-back.open { display: flex; }
+    .modal {
+      width: 100%; max-width: 720px; background: var(--bg1);
+      border-top: 1px solid var(--border);
+      border-radius: 14px 14px 0 0;
+      padding: 16px 16px calc(var(--safe-bottom) + 16px);
+      max-height: 90vh; overflow-y: auto;
+      box-shadow: 0 -8px 24px rgba(15,30,60,0.18);
+    }
+    .modal h2 { margin: 0 0 12px; font-size: 1.1rem; }
+    .modal label { display: block; color: var(--muted); font-size: 0.78rem; margin: 10px 0 4px; }
+    .modal input[type=text], .modal textarea {
+      width: 100%; background: var(--bg2); border: 1px solid var(--border); color: var(--text);
+      border-radius: 10px; padding: 12px; font-size: 1rem; font-family: inherit;
+    }
+    .modal textarea { min-height: 96px; resize: vertical; }
+    .modal .file-row { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
+    .modal .file-row input[type=file] { display: none; }
+    .modal .file-btn {
+      background: var(--bg2); border: 1px solid var(--border); color: var(--text);
+      border-radius: 10px; padding: 12px 14px; font-size: 0.95rem; cursor: pointer;
+    }
+    .modal .preview {
+      margin-top: 10px; max-width: 100%; max-height: 240px; object-fit: contain;
+      border-radius: 8px; background: #0a1a3a;
+    }
+    .modal .err { color: var(--danger); font-size: 0.85rem; margin-top: 10px; }
+    .modal .ok  { color: var(--ok); font-size: 0.85rem; margin-top: 10px; }
+
+    .verif-log { margin-top: 14px; font-size: 0.82rem; color: var(--muted); }
+    .verif-log .row { padding: 4px 0; border-bottom: 1px dashed var(--border); }
+    .verif-log .row:last-child { border-bottom: 0; }
+
+    .toast {
+      position: fixed; bottom: calc(var(--safe-bottom) + 18px); left: 50%;
+      transform: translateX(-50%) translateY(20px);
+      background: #0a1a3a; border: 1px solid #0a1a3a; color: #ffffff;
+      padding: 10px 16px; border-radius: 8px; font-size: 0.92rem;
+      box-shadow: 0 6px 18px rgba(15,30,60,0.25);
+      opacity: 0; transition: opacity 0.2s, transform 0.2s; pointer-events: none;
+      z-index: 30;
+    }
+    .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+    .toast.err { background: var(--danger); border-color: var(--danger); color: #ffffff; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="h-row">
+      <button type="button" class="h-back" id="back-btn" aria-label="Back">‹</button>
+      <div style="flex:1; min-width:0;">
+        <div class="h-title" id="h-title">Minot AFB Vehicle Management</div>
+        <div class="h-sub" id="h-sub">Pull up an asset to view or request waivers.</div>
+      </div>
+      <a class="h-switch" href="/go">Apps</a>
+    </div>
+  </header>
+
+  <main>
+    <div id="view-lookup">
+      <div class="lookup">
+        <div class="asset-ac">
+          <input id="asset-input" type="text" inputmode="text" autocapitalize="characters" autocorrect="off"
+                 spellcheck="false" placeholder="Type part of an asset id…"
+                 autocomplete="off" role="combobox" aria-autocomplete="list" aria-controls="asset-suggest" aria-expanded="false" />
+          <ul id="asset-suggest" class="asset-suggest" hidden role="listbox" aria-label="Matching asset ids"></ul>
+          <p class="asset-ac-hint">Matches load automatically — tap a row or keep typing until only one match, then Open.</p>
+        </div>
+        <button type="button" class="btn" id="lookup-btn">Open</button>
+      </div>
+      <div class="name-prompt">
+        <label for="name-input">Your name (used on every action you take)</label>
+        <input id="name-input" type="text" autocomplete="name" placeholder="First Last" />
+      </div>
+      <div class="recent" id="recent-wrap" hidden>
+        <div class="lbl">Recent</div>
+        <div class="chips" id="recent-chips"></div>
+      </div>
+    </div>
+
+    <div id="view-detail" hidden>
+      <div class="summary" id="summary"></div>
+      <div class="btn-row">
+        <button type="button" class="btn block" id="new-waiver-btn">+ Request waiver</button>
+      </div>
+      <div class="wlist" id="wlist"></div>
+    </div>
+  </main>
+
+  <!-- Submit modal -->
+  <div class="modal-back" id="submit-modal">
+    <div class="modal">
+      <h2>Request a waiver</h2>
+      <div class="h-sub" id="submit-asset-line"></div>
+      <label for="sub-name">Your name (required)</label>
+      <input id="sub-name" type="text" autocomplete="name" placeholder="First Last" />
+      <label for="sub-title">Short title (what is the defect?)</label>
+      <input id="sub-title" type="text" maxlength="120" placeholder="e.g. Driver-side mirror crack < 2&quot;" />
+      <label for="sub-desc">Details (where it is, why it doesn't affect safety, etc.)</label>
+      <textarea id="sub-desc" maxlength="2000"></textarea>
+      <label>Photos/videos of the defect (optional)</label>
+      <div class="file-row">
+        <label class="file-btn" for="sub-photo">📎 Add media</label>
+        <input id="sub-photo" type="file" accept="image/*,video/*" multiple />
+        <span id="sub-photo-name" style="font-size:0.85rem;color:var(--muted);"></span>
+      </div>
+      <div id="sub-preview-grid" class="sub-preview-grid" hidden></div>
+      <div id="sub-err" class="err" hidden></div>
+      <div class="btn-row">
+        <button type="button" class="btn secondary" id="sub-cancel">Cancel</button>
+        <button type="button" class="btn" id="sub-submit">Submit for review</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Verify modal -->
+  <div class="modal-back" id="verify-modal">
+    <div class="modal">
+      <h2>Verify this waiver</h2>
+      <div class="h-sub" id="verify-line"></div>
+      <label for="verify-name">Your name (required)</label>
+      <input id="verify-name" type="text" placeholder="First Last" />
+      <label for="verify-note">Optional note</label>
+      <textarea id="verify-note" maxlength="500" placeholder="e.g. Re-checked during PMI, still applies"></textarea>
+      <label>Photo at verification (optional)</label>
+      <div class="file-row">
+        <label class="file-btn" for="verify-photo">📷 Take / choose photo</label>
+        <input id="verify-photo" type="file" accept="image/*" capture="environment" />
+        <span id="verify-photo-name" style="font-size:0.85rem;color:var(--muted);"></span>
+      </div>
+      <img id="verify-preview" class="preview" hidden alt="" />
+      <div id="verify-err" class="err" hidden></div>
+      <div class="btn-row">
+        <button type="button" class="btn secondary" id="verify-cancel">Cancel</button>
+        <button type="button" class="btn success" id="verify-confirm">Verify</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+<script>
+(function () {
+  var NAME_KEY = "waiver.mechanicName";
+  var RECENT_KEY = "waiver.recentAssets";
+  var state = {
+    assetId: "",
+    waivers: [],
+    pendingActionId: null,
+  };
+  /** Asset ids that have at least one approved or pending waiver (from /api/waivers/counts). */
+  var waiverIndex = { keys: [], loaded: false, loadPromise: null };
+  var suggestTimer = null;
+
+  function $(id) { return document.getElementById(id); }
+  function esc(s) {
+    if (s == null) return "";
+    return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+  }
+  function fmtAge(iso) {
+    if (!iso) return "—";
+    var t = Date.parse(iso); if (!isFinite(t)) return "—";
+    var d = (Date.now() - t) / 86400000;
+    if (d < 1) return "today";
+    if (d < 2) return "yesterday";
+    if (d < 14) return Math.floor(d) + "d ago";
+    if (d < 60) return Math.floor(d / 7) + "w ago";
+    if (d < 730) return Math.floor(d / 30) + "mo ago";
+    return Math.floor(d / 365) + "y ago";
+  }
+  function fmtDate(iso) {
+    if (!iso) return "—";
+    var t = new Date(iso);
+    if (isNaN(t)) return "—";
+    return t.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+  }
+  function showToast(msg, isErr) {
+    var t = $("toast");
+    t.textContent = msg;
+    t.classList.toggle("err", !!isErr);
+    t.classList.add("show");
+    setTimeout(function () { t.classList.remove("show"); }, 2400);
+  }
+  function readName() { return ($("name-input").value || localStorage.getItem(NAME_KEY) || "").trim(); }
+  function rememberName(n) {
+    if (n) localStorage.setItem(NAME_KEY, n);
+  }
+  function loadRecent() {
+    try {
+      var raw = localStorage.getItem(RECENT_KEY);
+      var arr = raw ? JSON.parse(raw) : [];
+      return Array.isArray(arr) ? arr : [];
+    } catch { return []; }
+  }
+  function pushRecent(assetId) {
+    var cur = loadRecent().filter(function (a) { return a !== assetId; });
+    cur.unshift(assetId);
+    if (cur.length > 8) cur = cur.slice(0, 8);
+    localStorage.setItem(RECENT_KEY, JSON.stringify(cur));
+    renderRecent();
+  }
+  function renderRecent() {
+    var arr = loadRecent();
+    var wrap = $("recent-wrap");
+    var chips = $("recent-chips");
+    if (!arr.length) { wrap.hidden = true; return; }
+    wrap.hidden = false;
+    chips.innerHTML = arr.map(function (a) {
+      return '<button type="button" class="chip" data-asset="' + esc(a) + '">' + esc(a) + '</button>';
+    }).join("");
+    chips.querySelectorAll(".chip").forEach(function (b) {
+      b.addEventListener("click", function () {
+        $("asset-input").value = b.getAttribute("data-asset");
+        openAsset();
+      });
+    });
+  }
+
+  function hideSuggest() {
+    var ul = $("asset-suggest");
+    var inp = $("asset-input");
+    if (ul) {
+      ul.hidden = true;
+      ul.innerHTML = "";
+    }
+    if (inp) inp.setAttribute("aria-expanded", "false");
+  }
+  function showSuggest() {
+    var ul = $("asset-suggest");
+    var inp = $("asset-input");
+    if (ul && ul.children.length) ul.hidden = false;
+    if (inp) inp.setAttribute("aria-expanded", ul && !ul.hidden ? "true" : "false");
+  }
+  function filterMatches(q) {
+    var ql = (q || "").trim().toLowerCase();
+    if (!ql || !waiverIndex.keys.length) return [];
+    var starts = [];
+    var subs = [];
+    for (var i = 0; i < waiverIndex.keys.length; i++) {
+      var k = waiverIndex.keys[i];
+      var kl = k.toLowerCase();
+      var ix = kl.indexOf(ql);
+      if (ix < 0) continue;
+      if (ix === 0) starts.push(k);
+      else subs.push(k);
+    }
+    starts.sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); });
+    subs.sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); });
+    return starts.concat(subs);
+  }
+  function renderSuggest(matches) {
+    var ul = $("asset-suggest");
+    if (!ul) return;
+    ul.innerHTML = matches.map(function (id) {
+      return "<li role='presentation'><button type='button' role='option' data-asset='" + esc(id) + "'>" + esc(id) + "</button></li>";
+    }).join("");
+    ul.querySelectorAll("button[data-asset]").forEach(function (b) {
+      b.addEventListener("click", function () {
+        pickSuggest(b.getAttribute("data-asset") || "");
+      });
+    });
+    showSuggest();
+  }
+  function updateSuggestFromInput() {
+    var q = ($("asset-input").value || "").trim();
+    if (!q || !waiverIndex.loaded) { hideSuggest(); return; }
+    var m = filterMatches(q);
+    if (!m.length) { hideSuggest(); return; }
+    if (m.length > 50) m = m.slice(0, 50);
+    renderSuggest(m);
+  }
+  function pickSuggest(id) {
+    if (!id) return;
+    $("asset-input").value = id;
+    hideSuggest();
+    openAsset(id);
+  }
+  async function ensureWaiverIndex() {
+    if (waiverIndex.loaded) return;
+    if (waiverIndex.loadPromise) return waiverIndex.loadPromise;
+    waiverIndex.loadPromise = (async function () {
+      try {
+        var r = await fetch("/api/waivers/counts", { cache: "no-store" });
+        var j = await r.json();
+        var c = (j && j.counts) || {};
+        var keys = [];
+        for (var id in c) {
+          if (!Object.prototype.hasOwnProperty.call(c, id)) continue;
+          var n = c[id];
+          var tot = ((n && n.approved) || 0) + ((n && n.pending) || 0);
+          if (tot > 0) keys.push(id);
+        }
+        keys.sort(function (a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); });
+        waiverIndex.keys = keys;
+      } catch (e) {
+        waiverIndex.keys = [];
+      }
+      waiverIndex.loaded = true;
+      waiverIndex.loadPromise = null;
+    })();
+    return waiverIndex.loadPromise;
+  }
+  /**
+   * Resolve typed text to a single canonical asset id, or null if the user
+   * must pick from multiple matches (dropdown already shown).
+   */
+  function resolveCanonicalAssetId(inputVal) {
+    var q = (inputVal || "").trim();
+    if (!q) {
+      showToast("Enter an asset id", true);
+      return null;
+    }
+    var keys = waiverIndex.keys;
+    var qu = q.toUpperCase();
+    var i;
+    for (i = 0; i < keys.length; i++) {
+      if (keys[i].toUpperCase() === qu) return keys[i];
+    }
+    var m = filterMatches(q);
+    if (m.length === 1) return m[0];
+    if (!m.length) return q;
+    showToast("Several matches — pick one below", true);
+    renderSuggest(m);
+    return null;
+  }
+  function showLookup() {
+    document.body.classList.remove("detail");
+    $("view-lookup").hidden = false;
+    $("view-detail").hidden = true;
+    $("h-title").textContent = "Minot AFB Vehicle Management";
+    $("h-sub").textContent = "Pull up an asset to view or request waivers.";
+    state.assetId = "";
+    hideSuggest();
+  }
+  function showDetail() {
+    document.body.classList.add("detail");
+    $("view-lookup").hidden = true;
+    $("view-detail").hidden = false;
+  }
+
+  async function openAsset(forcedId) {
+    await ensureWaiverIndex();
+    var raw;
+    if (typeof forcedId === "string" && forcedId.trim()) {
+      raw = forcedId.trim();
+      var up = raw.toUpperCase();
+      for (var j = 0; j < waiverIndex.keys.length; j++) {
+        if (waiverIndex.keys[j].toUpperCase() === up) {
+          raw = waiverIndex.keys[j];
+          break;
+        }
+      }
+      $("asset-input").value = raw;
+    } else {
+      var resolved = resolveCanonicalAssetId($("asset-input").value);
+      if (resolved == null) return;
+      raw = resolved;
+    }
+    hideSuggest();
+    if (!raw) { showToast("Enter an asset id", true); return; }
+    state.assetId = raw;
+    pushRecent(raw);
+    $("h-title").textContent = "Asset " + raw;
+    $("h-sub").textContent = "Loading waivers…";
+    showDetail();
+    try {
+      var r = await fetch("/api/waivers/asset/" + encodeURIComponent(raw), { cache: "no-store" });
+      var j = await r.json();
+      state.waivers = (j && j.waivers) || [];
+      renderDetail();
+    } catch (e) {
+      $("h-sub").textContent = "Could not load waivers.";
+    }
+  }
+
+  function renderDetail() {
+    var ws = state.waivers;
+    var approved = ws.filter(function (w) { return w.status === "approved"; });
+    var pending = ws.filter(function (w) { return w.status === "pending"; });
+    var overdue = approved.filter(function (w) { return w.verifyState === "overdue"; });
+    $("h-sub").textContent = approved.length + " approved · " + pending.length + " pending review";
+    var summaryHtml =
+      '<div><div class="asset">' + esc(state.assetId) + '</div>' +
+      '<div class="stat"><strong>' + approved.length + '</strong> on card · ' +
+      '<strong>' + pending.length + '</strong> pending' +
+      (overdue.length ? ' · <strong style="color:var(--danger)">' + overdue.length + '</strong> overdue verify' : '') +
+      '</div></div>';
+    $("summary").innerHTML = summaryHtml;
+
+    if (!ws.length) {
+      $("wlist").innerHTML =
+        '<div class="empty"><strong>No waivers on file.</strong>' +
+        'Tap "Request waiver" if there is a defect that should be accepted.</div>';
+      return;
+    }
+    $("wlist").innerHTML = ws.map(renderCard).join("");
+    $("wlist").querySelectorAll("[data-verify]").forEach(function (b) {
+      b.addEventListener("click", function () { openVerifyModal(Number(b.getAttribute("data-verify"))); });
+    });
+    $("wlist").querySelectorAll("[data-waiver-remove]").forEach(function (b) {
+      b.addEventListener("click", function () { removeWaiverFromCard(Number(b.getAttribute("data-waiver-remove"))); });
+    });
+  }
+
+  async function removeWaiverFromCard(id) {
+    var name = readName();
+    if (!name) {
+      showToast("Enter your name in the field above first.", true);
+      return;
+    }
+    if (!confirm("Remove this waiver? Your name is stored for the audit trail.")) return;
+    try {
+      var r = await fetch("/api/waivers/" + id, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ deletedBy: name }),
+      });
+      var j = await r.json().catch(function () { return {}; });
+      if (!r.ok) throw new Error((j && j.error) || "Could not remove");
+      showToast("Removed");
+      await openAsset();
+    } catch (e) {
+      showToast(e && e.message ? e.message : "Remove failed", true);
+    }
+  }
+
+  function renderCard(w) {
+    var status = w.status;
+    var state = (status === "approved") ? (w.verifyState || "fresh") : status;
+    var pillCls = (status === "pending") ? "pending"
+                : (w.verifyState === "overdue") ? "overdue"
+                : (w.verifyState === "dueSoon") ? "dueSoon" : "approved";
+    var pillTxt = (status === "pending") ? "Pending review"
+                : (w.verifyState === "overdue") ? "Verify overdue"
+                : (w.verifyState === "dueSoon") ? "Verify due soon" : "On card";
+    var subLine = (status === "approved")
+      ? ('Approved by ' + esc(w.reviewedBy || "—") + ' · ' + fmtDate(w.reviewedAtIso) +
+         (w.lastVerifiedAtIso
+            ? (' · Last verified ' + fmtDate(w.lastVerifiedAtIso) + ' by ' + esc(w.lastVerifiedBy || "—"))
+            : ''))
+      : ('Submitted by ' + esc(w.submittedBy) + ' · ' + fmtAge(w.submittedAtIso));
+    var plist = (w.photos && w.photos.length) ? w.photos : (w.hasPhoto && w.photoUrl ? [{ url: w.photoUrl }] : []);
+    var photo = plist.length
+      ? ('<div class="wcard-photos">' + plist.map(function (p) {
+          var ct = String((p && p.contentType) || "").toLowerCase();
+          if (ct.indexOf("video/") === 0) {
+            return '<video class="wcard-video" src="' + esc(p.url) + '" controls preload="metadata"></video>';
+          }
+          return '<img class="wcard-photo" src="' + esc(p.url) + '" alt="" loading="lazy" />';
+        }).join("") + "</div>")
+      : "";
+    var actions = "";
+    if (status === "approved") {
+      actions =
+        '<div class="wcard-actions">' +
+        '<button type="button" class="btn" data-verify="' + w.id + '">Verify</button>' +
+        '<button type="button" class="btn danger" data-waiver-remove="' + w.id + '">Remove</button>' +
+        "</div>";
+    } else if (status === "pending") {
+      actions =
+        '<div class="wcard-actions">' +
+        '<button type="button" class="btn danger" data-waiver-remove="' + w.id + '">Withdraw</button>' +
+        "</div>";
+    }
+    return '<div class="wcard ' + state + '">' +
+             '<div class="wcard-head">' +
+               '<div class="title">' + esc(w.title) + '</div>' +
+               '<span class="pill ' + pillCls + '">' + esc(pillTxt) + '</span>' +
+             '</div>' +
+             (w.description ? '<div class="wcard-body"><div class="desc">' + esc(w.description) + '</div><div class="meta">' + subLine + '</div></div>'
+                            : '<div class="wcard-body"><div class="meta">' + subLine + '</div></div>') +
+             photo +
+             actions +
+           '</div>';
+  }
+
+  // ---- Submit modal ----
+  function openSubmitModal() {
+    if (!state.assetId) { showToast("Pick an asset first", true); return; }
+    $("submit-asset-line").textContent = "For asset " + state.assetId;
+    $("sub-name").value = readName();
+    $("sub-title").value = "";
+    $("sub-desc").value = "";
+    $("sub-photo").value = "";
+    $("sub-photo-name").textContent = "";
+    var g = $("sub-preview-grid");
+    if (g) { g.innerHTML = ""; g.hidden = true; }
+    $("sub-err").hidden = true;
+    $("submit-modal").classList.add("open");
+  }
+  function closeSubmitModal() { $("submit-modal").classList.remove("open"); }
+  $("new-waiver-btn").addEventListener("click", openSubmitModal);
+  $("sub-cancel").addEventListener("click", closeSubmitModal);
+  $("sub-photo").addEventListener("change", function () {
+    var grid = $("sub-preview-grid");
+    var inp = $("sub-photo");
+    if (!grid || !inp) return;
+    grid.innerHTML = "";
+    var files = inp.files ? Array.from(inp.files) : [];
+    if (!files.length) { grid.hidden = true; $("sub-photo-name").textContent = ""; return; }
+    var nPhotos = files.filter(function (f) { return (f.type || "").toLowerCase().indexOf("image/") === 0; }).length;
+    var nVideos = files.length - nPhotos;
+    var bits = [];
+    if (nPhotos) bits.push(nPhotos + " photo" + (nPhotos === 1 ? "" : "s"));
+    if (nVideos) bits.push(nVideos + " video" + (nVideos === 1 ? "" : "s"));
+    $("sub-photo-name").textContent = bits.join(" · ") || (files.length + " file(s) selected");
+    grid.hidden = false;
+    files.forEach(function (f) {
+      var url = URL.createObjectURL(f);
+      var isVideo = (f.type || "").toLowerCase().indexOf("video/") === 0;
+      if (isVideo) {
+        var vv = document.createElement("video");
+        vv.className = "sub-video";
+        vv.src = url;
+        vv.muted = true;
+        vv.playsInline = true;
+        vv.preload = "metadata";
+        grid.appendChild(vv);
+      } else {
+        var im = document.createElement("img");
+        im.className = "sub-thumb";
+        im.src = url;
+        im.alt = "";
+        grid.appendChild(im);
+      }
+    });
+  });
+  $("sub-submit").addEventListener("click", async function () {
+    var name = $("sub-name").value.trim();
+    if (!name) { $("sub-err").textContent = "Your name is required."; $("sub-err").hidden = false; return; }
+    rememberName(name);
+    var title = $("sub-title").value.trim();
+    if (!title) { $("sub-err").textContent = "Title is required."; $("sub-err").hidden = false; return; }
+    var files = $("sub-photo").files ? Array.from($("sub-photo").files) : [];
+    var fd = new FormData();
+    fd.append("assetId", state.assetId);
+    fd.append("title", title);
+    fd.append("description", $("sub-desc").value.trim());
+    fd.append("submittedBy", name);
+    files.forEach(function (f) { fd.append("photo", f); });
+    $("sub-submit").disabled = true;
+    try {
+      var r = await fetch("/api/waivers", { method: "POST", body: fd });
+      var j = await r.json();
+      if (!r.ok) throw new Error((j && j.error) || ("HTTP " + r.status));
+      closeSubmitModal();
+      showToast("Submitted — pending management approval");
+      await openAsset();
+    } catch (e) {
+      $("sub-err").textContent = "Submit failed: " + (e.message || e);
+      $("sub-err").hidden = false;
+    } finally {
+      $("sub-submit").disabled = false;
+    }
+  });
+
+  // ---- Verify modal ----
+  function openVerifyModal(id) {
+    state.pendingActionId = id;
+    var w = state.waivers.find(function (x) { return x.id === id; });
+    $("verify-line").textContent = w ? ('"' + w.title + '"') : "";
+    $("verify-name").value = readName();
+    $("verify-note").value = "";
+    $("verify-photo").value = "";
+    $("verify-photo-name").textContent = "";
+    $("verify-preview").hidden = true;
+    $("verify-err").hidden = true;
+    $("verify-modal").classList.add("open");
+  }
+  function closeVerifyModal() {
+    $("verify-modal").classList.remove("open");
+    state.pendingActionId = null;
+    $("verify-photo").value = "";
+    $("verify-photo-name").textContent = "";
+    $("verify-preview").hidden = true;
+  }
+  $("verify-cancel").addEventListener("click", closeVerifyModal);
+  $("verify-photo").addEventListener("change", function () {
+    var f = $("verify-photo").files && $("verify-photo").files[0];
+    if (!f) { $("verify-preview").hidden = true; $("verify-photo-name").textContent = ""; return; }
+    $("verify-photo-name").textContent = f.name + " (" + Math.round(f.size / 1024) + " KB)";
+    var url = URL.createObjectURL(f);
+    $("verify-preview").src = url;
+    $("verify-preview").hidden = false;
+  });
+  $("verify-confirm").addEventListener("click", async function () {
+    var name = $("verify-name").value.trim();
+    if (!name) { $("verify-err").textContent = "Name is required."; $("verify-err").hidden = false; return; }
+    rememberName(name);
+    var id = state.pendingActionId;
+    if (!id) return;
+    $("verify-confirm").disabled = true;
+    try {
+      var fd = new FormData();
+      fd.append("by", name);
+      fd.append("note", $("verify-note").value.trim());
+      fd.append("kind", "annual");
+      var vf = $("verify-photo").files && $("verify-photo").files[0];
+      if (vf) fd.append("photo", vf);
+      var r = await fetch("/api/waivers/" + id + "/verify", { method: "POST", body: fd });
+      var j = await r.json();
+      if (!r.ok) throw new Error((j && j.error) || ("HTTP " + r.status));
+      closeVerifyModal();
+      showToast("Verified — thanks " + name.split(" ")[0]);
+      await openAsset();
+    } catch (e) {
+      $("verify-err").textContent = "Failed: " + (e.message || e);
+      $("verify-err").hidden = false;
+    } finally {
+      $("verify-confirm").disabled = false;
+    }
+  });
+
+  // ---- Header back ----
+  $("back-btn").addEventListener("click", function () { showLookup(); });
+
+  // ---- Lookup binding ----
+  $("lookup-btn").addEventListener("click", function () { openAsset(); });
+  $("asset-input").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") { e.preventDefault(); openAsset(); }
+  });
+  $("asset-input").addEventListener("input", function () {
+    clearTimeout(suggestTimer);
+    suggestTimer = setTimeout(updateSuggestFromInput, 90);
+  });
+  $("asset-input").addEventListener("focus", function () {
+    ensureWaiverIndex().then(function () { updateSuggestFromInput(); });
+  });
+  var sug = $("asset-suggest");
+  if (sug) {
+    sug.addEventListener("mousedown", function (e) {
+      if (e.target.closest("button[data-asset]")) e.preventDefault();
+    });
+  }
+  document.addEventListener("click", function (e) {
+    if (!e.target.closest(".asset-ac")) hideSuggest();
+  });
+  $("name-input").addEventListener("change", function () { rememberName($("name-input").value.trim()); });
+
+  // ---- Init ----
+  $("name-input").value = localStorage.getItem(NAME_KEY) || "";
+  renderRecent();
+  ensureWaiverIndex();
+  // Allow ?asset=M-1234 deep link from desktop "Open in mobile" buttons.
+  var hashParams = new URLSearchParams(location.search);
+  var deep = hashParams.get("asset");
+  if (deep) { $("asset-input").value = deep; openAsset(deep); }
+
+  var appsL = document.querySelector("a.h-switch");
+  if (appsL) {
+    appsL.addEventListener("click", function (e) {
+      e.preventDefault();
+      window.location.assign(appsL.href);
+    });
+  }
+})();
+</script>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js/v8c78df7c7c0f484497ecbca7046644da1771523124516" integrity="sha512-8DS7rgIrAmghBFwoOTujcf6D9rXvH8xm8JQ1Ja01h9QX8EzXldiszufYa4IFfKdLUKTTrnSFXLDkUEOTrZQ8Qg==" data-cf-beacon='{"version":"2024.11.0","token":"3a3a3a6b85794d4d85a0c624556b419d","r":1,"server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
+</body>
+</html>
