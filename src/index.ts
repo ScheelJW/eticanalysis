@@ -18421,7 +18421,12 @@ function renderDashboardHtml(): string {
       }
       const nextM = row.elmsNextMaintDateIso ? fmtKeyShort(row.elmsNextMaintDateIso) : "";
       if (!nextM) {
-        if (eff === "ok" || eff === "no_due") return "No next calendar service date is listed in ELMS for this plan.";
+        if (eff === "ok" || eff === "no_due") {
+          if (row.elmsNextUtilQty != null) {
+            return "This plan is driven by utilization (meter), not a calendar date in ELMS. Use the service meter section below for how far you are from the next reading.";
+          }
+          return "No next calendar service date is listed in ELMS for this plan.";
+        }
         return "";
       }
       if (eff === "overdue") {

@@ -1417,7 +1417,16 @@ export function analyzeElmsScheduleMxFromRaw(
       bucket = "ok";
       scheduleMxDueIso = elmsNextMaintDateIso ?? legacy.scheduleMxDueIso;
       scheduleMxDaysUntil = daysUntil ?? legacy.scheduleMxDaysUntil;
-      if (!scheduleMxStatus && elmsNextMaintDateIso) scheduleMxStatus = "Current";
+      if (!scheduleMxStatus) {
+        if (elmsNextMaintDateIso) {
+          scheduleMxStatus = "Current";
+        } else if (elmsNextUtilQty != null) {
+          scheduleMxStatus =
+            elmsCurrentMeter != null
+              ? "Current (meter before next utilization target — no calendar date on this plan)"
+              : "Utilization target in ELMS — current reading not in this row (no calendar date)";
+        }
+      }
     } else {
       bucket = "missing";
       needsEntry = true;
