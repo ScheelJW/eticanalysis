@@ -14006,6 +14006,15 @@ function renderDashboardHtml(): string {
       max-width: 720px;
     }
     .smx-commander-actions { flex-shrink: 0; }
+    .smx-commander-actions--mail {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      justify-content: flex-end;
+    }
+    .smx-copy-status { font-size: 0.72rem; color: var(--muted); max-width: 220px; line-height: 1.3; }
+    .smx-cmd-mail-btns { display: flex; flex-direction: column; gap: 4px; align-items: stretch; }
     .smx-btn-outlook {
       display: inline-flex;
       align-items: center;
@@ -14915,10 +14924,14 @@ function renderDashboardHtml(): string {
                   <span class="smx-commander-summary-caret" aria-hidden="true"></span>
                   <span class="smx-commander-summary-line" id="smx-commander-summary-line"></span>
                 </div>
-                <div class="smx-commander-actions">
-                  <button type="button" class="btn smx-btn-outlook" id="smx-commander-mail-wing" title="Open Outlook with a pre-filled commander summary">
+                <div class="smx-commander-actions smx-commander-actions--mail">
+                  <button type="button" class="btn smx-btn-outlook" id="smx-commander-mail-wing" title="Opens default mail app with a plain-text summary (use Copy HTML table for a real table in Outlook)">
                     RTS Outlook — wing summary
                   </button>
+                  <button type="button" class="btn secondary" id="smx-commander-copy-html-wing" title="Copies an HTML table — paste into Outlook message body (Ctrl+V)">
+                    Copy HTML table
+                  </button>
+                  <span class="smx-copy-status hidden" id="smx-commander-copy-status" role="status"></span>
                 </div>
               </div>
             </summary>
@@ -18027,11 +18040,6 @@ function renderDashboardHtml(): string {
       return "mailto:?subject=" + encodeURIComponent(subject) + "&body=" + encodeURIComponent(body);
     }
 
-    /** mailto bodies are plain text in Outlook — use structured text, not HTML. */
-    function smxCommanderPlainTableRow(cells) {
-      return cells.join("\t");
-    }
-
     function smxCmdEmailNarrativeLines() {
       return [
         "Good afternoon,",
@@ -18045,6 +18053,213 @@ function renderDashboardHtml(): string {
           'According to DAFI 24-302, Vehicle Management, 4.1.8.5. "Owning/using organizations will make vehicles available for PM&I and Special Inspections or make other arrangements with servicing VM prior to due date/time. (T-3)". ' +
           "The VCO SAC in MICT can help your VCO's better understand their part of the process regarding routine Mx requirements.",
       ];
+    }
+
+    function smxHtmlTableEsc(s) {
+      return String(s ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    /** Fixed-width ASCII table: Outlook collapses tabs in mailto bodies. */
+    function smxAsciiTableLines(headers, dataRows) {
+      var cols = headers.length;
+      var cap = [26, 7, 7, 7, 7, 6];
+      var widths = [];
+      var c;
+      for (c = 0; c < cols; c++) {
+        var w = String(headers[c]).length;
+        for (var r = 0; r < dataRows.length; r++) {
+          w = Math.max(w, String(dataRows[r][c] ?? "").length);
+        }
+        var mx = cap[c] != null ? cap[c] : 18;
+        widths.push(Math.min(mx, Math.max(3, w)));
+      }
+      function padCell(str, width, right) {
+        var s = String(str ?? "");
+        if (s.length > width) {
+          s = s.slice(0, Math.max(1, width - 1)) + "~";
+        }
+        var pad = width - s.length;
+        return right ? " ".repeat(pad) + s : s + " ".repeat(pad);
+      }
+      function rowLine(values) {
+        var out = "|";
+        for (c = 0; c < cols; c++) {
+          var right = c > 0;
+          out += " " + padCell(values[c], widths[c], right) + " |";
+        }
+        return out;
+      }
+      function sepLine() {
+        var out = "+";
+        for (c = 0; c < cols; c++) {
+          out += "-".repeat(widths[c] + 2) + "+";
+        }
+        return out;
+      }
+      var lines = [];
+      lines.push(sepLine());
+      lines.push(rowLine(headers));
+      lines.push(sepLine());
+      for (var ri = 0; ri < dataRows.length; ri++) {
+        lines.push(rowLine(dataRows[ri]));
+      }
+      lines.push(sepLine());
+      return lines;
+    }
+
+    function smxCommanderAsciiUnitTableLines(units) {
+      var headers = ["Unit", "Total", "Not od", "% OK", "Overdue", "NCE od"];
+      var rows = [];
+      for (var i = 0; i < units.length; i++) {
+        var u = units[i];
+        rows.push([
+          u.unit,
+          String(u.totalVehicles),
+          String(u.notOverdue),
+          smxFmtPct2(u.pctNotOverdue),
+          String(u.overdue),
+          String(u.nceOverdue),
+        ]);
+      }
+      return smxAsciiTableLines(headers, rows);
+    }
+
+    function smxCommanderHtmlUnitsTable(units) {
+      var h =
+        "<table border='1' cellpadding='5' cellspacing='0' style='border-collapse:collapse;font-size:11pt;font-family:Segoe UI,Arial,sans-serif'>" +
+        "<thead><tr>" +
+        "<th align='left'>Unit</th>" +
+        "<th align='right'>Total vehicles</th>" +
+        "<th align='right'>Not overdue</th>" +
+        "<th align='right'>% Not overdue</th>" +
+        "<th align='right'>Overdue</th>" +
+        "<th align='right'>NCE overdue</th>" +
+        "</tr></thead><tbody>";
+      for (var i = 0; i < units.length; i++) {
+        var u = units[i];
+        h +=
+          "<tr><td>" +
+          smxHtmlTableEsc(u.unit) +
+          "</td><td align='right'>" +
+          smxHtmlTableEsc(String(u.totalVehicles)) +
+          "</td><td align='right'>" +
+          smxHtmlTableEsc(String(u.notOverdue)) +
+          "</td><td align='right'>" +
+          smxHtmlTableEsc(smxFmtPct2(u.pctNotOverdue)) +
+          "</td><td align='right'>" +
+          smxHtmlTableEsc(String(u.overdue)) +
+          "</td><td align='right'>" +
+          smxHtmlTableEsc(String(u.nceOverdue)) +
+          "</td></tr>";
+      }
+      return h + "</tbody></table>";
+    }
+
+    function smxCmdNarrativeHtml() {
+      var parts = [];
+      var lines = smxCmdEmailNarrativeLines();
+      for (var i = 0; i < lines.length; i++) {
+        var L = lines[i];
+        if (L === "") {
+          parts.push("<br/>");
+        } else if (L === "BLUF" || L === "DISCUSSION") {
+          parts.push("<p style='margin:12px 0 6px 0'><strong>" + smxHtmlTableEsc(L) + "</strong></p>");
+        } else {
+          parts.push("<p style='margin:0 0 8px 0'>" + smxHtmlTableEsc(L) + "</p>");
+        }
+      }
+      return parts.join("");
+    }
+
+    function smxCommanderEmailHtmlWing(cmd, importKey, eticKey) {
+      var w = cmd.wing;
+      var h =
+        "<html><body style='font-size:11pt;font-family:Segoe UI,Arial,sans-serif;color:#222'>" +
+        "<p><strong>" +
+        smxHtmlTableEsc(smxCommanderReportTitle()) +
+        "</strong></p>" +
+        smxCmdNarrativeHtml() +
+        "<p style='margin:10px 0 4px 0'><strong>Scheduled maintenance import:</strong> " +
+        smxHtmlTableEsc(importKey ? fmtKeyLong(importKey) : "—") +
+        "<br/><strong>Fleet book (ETIC) context:</strong> " +
+        smxHtmlTableEsc(eticKey ? fmtKeyLong(eticKey) : "—") +
+        "</p>" +
+        "<p style='margin:8px 0'><strong>Wing totals</strong> — Total vehicles: " +
+        smxHtmlTableEsc(String(w.totalVehicles)) +
+        " · Not overdue: " +
+        smxHtmlTableEsc(String(w.notOverdue)) +
+        " · % not overdue: " +
+        smxHtmlTableEsc(smxFmtPct2(w.pctNotOverdue)) +
+        "% · Overdue: " +
+        smxHtmlTableEsc(String(w.overdue)) +
+        " · NCE overdue: " +
+        smxHtmlTableEsc(String(w.nceOverdue)) +
+        "</p>" +
+        smxCommanderHtmlUnitsTable(cmd.units || []) +
+        "<p style='margin:14px 0 8px 0'>As always, Vehicle Management Team are available and happy to help!</p>" +
+        "<p style='color:#555;font-size:10pt'>— Sent from ETIC dashboard (Schedule maintenance)</p>" +
+        "</body></html>";
+      return h;
+    }
+
+    function smxCommanderEmailHtmlUnit(row, importKey, eticKey) {
+      var h =
+        "<html><body style='font-size:11pt;font-family:Segoe UI,Arial,sans-serif;color:#222'>" +
+        "<p><strong>" +
+        smxHtmlTableEsc(smxCommanderReportTitle()) +
+        "</strong></p>" +
+        smxCmdNarrativeHtml() +
+        "<p style='margin:10px 0 4px 0'><strong>Scheduled maintenance import:</strong> " +
+        smxHtmlTableEsc(importKey ? fmtKeyLong(importKey) : "—") +
+        "<br/><strong>Fleet book (ETIC) context:</strong> " +
+        smxHtmlTableEsc(eticKey ? fmtKeyLong(eticKey) : "—") +
+        "</p>" +
+        "<p style='margin:8px 0'><strong>Unit:</strong> " +
+        smxHtmlTableEsc(row.unit) +
+        "</p>" +
+        smxCommanderHtmlUnitsTable([row]) +
+        "<p style='margin:14px 0 8px 0'>As always, Vehicle Management Team are available and happy to help!</p>" +
+        "<p style='color:#555;font-size:10pt'>— Sent from ETIC dashboard (Schedule maintenance)</p>" +
+        "</body></html>";
+      return h;
+    }
+
+    function smxFlashCommanderCopyStatus(msg) {
+      var el = document.getElementById("smx-commander-copy-status");
+      if (!el) return;
+      el.textContent = msg;
+      el.classList.remove("hidden");
+      if (el._smxT) clearTimeout(el._smxT);
+      el._smxT = setTimeout(function () {
+        el.classList.add("hidden");
+      }, 3200);
+    }
+
+    function smxCopyCommanderHtml(html, plainFallback) {
+      if (navigator.clipboard && window.ClipboardItem) {
+        return navigator.clipboard
+          .write([
+            new ClipboardItem({
+              "text/html": new Blob([html], { type: "text/html" }),
+              "text/plain": new Blob([plainFallback], { type: "text/plain" }),
+            }),
+          ])
+          .then(function () {
+            return true;
+          })
+          .catch(function () {
+            return navigator.clipboard.writeText(plainFallback).then(function () {
+              return true;
+            });
+          });
+      }
+      return navigator.clipboard.writeText(plainFallback).then(function () {
+        return true;
+      });
     }
 
     function smxCommanderEmailBodyWing(cmd, importKey, eticKey) {
@@ -18069,22 +18284,8 @@ function renderDashboardHtml(): string {
           " · NCE overdue: " +
           w.nceOverdue,
       );
-      lines.push("");
-      lines.push(smxCommanderPlainTableRow(["Unit", "Total vehicles", "Not overdue", "% Not overdue", "Overdue", "NCE overdue"]));
-      var units = cmd.units || [];
-      for (var i = 0; i < units.length; i++) {
-        var u = units[i];
-        lines.push(
-          smxCommanderPlainTableRow([
-            u.unit,
-            String(u.totalVehicles),
-            String(u.notOverdue),
-            smxFmtPct2(u.pctNotOverdue),
-            String(u.overdue),
-            String(u.nceOverdue),
-          ]),
-        );
-      }
+      lines.push("By unit (fixed-width table — mailto cannot send HTML):");
+      lines = lines.concat(smxCommanderAsciiUnitTableLines(cmd.units || []));
       lines.push("");
       lines.push("As always, Vehicle Management Team are available and happy to help!");
       lines.push("");
@@ -18103,17 +18304,7 @@ function renderDashboardHtml(): string {
       lines.push("");
       lines.push("Unit: " + row.unit);
       lines.push("");
-      lines.push(smxCommanderPlainTableRow(["Unit", "Total vehicles", "Not overdue", "% Not overdue", "Overdue", "NCE overdue"]));
-      lines.push(
-        smxCommanderPlainTableRow([
-          row.unit,
-          String(row.totalVehicles),
-          String(row.notOverdue),
-          smxFmtPct2(row.pctNotOverdue),
-          String(row.overdue),
-          String(row.nceOverdue),
-        ]),
-      );
+      lines = lines.concat(smxCommanderAsciiUnitTableLines([row]));
       lines.push("");
       lines.push("As always, Vehicle Management Team are available and happy to help!");
       lines.push("");
@@ -18220,9 +18411,13 @@ function renderDashboardHtml(): string {
             "<td class='smx-cmd-num'>" +
             esc(String(u.nceOverdue)) +
             "</td>" +
-            "<td class='smx-cmd-mail-col'><button type='button' class='btn smx-btn-outlook smx-btn-outlook--sm smx-cmd-mail-unit' data-smx-mail-unit='" +
+            "<td class='smx-cmd-mail-col'><div class='smx-cmd-mail-btns'>" +
+            "<button type='button' class='btn smx-btn-outlook smx-btn-outlook--sm smx-cmd-mail-unit' data-smx-mail-unit='" +
             esc(u.unit) +
-            "'>RTS Outlook</button></td>" +
+            "' title='Plain-text mailto (use Copy HTML for a table)'>RTS Outlook</button>" +
+            "<button type='button' class='btn secondary smx-cmd-copy-html-unit' data-smx-copy-html-unit='" +
+            esc(u.unit) +
+            "' title='Copy HTML table for this unit'>Copy HTML</button></div></td>" +
             "</tr>"
           );
         })
@@ -21232,6 +21427,26 @@ function renderDashboardHtml(): string {
           window.location.href = smxMailtoUrl(subj, body);
         });
       }
+      const smxCopyWingHtml = document.getElementById("smx-commander-copy-html-wing");
+      if (smxCopyWingHtml && !smxCopyWingHtml.dataset.wired) {
+        smxCopyWingHtml.dataset.wired = "1";
+        smxCopyWingHtml.addEventListener("click", function (ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          if (!smxCommander) return;
+          var dk = smxSelectedDateKey || "";
+          var ek = smxEticDateKey || "";
+          var html = smxCommanderEmailHtmlWing(smxCommander, dk, ek);
+          var plain = smxCommanderEmailBodyWing(smxCommander, dk, ek);
+          smxCopyCommanderHtml(html, plain)
+            .then(function () {
+              smxFlashCommanderCopyStatus("Copied HTML. In Outlook, click in the message body and paste (Ctrl+V) for a real table.");
+            })
+            .catch(function () {
+              smxFlashCommanderCopyStatus("Copy failed — check browser permission or use RTS Outlook for plain text.");
+            });
+        });
+      }
       const smxClearCmdUnit = document.getElementById("smx-commander-clear-unit");
       if (smxClearCmdUnit && !smxClearCmdUnit.dataset.wired) {
         smxClearCmdUnit.dataset.wired = "1";
@@ -21274,6 +21489,34 @@ function renderDashboardHtml(): string {
             var subj2 = smxCommanderReportTitle() + " — " + unit;
             var body2 = smxCommanderEmailBodyUnit(row, dk2, ek2);
             window.location.href = smxMailtoUrl(subj2, body2);
+            return;
+          }
+          var copyHtmlBtn = ev.target.closest(".smx-cmd-copy-html-unit");
+          if (copyHtmlBtn) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            if (!smxCommander) return;
+            var unitC = (copyHtmlBtn.getAttribute("data-smx-copy-html-unit") || "").trim();
+            var rowsC = smxCommander.units || [];
+            var rowC = null;
+            for (var ci = 0; ci < rowsC.length; ci++) {
+              if (rowsC[ci].unit === unitC) {
+                rowC = rowsC[ci];
+                break;
+              }
+            }
+            if (!rowC) return;
+            var dk3 = smxSelectedDateKey || "";
+            var ek3 = smxEticDateKey || "";
+            var htmlC = smxCommanderEmailHtmlUnit(rowC, dk3, ek3);
+            var plainC = smxCommanderEmailBodyUnit(rowC, dk3, ek3);
+            smxCopyCommanderHtml(htmlC, plainC)
+              .then(function () {
+                smxFlashCommanderCopyStatus("Copied HTML for " + unitC + ". Paste into Outlook (Ctrl+V).");
+              })
+              .catch(function () {
+                smxFlashCommanderCopyStatus("Copy failed — try RTS Outlook for this unit.");
+              });
           }
         });
       }
