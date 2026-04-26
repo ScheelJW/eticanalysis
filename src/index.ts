@@ -18027,213 +18027,98 @@ function renderDashboardHtml(): string {
       return "mailto:?subject=" + encodeURIComponent(subject) + "&body=" + encodeURIComponent(body);
     }
 
-    /** HTML mail bodies for commander summary (mailto). No raw \\n in string literals here (outer TS template). */
-    function smxCmdEmailNarrativeHtml() {
-      return (
-        '<p style="margin:0 0 14px;font-size:15px;line-height:1.45;color:#0a1a3a">Good afternoon,</p>' +
-        '<div style="margin:0 0 16px;padding:14px 16px;background:#f0f5fb;border-radius:10px;border-left:4px solid #003a8c">' +
-        '<p style="margin:0 0 8px;font-size:11px;font-weight:800;letter-spacing:0.12em;text-transform:uppercase;color:#003a8c">BLUF</p>' +
-        '<p style="margin:0;font-size:14px;line-height:1.5;color:#1a2d4d">' +
-        "Vehicle Management (VM) has created a biweekly commander scheduled maintenance summary to help communication with users on vehicles and hopefully reduce write ups for units." +
-        "</p></div>" +
-        '<div style="margin:0 0 20px;padding:14px 16px;background:#fafbfc;border-radius:10px;border:1px solid #e2e6ed">' +
-        '<p style="margin:0 0 8px;font-size:11px;font-weight:800;letter-spacing:0.12em;text-transform:uppercase;color:#5b6675">DISCUSSION</p>' +
-        '<p style="margin:0;font-size:14px;line-height:1.55;color:#2c3a55">' +
+    /** mailto bodies are plain text in Outlook — use structured text, not HTML. */
+    function smxCommanderPlainTableRow(cells) {
+      return cells.join("\t");
+    }
+
+    function smxCmdEmailNarrativeLines() {
+      return [
+        "Good afternoon,",
+        "",
+        "BLUF",
+        "Vehicle Management (VM) has created a biweekly commander scheduled maintenance summary to help communication with users on vehicles and hopefully reduce write ups for units.",
+        "",
+        "DISCUSSION",
         "VM came up with the below scheduled MX roll up for unit commanders to give oversight of your vehicles. We see this tool being a great communication bridge between our leadership teams. " +
-        "The hope with this is that making the commanders aware will reduce the amount of overdue Preventative Maintenance and Inspections (PM&amp;I&apos;s) and special inspections, therefore reducing the write ups on owning units for overdue inspections. " +
-        "According to DAFI 24-302, Vehicle Management, 4.1.8.5. &ldquo;Owning/using organizations will make vehicles available for PM&amp;I and Special Inspections or make other arrangements with servicing VM prior to due date/time. (T-3)&rdquo;. " +
-        "The VCO SAC in MICT can help your VCO&apos;s better understand their part of the process regarding routine Mx requirements." +
-        "</p></div>"
-      );
-    }
-
-    function smxCmdEmailMetaHtml(importKey, eticKey) {
-      var imp = importKey ? fmtKeyLong(importKey) : "—";
-      var book = eticKey ? fmtKeyLong(eticKey) : "—";
-      return (
-        '<table role="presentation" cellpadding="0" cellspacing="0" style="margin:0 0 18px;border-collapse:collapse;width:100%;max-width:640px">' +
-        "<tr>" +
-        '<td style="padding:10px 14px;background:#003a8c;color:#fff;font-size:12px;font-weight:700;border-radius:8px 0 0 8px">Import</td>' +
-        '<td style="padding:10px 14px;background:#e9edf3;color:#0a1a3a;font-size:13px;font-weight:600;border-radius:0 8px 8px 0">' +
-        esc(imp) +
-        "</td></tr>" +
-        '<tr><td colspan="2" style="height:8px"></td></tr>' +
-        "<tr>" +
-        '<td style="padding:10px 14px;background:#003a8c;color:#fff;font-size:12px;font-weight:700;border-radius:8px 0 0 8px">Fleet book (ETIC)</td>' +
-        '<td style="padding:10px 14px;background:#e9edf3;color:#0a1a3a;font-size:13px;font-weight:600;border-radius:0 8px 8px 0">' +
-        esc(book) +
-        "</td></tr></table>"
-      );
-    }
-
-    function smxCmdEmailWingStripHtml(w) {
-      return (
-        '<table role="presentation" cellpadding="0" cellspacing="0" style="margin:0 0 20px;border-collapse:collapse;width:100%;max-width:720px">' +
-        "<tr>" +
-        '<td style="padding:12px;text-align:center;background:#f3f5f8;border:1px solid #d3d9e2;border-radius:10px 0 0 10px;width:20%">' +
-        '<div style="font-size:10px;font-weight:700;color:#5b6675;text-transform:uppercase;letter-spacing:0.06em">Total</div>' +
-        '<div style="font-size:20px;font-weight:800;color:#0a1a3a">' +
-        esc(String(w.totalVehicles)) +
-        "</div></td>" +
-        '<td style="padding:12px;text-align:center;background:#e8f5ec;border:1px solid #b8dcc4;width:20%">' +
-        '<div style="font-size:10px;font-weight:700;color:#157f3a;text-transform:uppercase;letter-spacing:0.06em">Not overdue</div>' +
-        '<div style="font-size:20px;font-weight:800;color:#157f3a">' +
-        esc(String(w.notOverdue)) +
-        "</div></td>" +
-        '<td style="padding:12px;text-align:center;background:#e8f5ec;border:1px solid #b8dcc4;width:20%">' +
-        '<div style="font-size:10px;font-weight:700;color:#157f3a;text-transform:uppercase;letter-spacing:0.06em">Wing % OK</div>' +
-        '<div style="font-size:20px;font-weight:800;color:#157f3a">' +
-        esc(smxFmtPct2(w.pctNotOverdue)) +
-        "%</div></td>" +
-        '<td style="padding:12px;text-align:center;background:' +
-        (w.overdue > 0 ? "#fdecea" : "#e8f5ec") +
-        ";border:1px solid " +
-        (w.overdue > 0 ? "#f5c2c0" : "#b8dcc4") +
-        ';width:20%">' +
-        '<div style="font-size:10px;font-weight:700;color:' +
-        (w.overdue > 0 ? "#b00020" : "#157f3a") +
-        ';text-transform:uppercase;letter-spacing:0.06em">Overdue</div>' +
-        '<div style="font-size:20px;font-weight:800;color:' +
-        (w.overdue > 0 ? "#b00020" : "#157f3a") +
-        '">' +
-        esc(String(w.overdue)) +
-        "</div></td>" +
-        '<td style="padding:12px;text-align:center;background:' +
-        (w.nceOverdue > 0 ? "#f8e8ec" : "#f3f5f8") +
-        ';border:1px solid #d3d9e2;border-radius:0 10px 10px 0;width:20%">' +
-        '<div style="font-size:10px;font-weight:700;color:#7a1020;text-transform:uppercase;letter-spacing:0.06em">NCE od</div>' +
-        '<div style="font-size:20px;font-weight:800;color:' +
-        (w.nceOverdue > 0 ? "#7a1020" : "#5b6675") +
-        '">' +
-        esc(String(w.nceOverdue)) +
-        "</div></td></tr></table>"
-      );
-    }
-
-    function smxCmdEmailUnitRowBg(u) {
-      if (u.nceOverdue > 0) return "#fde8ec";
-      if (u.overdue > 0) return "#fff8e6";
-      return "#f6faf7";
-    }
-
-    function smxCmdEmailMetricCell(val, good) {
-      var bg = good ? "#e8f5ec" : "#fff5f5";
-      var fg = good ? "#157f3a" : "#b00020";
-      return (
-        '<td style="padding:10px 12px;text-align:right;font-size:14px;font-weight:700;border-bottom:1px solid #e2e6ed;background:' +
-        bg +
-        ";color:" +
-        fg +
-        '">' +
-        esc(String(val)) +
-        "</td>"
-      );
-    }
-
-    function smxCmdEmailUnitsTableHtml(units) {
-      var head =
-        '<table role="presentation" cellpadding="0" cellspacing="0" style="margin:0 0 20px;border-collapse:collapse;width:100%;max-width:900px;border:1px solid #d3d9e2;border-radius:10px;overflow:hidden">' +
-        "<thead><tr>" +
-        '<th style="padding:12px 14px;text-align:left;font-size:11px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;background:#003a8c;color:#fff">Unit</th>' +
-        '<th style="padding:12px 14px;text-align:right;font-size:11px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;background:#003a8c;color:#fff">Total</th>' +
-        '<th style="padding:12px 14px;text-align:right;font-size:11px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;background:#003a8c;color:#fff">Not overdue</th>' +
-        '<th style="padding:12px 14px;text-align:right;font-size:11px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;background:#003a8c;color:#fff">% OK</th>' +
-        '<th style="padding:12px 14px;text-align:right;font-size:11px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;background:#003a8c;color:#fff">Overdue</th>' +
-        '<th style="padding:12px 14px;text-align:right;font-size:11px;font-weight:800;letter-spacing:0.06em;text-transform:uppercase;background:#003a8c;color:#fff">NCE od</th>' +
-        "</tr></thead><tbody>";
-      var rows = "";
-      for (var i = 0; i < units.length; i++) {
-        var u = units[i];
-        var rowBg = smxCmdEmailUnitRowBg(u);
-        var pct = u.pctNotOverdue;
-        var pctGood = pct >= 100 && u.overdue === 0;
-        rows +=
-          "<tr>" +
-          '<td style="padding:10px 14px;font-weight:700;font-size:14px;border-bottom:1px solid #e2e6ed;background:' +
-          rowBg +
-          ';color:#003a8c">' +
-          esc(u.unit) +
-          "</td>" +
-          smxCmdEmailMetricCell(u.totalVehicles, u.overdue === 0) +
-          smxCmdEmailMetricCell(u.notOverdue, u.overdue === 0) +
-          '<td style="padding:10px 12px;text-align:right;font-size:14px;font-weight:700;border-bottom:1px solid #e2e6ed;background:' +
-          (pctGood ? "#e8f5ec" : pct >= 85 ? "#fff8e6" : "#fdecea") +
-          ";color:" +
-          (pctGood ? "#157f3a" : pct >= 85 ? "#a0670a" : "#b00020") +
-          '">' +
-          esc(smxFmtPct2(pct)) +
-          "%</td>" +
-          smxCmdEmailMetricCell(u.overdue, u.overdue === 0) +
-          smxCmdEmailMetricCell(u.nceOverdue, u.nceOverdue === 0) +
-          "</tr>";
-      }
-      return head + rows + "</tbody></table>";
-    }
-
-    function smxCmdEmailFooterHtml() {
-      return (
-        '<p style="margin:24px 0 0;font-size:14px;line-height:1.5;color:#0a1a3a;font-weight:600">As always, Vehicle Management Team are available and happy to help!</p>' +
-        '<p style="margin:16px 0 0;padding-top:16px;border-top:1px solid #e2e6ed;font-size:12px;color:#8a94a4">Sent from ETIC dashboard (Schedule maintenance)</p>'
-      );
+          "The hope with this is that making the commanders aware will reduce the amount of overdue Preventative Maintenance and Inspections (PM&I's) and special inspections, therefore reducing the write ups on owning units for overdue inspections. " +
+          'According to DAFI 24-302, Vehicle Management, 4.1.8.5. "Owning/using organizations will make vehicles available for PM&I and Special Inspections or make other arrangements with servicing VM prior to due date/time. (T-3)". ' +
+          "The VCO SAC in MICT can help your VCO's better understand their part of the process regarding routine Mx requirements.",
+      ];
     }
 
     function smxCommanderEmailBodyWing(cmd, importKey, eticKey) {
       var w = cmd.wing;
-      var title = smxCommanderReportTitle();
-      var units = cmd.units || [];
-      return (
-        '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">' +
-        '<meta name="viewport" content="width=device-width, initial-scale=1">' +
-        "<title>" +
-        esc(title) +
-        "</title></head>" +
-        '<body style="margin:0;padding:24px;background:#eef2f7;font-family:Segoe UI,Roboto,Helvetica Neue,Arial,sans-serif">' +
-        '<div style="max-width:720px;margin:0 auto;background:#ffffff;border-radius:14px;box-shadow:0 4px 24px rgba(15,30,60,0.08);overflow:hidden;border:1px solid #d3d9e2">' +
-        '<div style="padding:20px 24px;background:linear-gradient(90deg,#003a8c 0%,#004a9c 100%);color:#fff">' +
-        '<h1 style="margin:0;font-size:18px;font-weight:800;letter-spacing:-0.02em;line-height:1.25">' +
-        esc(title) +
-        "</h1>" +
-        '<p style="margin:8px 0 0;font-size:12px;opacity:0.9;font-weight:500">Scheduled maintenance compliance by unit (including NCE)</p>' +
-        "</div>" +
-        '<div style="padding:24px 26px 28px">' +
-        smxCmdEmailNarrativeHtml() +
-        smxCmdEmailMetaHtml(importKey, eticKey) +
-        '<h2 style="margin:0 0 12px;font-size:13px;font-weight:800;color:#003a8c;text-transform:uppercase;letter-spacing:0.08em">Wing totals</h2>' +
-        smxCmdEmailWingStripHtml(w) +
-        '<h2 style="margin:0 0 12px;font-size:13px;font-weight:800;color:#003a8c;text-transform:uppercase;letter-spacing:0.08em">By unit</h2>' +
-        smxCmdEmailUnitsTableHtml(units) +
-        smxCmdEmailFooterHtml() +
-        "</div></div></body></html>"
+      var lines = [];
+      lines.push(smxCommanderReportTitle());
+      lines.push("");
+      lines = lines.concat(smxCmdEmailNarrativeLines());
+      lines.push("");
+      lines.push("Scheduled maintenance import: " + (importKey ? fmtKeyLong(importKey) : "—"));
+      lines.push("Fleet book (ETIC) context: " + (eticKey ? fmtKeyLong(eticKey) : "—"));
+      lines.push("");
+      lines.push(
+        "Wing totals — Total vehicles: " +
+          w.totalVehicles +
+          " · Not overdue: " +
+          w.notOverdue +
+          " · % not overdue: " +
+          smxFmtPct2(w.pctNotOverdue) +
+          "% · Overdue: " +
+          w.overdue +
+          " · NCE overdue: " +
+          w.nceOverdue,
       );
+      lines.push("");
+      lines.push(smxCommanderPlainTableRow(["Unit", "Total vehicles", "Not overdue", "% Not overdue", "Overdue", "NCE overdue"]));
+      var units = cmd.units || [];
+      for (var i = 0; i < units.length; i++) {
+        var u = units[i];
+        lines.push(
+          smxCommanderPlainTableRow([
+            u.unit,
+            String(u.totalVehicles),
+            String(u.notOverdue),
+            smxFmtPct2(u.pctNotOverdue),
+            String(u.overdue),
+            String(u.nceOverdue),
+          ]),
+        );
+      }
+      lines.push("");
+      lines.push("As always, Vehicle Management Team are available and happy to help!");
+      lines.push("");
+      lines.push("— Sent from ETIC dashboard (Schedule maintenance)");
+      return lines.join("\\r\\n");
     }
 
     function smxCommanderEmailBodyUnit(row, importKey, eticKey) {
-      var title = smxCommanderReportTitle();
-      return (
-        '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">' +
-        '<meta name="viewport" content="width=device-width, initial-scale=1">' +
-        "<title>" +
-        esc(title) +
-        " — " +
-        esc(row.unit) +
-        "</title></head>" +
-        '<body style="margin:0;padding:24px;background:#eef2f7;font-family:Segoe UI,Roboto,Helvetica Neue,Arial,sans-serif">' +
-        '<div style="max-width:720px;margin:0 auto;background:#ffffff;border-radius:14px;box-shadow:0 4px 24px rgba(15,30,60,0.08);overflow:hidden;border:1px solid #d3d9e2">' +
-        '<div style="padding:20px 24px;background:linear-gradient(90deg,#003a8c 0%,#004a9c 100%);color:#fff">' +
-        '<h1 style="margin:0;font-size:18px;font-weight:800;letter-spacing:-0.02em;line-height:1.25">' +
-        esc(title) +
-        "</h1>" +
-        '<p style="margin:8px 0 0;font-size:13px;font-weight:700;opacity:0.95">Unit: ' +
-        esc(row.unit) +
-        "</p></div>" +
-        '<div style="padding:24px 26px 28px">' +
-        smxCmdEmailNarrativeHtml() +
-        smxCmdEmailMetaHtml(importKey, eticKey) +
-        '<h2 style="margin:0 0 12px;font-size:13px;font-weight:800;color:#003a8c;text-transform:uppercase;letter-spacing:0.08em">Unit rollup</h2>' +
-        smxCmdEmailUnitsTableHtml([row]) +
-        smxCmdEmailFooterHtml() +
-        "</div></div></body></html>"
+      var lines = [];
+      lines.push(smxCommanderReportTitle());
+      lines.push("");
+      lines = lines.concat(smxCmdEmailNarrativeLines());
+      lines.push("");
+      lines.push("Scheduled maintenance import: " + (importKey ? fmtKeyLong(importKey) : "—"));
+      lines.push("Fleet book (ETIC) context: " + (eticKey ? fmtKeyLong(eticKey) : "—"));
+      lines.push("");
+      lines.push("Unit: " + row.unit);
+      lines.push("");
+      lines.push(smxCommanderPlainTableRow(["Unit", "Total vehicles", "Not overdue", "% Not overdue", "Overdue", "NCE overdue"]));
+      lines.push(
+        smxCommanderPlainTableRow([
+          row.unit,
+          String(row.totalVehicles),
+          String(row.notOverdue),
+          smxFmtPct2(row.pctNotOverdue),
+          String(row.overdue),
+          String(row.nceOverdue),
+        ]),
       );
+      lines.push("");
+      lines.push("As always, Vehicle Management Team are available and happy to help!");
+      lines.push("");
+      lines.push("— Sent from ETIC dashboard (Schedule maintenance)");
+      return lines.join("\\r\\n");
     }
 
     function renderSmxCommander() {
@@ -18936,8 +18821,46 @@ function renderDashboardHtml(): string {
       return "miles";
     }
 
+    function smxPlainDateLine(row) {
+      const eff = smxEffBucket(row);
+      if (eff === "missing") {
+        return "";
+      }
+      const nextM = row.elmsNextMaintDateIso ? fmtKeyShort(row.elmsNextMaintDateIso) : "";
+      if (!nextM) {
+        if (eff === "ok" || eff === "no_due") {
+          return "";
+        }
+        return "";
+      }
+      if (eff === "overdue") {
+        const d = row.scheduleMxOverdueByDays != null ? row.scheduleMxOverdueByDays + " day" + (row.scheduleMxOverdueByDays === 1 ? "" : "s") : "some time";
+        return "Next calendar service date was " + nextM + " (" + d + " past that date).";
+      }
+      if (eff === "due_soon" && row.scheduleMxDaysUntil != null) {
+        return "Next calendar service date is " + nextM + " (about " + row.scheduleMxDaysUntil + " day" + (row.scheduleMxDaysUntil === 1 ? "" : "s") + " away).";
+      }
+      if (eff === "ok" || eff === "no_due") {
+        return "Next calendar service date: " + nextM + ".";
+      }
+      return "";
+    }
+
+    function smxRowHasCalendarContent(row) {
+      var eff = smxEffBucket(row);
+      if (row.elmsLastMaintDateIso || row.elmsNextMaintDateIso || row.scheduleMxDueIso) return true;
+      if (row.scheduleMxOverdueByDays != null) return true;
+      if (row.scheduleMxDaysUntil != null && eff === "due_soon") return true;
+      return !!smxPlainDateLine(row);
+    }
+
+    function smxRowHasUtilMeterContent(row) {
+      return row.elmsCurrentMeter != null && row.elmsNextUtilQty != null;
+    }
+
     /** Calendar section: same boxed metric + progress pattern as service meter. */
     function smxPlainScheduleBlock(row) {
+      if (!smxRowHasCalendarContent(row)) return "";
       const eff = smxEffBucket(row);
       const src = row.scheduleMxStatus || "—";
       const lastM = row.elmsLastMaintDateIso ? fmtKeyShort(row.elmsLastMaintDateIso) : "—";
@@ -18994,7 +18917,6 @@ function renderDashboardHtml(): string {
           }
         }
       }
-      if (!lead && eff === "missing") lead = "Not enough schedule data on this plan.";
       var leadCls = "smx-plain-lead" + (eff === "overdue" ? " smx-plain-lead--warn" : "");
       var calloutCls = "smx-plain-callout smx-plain-callout--compact" + (eff === "overdue" ? " smx-plain-callout--warn" : "");
       return (
@@ -19022,18 +18944,11 @@ function renderDashboardHtml(): string {
 
     /** Compact service-meter card: metrics + thin progress + one short line. */
     function smxPlainUtilBlock(row) {
+      if (!smxRowHasUtilMeterContent(row)) return "";
       const uom = smxUtilUomLabel(row.elmsUtilType);
       const cur = row.elmsCurrentMeter;
       const nxt = row.elmsNextUtilQty;
       const uSuffix = " " + uom;
-      if (cur == null || nxt == null) {
-        return (
-          "<section class='wo-facts-group smx-util-section' aria-label='Service meter'>" +
-          "<h4 class='wo-facts-group-h'>Service meter</h4>" +
-          "<div class='smx-plain-callout smx-plain-callout--compact' role='status'>No current reading and next target on this row.</div>" +
-          "</section>"
-        );
-      }
       const rem = row.scheduleMxUtilRemaining != null ? row.scheduleMxUtilRemaining : nxt - cur;
       const overUtil = row.scheduleMxOverdueUtil || rem < 0;
       const safeNxt = Math.max(1, nxt);
@@ -19163,34 +19078,6 @@ function renderDashboardHtml(): string {
           .join("") +
         "</div>"
       );
-    }
-
-    function smxPlainDateLine(row) {
-      const eff = smxEffBucket(row);
-      if (eff === "missing") {
-        return "Not enough schedule data on this plan.";
-      }
-      const nextM = row.elmsNextMaintDateIso ? fmtKeyShort(row.elmsNextMaintDateIso) : "";
-      if (!nextM) {
-        if (eff === "ok" || eff === "no_due") {
-          if (row.elmsNextUtilQty != null) {
-            return "This plan is tracked by the service meter, not a calendar date. See the meter section below.";
-          }
-          return "No next calendar service date on this plan.";
-        }
-        return "";
-      }
-      if (eff === "overdue") {
-        const d = row.scheduleMxOverdueByDays != null ? row.scheduleMxOverdueByDays + " day" + (row.scheduleMxOverdueByDays === 1 ? "" : "s") : "some time";
-        return "Next calendar service date was " + nextM + " (" + d + " past that date).";
-      }
-      if (eff === "due_soon" && row.scheduleMxDaysUntil != null) {
-        return "Next calendar service date is " + nextM + " (about " + row.scheduleMxDaysUntil + " day" + (row.scheduleMxDaysUntil === 1 ? "" : "s") + " away).";
-      }
-      if (eff === "ok" || eff === "no_due") {
-        return "Next calendar service date: " + nextM + ".";
-      }
-      return "";
     }
 
     function renderScheduleMxList() {
