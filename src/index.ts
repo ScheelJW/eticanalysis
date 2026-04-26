@@ -16307,19 +16307,27 @@ function renderDashboardHtml(): string {
       if (raw === "abuse-tracker" || raw === "aa-tracker") {
         return { tab: "abuse-tracker", dateKey: null, workOrderId: null, abuseCaseId: null };
       }
-      if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
-        return { tab: "snapshot", dateKey: raw, workOrderId: null, abuseCaseId: null };
-      }
-
       const qs = new URLSearchParams(location.search);
       const qTab = String(qs.get("tab") || "").trim().toLowerCase();
-      if (qTab === "waivers") return { tab: "waivers", dateKey: null, workOrderId: null };
+      const isHashDate = /^\d{4}-\d{2}-\d{2}$/.test(raw);
+      const hashDate = isHashDate ? raw : null;
+
+      if (qTab === "waivers") return { tab: "waivers", dateKey: hashDate, workOrderId: null, abuseCaseId: null };
       if (qTab === "yard") {
         let yv = String(qs.get("yard") || qs.get("yv") || "").trim().toLowerCase();
         if (yv === "needs-fix" || yv === "needsfix") yv = "findings";
-        return { tab: "yard", dateKey: null, workOrderId: null, abuseCaseId: null, yardSub: yv || null };
+        return { tab: "yard", dateKey: hashDate, workOrderId: null, abuseCaseId: null, yardSub: yv || null };
       }
-      if (qTab) return { tab: qTab, dateKey: null, workOrderId: null, abuseCaseId: null };
+      if (qTab === "smx" || qTab === "schedule-mx" || qTab === "schedule") {
+        return { tab: "smx", dateKey: hashDate, workOrderId: null, abuseCaseId: null };
+      }
+      if (raw === "smx" || raw === "schedule-mx") {
+        return { tab: "smx", dateKey: null, workOrderId: null, abuseCaseId: null };
+      }
+      if (qTab) return { tab: qTab, dateKey: hashDate, workOrderId: null, abuseCaseId: null };
+      if (isHashDate) {
+        return { tab: "snapshot", dateKey: hashDate, workOrderId: null, abuseCaseId: null };
+      }
       if (!raw) return { tab: "snapshot", dateKey: null, workOrderId: null, abuseCaseId: null };
       return { tab: "snapshot", dateKey: null, workOrderId: null, abuseCaseId: null };
     }
@@ -20182,6 +20190,31 @@ function renderDashboardHtml(): string {
         }
         return;
       }
+      if (r.tab === "wo") {
+        setMainTab("wo");
+        if (selectedDate) await loadAndRenderWoList(selectedDate);
+        return;
+      }
+      if (r.tab === "smx") {
+        setMainTab("smx");
+        return;
+      }
+      if (r.tab === "mel") {
+        setMainTab("mel");
+        return;
+      }
+      if (r.tab === "meeting") {
+        setMainTab("meeting");
+        return;
+      }
+      if (r.tab === "ask") {
+        setMainTab("ask");
+        return;
+      }
+      if (r.tab === "settings") {
+        setMainTab("settings");
+        return;
+      }
       setMainTab("snapshot");
       if (r.dateKey && historyEntries.some((e) => e.dateKey === r.dateKey)) {
         await selectDate(r.dateKey, false);
@@ -20718,7 +20751,7 @@ function renderDashboardHtml(): string {
       const sorted = activeHistoryDesc();
       const route = readHashRoute();
       const start =
-        route.tab === "snapshot" && route.dateKey && sorted.some((e) => e.dateKey === route.dateKey)
+        route.dateKey && sorted.some((e) => e.dateKey === route.dateKey)
           ? route.dateKey
           : sorted[0].dateKey;
       selectedDate = start;
