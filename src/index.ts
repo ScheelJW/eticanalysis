@@ -13896,57 +13896,105 @@ function renderDashboardHtml(): string {
       position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
       clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
     }
-    .smx-header {
-      display: flex; justify-content: space-between; align-items: flex-start; gap: 16px;
-      flex-wrap: wrap; margin-bottom: 16px;
+    /* Schedule Mx tab — same split-pane rhythm as Work Orders */
+    .smx-layout .smx-panel-heading { margin-bottom: 10px; }
+    .smx-panel-title { margin: 0 0 4px; font-size: 1.05rem; font-weight: 700; color: var(--text); }
+    .smx-panel-hint {
+      margin: 0; font-size: 0.72rem; color: var(--muted); line-height: 1.45;
     }
-    .smx-title { margin: 0 0 6px; font-size: 1.35rem; }
-    .smx-sub { margin: 0; color: var(--muted); font-size: 0.9rem; line-height: 1.45; max-width: 860px; }
+    .smx-panel-hint code { font-size: 0.68rem; }
+    .smx-date-field { display: block; margin-bottom: 12px; }
+    .smx-date-field .wo-refine-sel { width: 100%; }
+    .smx-refine-one {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+      padding: 4px 0 10px;
+    }
     .nce-inline { font-weight: 800; color: var(--accent); }
-    .smx-asof-pill {
-      font-size: 0.72rem; font-weight: 700; padding: 6px 12px; border-radius: 999px;
-      background: rgba(0,58,140,0.12); color: var(--accent); border: 1px solid rgba(0,58,140,0.3);
+    .smx-stats {
+      display: flex; flex-wrap: wrap; gap: 8px 10px;
+      margin-bottom: 12px;
     }
-    .smx-stats { display: flex; flex-wrap: wrap; gap: 10px 14px; margin-bottom: 14px; }
     .smx-stat {
       background: var(--card); border: 1px solid var(--border); border-radius: 10px;
-      padding: 10px 14px; min-width: 118px;
+      padding: 8px 12px; min-width: 96px;
     }
-    .smx-stat .lbl { display: block; font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
-    .smx-stat .v { font-size: 1.28rem; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.2; }
+    .smx-stat .lbl { display: block; font-size: 0.58rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+    .smx-stat .v { font-size: 1.05rem; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.2; }
     .smx-stat.bad .v { color: var(--danger); }
     .smx-stat.warn .v { color: var(--warn); }
     .smx-stat.crit .v { color: #7a1020; }
-    .smx-toolbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 12px; }
-    .smx-search input {
-      min-width: 220px; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border);
-      background: var(--bg); font: inherit;
+    .smx-n { font-variant-numeric: tabular-nums; }
+    .smx-card {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 12px 14px 12px 18px;
+      border-radius: 12px;
+      border: 1px solid transparent;
+      background: transparent;
+      cursor: pointer;
+      transition: background 0.12s ease, border-color 0.12s ease;
+      text-align: left;
+      font-family: var(--font);
     }
-    .smx-filters { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-    .smx-filter-btn {
-      padding: 6px 12px; border-radius: 999px; border: 1px solid var(--border);
-      background: var(--bg1); font: inherit; font-size: 0.82rem; cursor: pointer;
+    .smx-card::before {
+      content: "";
+      position: absolute;
+      left: 6px;
+      top: 14px;
+      bottom: 14px;
+      width: 2px;
+      border-radius: 2px;
+      background: transparent;
+      transition: background 0.15s ease;
     }
-    .smx-filter-btn.active {
-      border-color: var(--accent); background: rgba(0,58,140,0.08); color: var(--accent); font-weight: 700;
+    .smx-card[data-smx-tier="nce_crit"]::before { background: #8b1538; }
+    .smx-card[data-smx-tier="overdue"]::before { background: var(--danger); }
+    .smx-card[data-smx-tier="due_soon"]::before { background: var(--warn); }
+    .smx-card[data-smx-tier="missing"]::before { background: var(--warn); }
+    .smx-card[data-smx-tier="ok"]::before { background: var(--success); }
+    .smx-card[data-smx-tier="no_due"]::before { background: var(--subtle); }
+    .smx-card:hover { background: var(--bg1); border-color: var(--border); }
+    .smx-card.active {
+      background: var(--accent-soft);
+      border-color: rgba(0,58,140,0.4);
     }
-    .smx-n { opacity: 0.8; font-weight: 600; margin-left: 4px; font-variant-numeric: tabular-nums; }
-    .smx-table-wrap {
-      overflow: auto; border: 1px solid var(--border); border-radius: 10px;
-      max-height: min(70vh, 720px);
+    .smx-card .top-line {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
     }
-    .smx-table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
-    .smx-table th {
-      text-align: left; padding: 10px 12px; background: var(--bg2); position: sticky; top: 0; z-index: 1;
-      font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted);
+    .smx-card .smx-card-title {
+      font-size: 0.88rem;
+      font-weight: 600;
+      color: var(--text);
+      line-height: 1.3;
+      min-width: 0;
     }
-    .smx-table td { padding: 10px 12px; border-top: 1px solid var(--border); vertical-align: top; }
-    .smx-table tr.smx-row-nce-crit td { box-shadow: inset 3px 0 0 #8b1538; }
-    .smx-table tr.smx-row-nce-crit { background: rgba(176,0,32,0.09); }
-    .smx-table tr.smx-row-overdue { background: rgba(176,0,32,0.04); }
-    .smx-table .asset-mono { font-family: var(--font-mono); font-weight: 700; }
+    .smx-card .badges { display: inline-flex; gap: 6px; align-items: center; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
+    .smx-card .asset-mono {
+      font-family: var(--font-mono);
+      font-size: 0.92rem;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .smx-card .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 14px;
+      font-size: 0.74rem;
+      color: var(--text-dim);
+      font-variant-numeric: tabular-nums;
+    }
+    .smx-card .meta .k { color: var(--muted); font-weight: 500; margin-right: 4px; }
+    .smx-card .meta .v { font-weight: 500; color: var(--text); }
+    .smx-card .meta .v.danger { color: var(--danger); font-weight: 600; }
     .smx-pill {
-      display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 0.72rem; font-weight: 700;
+      display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.62rem; font-weight: 700;
       text-transform: uppercase; letter-spacing: 0.04em;
     }
     .smx-pill.overdue { background: rgba(176,0,32,0.16); color: var(--danger); }
@@ -14400,43 +14448,53 @@ function renderDashboardHtml(): string {
       </div>
 
       <div id="panel-schedule-mx" class="hidden">
-        <div class="smx-header">
-          <div>
-            <h2 class="smx-title">Schedule Maintenance Status</h2>
-            <p class="smx-sub">Each row is one <strong>maintenance plan</strong> per asset from the <strong>ELMS extract</strong> (email <code>prevmx@2t3.app</code>). Due/overdue uses <strong>next maint date</strong> and <strong>current meter</strong> vs <strong>next util qty</strong> when those columns exist. Same import date as Work Orders is only used for optional open WO counts. Sub work order tie-in (Plan ID) comes later.</p>
-          </div>
-          <span class="smx-asof-pill" id="smx-asof-pill" title="Latest prevmx import date">Latest import</span>
-          <label class="smx-search" style="margin-left:10px"><span class="sr-only">Import date</span>
-            <select id="smx-date-select" aria-label="Schedule Mx import date"></select>
-          </label>
-        </div>
-        <div class="smx-stats" id="smx-stats" role="status">Loading…</div>
-        <div class="smx-toolbar">
-          <label class="smx-search"><span class="sr-only">Filter rows</span>
-            <input type="text" id="smx-query" placeholder="Filter asset, plan, location…" autocomplete="off" />
-          </label>
-          <div class="smx-filters" id="smx-filters" role="tablist" aria-label="Schedule maintenance filters">
-            <button type="button" class="smx-filter-btn active" data-smx-filter="all">All <span class="smx-n" data-smx-c="all">0</span></button>
-            <button type="button" class="smx-filter-btn" data-smx-filter="nce_critical"><span class="nce-inline">NCE</span> overdue <span class="smx-n" data-smx-c="nce_critical">0</span></button>
-            <button type="button" class="smx-filter-btn" data-smx-filter="overdue">Overdue <span class="smx-n" data-smx-c="overdue">0</span></button>
-            <button type="button" class="smx-filter-btn" data-smx-filter="due_soon">Due soon <span class="smx-n" data-smx-c="due_soon">0</span></button>
-            <button type="button" class="smx-filter-btn" data-smx-filter="missing">Missing data <span class="smx-n" data-smx-c="missing">0</span></button>
-          </div>
-        </div>
-        <div class="smx-table-wrap">
-          <table class="smx-table" aria-label="Schedule maintenance by plan">
-            <thead>
-              <tr>
-                <th>Asset / plan</th>
-                <th>Last / next</th>
-                <th>Utilization</th>
-                <th>NCE</th>
-                <th>Status</th>
-                <th>State</th>
-              </tr>
-            </thead>
-            <tbody id="smx-tbody"><tr><td colspan="6">Loading…</td></tr></tbody>
-          </table>
+        <div class="wo-layout smx-layout">
+          <aside class="wo-sidebar">
+            <div class="smx-panel-heading">
+              <h2 class="smx-panel-title">Schedule maintenance</h2>
+              <p class="smx-panel-hint">One card per <strong>maintenance plan</strong> from the ELMS extract (email <code>prevmx@2t3.app</code>). Open WO counts use the same calendar date when a workbook exists.</p>
+            </div>
+            <label class="smx-date-field">
+              <span class="sr-only">Import date</span>
+              <select id="smx-date-select" class="wo-refine-sel" aria-label="Schedule Mx import date"></select>
+            </label>
+            <div class="smx-stats" id="smx-stats" role="status">Loading…</div>
+            <div class="wo-searchbar">
+              <input type="text" id="smx-query" placeholder="Search asset, plan, location…" autocomplete="off" aria-label="Search schedule maintenance plans" />
+              <span class="wo-asof-pill" id="smx-asof-pill" title="Selected prevmx import date">—</span>
+            </div>
+            <div class="wo-filters" id="smx-filters" role="tablist" aria-label="Schedule maintenance filters">
+              <button type="button" class="wo-filter-btn active" data-smx-filter="all">All <span class="count smx-n" data-smx-c="all">0</span></button>
+              <button type="button" class="wo-filter-btn" data-smx-filter="nce_critical"><span class="nce-inline">NCE</span> overdue <span class="count smx-n" data-smx-c="nce_critical">0</span></button>
+              <button type="button" class="wo-filter-btn" data-smx-filter="overdue">Overdue <span class="count smx-n" data-smx-c="overdue">0</span></button>
+              <button type="button" class="wo-filter-btn" data-smx-filter="due_soon">Due soon <span class="count smx-n" data-smx-c="due_soon">0</span></button>
+              <button type="button" class="wo-filter-btn" data-smx-filter="missing">Missing <span class="count smx-n" data-smx-c="missing">0</span></button>
+            </div>
+            <div class="smx-refine-one">
+              <select id="smx-sort" class="wo-refine-sel" aria-label="Sort maintenance plans">
+                <option value="priority">Sort: Priority</option>
+                <option value="asset">Sort: Asset</option>
+                <option value="plan">Sort: Plan name</option>
+                <option value="next">Sort: Next maint (soonest)</option>
+                <option value="next_desc">Sort: Next maint (latest)</option>
+                <option value="wo">Sort: Open WOs</option>
+              </select>
+            </div>
+            <div class="wo-list-meta" id="smx-list-meta">Loading…</div>
+            <div class="wo-list" id="smx-list"></div>
+          </aside>
+          <section class="wo-detail-pane">
+            <div id="smx-detail-empty" class="wo-empty">Select a plan from the list to see dates, utilization, and ELMS status.</div>
+            <div id="smx-detail" class="hidden wo-detail-inner">
+              <section class="wo-detail-overview" aria-label="Schedule maintenance summary">
+                <div class="wo-hero" id="smx-hero"></div>
+              </section>
+              <section class="wo-detail-block" aria-labelledby="smx-facts-heading">
+                <h3 class="wo-detail-block-title" id="smx-facts-heading">Plan details</h3>
+                <div class="wo-facts" id="smx-facts"></div>
+              </section>
+            </div>
+          </section>
         </div>
       </div>
 
@@ -17428,18 +17486,244 @@ function renderDashboardHtml(): string {
     var smxRows = [];
     var smxStats = null;
     var smxFilter = "all";
+    var smxSort = "priority";
+    /** planRowKey of selected row for detail pane */
+    var smxSelectedPlanKey = "";
     /** Selected prevmx import date (YYYY-MM-DD); null = use latest from server. */
     var smxSelectedDateKey = null;
+
+    function smxCardTier(row) {
+      if (row.scheduleMxNceCritical) return "nce_crit";
+      const b = row.scheduleMxBucket || "";
+      if (b === "overdue" || b === "due_soon" || b === "missing" || b === "ok" || b === "no_due") return b;
+      return "ok";
+    }
+
+    function smxFilteredRows() {
+      const qel = document.getElementById("smx-query");
+      const q = (qel && qel.value) ? qel.value.trim() : "";
+      return smxRows.filter(function (row) {
+        return smxMatchesFilter(row, smxFilter) && smxMatchesQuery(row, q);
+      });
+    }
+
+    function smxSortRows(rows) {
+      const sortSel = document.getElementById("smx-sort");
+      const mode = (sortSel && sortSel.value) ? sortSel.value : smxSort;
+      function rank(a) {
+        if (a.scheduleMxNceCritical) return 0;
+        if (a.scheduleMxBucket === "overdue") return 1;
+        if (a.scheduleMxBucket === "due_soon") return 2;
+        if (a.scheduleMxBucket === "missing") return 3;
+        return 4;
+      }
+      function nextKey(a) {
+        return a.elmsNextMaintDateIso || a.scheduleMxDueIso || "9999-99-99";
+      }
+      const out = rows.slice();
+      out.sort(function (a, b) {
+        if (mode === "asset") {
+          const c = (a.assetId || "").localeCompare(b.assetId || "", undefined, { sensitivity: "base", numeric: true });
+          if (c !== 0) return c;
+          return (a.planRowKey || "").localeCompare(b.planRowKey || "");
+        }
+        if (mode === "plan") {
+          const c = (a.planName || "").localeCompare(b.planName || "", undefined, { sensitivity: "base", numeric: true });
+          if (c !== 0) return c;
+          return (a.assetId || "").localeCompare(b.assetId || "", undefined, { sensitivity: "base", numeric: true });
+        }
+        if (mode === "next") {
+          const ax = nextKey(a);
+          const bx = nextKey(b);
+          if (ax !== bx) return ax < bx ? -1 : 1;
+          return (a.planRowKey || "").localeCompare(b.planRowKey || "");
+        }
+        if (mode === "next_desc") {
+          const ax = nextKey(a);
+          const bx = nextKey(b);
+          if (ax !== bx) return ax < bx ? 1 : -1;
+          return (a.planRowKey || "").localeCompare(b.planRowKey || "");
+        }
+        if (mode === "wo") {
+          const wa = a.workOrderCount || 0;
+          const wb = b.workOrderCount || 0;
+          if (wa !== wb) return wb - wa;
+          return (a.planRowKey || "").localeCompare(b.planRowKey || "");
+        }
+        const ra = rank(a);
+        const rb = rank(b);
+        if (ra !== rb) return ra - rb;
+        const ac = (a.assetId || "").localeCompare(b.assetId || "", undefined, { sensitivity: "base", numeric: true });
+        if (ac !== 0) return ac;
+        return (a.planRowKey || "").localeCompare(b.planRowKey || "");
+      });
+      return out;
+    }
+
+    function selectSmxPlan(planKey, scrollIntoView) {
+      smxSelectedPlanKey = planKey || "";
+      const list = document.getElementById("smx-list");
+      if (list) {
+        list.querySelectorAll(".smx-card").forEach(function (el) {
+          el.classList.toggle("active", el.getAttribute("data-smx-plan") === smxSelectedPlanKey);
+        });
+      }
+      const empty = document.getElementById("smx-detail-empty");
+      const wrap = document.getElementById("smx-detail");
+      if (!empty || !wrap) return;
+      if (!smxSelectedPlanKey) {
+        empty.classList.remove("hidden");
+        wrap.classList.add("hidden");
+        return;
+      }
+      const row = smxRows.find(function (r) { return r.planRowKey === smxSelectedPlanKey; });
+      if (!row) {
+        empty.classList.remove("hidden");
+        wrap.classList.add("hidden");
+        return;
+      }
+      empty.classList.add("hidden");
+      wrap.classList.remove("hidden");
+      renderSmxHero(row);
+      renderSmxFacts(row);
+      if (scrollIntoView && wrap.scrollIntoView) {
+        try {
+          wrap.scrollIntoView({ block: "nearest", behavior: "smooth" });
+        } catch (e2) { /* ignore */ }
+      }
+    }
+
+    function renderSmxHero(row) {
+      const el = document.getElementById("smx-hero");
+      if (!el) return;
+      const chips = [];
+      if (row.nce) {
+        chips.push(
+          "<span class='wo-chip nce' title='Nuclear Certified Equipment" +
+            (row.nceStatus ? " · " + esc(row.nceStatus) : "") +
+            "'>NCE</span>",
+        );
+      }
+      if (row.scheduleMxNceCritical) {
+        chips.push("<span class='wo-chip tier-below' title='Overdue schedule maintenance on NCE'>NCE overdue</span>");
+      }
+      const b = row.scheduleMxBucket || "";
+      if (b === "overdue") chips.push("<span class='wo-chip tier-below'>Overdue</span>");
+      else if (b === "due_soon") chips.push("<span class='wo-chip tier-at'>Due soon</span>");
+      else if (b === "missing") chips.push("<span class='wo-chip stale'>Missing data</span>");
+      else if (b === "no_due") chips.push("<span class='wo-chip tier-unknown'>No due date</span>");
+      else chips.push("<span class='wo-chip ok'>Current</span>");
+      const planTitle = (row.planName || "Maintenance plan").trim() || "Maintenance plan";
+      const subParts = [];
+      if (row.assetId) {
+        subParts.push(
+          "<span class='wo-hero-asset'>" + esc(row.assetId) + "</span> " +
+            renderSightingBadge(row.assetId) + " " + renderWaiverBadge(row.assetId),
+        );
+      }
+      const metaParts = [];
+      if (row.planId) metaParts.push("Plan ID " + esc(row.planId));
+      if (row.location) metaParts.push(esc(row.location));
+      if (row.makeModel) metaParts.push(esc(row.makeModel));
+      el.innerHTML =
+        "<div class='wo-hero-row'>" +
+        "<div class='wo-hero-id' style='font-size:1rem;max-width:100%;word-break:break-word'>" + esc(planTitle) + "</div>" +
+        chips.join("") +
+        "</div>" +
+        (subParts.length ? "<div class='wo-hero-sub wo-hero-sub-primary'>" + subParts.join(" ") + "</div>" : "") +
+        (metaParts.length
+          ? "<div class='wo-hero-sub wo-hero-sub-meta'>" + metaParts.join("<span class='dot'>·</span>") + "</div>"
+          : "");
+    }
+
+    function renderSmxFacts(row) {
+      const el = document.getElementById("smx-facts");
+      if (!el) return;
+      const sched = [];
+      sched.push({ dt: "ELMS status", dd: esc(row.scheduleMxStatus || "—") });
+      sched.push({
+        dt: "Health",
+        dd:
+          "<span class='smx-pill " + esc(row.scheduleMxBucket || "") + "'>" +
+          esc(smxPillLabel(row.scheduleMxBucket)) +
+          "</span>",
+      });
+      const lastM = row.elmsLastMaintDateIso ? fmtKeyShort(row.elmsLastMaintDateIso) : "—";
+      const nextM = row.elmsNextMaintDateIso ? fmtKeyShort(row.elmsNextMaintDateIso) : "—";
+      sched.push({ dt: "Last maint (ELMS)", dd: esc(lastM) });
+      sched.push({ dt: "Next maint (ELMS)", dd: esc(nextM) });
+      if (row.scheduleMxDueIso && row.scheduleMxDueIso !== row.elmsNextMaintDateIso) {
+        sched.push({ dt: "Computed due", dd: esc(fmtKeyShort(row.scheduleMxDueIso)) });
+      }
+      if (row.scheduleMxOverdueByDays != null) {
+        sched.push({ dt: "Overdue by", dd: esc(String(row.scheduleMxOverdueByDays) + " days") });
+      }
+      if (row.scheduleMxDaysUntil != null && row.scheduleMxBucket === "due_soon") {
+        sched.push({ dt: "Days until due", dd: esc(String(row.scheduleMxDaysUntil)) });
+      }
+      const util = [];
+      const ut = (row.elmsUtilType || "").trim();
+      util.push({
+        dt: "Current meter",
+        dd: esc(row.elmsCurrentMeter != null ? String(row.elmsCurrentMeter) + (ut ? " " + ut : "") : "—"),
+      });
+      util.push({
+        dt: "Next util qty",
+        dd: esc(row.elmsNextUtilQty != null ? String(row.elmsNextUtilQty) : "—"),
+      });
+      if (row.scheduleMxUtilRemaining != null) {
+        const rem = row.scheduleMxUtilRemaining;
+        util.push({
+          dt: "Util remaining",
+          dd: esc((rem >= 0 ? "" : "over ") + Math.abs(rem) + (ut ? " " + ut : "")),
+        });
+      }
+      if (row.scheduleMxOverdueUtil) {
+        util.push({ dt: "Util overdue", dd: "<span class='facts-sub'>At or past next util qty</span>" });
+      }
+      const plan = [];
+      if (row.maintenanceScheduleId) plan.push({ dt: "Maint schedule ID", dd: esc(row.maintenanceScheduleId) });
+      if (row.planDesc) plan.push({ dt: "Plan description", dd: esc(row.planDesc) });
+      if (row.itemDesc) plan.push({ dt: "Item", dd: esc(row.itemDesc) });
+      plan.push({ dt: "Plan row key", dd: "<span class='asset-mono' style='font-size:0.82rem'>" + esc(row.planRowKey || "—") + "</span>" });
+      const org = [];
+      if (row.mgmtCd) org.push({ dt: "Mgmt Cd", dd: esc(row.mgmtCd) });
+      org.push({
+        dt: "Open WOs (date)",
+        dd: esc(String(row.workOrderCount ?? 0)),
+      });
+      function factPair(x) {
+        return "<div class='wo-facts-pair'><dt>" + esc(x.dt) + "</dt><dd>" + x.dd + "</dd></div>";
+      }
+      function factGroup(title, rows2) {
+        if (!rows2.length) return "";
+        return (
+          "<section class='wo-facts-group' aria-label='" + esc(title) + "'>" +
+          "<h4 class='wo-facts-group-h'>" + esc(title) + "</h4>" +
+          "<dl class='wo-facts-dl'>" + rows2.map(factPair).join("") + "</dl>" +
+          "</section>"
+        );
+      }
+      el.innerHTML =
+        factGroup("Schedule", sched) +
+        factGroup("Utilization", util) +
+        factGroup("Plan", plan) +
+        factGroup("Organization", org);
+    }
 
     async function loadScheduleMxTab() {
       const pill = document.getElementById("smx-asof-pill");
       const dateSel = document.getElementById("smx-date-select");
       const statsEl = document.getElementById("smx-stats");
-      const tbody = document.getElementById("smx-tbody");
+      const listMeta = document.getElementById("smx-list-meta");
+      const list = document.getElementById("smx-list");
       if (statsEl) {
         statsEl.innerHTML = "<span class='smx-stat'><span class='lbl'>Loading</span><span class='v'>…</span></span>";
       }
-      if (tbody) tbody.innerHTML = "<tr><td colspan='6'>Loading…</td></tr>";
+      if (listMeta) listMeta.textContent = "Loading…";
+      if (list) list.innerHTML = "";
+      smxSelectedPlanKey = "";
+      selectSmxPlan("", false);
       try {
         const rd = await fetch("/api/schedule-mx?dates=1", { cache: "no-store" });
         const jd = await rd.json();
@@ -17460,7 +17744,10 @@ function renderDashboardHtml(): string {
         if (pill) pill.textContent = dk ? fmtKeyLong(dk) : "No imports";
         if (!dk) {
           if (statsEl) statsEl.textContent = "No Schedule Mx imports yet — send a CSV or XLSX to prevmx@2t3.app.";
-          if (tbody) tbody.innerHTML = "<tr><td colspan='6'>No data.</td></tr>";
+          if (listMeta) listMeta.textContent = "";
+          if (list) {
+            list.innerHTML = "<div class='problem-empty' style='padding:18px 4px'>No imports yet.</div>";
+          }
           smxRows = [];
           smxStats = null;
           return;
@@ -17469,7 +17756,10 @@ function renderDashboardHtml(): string {
         const j = await r.json();
         if (!r.ok) {
           if (statsEl) statsEl.textContent = j.error || "Could not load schedule maintenance.";
-          if (tbody) tbody.innerHTML = "<tr><td colspan='6'>No rows for this date.</td></tr>";
+          if (listMeta) listMeta.textContent = "";
+          if (list) {
+            list.innerHTML = "<div class='problem-empty' style='padding:18px 4px'>No rows for this date.</div>";
+          }
           smxRows = [];
           smxStats = null;
           return;
@@ -17477,10 +17767,16 @@ function renderDashboardHtml(): string {
         smxRows = Array.isArray(j.rows) ? j.rows : [];
         smxStats = j.stats || null;
         renderScheduleMxStats();
-        renderScheduleMxTable();
+        renderScheduleMxList();
+        Promise.all([loadSightings(false), loadWaiverCounts(false)]).then(function () {
+          const p = document.getElementById("panel-schedule-mx");
+          if (!p || p.classList.contains("hidden")) return;
+          renderScheduleMxList();
+        });
       } catch (e) {
         if (statsEl) statsEl.textContent = "Could not load schedule maintenance.";
-        if (tbody) tbody.innerHTML = "<tr><td colspan='6'>Could not load.</td></tr>";
+        if (listMeta) listMeta.textContent = "";
+        if (list) list.innerHTML = "<div class='problem-empty' style='padding:18px 4px'>Could not load.</div>";
       }
     }
 
@@ -17656,69 +17952,76 @@ function renderDashboardHtml(): string {
       return bucket || "—";
     }
 
-    function renderScheduleMxTable() {
-      const tbody = document.getElementById("smx-tbody");
-      if (!tbody) return;
-      const qel = document.getElementById("smx-query");
-      const q = (qel && qel.value) ? qel.value.trim() : "";
-      const filtered = smxRows.filter(function (row) {
-        return smxMatchesFilter(row, smxFilter) && smxMatchesQuery(row, q);
-      });
+    function renderScheduleMxList() {
+      const list = document.getElementById("smx-list");
+      const meta = document.getElementById("smx-list-meta");
+      if (!list) return;
       document.querySelectorAll("#smx-filters .smx-n").forEach(function (el) {
         const k = el.getAttribute("data-smx-c");
         if (!k) return;
         const n = smxRows.filter(function (row) { return smxMatchesFilter(row, k); }).length;
         el.textContent = n;
       });
-      if (!filtered.length) {
-        tbody.innerHTML = "<tr><td colspan='6'>No rows match.</td></tr>";
+      const filtered = smxFilteredRows();
+      const visible = smxSortRows(filtered);
+      if (meta) {
+        meta.textContent = visible.length + " of " + smxRows.length + " plan" + (smxRows.length === 1 ? "" : "s");
+      }
+      if (smxSelectedPlanKey && !visible.some(function (r) { return r.planRowKey === smxSelectedPlanKey; })) {
+        smxSelectedPlanKey = "";
+      }
+      if (!visible.length) {
+        list.innerHTML = "<div class='problem-empty' style='padding:18px 4px'>No plans match this filter.</div>";
+        selectSmxPlan("", false);
         return;
       }
-      tbody.innerHTML = filtered.map(function (row) {
-        const nce = row.nce
-          ? ("<span class='nce-inline' title='" + esc(row.nceStatus || "NCE") + "'>NCE</span>")
-          : "—";
-        const due = row.scheduleMxDueIso ? fmtKeyShort(row.scheduleMxDueIso) : "—";
-        const ov = row.scheduleMxOverdueByDays != null ? row.scheduleMxOverdueByDays + " d" : "—";
+      list.innerHTML = visible.map(function (row) {
+        const isActive = row.planRowKey === smxSelectedPlanKey;
+        const tier = smxCardTier(row);
+        const nceChip = row.nce
+          ? "<span class='chip nce' title='Nuclear Certified Equipment" + (row.nceStatus ? " · " + esc(row.nceStatus) : "") + "'>NCE</span>"
+          : "";
+        const critChip = row.scheduleMxNceCritical
+          ? "<span class='chip stale' title='Overdue on NCE'>NCE od</span>"
+          : "";
         const pillCls = row.scheduleMxBucket || "";
-        let trCls = "";
-        if (row.scheduleMxNceCritical) trCls = "smx-row-nce-crit";
-        else if (row.scheduleMxBucket === "overdue") trCls = "smx-row-overdue";
-        const mgmtLine = row.mgmtCd
-          ? ("Mgmt " + esc(row.mgmtCd) + " · " + row.workOrderCount + " WO")
-          : (String(row.workOrderCount) + " WO");
-        const lastNext =
-          (row.elmsLastMaintDateIso ? fmtKeyShort(row.elmsLastMaintDateIso) : "—") +
-          " → " +
-          (row.elmsNextMaintDateIso ? fmtKeyShort(row.elmsNextMaintDateIso) : due);
-        const ut = (row.elmsUtilType || "").trim();
-        const utilLine =
-          (row.elmsCurrentMeter != null ? esc(String(row.elmsCurrentMeter)) : "—") +
-          (ut ? " " + esc(ut) : "") +
-          " · next " +
-          (row.elmsNextUtilQty != null ? esc(String(row.elmsNextUtilQty)) : "—") +
-          (row.scheduleMxUtilRemaining != null
-            ? " (" + (row.scheduleMxUtilRemaining >= 0 ? "rem " : "over ") + Math.abs(row.scheduleMxUtilRemaining) + ")"
-            : "");
+        const statePill = "<span class='smx-pill " + esc(pillCls) + "'>" + esc(smxPillLabel(row.scheduleMxBucket)) + "</span>";
+        const planLine = (row.planName || "Plan").trim() || "Plan";
+        const nextD = row.elmsNextMaintDateIso || row.scheduleMxDueIso;
+        const nextTxt = nextD ? fmtKeyShort(nextD) : "—";
+        const ov = row.scheduleMxOverdueByDays != null ? row.scheduleMxOverdueByDays + "d od" : "";
+        const metaBits = [];
+        metaBits.push("<span><span class='k'>Next</span><span class='v'>" + esc(nextTxt) + "</span></span>");
+        if (ov) metaBits.push("<span><span class='k'>Late</span><span class='v danger'>" + esc(ov) + "</span></span>");
+        if (row.workOrderCount) {
+          metaBits.push("<span><span class='k'>WOs</span><span class='v'>" + row.workOrderCount + "</span></span>");
+        }
         return (
-          "<tr" + (trCls ? " class='" + esc(trCls) + "'" : "") + ">" +
-            "<td><span class='asset-mono'>" + esc(row.assetId) + "</span>" +
-              (row.planName ? "<div class='remark-snippet'><strong>" + esc(row.planName) + "</strong>" +
-                (row.planId ? " · Plan " + esc(row.planId) : "") + "</div>" : "") +
-              (row.location ? "<div class='remark-snippet'>" + esc(row.location) + "</div>" : "") +
-              (row.makeModel ? "<div class='remark-snippet'>" + esc(row.makeModel) + "</div>" : "") +
-              "<div class='remark-snippet'>" + mgmtLine + "</div>" +
-            "</td>" +
-            "<td><div class='remark-snippet'>" + esc(lastNext) + "</div>" +
-              (ov !== "—" ? "<div class='remark-snippet'>Overdue " + esc(ov) + "</div>" : "") +
-            "</td>" +
-            "<td><div class='remark-snippet'>" + utilLine + "</div></td>" +
-            "<td>" + nce + "</td>" +
-            "<td>" + esc(row.scheduleMxStatus || "—") + "</td>" +
-            "<td><span class='smx-pill " + esc(pillCls) + "'>" + esc(smxPillLabel(row.scheduleMxBucket)) + "</span></td>" +
-          "</tr>"
+          "<button type='button' class='smx-card" + (isActive ? " active" : "") + "' data-smx-plan='" + esc(row.planRowKey) + "' data-smx-tier='" + esc(tier) + "'>" +
+          "<div class='top-line'>" +
+          "<span class='smx-card-title'>" + esc(planLine) + "</span>" +
+          "<span class='badges'>" + nceChip + critChip + statePill + "</span>" +
+          "</div>" +
+          "<div class='top-line wo-card-asset-row'><span class='asset-mono'>" + esc(row.assetId || "—") + "</span><span></span></div>" +
+          "<div class='wo-meta-line'>" + renderSightingBadge(row.assetId, { compact: true }) + renderWaiverBadge(row.assetId) + "</div>" +
+          "<div class='meta'>" + metaBits.join("") + "</div>" +
+          "</button>"
         );
       }).join("");
+      list.querySelectorAll(".smx-card").forEach(function (el) {
+        el.addEventListener("click", function () {
+          const pk = el.getAttribute("data-smx-plan");
+          selectSmxPlan(pk || "", true);
+          list.querySelectorAll(".smx-card").forEach(function (c) {
+            c.classList.toggle("active", c.getAttribute("data-smx-plan") === smxSelectedPlanKey);
+          });
+        });
+      });
+      if (!smxSelectedPlanKey && visible.length) smxSelectedPlanKey = visible[0].planRowKey || "";
+      selectSmxPlan(smxSelectedPlanKey, false);
+      list.querySelectorAll(".smx-card").forEach(function (c) {
+        c.classList.toggle("active", c.getAttribute("data-smx-plan") === smxSelectedPlanKey);
+      });
     }
 
     /* --- Work Orders list + filters -------------------------------------- */
@@ -19601,14 +19904,22 @@ function renderDashboardHtml(): string {
           const b = e.target.closest("[data-smx-filter]");
           if (!b) return;
           smxFilter = b.getAttribute("data-smx-filter") || "all";
-          smxFilt.querySelectorAll(".smx-filter-btn").forEach(function (x) {
+          smxFilt.querySelectorAll(".wo-filter-btn").forEach(function (x) {
             x.classList.toggle("active", x === b);
           });
-          renderScheduleMxTable();
+          renderScheduleMxList();
         });
       }
       const smxQ = document.getElementById("smx-query");
-      if (smxQ) smxQ.addEventListener("input", function () { renderScheduleMxTable(); });
+      if (smxQ) smxQ.addEventListener("input", function () { renderScheduleMxList(); });
+      const smxSortSel = document.getElementById("smx-sort");
+      if (smxSortSel && !smxSortSel.dataset.wired) {
+        smxSortSel.dataset.wired = "1";
+        smxSortSel.addEventListener("change", function () {
+          smxSort = smxSortSel.value || "priority";
+          renderScheduleMxList();
+        });
+      }
       const smxDateSel = document.getElementById("smx-date-select");
       if (smxDateSel && !smxDateSel.dataset.wired) {
         smxDateSel.dataset.wired = "1";
