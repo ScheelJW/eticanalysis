@@ -240,6 +240,19 @@ describe("analyzeElmsScheduleMxFromRaw", () => {
     expect(a.scheduleMxUtilRemaining).toBe(45);
     expect(a.scheduleMxBucket).toBe("due_soon");
   });
+
+  it("overrideCurrentMeter replaces extract reading for util math", () => {
+    const raw = {
+      "fleet.next maint date": "2026-12-01",
+      "fleet.current meter reading": "1000",
+      "fleet.next util qty": "5000",
+      "fleet.utilization type": "Miles",
+    };
+    const a = analyzeElmsScheduleMxFromRaw(raw, "2026-04-25", { overrideCurrentMeter: 4900 });
+    expect(a.elmsCurrentMeter).toBe(4900);
+    expect(a.scheduleMxUtilRemaining).toBe(100);
+    expect(a.scheduleMxBucket).toBe("due_soon");
+  });
 });
 
 describe("calendarDaysBetween", () => {

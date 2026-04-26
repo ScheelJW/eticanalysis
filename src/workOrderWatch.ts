@@ -1328,12 +1328,18 @@ function elmsUtilDueSoonThreshold(utilType: string): number {
   return DUE_SOON_UTIL_MILES;
 }
 
+export type AnalyzeElmsScheduleMxOpts = {
+  /** When set, use this as current meter instead of the extract cell (shop-floor calculator). */
+  overrideCurrentMeter?: number | null;
+};
+
 /**
  * Merge ELMS date/util signals with legacy Fleet (P&A) schedule fields when present in raw JSON.
  */
 export function analyzeElmsScheduleMxFromRaw(
   raw: Record<string, string>,
   asOfDateKey: string,
+  opts?: AnalyzeElmsScheduleMxOpts,
 ): {
   scheduleMxStatus: string;
   scheduleMxDueIso: string | null;
@@ -1367,7 +1373,9 @@ export function analyzeElmsScheduleMxFromRaw(
   let elmsNextMaintDateIso = parseEticDate(nextMaintText);
   const elmsLastUtilQty = parseUtilNumber(lastUtilText);
   const elmsNextUtilQty = parseUtilNumber(nextUtilText);
-  const elmsCurrentMeter = parseUtilNumber(meterText);
+  const ov = opts?.overrideCurrentMeter;
+  const elmsCurrentMeter =
+    typeof ov === "number" && Number.isFinite(ov) ? ov : parseUtilNumber(meterText);
   const elmsUtilType = utilTypeRaw.replace(/\s+/g, " ").trim().toLowerCase();
 
   let dateOverdue = false;
@@ -1900,6 +1908,111 @@ export async function ingestScheduleMxExtractFromAttachment(
     }),
   );
   return { rowCount: assetSet.size, planRows: planRows.length, dateKey: opts.dateKey };
+}
+
+/** Per-plan result for shop-floor “what to add to the WO” calculator (meter override). */
+export type ScheduleMxShopCalcPlanRow = {
+  planRowKey: string;
+  planId: string;
+  planName: string;
+  nextMaintDateIso: string | null;
+  nextUtilQty: number | null;
+  utilType: string;
+  extractMeter: number | null;
+  shopMeter: number;
+  remaining: number | null;
+  bucket: ScheduleMxBucket;
+  recommendWo: boolean;
+  reason: string;
+};
+
+function shopCalcReason(params: {
+  bucket: ScheduleMxBucket;
+  dateOverdue: boolean;
+  utilOverdue: boolean;
+  dateDueSoon: boolean;
+  utilDueSoon: boolean;
+}): string {
+  const parts: string[] = [];
+  if (params.dateOverdue) parts.push("Next maint date is past");
+  if (params.utilOverdue) parts.push("Meter at or past next util interval");
+  if (params.dateDueSoon && !params.dateOverdue) parts.push("Next maint within " + DUE_SOON_DAYS_ELMS + " days");
+  if (params.utilDueSoon && !params.utilOverdue) parts.push("Util remaining within due-soon threshold");
+  if (parts.length) return parts.join(". ") + ".";
+  if (params.bucket === "missing") return "No next maint or util target in extract.";
+  return "Not due on calendar or util at this meter.";
+}
+
+/**
+ * Recompute schedule buckets for one asset’s ELMS plans using a **shop** odometer/hour reading.
+ * Does not apply open-WO suppression (you are already opening maintenance).
+ */
+export async function computeScheduleMxShopFloorPlans(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  scheduleMxDateKey: string,
+  assetId: string,
+  shopMeter: number,
+  asOfDateKey: string,
+): Promise<ScheduleMxShopCalcPlanRow[]> {
+  const aid = assetId.trim().toUpperCase();
+  if (!aid || !/^\d{4}-\d{2}-\d{2}$/.test(scheduleMxDateKey) || !/^\d{4}-\d{2}-\d{2}$/.test(asOfDateKey)) {
+    return [];
+  }
+  const allPlans = await loadScheduleMxPlanRowsForDate(env, scheduleMxDateKey);
+  const rows = allPlans.filter((p) => p.assetId.trim().toUpperCase() === aid);
+  const out: ScheduleMxShopCalcPlanRow[] = [];
+  for (const pr of rows) {
+    const merged = pr.raw;
+    const base = analyzeElmsScheduleMxFromRaw(merged, asOfDateKey);
+    const smx = analyzeElmsScheduleMxFromRaw(merged, asOfDateKey, { overrideCurrentMeter: shopMeter });
+
+    let dateOverdue = false;
+    let dateDueSoon = false;
+    if (base.elmsNextMaintDateIso) {
+      const d = calendarDaysBetween(asOfDateKey, base.elmsNextMaintDateIso);
+      if (d < 0) dateOverdue = true;
+      else if (d >= 0 && d <= DUE_SOON_DAYS_ELMS) dateDueSoon = true;
+    }
+    const utilOverdue = smx.scheduleMxOverdueUtil;
+    let utilDueSoon = false;
+    if (!utilOverdue && smx.scheduleMxUtilRemaining != null && smx.scheduleMxUtilRemaining > 0) {
+      utilDueSoon = smx.scheduleMxUtilRemaining <= elmsUtilDueSoonThreshold(smx.elmsUtilType);
+    }
+    const recommendWo = smx.scheduleMxBucket === "overdue" || smx.scheduleMxBucket === "due_soon";
+    out.push({
+      planRowKey: pr.planRowKey,
+      planId: pickElmsFromRaw(merged, ["plan id"]),
+      planName: pickElmsFromRaw(merged, ["plan name"]),
+      nextMaintDateIso: smx.elmsNextMaintDateIso,
+      nextUtilQty: smx.elmsNextUtilQty,
+      utilType: smx.elmsUtilType,
+      extractMeter: base.elmsCurrentMeter,
+      shopMeter,
+      remaining: smx.scheduleMxUtilRemaining,
+      bucket: smx.scheduleMxBucket,
+      recommendWo,
+      reason: shopCalcReason({
+        bucket: smx.scheduleMxBucket,
+        dateOverdue,
+        utilOverdue,
+        dateDueSoon,
+        utilDueSoon,
+      }),
+    });
+  }
+  function rank(b: ScheduleMxBucket): number {
+    if (b === "overdue") return 0;
+    if (b === "due_soon") return 1;
+    if (b === "missing") return 2;
+    return 3;
+  }
+  out.sort(function (a, b) {
+    const ra = rank(a.bucket);
+    const rb = rank(b.bucket);
+    if (ra !== rb) return ra - rb;
+    return a.planRowKey.localeCompare(b.planRowKey);
+  });
+  return out;
 }
 
 async function loadScheduleMxPlanRowsForDate(

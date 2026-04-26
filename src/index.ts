@@ -22,6 +22,7 @@ import {
   rollupScheduleMxPlansToAssets,
   sortScheduleMxAssetRows,
   getLatestScheduleMxExtractDateKey,
+  computeScheduleMxShopFloorPlans,
   listScheduleMxExtractDateKeysDesc,
   getWatchRowsLatest,
   getWorkOrderActions,
@@ -4832,8 +4833,57 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
 }
 
 async function handleScheduleMxApi(env: Env, request: Request): Promise<Response> {
-  if (request.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
   const url = new URL(request.url);
+  if (request.method === "POST" && url.searchParams.get("shop_calc") === "1") {
+    let body: {
+      assetId?: string;
+      shopMeter?: number;
+      scheduleMxDateKey?: string;
+      asOfDateKey?: string;
+    };
+    try {
+      body = (await request.json()) as typeof body;
+    } catch {
+      return Response.json({ error: "Invalid JSON body." }, { status: 400, headers: cacheHeaders() });
+    }
+    const assetId = String(body.assetId ?? "").trim();
+    const shopMeter = Number(body.shopMeter);
+    if (!assetId) {
+      return Response.json({ error: "assetId is required." }, { status: 400, headers: cacheHeaders() });
+    }
+    if (!Number.isFinite(shopMeter)) {
+      return Response.json({ error: "shopMeter must be a number." }, { status: 400, headers: cacheHeaders() });
+    }
+    let scheduleMxDateKey = String(body.scheduleMxDateKey ?? "").trim();
+    if (!scheduleMxDateKey) scheduleMxDateKey = (await getLatestScheduleMxExtractDateKey(env)) ?? "";
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(scheduleMxDateKey)) {
+      return Response.json(
+        { error: "No Schedule Mx import date. Pick an import or send scheduleMxDateKey." },
+        { status: 404, headers: cacheHeaders() },
+      );
+    }
+    let asOfDateKey = String(body.asOfDateKey ?? "").trim();
+    if (!asOfDateKey) asOfDateKey = new Date().toISOString().slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(asOfDateKey)) {
+      return Response.json({ error: "asOfDateKey must be YYYY-MM-DD." }, { status: 400, headers: cacheHeaders() });
+    }
+    const plans = await computeScheduleMxShopFloorPlans(env, scheduleMxDateKey, assetId, shopMeter, asOfDateKey);
+    const recommend = plans.filter((p) => p.recommendWo);
+    return Response.json(
+      {
+        assetId,
+        shopMeter,
+        scheduleMxDateKey,
+        asOfDateKey,
+        planCount: plans.length,
+        recommendCount: recommend.length,
+        plans,
+        recommend,
+      },
+      { headers: cacheHeaders() },
+    );
+  }
+  if (request.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
   if (url.searchParams.get("dates") === "1") {
     const dates = await listScheduleMxExtractDateKeysDesc(env);
     const latest = dates[0] ?? null;
@@ -13973,6 +14023,32 @@ function renderDashboardHtml(): string {
     .smx-mini-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; margin-top: 6px; }
     .smx-mini-table th, .smx-mini-table td { padding: 6px 8px; border-top: 1px solid var(--border); text-align: left; vertical-align: top; }
     .smx-mini-table th { color: var(--muted); font-weight: 600; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.06em; }
+    .smx-calc-wrap {
+      margin: 0 0 16px;
+      padding: 12px 14px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--panel);
+    }
+    .smx-calc-summary { cursor: pointer; font-weight: 700; font-size: 0.95rem; user-select: none; }
+    .smx-calc-summary:hover { color: var(--accent); }
+    .smx-calc-inner { margin-top: 12px; }
+    .smx-calc-row {
+      display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: flex-end; margin-bottom: 10px;
+    }
+    .smx-calc-row label { display: flex; flex-direction: column; gap: 4px; font-size: 0.78rem; color: var(--muted); }
+    .smx-calc-row input[type="text"], .smx-calc-row input[type="number"], .smx-calc-row input[type="date"] {
+      font: inherit; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border); min-width: 140px;
+      background: var(--bg); color: var(--text);
+    }
+    .smx-calc-run {
+      font: inherit; padding: 8px 16px; border-radius: 8px; border: none;
+      background: var(--accent); color: var(--accent-contrast, #fff); cursor: pointer; font-weight: 600;
+    }
+    .smx-calc-run:hover { filter: brightness(1.05); }
+    .smx-calc-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; margin-top: 8px; }
+    .smx-calc-table th, .smx-calc-table td { padding: 8px 10px; border-top: 1px solid var(--border); text-align: left; vertical-align: top; }
+    .smx-calc-table th { color: var(--muted); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.06em; }
     .smx-pill {
       display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 0.72rem; font-weight: 700;
       text-transform: uppercase; letter-spacing: 0.04em;
@@ -14431,7 +14507,7 @@ function renderDashboardHtml(): string {
         <div class="smx-header">
           <div>
             <h2 class="smx-title">Schedule Maintenance Status</h2>
-            <p class="smx-sub">One row per <strong>asset</strong> from the <strong>ELMS extract</strong> (email <code>prevmx@2t3.app</code>). Counts roll up every maintenance plan; expand for plan detail. <strong>Open work orders</strong> come from the <strong>latest ETIC ingest</strong> — those assets are not counted overdue on preventive schedule (in maintenance). <strong>NCE</strong>, make/model, and mgmt code prefer that same ETIC Fleet P&amp;A snapshot when available.</p>
+            <p class="smx-sub">One row per <strong>asset</strong> from the <strong>ELMS extract</strong> (email <code>prevmx@2t3.app</code>). Counts roll up every maintenance plan; expand for plan detail. <strong>Open work orders</strong> come from the <strong>latest ETIC ingest</strong> — those assets are not counted overdue on preventive schedule (in maintenance). <strong>NCE</strong>, make/model, and mgmt code prefer that same ETIC Fleet P&amp;A snapshot when available. Use <strong>Is it due calculator</strong> below with the shop odometer/hours to see which plans to add to a WO.</p>
           </div>
           <span class="smx-asof-pill" id="smx-asof-pill" title="Latest prevmx import date">Latest import</span>
           <label class="smx-search" style="margin-left:10px"><span class="sr-only">Import date</span>
@@ -14452,6 +14528,26 @@ function renderDashboardHtml(): string {
             <button type="button" class="smx-filter-btn" data-smx-filter="missing">Missing data <span class="smx-n" data-smx-c="missing">0</span></button>
           </div>
         </div>
+        <details class="smx-calc-wrap" id="smx-shop-calc">
+          <summary class="smx-calc-summary">Is it due calculator (shop odometer / hours)</summary>
+          <div class="smx-calc-inner">
+            <p class="hint" style="margin:0 0 10px">Uses the <strong>selected Schedule Mx import</strong> for each plan next maint / next util. Enter the shop odometer or hour meter. <strong>Add?</strong> = overdue or due soon: calendar within 60 days, or util remaining ≤1500 mi (or ≤50 hr when type is hours). As-of date defaults to latest ETIC when the tab loads.</p>
+            <div class="smx-calc-row">
+              <label>Asset ID
+                <input type="text" id="smx-calc-asset" placeholder="e.g. AF00C00831" autocomplete="off" />
+              </label>
+              <label>Current reading
+                <input type="number" id="smx-calc-meter" placeholder="Odometer or hours" step="any" min="0" />
+              </label>
+              <label>As-of date
+                <input type="date" id="smx-calc-asof" />
+              </label>
+              <button type="button" class="smx-calc-run" id="smx-calc-run">Calculate</button>
+            </div>
+            <p class="status" id="smx-calc-status" role="status"></p>
+            <div id="smx-calc-results" aria-live="polite"></div>
+          </div>
+        </details>
         <div class="smx-table-wrap">
           <table class="smx-table" aria-label="Schedule maintenance by asset">
             <thead>
@@ -17506,10 +17602,18 @@ function renderDashboardHtml(): string {
         smxStats = j.stats || null;
         renderScheduleMxStats();
         renderScheduleMxTable();
+        syncSmxShopCalcAsOf();
       } catch (e) {
         if (statsEl) statsEl.textContent = "Could not load schedule maintenance.";
         if (tbody) tbody.innerHTML = "<tr><td colspan='5'>Could not load.</td></tr>";
       }
+    }
+
+    function syncSmxShopCalcAsOf() {
+      const inp = document.getElementById("smx-calc-asof");
+      if (!inp || !(inp instanceof HTMLInputElement)) return;
+      const k = smxStats && smxStats.eticAsOfDateKey;
+      if (k && /^\d{4}-\d{2}-\d{2}$/.test(k)) inp.value = k;
     }
 
     var authzPayload = null;
@@ -17692,6 +17796,145 @@ function renderDashboardHtml(): string {
       if (bucket === "no_due") return "No due date";
       if (bucket === "missing") return "Missing";
       return bucket || "—";
+    }
+
+    function renderSmxShopCalcResults(j) {
+      const box = document.getElementById("smx-calc-results");
+      if (!box) return;
+      const plans = Array.isArray(j.plans) ? j.plans : [];
+      const rec = Array.isArray(j.recommend) ? j.recommend : [];
+      if (!plans.length) {
+        box.innerHTML =
+          "<p class='hint'>No maintenance plans for <strong>" +
+          esc(j.assetId || "") +
+          "</strong> on this Schedule Mx import. Check asset ID and import date.</p>";
+        return;
+      }
+      var head =
+        "<p class='hint' style='margin:0 0 8px'><strong>" +
+        rec.length +
+        "</strong> plan" +
+        (rec.length === 1 ? "" : "s") +
+        " to add (overdue or due soon at shop reading). As-of " +
+        esc(j.asOfDateKey || "") +
+        ".</p>" +
+        "<table class='smx-calc-table'><thead><tr>" +
+        "<th>Add?</th><th>Plan</th><th>Next maint</th><th>Next util</th><th>Remaining</th><th>State</th><th>Why</th>" +
+        "</tr></thead><tbody>";
+      var body = plans
+        .map(function (p) {
+          var add = p.recommendWo ? "Yes" : "—";
+          var pname = (p.planName || "").trim();
+          var pid = (p.planId || "").trim();
+          var plab = pname ? esc(pname) + (pid ? " (" + esc(pid) + ")" : "") : (pid ? esc(pid) : "—");
+          var nm = p.nextMaintDateIso ? fmtKeyShort(p.nextMaintDateIso) : "—";
+          var ut = (p.utilType || "").trim();
+          var nu =
+            p.nextUtilQty != null
+              ? esc(String(p.nextUtilQty)) + (ut ? " " + esc(ut) : "")
+              : "—";
+          var rem =
+            p.remaining != null
+              ? esc(String(p.remaining)) + (ut ? " " + esc(ut) : "")
+              : "—";
+          return (
+            "<tr>" +
+            "<td><strong>" +
+            esc(add) +
+            "</strong></td>" +
+            "<td>" +
+            plab +
+            "</td>" +
+            "<td>" +
+            esc(nm) +
+            "</td>" +
+            "<td>" +
+            nu +
+            "</td>" +
+            "<td>" +
+            rem +
+            "</td>" +
+            "<td><span class='smx-pill " +
+            esc(p.bucket || "") +
+            "'>" +
+            esc(smxPillLabel(p.bucket)) +
+            "</span></td>" +
+            "<td>" +
+            esc(p.reason || "") +
+            "</td>" +
+            "</tr>"
+          );
+        })
+        .join("");
+      box.innerHTML = head + body + "</tbody></table>";
+    }
+
+    async function runSmxShopCalc() {
+      const st = document.getElementById("smx-calc-status");
+      const box = document.getElementById("smx-calc-results");
+      const assetEl = document.getElementById("smx-calc-asset");
+      const meterEl = document.getElementById("smx-calc-meter");
+      const asofEl = document.getElementById("smx-calc-asof");
+      if (!assetEl || !meterEl || !asofEl) return;
+      const assetId = (assetEl.value || "").trim();
+      const shopMeter = Number(String(meterEl.value || "").replace(/,/g, ""));
+      const asOf = (asofEl.value || "").trim();
+      if (st) st.textContent = "";
+      if (box) box.innerHTML = "";
+      if (!assetId) {
+        if (st) st.textContent = "Enter an asset ID.";
+        return;
+      }
+      if (!Number.isFinite(shopMeter)) {
+        if (st) st.textContent = "Enter the current odometer or hour reading.";
+        return;
+      }
+      if (!asOf || !/^\d{4}-\d{2}-\d{2}$/.test(asOf)) {
+        if (st) st.textContent = "Pick an as-of date (usually latest ETIC).";
+        return;
+      }
+      var dk = smxSelectedDateKey;
+      if (!dk && document.getElementById("smx-date-select")) {
+        var sel = document.getElementById("smx-date-select");
+        dk = sel && sel.value ? sel.value : null;
+      }
+      if (!dk) {
+        if (st) st.textContent = "Load Schedule Mx data first (select an import date).";
+        return;
+      }
+      if (st) st.textContent = "Calculating…";
+      try {
+        const r = await fetch("/api/schedule-mx?shop_calc=1", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            assetId: assetId,
+            shopMeter: shopMeter,
+            scheduleMxDateKey: dk,
+            asOfDateKey: asOf,
+          }),
+        });
+        const j = await r.json();
+        if (!r.ok) {
+          if (st) st.textContent = j.error || "Request failed.";
+          return;
+        }
+        if (st) {
+          st.textContent =
+            "Shop reading " +
+            shopMeter +
+            " · " +
+            (j.planCount || 0) +
+            " plan" +
+            ((j.planCount || 0) === 1 ? "" : "s") +
+            " · " +
+            (j.recommendCount || 0) +
+            " to add.";
+        }
+        renderSmxShopCalcResults(j);
+      } catch (e) {
+        if (st) st.textContent = e && e.message ? e.message : "Could not calculate.";
+      }
     }
 
     function smxAssetSummaryLine(row) {
@@ -19762,6 +20005,11 @@ function renderDashboardHtml(): string {
           smxSelectedDateKey = smxDateSel.value || null;
           loadScheduleMxTab();
         });
+      }
+      const smxCalcRun = document.getElementById("smx-calc-run");
+      if (smxCalcRun && !smxCalcRun.dataset.wired) {
+        smxCalcRun.dataset.wired = "1";
+        smxCalcRun.addEventListener("click", function () { void runSmxShopCalc(); });
       }
       const melTabBtn = document.getElementById("tab-mel");
       if (melTabBtn) melTabBtn.addEventListener("click", function () { setMainTab("mel"); syncDashboardQuery("mel"); });
