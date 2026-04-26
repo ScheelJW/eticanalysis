@@ -13993,6 +13993,34 @@ function renderDashboardHtml(): string {
     .smx-card .meta .k { color: var(--muted); font-weight: 500; margin-right: 4px; }
     .smx-card .meta .v { font-weight: 500; color: var(--text); }
     .smx-card .meta .v.danger { color: var(--danger); font-weight: 600; }
+    .smx-plan-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+    .smx-plan-block {
+      margin: 0;
+      padding: 0 0 18px;
+      border-bottom: 1px solid var(--border);
+    }
+    .smx-plan-block:last-child {
+      border-bottom: none;
+      padding-bottom: 0;
+    }
+    .smx-plan-block-title {
+      margin: 0 0 12px;
+      font-size: 0.95rem;
+      font-weight: 700;
+      color: var(--text);
+      line-height: 1.35;
+    }
+    .smx-plan-block-title .smx-plan-sub {
+      display: block;
+      font-size: 0.72rem;
+      font-weight: 500;
+      color: var(--muted);
+      margin-top: 4px;
+    }
     .smx-pill {
       display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.62rem; font-weight: 700;
       text-transform: uppercase; letter-spacing: 0.04em;
@@ -14452,7 +14480,7 @@ function renderDashboardHtml(): string {
           <aside class="wo-sidebar">
             <div class="smx-panel-heading">
               <h2 class="smx-panel-title">Schedule maintenance</h2>
-              <p class="smx-panel-hint">One card per <strong>maintenance plan</strong> from the ELMS extract (email <code>prevmx@2t3.app</code>). Open WO counts use the same calendar date when a workbook exists.</p>
+              <p class="smx-panel-hint">Pick an <strong>asset</strong>; all <strong>maintenance plans</strong> for that asset from the ELMS extract (email <code>prevmx@2t3.app</code>) load on the right. Open WO counts use the same calendar date when a workbook exists.</p>
             </div>
             <label class="smx-date-field">
               <span class="sr-only">Import date</span>
@@ -14460,7 +14488,7 @@ function renderDashboardHtml(): string {
             </label>
             <div class="smx-stats" id="smx-stats" role="status">Loading…</div>
             <div class="wo-searchbar">
-              <input type="text" id="smx-query" placeholder="Search asset, plan, location…" autocomplete="off" aria-label="Search schedule maintenance plans" />
+              <input type="text" id="smx-query" placeholder="Search asset, plan, location…" autocomplete="off" aria-label="Search schedule maintenance by asset or plan" />
               <span class="wo-asof-pill" id="smx-asof-pill" title="Selected prevmx import date">—</span>
             </div>
             <div class="wo-filters" id="smx-filters" role="tablist" aria-label="Schedule maintenance filters">
@@ -14471,12 +14499,12 @@ function renderDashboardHtml(): string {
               <button type="button" class="wo-filter-btn" data-smx-filter="missing">Missing <span class="count smx-n" data-smx-c="missing">0</span></button>
             </div>
             <div class="smx-refine-one">
-              <select id="smx-sort" class="wo-refine-sel" aria-label="Sort maintenance plans">
-                <option value="priority">Sort: Priority</option>
-                <option value="asset">Sort: Asset</option>
-                <option value="plan">Sort: Plan name</option>
-                <option value="next">Sort: Next maint (soonest)</option>
-                <option value="next_desc">Sort: Next maint (latest)</option>
+              <select id="smx-sort" class="wo-refine-sel" aria-label="Sort assets">
+                <option value="priority">Sort: Priority (worst first)</option>
+                <option value="asset">Sort: Asset ID</option>
+                <option value="plan">Sort: First plan name</option>
+                <option value="next">Sort: Earliest next maint</option>
+                <option value="next_desc">Sort: Latest next maint</option>
                 <option value="wo">Sort: Open WOs</option>
               </select>
             </div>
@@ -14484,14 +14512,14 @@ function renderDashboardHtml(): string {
             <div class="wo-list" id="smx-list"></div>
           </aside>
           <section class="wo-detail-pane">
-            <div id="smx-detail-empty" class="wo-empty">Select a plan from the list to see dates, utilization, and ELMS status.</div>
+            <div id="smx-detail-empty" class="wo-empty">Select an asset to see every maintenance plan, dates, utilization, and ELMS status.</div>
             <div id="smx-detail" class="hidden wo-detail-inner">
-              <section class="wo-detail-overview" aria-label="Schedule maintenance summary">
+              <section class="wo-detail-overview" aria-label="Asset schedule maintenance summary">
                 <div class="wo-hero" id="smx-hero"></div>
               </section>
               <section class="wo-detail-block" aria-labelledby="smx-facts-heading">
-                <h3 class="wo-detail-block-title" id="smx-facts-heading">Plan details</h3>
-                <div class="wo-facts" id="smx-facts"></div>
+                <h3 class="wo-detail-block-title" id="smx-facts-heading">Maintenance plans</h3>
+                <div id="smx-plans-wrap"></div>
               </section>
             </div>
           </section>
@@ -17487,19 +17515,41 @@ function renderDashboardHtml(): string {
     var smxStats = null;
     var smxFilter = "all";
     var smxSort = "priority";
-    /** planRowKey of selected row for detail pane */
-    var smxSelectedPlanKey = "";
+    /** Selected asset id for list + detail (matches row.assetId). */
+    var smxSelectedAssetId = "";
     /** Selected prevmx import date (YYYY-MM-DD); null = use latest from server. */
     var smxSelectedDateKey = null;
 
-    function smxCardTier(row) {
-      if (row.scheduleMxNceCritical) return "nce_crit";
-      const b = row.scheduleMxBucket || "";
-      if (b === "overdue" || b === "due_soon" || b === "missing" || b === "ok" || b === "no_due") return b;
+    function smxPlanRank(row) {
+      if (row.scheduleMxNceCritical) return 0;
+      if (row.scheduleMxBucket === "overdue") return 1;
+      if (row.scheduleMxBucket === "due_soon") return 2;
+      if (row.scheduleMxBucket === "missing") return 3;
+      return 4;
+    }
+
+    function smxCardTierFromRank(rk) {
+      if (rk === 0) return "nce_crit";
+      if (rk === 1) return "overdue";
+      if (rk === 2) return "due_soon";
+      if (rk === 3) return "missing";
       return "ok";
     }
 
-    function smxFilteredRows() {
+    function smxCardTierForPlans(plans) {
+      var best = 4;
+      for (var i = 0; i < plans.length; i++) {
+        var r = smxPlanRank(plans[i]);
+        if (r < best) best = r;
+      }
+      return smxCardTierFromRank(best);
+    }
+
+    function smxNextKey(row) {
+      return row.elmsNextMaintDateIso || row.scheduleMxDueIso || "9999-99-99";
+    }
+
+    function smxFilteredPlanRows() {
       const qel = document.getElementById("smx-query");
       const q = (qel && qel.value) ? qel.value.trim() : "";
       return smxRows.filter(function (row) {
@@ -17507,85 +17557,132 @@ function renderDashboardHtml(): string {
       });
     }
 
-    function smxSortRows(rows) {
-      const sortSel = document.getElementById("smx-sort");
-      const mode = (sortSel && sortSel.value) ? sortSel.value : smxSort;
-      function rank(a) {
-        if (a.scheduleMxNceCritical) return 0;
-        if (a.scheduleMxBucket === "overdue") return 1;
-        if (a.scheduleMxBucket === "due_soon") return 2;
-        if (a.scheduleMxBucket === "missing") return 3;
-        return 4;
+    /** assetId -> plan rows (only rows passing current filter + query). */
+    function smxPlansByAsset() {
+      const m = new Map();
+      const filtered = smxFilteredPlanRows();
+      for (var i = 0; i < filtered.length; i++) {
+        var row = filtered[i];
+        var aid = String(row.assetId || "").trim() || "—";
+        if (!m.has(aid)) m.set(aid, []);
+        m.get(aid).push(row);
       }
-      function nextKey(a) {
-        return a.elmsNextMaintDateIso || a.scheduleMxDueIso || "9999-99-99";
-      }
-      const out = rows.slice();
+      return m;
+    }
+
+    function smxSortPlansForAsset(plans) {
+      const out = plans.slice();
       out.sort(function (a, b) {
-        if (mode === "asset") {
-          const c = (a.assetId || "").localeCompare(b.assetId || "", undefined, { sensitivity: "base", numeric: true });
-          if (c !== 0) return c;
-          return (a.planRowKey || "").localeCompare(b.planRowKey || "");
-        }
-        if (mode === "plan") {
-          const c = (a.planName || "").localeCompare(b.planName || "", undefined, { sensitivity: "base", numeric: true });
-          if (c !== 0) return c;
-          return (a.assetId || "").localeCompare(b.assetId || "", undefined, { sensitivity: "base", numeric: true });
-        }
-        if (mode === "next") {
-          const ax = nextKey(a);
-          const bx = nextKey(b);
-          if (ax !== bx) return ax < bx ? -1 : 1;
-          return (a.planRowKey || "").localeCompare(b.planRowKey || "");
-        }
-        if (mode === "next_desc") {
-          const ax = nextKey(a);
-          const bx = nextKey(b);
-          if (ax !== bx) return ax < bx ? 1 : -1;
-          return (a.planRowKey || "").localeCompare(b.planRowKey || "");
-        }
-        if (mode === "wo") {
-          const wa = a.workOrderCount || 0;
-          const wb = b.workOrderCount || 0;
-          if (wa !== wb) return wb - wa;
-          return (a.planRowKey || "").localeCompare(b.planRowKey || "");
-        }
-        const ra = rank(a);
-        const rb = rank(b);
+        var ra = smxPlanRank(a);
+        var rb = smxPlanRank(b);
         if (ra !== rb) return ra - rb;
-        const ac = (a.assetId || "").localeCompare(b.assetId || "", undefined, { sensitivity: "base", numeric: true });
-        if (ac !== 0) return ac;
+        var na = smxNextKey(a);
+        var nb = smxNextKey(b);
+        if (na !== nb) return na < nb ? -1 : 1;
         return (a.planRowKey || "").localeCompare(b.planRowKey || "");
       });
       return out;
     }
 
-    function selectSmxPlan(planKey, scrollIntoView) {
-      smxSelectedPlanKey = planKey || "";
+    function smxSortedAssetIds(byAsset) {
+      const sortSel = document.getElementById("smx-sort");
+      const mode = (sortSel && sortSel.value) ? sortSel.value : smxSort;
+      const ids = Array.from(byAsset.keys());
+      function aggWorstRank(plans) {
+        var best = 4;
+        for (var i = 0; i < plans.length; i++) {
+          var r = smxPlanRank(plans[i]);
+          if (r < best) best = r;
+        }
+        return best;
+      }
+      function minNext(plans) {
+        var k = "9999-99-99";
+        for (var i = 0; i < plans.length; i++) {
+          var nk = smxNextKey(plans[i]);
+          if (nk < k) k = nk;
+        }
+        return k;
+      }
+      function maxNext(plans) {
+        var k = "0000-00-00";
+        for (var i = 0; i < plans.length; i++) {
+          var nk = smxNextKey(plans[i]);
+          if (nk > k) k = nk;
+        }
+        return k;
+      }
+      function firstPlanName(plans) {
+        var sorted = smxSortPlansForAsset(plans);
+        var nm = (sorted[0] && sorted[0].planName) ? String(sorted[0].planName).trim() : "";
+        return nm || "—";
+      }
+      ids.sort(function (ida, idb) {
+        var pa = byAsset.get(ida) || [];
+        var pb = byAsset.get(idb) || [];
+        if (mode === "asset") {
+          return ida.localeCompare(idb, undefined, { sensitivity: "base", numeric: true });
+        }
+        if (mode === "plan") {
+          return firstPlanName(pa).localeCompare(firstPlanName(pb), undefined, { sensitivity: "base", numeric: true });
+        }
+        if (mode === "next") {
+          var na = minNext(pa);
+          var nb = minNext(pb);
+          if (na !== nb) return na < nb ? -1 : 1;
+          return ida.localeCompare(idb, undefined, { sensitivity: "base", numeric: true });
+        }
+        if (mode === "next_desc") {
+          var xa = maxNext(pa);
+          var xb = maxNext(pb);
+          if (xa !== xb) return xa < xb ? 1 : -1;
+          return ida.localeCompare(idb, undefined, { sensitivity: "base", numeric: true });
+        }
+        if (mode === "wo") {
+          var wa = (pa[0] && pa[0].workOrderCount) ? pa[0].workOrderCount : 0;
+          var wb = (pb[0] && pb[0].workOrderCount) ? pb[0].workOrderCount : 0;
+          if (wa !== wb) return wb - wa;
+          return ida.localeCompare(idb, undefined, { sensitivity: "base", numeric: true });
+        }
+        var ra = aggWorstRank(pa);
+        var rb = aggWorstRank(pb);
+        if (ra !== rb) return ra - rb;
+        return ida.localeCompare(idb, undefined, { sensitivity: "base", numeric: true });
+      });
+      return ids;
+    }
+
+    function selectSmxAsset(assetId, scrollIntoView) {
+      smxSelectedAssetId = assetId || "";
       const list = document.getElementById("smx-list");
       if (list) {
         list.querySelectorAll(".smx-card").forEach(function (el) {
-          el.classList.toggle("active", el.getAttribute("data-smx-plan") === smxSelectedPlanKey);
+          el.classList.toggle("active", el.getAttribute("data-smx-asset") === smxSelectedAssetId);
         });
       }
       const empty = document.getElementById("smx-detail-empty");
       const wrap = document.getElementById("smx-detail");
       if (!empty || !wrap) return;
-      if (!smxSelectedPlanKey) {
+      if (!smxSelectedAssetId) {
         empty.classList.remove("hidden");
         wrap.classList.add("hidden");
         return;
       }
-      const row = smxRows.find(function (r) { return r.planRowKey === smxSelectedPlanKey; });
-      if (!row) {
+      const byAsset = smxPlansByAsset();
+      var plans = byAsset.get(smxSelectedAssetId) || [];
+      if (!plans.length) {
+        plans = smxRows.filter(function (r) { return String(r.assetId || "").trim() === smxSelectedAssetId; });
+      }
+      if (!plans.length) {
         empty.classList.remove("hidden");
         wrap.classList.add("hidden");
         return;
       }
+      plans = smxSortPlansForAsset(plans);
       empty.classList.add("hidden");
       wrap.classList.remove("hidden");
-      renderSmxHero(row);
-      renderSmxFacts(row);
+      renderSmxHeroAsset(smxSelectedAssetId, plans);
+      renderSmxPlansWrap(plans);
       if (scrollIntoView && wrap.scrollIntoView) {
         try {
           wrap.scrollIntoView({ block: "nearest", behavior: "smooth" });
@@ -17593,52 +17690,86 @@ function renderDashboardHtml(): string {
       }
     }
 
-    function renderSmxHero(row) {
+    function renderSmxHeroAsset(assetId, plans) {
       const el = document.getElementById("smx-hero");
       if (!el) return;
       const chips = [];
-      if (row.nce) {
+      var anyNce = false;
+      var nceStatus = "";
+      var anyCrit = false;
+      var worstRank = 4;
+      for (var i = 0; i < plans.length; i++) {
+        var p = plans[i];
+        if (p.nce) {
+          anyNce = true;
+          if (p.nceStatus && !nceStatus) nceStatus = p.nceStatus;
+        }
+        if (p.scheduleMxNceCritical) anyCrit = true;
+        var r = smxPlanRank(p);
+        if (r < worstRank) worstRank = r;
+      }
+      if (anyNce) {
         chips.push(
           "<span class='wo-chip nce' title='Nuclear Certified Equipment" +
-            (row.nceStatus ? " · " + esc(row.nceStatus) : "") +
+            (nceStatus ? " · " + esc(nceStatus) : "") +
             "'>NCE</span>",
         );
       }
-      if (row.scheduleMxNceCritical) {
-        chips.push("<span class='wo-chip tier-below' title='Overdue schedule maintenance on NCE'>NCE overdue</span>");
+      if (anyCrit) {
+        chips.push("<span class='wo-chip tier-below' title='At least one plan is overdue on NCE'>NCE overdue</span>");
       }
-      const b = row.scheduleMxBucket || "";
-      if (b === "overdue") chips.push("<span class='wo-chip tier-below'>Overdue</span>");
-      else if (b === "due_soon") chips.push("<span class='wo-chip tier-at'>Due soon</span>");
-      else if (b === "missing") chips.push("<span class='wo-chip stale'>Missing data</span>");
-      else if (b === "no_due") chips.push("<span class='wo-chip tier-unknown'>No due date</span>");
-      else chips.push("<span class='wo-chip ok'>Current</span>");
-      const planTitle = (row.planName || "Maintenance plan").trim() || "Maintenance plan";
-      const subParts = [];
-      if (row.assetId) {
-        subParts.push(
-          "<span class='wo-hero-asset'>" + esc(row.assetId) + "</span> " +
-            renderSightingBadge(row.assetId) + " " + renderWaiverBadge(row.assetId),
-        );
+      if (worstRank === 1) chips.push("<span class='wo-chip tier-below'>Overdue plan</span>");
+      else if (worstRank === 2) chips.push("<span class='wo-chip tier-at'>Due soon</span>");
+      else if (worstRank === 3) chips.push("<span class='wo-chip stale'>Missing data</span>");
+      else if (worstRank === 4) {
+        var allNoDue = plans.every(function (x) { return (x.scheduleMxBucket || "") === "no_due"; });
+        if (allNoDue && plans.length) chips.push("<span class='wo-chip tier-unknown'>No due date</span>");
+        else chips.push("<span class='wo-chip ok'>Current</span>");
       }
+      chips.push(
+        "<span class='wo-chip tier-unknown' title='Maintenance plans on this asset'>" +
+          plans.length +
+          " plan" +
+          (plans.length === 1 ? "" : "s") +
+          "</span>",
+      );
+      const wo = plans[0] && plans[0].workOrderCount != null ? plans[0].workOrderCount : 0;
+      const locSet = {};
+      const mmSet = {};
+      const mgmtSet = {};
+      for (var j = 0; j < plans.length; j++) {
+        var q = plans[j];
+        if (q.location && String(q.location).trim()) locSet[String(q.location).trim()] = 1;
+        if (q.makeModel && String(q.makeModel).trim()) mmSet[String(q.makeModel).trim()] = 1;
+        if (q.mgmtCd && String(q.mgmtCd).trim()) mgmtSet[String(q.mgmtCd).trim()] = 1;
+      }
+      const locs = Object.keys(locSet);
+      const mms = Object.keys(mmSet);
+      const mgmts = Object.keys(mgmtSet);
       const metaParts = [];
-      if (row.planId) metaParts.push("Plan ID " + esc(row.planId));
-      if (row.location) metaParts.push(esc(row.location));
-      if (row.makeModel) metaParts.push(esc(row.makeModel));
+      if (mms.length === 1) metaParts.push(esc(mms[0]));
+      else if (mms.length > 1) metaParts.push(mms.length + " make/models");
+      if (locs.length === 1) metaParts.push(esc(locs[0]));
+      else if (locs.length > 1) metaParts.push(locs.length + " locations");
+      if (mgmts.length === 1) metaParts.push("Mgmt " + esc(mgmts[0]));
+      else if (mgmts.length > 1) metaParts.push(mgmts.length + " mgmt codes");
+      if (wo) metaParts.push(wo + " open WO" + (wo === 1 ? "" : "s") + " (date)");
       el.innerHTML =
         "<div class='wo-hero-row'>" +
-        "<div class='wo-hero-id' style='font-size:1rem;max-width:100%;word-break:break-word'>" + esc(planTitle) + "</div>" +
+        "<div class='wo-hero-id'>" + esc(assetId) + "</div>" +
         chips.join("") +
         "</div>" +
-        (subParts.length ? "<div class='wo-hero-sub wo-hero-sub-primary'>" + subParts.join(" ") + "</div>" : "") +
+        "<div class='wo-hero-sub wo-hero-sub-primary'>" +
+        renderSightingBadge(assetId) +
+        " " +
+        renderWaiverBadge(assetId) +
+        "</div>" +
         (metaParts.length
           ? "<div class='wo-hero-sub wo-hero-sub-meta'>" + metaParts.join("<span class='dot'>·</span>") + "</div>"
           : "");
     }
 
-    function renderSmxFacts(row) {
-      const el = document.getElementById("smx-facts");
-      if (!el) return;
+    function smxFactsHtmlForPlan(row) {
       const sched = [];
       sched.push({ dt: "ELMS status", dd: esc(row.scheduleMxStatus || "—") });
       sched.push({
@@ -17688,6 +17819,8 @@ function renderDashboardHtml(): string {
       plan.push({ dt: "Plan row key", dd: "<span class='asset-mono' style='font-size:0.82rem'>" + esc(row.planRowKey || "—") + "</span>" });
       const org = [];
       if (row.mgmtCd) org.push({ dt: "Mgmt Cd", dd: esc(row.mgmtCd) });
+      if (row.location) org.push({ dt: "Location", dd: esc(row.location) });
+      if (row.makeModel) org.push({ dt: "Make/Model", dd: esc(row.makeModel) });
       org.push({
         dt: "Open WOs (date)",
         dd: esc(String(row.workOrderCount ?? 0)),
@@ -17704,11 +17837,48 @@ function renderDashboardHtml(): string {
           "</section>"
         );
       }
-      el.innerHTML =
+      return (
         factGroup("Schedule", sched) +
         factGroup("Utilization", util) +
         factGroup("Plan", plan) +
-        factGroup("Organization", org);
+        factGroup("Organization", org)
+      );
+    }
+
+    function renderSmxPlansWrap(plans) {
+      const wrap = document.getElementById("smx-plans-wrap");
+      if (!wrap) return;
+      wrap.innerHTML =
+        "<div class='smx-plan-stack'>" +
+        plans
+          .map(function (row) {
+            const title = ((row.planName || "").trim() || "Maintenance plan");
+            const sub = row.planId ? "Plan ID " + esc(row.planId) : "";
+            var badges =
+              (row.nce ? "<span class='chip nce'>NCE</span>" : "") +
+              (row.scheduleMxNceCritical ? "<span class='chip stale'>NCE od</span>" : "") +
+              "<span class='smx-pill " +
+              esc(row.scheduleMxBucket || "") +
+              "'>" +
+              esc(smxPillLabel(row.scheduleMxBucket)) +
+              "</span>";
+            return (
+              "<article class='smx-plan-block' aria-label='" + esc(title) + "'>" +
+              "<h4 class='smx-plan-block-title'>" +
+              esc(title) +
+              (sub ? "<span class='smx-plan-sub'>" + sub + "</span>" : "") +
+              "</h4>" +
+              "<div class='badges' style='margin-bottom:10px'>" +
+              badges +
+              "</div>" +
+              "<div class='wo-facts'>" +
+              smxFactsHtmlForPlan(row) +
+              "</div>" +
+              "</article>"
+            );
+          })
+          .join("") +
+        "</div>";
     }
 
     async function loadScheduleMxTab() {
@@ -17722,8 +17892,8 @@ function renderDashboardHtml(): string {
       }
       if (listMeta) listMeta.textContent = "Loading…";
       if (list) list.innerHTML = "";
-      smxSelectedPlanKey = "";
-      selectSmxPlan("", false);
+      smxSelectedAssetId = "";
+      selectSmxAsset("", false);
       try {
         const rd = await fetch("/api/schedule-mx?dates=1", { cache: "no-store" });
         const jd = await rd.json();
@@ -17936,8 +18106,8 @@ function renderDashboardHtml(): string {
         );
       }
       box.innerHTML =
-        pill("planRows", "Plan rows", "") +
         pill("distinctAssets", "Assets", "") +
+        pill("planRows", "Plans", "") +
         pill("nceCritical", "NCE overdue (critical)", "crit") +
         pill("overdue", "Overdue", "bad") +
         pill("dueSoon", "Due soon (≤30d)", "warn") +
@@ -17959,68 +18129,112 @@ function renderDashboardHtml(): string {
       document.querySelectorAll("#smx-filters .smx-n").forEach(function (el) {
         const k = el.getAttribute("data-smx-c");
         if (!k) return;
-        const n = smxRows.filter(function (row) { return smxMatchesFilter(row, k); }).length;
+        const seen = Object.create(null);
+        var n = 0;
+        for (var i = 0; i < smxRows.length; i++) {
+          var row = smxRows[i];
+          if (!smxMatchesFilter(row, k)) continue;
+          var aid = String(row.assetId || "").trim() || "—";
+          if (seen[aid]) continue;
+          seen[aid] = 1;
+          n++;
+        }
         el.textContent = n;
       });
-      const filtered = smxFilteredRows();
-      const visible = smxSortRows(filtered);
+      const byAsset = smxPlansByAsset();
+      const visibleAssetIds = smxSortedAssetIds(byAsset);
+      var totalDistinct = 0;
+      var seenAll = Object.create(null);
+      for (var j = 0; j < smxRows.length; j++) {
+        var aj = String(smxRows[j].assetId || "").trim() || "—";
+        if (!seenAll[aj]) {
+          seenAll[aj] = 1;
+          totalDistinct++;
+        }
+      }
       if (meta) {
-        meta.textContent = visible.length + " of " + smxRows.length + " plan" + (smxRows.length === 1 ? "" : "s");
+        meta.textContent =
+          visibleAssetIds.length +
+          " of " +
+          totalDistinct +
+          " asset" +
+          (totalDistinct === 1 ? "" : "s");
       }
-      if (smxSelectedPlanKey && !visible.some(function (r) { return r.planRowKey === smxSelectedPlanKey; })) {
-        smxSelectedPlanKey = "";
+      if (smxSelectedAssetId && visibleAssetIds.indexOf(smxSelectedAssetId) < 0) {
+        smxSelectedAssetId = "";
       }
-      if (!visible.length) {
-        list.innerHTML = "<div class='problem-empty' style='padding:18px 4px'>No plans match this filter.</div>";
-        selectSmxPlan("", false);
+      if (!visibleAssetIds.length) {
+        list.innerHTML = "<div class='problem-empty' style='padding:18px 4px'>No assets match this filter.</div>";
+        selectSmxAsset("", false);
         return;
       }
-      list.innerHTML = visible.map(function (row) {
-        const isActive = row.planRowKey === smxSelectedPlanKey;
-        const tier = smxCardTier(row);
-        const nceChip = row.nce
-          ? "<span class='chip nce' title='Nuclear Certified Equipment" + (row.nceStatus ? " · " + esc(row.nceStatus) : "") + "'>NCE</span>"
-          : "";
-        const critChip = row.scheduleMxNceCritical
-          ? "<span class='chip stale' title='Overdue on NCE'>NCE od</span>"
-          : "";
-        const pillCls = row.scheduleMxBucket || "";
-        const statePill = "<span class='smx-pill " + esc(pillCls) + "'>" + esc(smxPillLabel(row.scheduleMxBucket)) + "</span>";
-        const planLine = (row.planName || "Plan").trim() || "Plan";
-        const nextD = row.elmsNextMaintDateIso || row.scheduleMxDueIso;
-        const nextTxt = nextD ? fmtKeyShort(nextD) : "—";
-        const ov = row.scheduleMxOverdueByDays != null ? row.scheduleMxOverdueByDays + "d od" : "";
-        const metaBits = [];
-        metaBits.push("<span><span class='k'>Next</span><span class='v'>" + esc(nextTxt) + "</span></span>");
-        if (ov) metaBits.push("<span><span class='k'>Late</span><span class='v danger'>" + esc(ov) + "</span></span>");
-        if (row.workOrderCount) {
-          metaBits.push("<span><span class='k'>WOs</span><span class='v'>" + row.workOrderCount + "</span></span>");
+      list.innerHTML = visibleAssetIds.map(function (assetId) {
+        var plans = byAsset.get(assetId) || [];
+        var isActive = assetId === smxSelectedAssetId;
+        var tier = smxCardTierForPlans(plans);
+        var anyNce = false;
+        var nceTitle = "";
+        var anyCrit = false;
+        var worstRank = 4;
+        var worstBucket = "ok";
+        for (var pi = 0; pi < plans.length; pi++) {
+          var p = plans[pi];
+          if (p.nce) {
+            anyNce = true;
+            if (p.nceStatus && !nceTitle) nceTitle = p.nceStatus;
+          }
+          if (p.scheduleMxNceCritical) anyCrit = true;
+          var rk = smxPlanRank(p);
+          if (rk < worstRank) {
+            worstRank = rk;
+            worstBucket = p.scheduleMxBucket || "ok";
+          }
         }
+        var nceChip = anyNce
+          ? "<span class='chip nce' title='Nuclear Certified Equipment" + (nceTitle ? " · " + esc(nceTitle) : "") + "'>NCE</span>"
+          : "";
+        var critChip = anyCrit ? "<span class='chip stale' title='Overdue on NCE'>NCE od</span>" : "";
+        var aggPill =
+          "<span class='smx-pill " + esc(worstBucket) + "'>" + esc(smxPillLabel(worstBucket)) + "</span>";
+        var nextD = null;
+        var minK = "9999-99-99";
+        for (var qi = 0; qi < plans.length; qi++) {
+          var nk = smxNextKey(plans[qi]);
+          if (nk < minK) {
+            minK = nk;
+            nextD = plans[qi].elmsNextMaintDateIso || plans[qi].scheduleMxDueIso;
+          }
+        }
+        var nextTxt = nextD ? fmtKeyShort(nextD) : "—";
+        var wo = plans[0] && plans[0].workOrderCount != null ? plans[0].workOrderCount : 0;
+        var metaBits = [];
+        metaBits.push("<span><span class='k'>Plans</span><span class='v'>" + plans.length + "</span></span>");
+        metaBits.push("<span><span class='k'>Next</span><span class='v'>" + esc(nextTxt) + "</span></span>");
+        if (wo) metaBits.push("<span><span class='k'>WOs</span><span class='v'>" + wo + "</span></span>");
         return (
-          "<button type='button' class='smx-card" + (isActive ? " active" : "") + "' data-smx-plan='" + esc(row.planRowKey) + "' data-smx-tier='" + esc(tier) + "'>" +
+          "<button type='button' class='smx-card" + (isActive ? " active" : "") + "' data-smx-asset='" + esc(assetId) + "' data-smx-tier='" + esc(tier) + "'>" +
           "<div class='top-line'>" +
-          "<span class='smx-card-title'>" + esc(planLine) + "</span>" +
-          "<span class='badges'>" + nceChip + critChip + statePill + "</span>" +
+          "<span class='asset-mono'>" + esc(assetId) + "</span>" +
+          "<span class='badges'>" + nceChip + critChip + aggPill + "</span>" +
           "</div>" +
-          "<div class='top-line wo-card-asset-row'><span class='asset-mono'>" + esc(row.assetId || "—") + "</span><span></span></div>" +
-          "<div class='wo-meta-line'>" + renderSightingBadge(row.assetId, { compact: true }) + renderWaiverBadge(row.assetId) + "</div>" +
+          "<div class='wo-meta-line'>" + renderSightingBadge(assetId, { compact: true }) + renderWaiverBadge(assetId) + "</div>" +
           "<div class='meta'>" + metaBits.join("") + "</div>" +
           "</button>"
         );
       }).join("");
       list.querySelectorAll(".smx-card").forEach(function (el) {
         el.addEventListener("click", function () {
-          const pk = el.getAttribute("data-smx-plan");
-          selectSmxPlan(pk || "", true);
+          var aid = el.getAttribute("data-smx-asset") || "";
+          selectSmxAsset(aid, true);
           list.querySelectorAll(".smx-card").forEach(function (c) {
-            c.classList.toggle("active", c.getAttribute("data-smx-plan") === smxSelectedPlanKey);
+            c.classList.toggle("active", c.getAttribute("data-smx-asset") === smxSelectedAssetId);
           });
         });
       });
-      if (!smxSelectedPlanKey && visible.length) smxSelectedPlanKey = visible[0].planRowKey || "";
-      selectSmxPlan(smxSelectedPlanKey, false);
+      if (!smxSelectedAssetId && visibleAssetIds.length) smxSelectedAssetId = visibleAssetIds[0];
+      selectSmxAsset(smxSelectedAssetId, false);
       list.querySelectorAll(".smx-card").forEach(function (c) {
-        c.classList.toggle("active", c.getAttribute("data-smx-plan") === smxSelectedPlanKey);
+        c.classList.toggle("active", c.getAttribute("data-smx-asset") === smxSelectedAssetId);
       });
     }
 
