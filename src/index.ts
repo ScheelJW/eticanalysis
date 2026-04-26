@@ -18236,11 +18236,6 @@ function renderDashboardHtml(): string {
         smxHtmlTableEsc(smxCommanderReportTitle()) +
         "</strong></p>" +
         smxCmdNarrativeHtml() +
-        "<p style='margin:10px 0 4px 0'><strong>Scheduled maintenance import:</strong> " +
-        smxHtmlTableEsc(importKey ? fmtKeyLong(importKey) : "—") +
-        "<br/><strong>Fleet book (ETIC) context:</strong> " +
-        smxHtmlTableEsc(eticKey ? fmtKeyLong(eticKey) : "—") +
-        "</p>" +
         "<p style='margin:8px 0'><strong>Wing totals</strong> — Total vehicles: " +
         smxHtmlTableEsc(String(w.totalVehicles)) +
         " · Not overdue: " +
@@ -18254,7 +18249,6 @@ function renderDashboardHtml(): string {
         "</p>" +
         smxCommanderHtmlUnitsTable(cmd.units || []) +
         "<p style='margin:14px 0 8px 0'>As always, Vehicle Management Team are available and happy to help!</p>" +
-        "<p style='color:#555;font-size:10pt'>— Sent from ETIC dashboard (Schedule maintenance)</p>" +
         "</body></html>";
       return h;
     }
@@ -18266,17 +18260,8 @@ function renderDashboardHtml(): string {
         smxHtmlTableEsc(smxCommanderReportTitle()) +
         "</strong></p>" +
         smxCmdNarrativeHtml() +
-        "<p style='margin:10px 0 4px 0'><strong>Scheduled maintenance import:</strong> " +
-        smxHtmlTableEsc(importKey ? fmtKeyLong(importKey) : "—") +
-        "<br/><strong>Fleet book (ETIC) context:</strong> " +
-        smxHtmlTableEsc(eticKey ? fmtKeyLong(eticKey) : "—") +
-        "</p>" +
-        "<p style='margin:8px 0'><strong>Unit:</strong> " +
-        smxHtmlTableEsc(row.unit) +
-        "</p>" +
         smxCommanderHtmlUnitsTable([row]) +
         "<p style='margin:14px 0 8px 0'>As always, Vehicle Management Team are available and happy to help!</p>" +
-        "<p style='color:#555;font-size:10pt'>— Sent from ETIC dashboard (Schedule maintenance)</p>" +
         "</body></html>";
       return h;
     }
@@ -18322,9 +18307,6 @@ function renderDashboardHtml(): string {
       lines.push("");
       lines = lines.concat(smxCmdEmailNarrativeLines());
       lines.push("");
-      lines.push("Scheduled maintenance import: " + (importKey ? fmtKeyLong(importKey) : "—"));
-      lines.push("Fleet book (ETIC) context: " + (eticKey ? fmtKeyLong(eticKey) : "—"));
-      lines.push("");
       lines.push(
         "Wing totals — Total vehicles: " +
           w.totalVehicles +
@@ -18341,8 +18323,6 @@ function renderDashboardHtml(): string {
       lines = lines.concat(smxCommanderAsciiUnitTableLines(cmd.units || []));
       lines.push("");
       lines.push("As always, Vehicle Management Team are available and happy to help!");
-      lines.push("");
-      lines.push("— Sent from ETIC dashboard (Schedule maintenance)");
       return lines.join("\\r\\n");
     }
 
@@ -18352,16 +18332,9 @@ function renderDashboardHtml(): string {
       lines.push("");
       lines = lines.concat(smxCmdEmailNarrativeLines());
       lines.push("");
-      lines.push("Scheduled maintenance import: " + (importKey ? fmtKeyLong(importKey) : "—"));
-      lines.push("Fleet book (ETIC) context: " + (eticKey ? fmtKeyLong(eticKey) : "—"));
-      lines.push("");
-      lines.push("Unit: " + row.unit);
-      lines.push("");
       lines = lines.concat(smxCommanderAsciiUnitTableLines([row]));
       lines.push("");
       lines.push("As always, Vehicle Management Team are available and happy to help!");
-      lines.push("");
-      lines.push("— Sent from ETIC dashboard (Schedule maintenance)");
       return lines.join("\\r\\n");
     }
 
