@@ -970,6 +970,14 @@ function extractRawExtrasFromColumns(raw: Record<string, string>): {
 
 export type ScheduleMxFleetRow = {
   assetId: string;
+  /** Stable id for this plan row (ELMS); one asset can have many. */
+  planRowKey: string;
+  planId: string;
+  planName: string;
+  planDesc: string;
+  maintenanceScheduleId: string;
+  itemDesc: string;
+  location: string;
   makeModel: string;
   mgmtCd: string;
   workOrderCount: number;
@@ -977,7 +985,18 @@ export type ScheduleMxFleetRow = {
   nceStatus: string;
   /** Overdue schedule maintenance on an NCE asset — highest leadership priority. */
   scheduleMxNceCritical: boolean;
-} & ReturnType<typeof analyzeScheduleMxFromRaw>;
+  elmsLastMaintDateIso: string | null;
+  elmsNextMaintDateIso: string | null;
+  elmsLastUtilQty: number | null;
+  elmsNextUtilQty: number | null;
+  elmsCurrentMeter: number | null;
+  /** e.g. miles, hours — lowercase token from extract */
+  elmsUtilType: string;
+  /** True when current meter at/ past next util qty (ELMS). */
+  scheduleMxOverdueUtil: boolean;
+  /** nextUtil - currentMeter when both numeric (positive = units until due). */
+  scheduleMxUtilRemaining: number | null;
+} & ReturnType<typeof analyzeElmsScheduleMxFromRaw>;
 
 async function loadWoCountsPerAsset(
   env: { ETIC_SNAPSHOTS: D1Database },
@@ -1008,9 +1027,175 @@ function sortScheduleMxRows(out: ScheduleMxFleetRow[]): ScheduleMxFleetRow[] {
     const ra = rank(a);
     const rb = rank(b);
     if (ra !== rb) return ra - rb;
-    return a.assetId.localeCompare(b.assetId);
+    const ac = a.assetId.localeCompare(b.assetId);
+    if (ac !== 0) return ac;
+    return a.planRowKey.localeCompare(b.planRowKey);
   });
   return out;
+}
+
+function pickElmsFromRaw(raw: Record<string, string>, needleFragments: string[]): string {
+  for (const [k, v] of Object.entries(raw)) {
+    const vv = (v ?? "").trim();
+    if (!vv) continue;
+    const kn = k.toLowerCase().replace(/^fleet\./, "");
+    for (const frag of needleFragments) {
+      if (kn.includes(frag)) return vv;
+    }
+  }
+  return "";
+}
+
+function parseUtilNumber(s: string): number | null {
+  const t = String(s ?? "")
+    .replace(/,/g, "")
+    .replace(/[^\d.-]/g, "")
+    .trim();
+  if (!t) return null;
+  const n = Number.parseFloat(t);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Stable primary key for one ELMS plan row within an import. */
+export function elmsPlanRowKeyFromRaw(raw: Record<string, string>, assetId: string, rowIndex: number): string {
+  const sched = pickElmsFromRaw(raw, ["maintenance schedule id", "maint schedule id"]).trim();
+  if (sched) return sched;
+  const pid = pickElmsFromRaw(raw, ["plan id"]).trim();
+  const pname = pickElmsFromRaw(raw, ["plan name"]).trim();
+  if (pid && pname) return assetId + "|" + pid + "|" + normalizeHeaderKey(pname);
+  if (pid) return assetId + "|" + pid + "|r" + String(rowIndex);
+  return assetId + "|r" + String(rowIndex);
+}
+
+const DUE_SOON_DAYS_ELMS = 30;
+
+/**
+ * Merge ELMS date/util signals with legacy Fleet (P&A) schedule fields when present in raw JSON.
+ */
+export function analyzeElmsScheduleMxFromRaw(
+  raw: Record<string, string>,
+  asOfDateKey: string,
+): {
+  scheduleMxStatus: string;
+  scheduleMxDueIso: string | null;
+  scheduleMxDaysUntil: number | null;
+  scheduleMxOverdueByDays: number | null;
+  scheduleMxBucket: ScheduleMxBucket;
+  scheduleMxNeedsEntry: boolean;
+  elmsLastMaintDateIso: string | null;
+  elmsNextMaintDateIso: string | null;
+  elmsLastUtilQty: number | null;
+  elmsNextUtilQty: number | null;
+  elmsCurrentMeter: number | null;
+  elmsUtilType: string;
+  scheduleMxOverdueUtil: boolean;
+  scheduleMxUtilRemaining: number | null;
+} {
+  const lastMaintText = pickElmsFromRaw(raw, ["last maint", "last maintenance", "last maint dt"]);
+  const nextMaintText = pickElmsFromRaw(raw, ["next maint", "next maintenance", "next maint date", "next due"]);
+  const lastUtilText = pickElmsFromRaw(raw, ["last util", "last utilization"]);
+  const nextUtilText = pickElmsFromRaw(raw, ["next util", "next utilization"]);
+  const meterText = pickElmsFromRaw(raw, [
+    "current meter reading",
+    "current meter",
+    "meter reading",
+    "current reading",
+    "curr meter",
+  ]);
+  const utilTypeRaw = pickElmsFromRaw(raw, ["utilization type", "util type", "meter type", "uom"]);
+
+  let elmsLastMaintDateIso = parseEticDate(lastMaintText);
+  let elmsNextMaintDateIso = parseEticDate(nextMaintText);
+  const elmsLastUtilQty = parseUtilNumber(lastUtilText);
+  const elmsNextUtilQty = parseUtilNumber(nextUtilText);
+  const elmsCurrentMeter = parseUtilNumber(meterText);
+  const elmsUtilType = utilTypeRaw.replace(/\s+/g, " ").trim().toLowerCase();
+
+  let dateOverdue = false;
+  let dateOverdueByDays: number | null = null;
+  let daysUntil: number | null = null;
+  if (elmsNextMaintDateIso) {
+    daysUntil = calendarDaysBetween(asOfDateKey, elmsNextMaintDateIso);
+    if (daysUntil < 0) {
+      dateOverdue = true;
+      dateOverdueByDays = -daysUntil;
+    }
+  }
+
+  let scheduleMxOverdueUtil = false;
+  let scheduleMxUtilRemaining: number | null = null;
+  if (elmsNextUtilQty != null && elmsCurrentMeter != null) {
+    scheduleMxUtilRemaining = elmsNextUtilQty - elmsCurrentMeter;
+    if (elmsCurrentMeter >= elmsNextUtilQty) scheduleMxOverdueUtil = true;
+  }
+
+  const legacy = analyzeScheduleMxFromRaw(raw, asOfDateKey);
+  const hasElmsSignal =
+    !!elmsNextMaintDateIso ||
+    (elmsNextUtilQty != null && elmsCurrentMeter != null) ||
+    !!lastMaintText ||
+    !!nextMaintText;
+
+  let bucket: ScheduleMxBucket;
+  let scheduleMxOverdueByDays: number | null = legacy.scheduleMxOverdueByDays;
+  let scheduleMxDaysUntil: number | null = legacy.scheduleMxDaysUntil;
+  let scheduleMxDueIso: string | null = legacy.scheduleMxDueIso;
+  let scheduleMxStatus = legacy.scheduleMxStatus;
+  let needsEntry = legacy.scheduleMxNeedsEntry;
+
+  if (hasElmsSignal) {
+    const overdue = dateOverdue || scheduleMxOverdueUtil;
+    const dateDueSoon = !dateOverdue && elmsNextMaintDateIso != null && daysUntil != null && daysUntil >= 0 && daysUntil <= DUE_SOON_DAYS_ELMS;
+    let utilDueSoon = false;
+    if (!scheduleMxOverdueUtil && scheduleMxUtilRemaining != null && scheduleMxUtilRemaining > 0 && elmsNextUtilQty != null && elmsNextUtilQty > 0) {
+      const pct = scheduleMxUtilRemaining / elmsNextUtilQty;
+      utilDueSoon = pct <= 0.05;
+    }
+    if (overdue) {
+      bucket = "overdue";
+      scheduleMxOverdueByDays = dateOverdueByDays ?? (scheduleMxOverdueUtil ? 0 : null);
+      scheduleMxDueIso = elmsNextMaintDateIso ?? legacy.scheduleMxDueIso;
+      scheduleMxDaysUntil = daysUntil ?? legacy.scheduleMxDaysUntil;
+      scheduleMxStatus = scheduleMxStatus || (dateOverdue ? "Past next maint date" : "Past next util qty");
+    } else if (dateDueSoon || utilDueSoon) {
+      bucket = "due_soon";
+      scheduleMxDueIso = elmsNextMaintDateIso ?? legacy.scheduleMxDueIso;
+      scheduleMxDaysUntil = daysUntil ?? legacy.scheduleMxDaysUntil;
+      scheduleMxStatus = scheduleMxStatus || "Due soon";
+    } else if (elmsNextMaintDateIso || elmsNextUtilQty != null) {
+      bucket = "ok";
+      scheduleMxDueIso = elmsNextMaintDateIso ?? legacy.scheduleMxDueIso;
+      scheduleMxDaysUntil = daysUntil ?? legacy.scheduleMxDaysUntil;
+      if (!scheduleMxStatus && elmsNextMaintDateIso) scheduleMxStatus = "Current";
+    } else {
+      bucket = "missing";
+      needsEntry = true;
+    }
+  } else {
+    bucket = legacy.scheduleMxBucket;
+    scheduleMxOverdueByDays = legacy.scheduleMxOverdueByDays;
+    scheduleMxDaysUntil = legacy.scheduleMxDaysUntil;
+    scheduleMxDueIso = legacy.scheduleMxDueIso;
+    scheduleMxStatus = legacy.scheduleMxStatus;
+    needsEntry = legacy.scheduleMxNeedsEntry;
+  }
+
+  return {
+    scheduleMxStatus,
+    scheduleMxDueIso,
+    scheduleMxDaysUntil,
+    scheduleMxOverdueByDays,
+    scheduleMxBucket: bucket,
+    scheduleMxNeedsEntry: needsEntry,
+    elmsLastMaintDateIso,
+    elmsNextMaintDateIso,
+    elmsLastUtilQty,
+    elmsNextUtilQty,
+    elmsCurrentMeter,
+    elmsUtilType,
+    scheduleMxOverdueUtil,
+    scheduleMxUtilRemaining,
+  };
 }
 
 function buildScheduleMxRowsFromFleetSheet(
@@ -1029,16 +1214,68 @@ function buildScheduleMxRowsFromFleetSheet(
       "fleet.nce",
     ]);
     const nce = !!nceStatus;
-    const smx = analyzeScheduleMxFromRaw(merged, dateKey);
+    const smx = analyzeElmsScheduleMxFromRaw(merged, dateKey);
     const scheduleMxNceCritical = nce && smx.scheduleMxBucket === "overdue";
     const makeModel =
       (typed?.makeModel ?? "").trim() ||
-      pickRawValue(merged, ["fleet.make/model", "fleet.make model", "make model"]);
+      pickRawValue(merged, ["fleet.make/model", "fleet.make model", "make model", "fleet.item desc", "item desc"]);
     const mgmtCd =
       (typed?.mgmtCd ?? "").trim() ||
       pickRawValue(merged, ["fleet.mgmt cd", "fleet.mgmt code", "mgmt cd"]);
+    const planName = pickElmsFromRaw(merged, ["plan name"]);
+    const planId = pickElmsFromRaw(merged, ["plan id"]);
     out.push({
       assetId,
+      planRowKey: assetId,
+      planId,
+      planName,
+      planDesc: pickElmsFromRaw(merged, ["plan desc"]),
+      maintenanceScheduleId: pickElmsFromRaw(merged, ["maintenance schedule id", "maint schedule id"]),
+      itemDesc: pickElmsFromRaw(merged, ["item desc"]),
+      location: pickElmsFromRaw(merged, ["location"]),
+      makeModel,
+      mgmtCd,
+      workOrderCount: woCounts.get(assetId) ?? 0,
+      nce,
+      nceStatus,
+      scheduleMxNceCritical,
+      ...smx,
+    });
+  }
+  return sortScheduleMxRows(out);
+}
+
+function buildScheduleMxRowsFromPlanRows(
+  rows: Array<{ planRowKey: string; assetId: string; raw: Record<string, string> }>,
+  woCounts: Map<string, number>,
+  dateKey: string,
+): ScheduleMxFleetRow[] {
+  const out: ScheduleMxFleetRow[] = [];
+  for (const pr of rows) {
+    const assetId = pr.assetId;
+    const merged = pr.raw;
+    const nceStatus = pickRawValue(merged, [
+      "fleet.nce vehicle listing.status",
+      "fleet.nce vehicle listing status",
+      "fleet.nce status",
+      "fleet.nce",
+    ]);
+    const nce = !!nceStatus;
+    const smx = analyzeElmsScheduleMxFromRaw(merged, dateKey);
+    const scheduleMxNceCritical = nce && smx.scheduleMxBucket === "overdue";
+    const makeModel =
+      pickRawValue(merged, ["fleet.make/model", "fleet.make model", "make model"]) ||
+      pickElmsFromRaw(merged, ["item desc"]);
+    const mgmtCd = pickRawValue(merged, ["fleet.mgmt cd", "fleet.mgmt code", "mgmt cd"]);
+    out.push({
+      assetId,
+      planRowKey: pr.planRowKey,
+      planId: pickElmsFromRaw(merged, ["plan id"]),
+      planName: pickElmsFromRaw(merged, ["plan name"]),
+      planDesc: pickElmsFromRaw(merged, ["plan desc"]),
+      maintenanceScheduleId: pickElmsFromRaw(merged, ["maintenance schedule id", "maint schedule id"]),
+      itemDesc: pickElmsFromRaw(merged, ["item desc"]),
+      location: pickElmsFromRaw(merged, ["location"]),
       makeModel,
       mgmtCd,
       workOrderCount: woCounts.get(assetId) ?? 0,
@@ -1108,7 +1345,9 @@ function findAssetColumnIndex(headers: string[]): number {
   return scored[0]!.i;
 }
 
-function tableToRawByAsset(headers: string[], dataRows: string[][]): Map<string, Record<string, string>> {
+export type ScheduleMxPlanParseRow = { planRowKey: string; assetId: string; raw: Record<string, string> };
+
+function buildPlanRowsFromTable(headers: string[], dataRows: string[][]): ScheduleMxPlanParseRow[] {
   const assetIdx = findAssetColumnIndex(headers);
   if (assetIdx < 0) {
     const preview = headers
@@ -1121,7 +1360,8 @@ function tableToRawByAsset(headers: string[], dataRows: string[][]): Map<string,
     );
   }
   const headerFleet = headers.map((h) => `fleet.${normalizeHeaderKey(h)}`);
-  const out = new Map<string, Record<string, string>>();
+  const out: ScheduleMxPlanParseRow[] = [];
+  let rowIndex = 0;
   for (const cells of dataRows) {
     if (cells.length <= assetIdx) continue;
     const aid = (cells[assetIdx] ?? "").trim();
@@ -1132,29 +1372,40 @@ function tableToRawByAsset(headers: string[], dataRows: string[][]): Map<string,
       if (!v) continue;
       raw[headerFleet[i] ?? `fleet.col${i}`] = v;
     }
-    out.set(aid, raw);
+    const planRowKey = elmsPlanRowKeyFromRaw(raw, aid, rowIndex);
+    rowIndex += 1;
+    out.push({ planRowKey, assetId: aid, raw });
   }
   return out;
 }
 
-/** Parse ELMS / Schedule Mx CSV export: first row = headers; asset column detected heuristically. */
-export function parseScheduleMxCsvToRawByAsset(csvText: string): Map<string, Record<string, string>> {
+/** Parse ELMS / Schedule Mx CSV: one entry per plan row (many per asset). */
+export function parseScheduleMxCsvToPlanRows(csvText: string): ScheduleMxPlanParseRow[] {
   let t = csvText.replace(/^\uFEFF/, "");
   const lines = t.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n").filter((l) => l.trim().length > 0);
-  if (lines.length < 2) return new Map();
+  if (lines.length < 2) return [];
   const headers = parseCsvLine(lines[0]!).map((h) => h.trim());
   const dataRows: string[][] = [];
   for (let i = 1; i < lines.length; i++) {
     dataRows.push(parseCsvLine(lines[i]!));
   }
-  return tableToRawByAsset(headers, dataRows);
+  return buildPlanRowsFromTable(headers, dataRows);
 }
 
-async function parseScheduleMxXlsxToRawByAsset(bytes: ArrayBuffer): Promise<Map<string, Record<string, string>>> {
+/** @deprecated for tests; use parseScheduleMxCsvToPlanRows — last plan per asset only. */
+export function parseScheduleMxCsvToRawByAsset(csvText: string): Map<string, Record<string, string>> {
+  const m = new Map<string, Record<string, string>>();
+  for (const row of parseScheduleMxCsvToPlanRows(csvText)) {
+    m.set(row.assetId, row.raw);
+  }
+  return m;
+}
+
+async function parseScheduleMxXlsxToPlanRows(bytes: ArrayBuffer): Promise<ScheduleMxPlanParseRow[]> {
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(bytes);
   const sheet = wb.worksheets[0];
-  if (!sheet) return new Map();
+  if (!sheet) return [];
   const headerRow = sheet.getRow(1);
   const colCount = Math.max(headerRow.cellCount, sheet.columnCount ?? 0, 1);
   const headers: string[] = [];
@@ -1177,7 +1428,7 @@ async function parseScheduleMxXlsxToRawByAsset(bytes: ArrayBuffer): Promise<Map<
     }
     if (any) dataRows.push(cells);
   }
-  return tableToRawByAsset(headers, dataRows);
+  return buildPlanRowsFromTable(headers, dataRows);
 }
 
 /**
@@ -1193,88 +1444,92 @@ export async function ingestScheduleMxExtractFromAttachment(
     from: string;
     to: string;
   },
-): Promise<{ rowCount: number; dateKey: string }> {
+): Promise<{ rowCount: number; planRows: number; dateKey: string }> {
   const lower = opts.fileName.toLowerCase();
-  let rawByAsset: Map<string, Record<string, string>>;
+  let planRows: ScheduleMxPlanParseRow[];
   if (lower.endsWith(".csv")) {
     const text = new TextDecoder("utf-8", { fatal: false }).decode(new Uint8Array(opts.bytes));
-    rawByAsset = parseScheduleMxCsvToRawByAsset(text);
+    planRows = parseScheduleMxCsvToPlanRows(text);
   } else if (lower.endsWith(".xlsx")) {
-    rawByAsset = await parseScheduleMxXlsxToRawByAsset(opts.bytes);
+    planRows = await parseScheduleMxXlsxToPlanRows(opts.bytes);
   } else {
     throw new Error("prevmx: attachment must be .csv or .xlsx");
   }
-  if (rawByAsset.size === 0) {
+  if (planRows.length === 0) {
     throw new Error("prevmx: no data rows with asset ids found");
   }
 
   const stmt = env.ETIC_SNAPSHOTS.prepare(
-    `INSERT INTO schedule_mx_extract_snapshot (
-       snapshot_date_key, asset_id, raw_row_json, source_filename, received_at_iso
-     ) VALUES (?,?,?,?,?)
-     ON CONFLICT(snapshot_date_key, asset_id) DO UPDATE SET
+    `INSERT INTO schedule_mx_plan_snapshot (
+       snapshot_date_key, plan_row_key, asset_id, raw_row_json, source_filename, received_at_iso
+     ) VALUES (?,?,?,?,?,?)
+     ON CONFLICT(snapshot_date_key, plan_row_key) DO UPDATE SET
+       asset_id = excluded.asset_id,
        raw_row_json = excluded.raw_row_json,
        source_filename = excluded.source_filename,
        received_at_iso = excluded.received_at_iso`,
   );
   const BATCH = 50;
-  const entries = [...rawByAsset.entries()];
-  for (let i = 0; i < entries.length; i += BATCH) {
-    const chunk = entries.slice(i, i + BATCH);
+  for (let i = 0; i < planRows.length; i += BATCH) {
+    const chunk = planRows.slice(i, i + BATCH);
     await env.ETIC_SNAPSHOTS.batch(
-      chunk.map(([assetId, raw]) =>
+      chunk.map((row) =>
         stmt.bind(
           opts.dateKey,
-          assetId,
-          JSON.stringify(raw),
+          row.planRowKey,
+          row.assetId,
+          JSON.stringify(row.raw),
           opts.fileName,
           opts.receivedAtIso,
         ),
       ),
     );
   }
+  const assetSet = new Set(planRows.map((r) => r.assetId));
   console.log(
     JSON.stringify({
       level: "info",
       message: "schedule_mx_prevmx_ingested",
       dateKey: opts.dateKey,
-      rowCount: rawByAsset.size,
+      planRows: planRows.length,
+      distinctAssets: assetSet.size,
       fileName: opts.fileName,
       from: opts.from,
       to: opts.to,
     }),
   );
-  return { rowCount: rawByAsset.size, dateKey: opts.dateKey };
+  return { rowCount: assetSet.size, planRows: planRows.length, dateKey: opts.dateKey };
 }
 
-async function loadScheduleMxExtractForDate(
+async function loadScheduleMxPlanRowsForDate(
   env: { ETIC_SNAPSHOTS: D1Database },
   dateKey: string,
-): Promise<Map<string, Record<string, string>>> {
-  const out = new Map<string, Record<string, string>>();
+): Promise<ScheduleMxPlanParseRow[]> {
   const r = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT asset_id, raw_row_json FROM schedule_mx_extract_snapshot WHERE snapshot_date_key = ?`,
+    `SELECT plan_row_key, asset_id, raw_row_json FROM schedule_mx_plan_snapshot WHERE snapshot_date_key = ? ORDER BY asset_id ASC, plan_row_key ASC`,
   )
     .bind(dateKey)
-    .all<{ asset_id: string; raw_row_json: string }>();
+    .all<{ plan_row_key: string; asset_id: string; raw_row_json: string }>();
+  const out: ScheduleMxPlanParseRow[] = [];
   for (const row of r.results ?? []) {
+    const planRowKey = (row.plan_row_key ?? "").trim();
     const aid = (row.asset_id ?? "").trim();
-    if (!aid) continue;
+    if (!planRowKey || !aid) continue;
     let raw: Record<string, string> = {};
     try {
       raw = JSON.parse(row.raw_row_json || "{}") as Record<string, string>;
     } catch {
       raw = {};
     }
-    out.set(aid, raw);
+    out.push({ planRowKey, assetId: aid, raw });
   }
   return out;
 }
 
-/** Latest `snapshot_date_key` in schedule_mx_extract_snapshot (prevmx imports), or null. */
+/** Latest `snapshot_date_key` in schedule_mx_plan_snapshot (prevmx imports), or null. */
 export async function getLatestScheduleMxExtractDateKey(env: { ETIC_SNAPSHOTS: D1Database }): Promise<string | null> {
   const r = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT MAX(snapshot_date_key) AS k FROM schedule_mx_extract_snapshot`,
+    `SELECT MAX(snapshot_date_key) AS k FROM schedule_mx_plan_snapshot`,
   ).first<{ k: string | null }>();
   const k = r?.k?.trim() ?? "";
   return k || null;
@@ -1283,24 +1538,23 @@ export async function getLatestScheduleMxExtractDateKey(env: { ETIC_SNAPSHOTS: D
 /** Distinct import dates (newest first) for Schedule Mx history picker. */
 export async function listScheduleMxExtractDateKeysDesc(env: { ETIC_SNAPSHOTS: D1Database }): Promise<string[]> {
   const r = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT DISTINCT snapshot_date_key AS k FROM schedule_mx_extract_snapshot ORDER BY k DESC`,
+    `SELECT DISTINCT snapshot_date_key AS k FROM schedule_mx_plan_snapshot ORDER BY k DESC`,
   ).all<{ k: string }>();
   return (r.results ?? []).map((row) => (row.k ?? "").trim()).filter(Boolean);
 }
 
 /**
- * Schedule Mx tab: **only** `schedule_mx_extract_snapshot` rows (prevmx@ CSV/XLSX). Independent of ETIC workbooks.
+ * Schedule Mx tab: **only** `schedule_mx_plan_snapshot` rows (prevmx@ CSV/XLSX), one row per maintenance plan.
  * Open WO counts on the same calendar date are joined from `work_order_snapshot` when present (optional context only).
  */
 export async function getScheduleMxFleetForDate(
   env: { ETIC_SNAPSHOTS: D1Database },
   dateKey: string,
 ): Promise<ScheduleMxFleetRow[]> {
-  const extractOnly = await loadScheduleMxExtractForDate(env, dateKey);
-  if (extractOnly.size === 0) return [];
+  const planRows = await loadScheduleMxPlanRowsForDate(env, dateKey);
+  if (planRows.length === 0) return [];
   const woCounts = await loadWoCountsPerAsset(env, dateKey);
-  const emptyTyped = new Map<string, FleetRecord>();
-  return buildScheduleMxRowsFromFleetSheet(extractOnly, emptyTyped, woCounts, dateKey);
+  return buildScheduleMxRowsFromPlanRows(planRows, woCounts, dateKey);
 }
 
 async function getEarliestSnapshotDate(env: { ETIC_SNAPSHOTS: D1Database }): Promise<string> {

@@ -4866,8 +4866,11 @@ async function handleScheduleMxApi(env: Env, request: Request): Promise<Response
       { status: 404, headers: cacheHeaders() },
     );
   }
+  const distinctAssets = new Set(rows.map((r) => r.assetId)).size;
   const stats = {
-    assets: rows.length,
+    planRows: rows.length,
+    distinctAssets,
+    assets: distinctAssets,
     missing: rows.filter((r) => r.scheduleMxBucket === "missing").length,
     noDue: rows.filter((r) => r.scheduleMxBucket === "no_due").length,
     overdue: rows.filter((r) => r.scheduleMxBucket === "overdue").length,
@@ -14400,7 +14403,7 @@ function renderDashboardHtml(): string {
         <div class="smx-header">
           <div>
             <h2 class="smx-title">Schedule Maintenance Status</h2>
-            <p class="smx-sub">Per-asset schedule maintenance from the <strong>ELMS / Schedule Mx extract</strong> (email <code>prevmx@2t3.app</code> with a CSV or XLSX). This feed is separate from the Vehicle ETIC workbook. <strong>Overdue</strong> follows the <strong>Schedule Mx Slicer</strong> column when present. Open work-order counts (if shown) use the same calendar date when an ETIC snapshot exists. Overdue on <span class="nce-inline">NCE</span> is treated as critical.</p>
+            <p class="smx-sub">Each row is one <strong>maintenance plan</strong> per asset from the <strong>ELMS extract</strong> (email <code>prevmx@2t3.app</code>). Due/overdue uses <strong>next maint date</strong> and <strong>current meter</strong> vs <strong>next util qty</strong> when those columns exist. Same import date as Work Orders is only used for optional open WO counts. Sub work order tie-in (Plan ID) comes later.</p>
           </div>
           <span class="smx-asof-pill" id="smx-asof-pill" title="Latest prevmx import date">Latest import</span>
           <label class="smx-search" style="margin-left:10px"><span class="sr-only">Import date</span>
@@ -14410,7 +14413,7 @@ function renderDashboardHtml(): string {
         <div class="smx-stats" id="smx-stats" role="status">Loading…</div>
         <div class="smx-toolbar">
           <label class="smx-search"><span class="sr-only">Filter rows</span>
-            <input type="text" id="smx-query" placeholder="Filter asset, mgmt, status…" autocomplete="off" />
+            <input type="text" id="smx-query" placeholder="Filter asset, plan, location…" autocomplete="off" />
           </label>
           <div class="smx-filters" id="smx-filters" role="tablist" aria-label="Schedule maintenance filters">
             <button type="button" class="smx-filter-btn active" data-smx-filter="all">All <span class="smx-n" data-smx-c="all">0</span></button>
@@ -14421,14 +14424,14 @@ function renderDashboardHtml(): string {
           </div>
         </div>
         <div class="smx-table-wrap">
-          <table class="smx-table" aria-label="Schedule maintenance by asset">
+          <table class="smx-table" aria-label="Schedule maintenance by plan">
             <thead>
               <tr>
-                <th>Asset</th>
+                <th>Asset / plan</th>
+                <th>Last / next</th>
+                <th>Utilization</th>
                 <th>NCE</th>
-                <th>Schedule Mx status</th>
-                <th>Due</th>
-                <th>Overdue by</th>
+                <th>Status</th>
                 <th>State</th>
               </tr>
             </thead>
@@ -17616,6 +17619,9 @@ function renderDashboardHtml(): string {
       const ql = q.toLowerCase();
       return (
         (row.assetId || "").toLowerCase().indexOf(ql) !== -1 ||
+        (row.planName || "").toLowerCase().indexOf(ql) !== -1 ||
+        (row.planId || "").toLowerCase().indexOf(ql) !== -1 ||
+        (row.location || "").toLowerCase().indexOf(ql) !== -1 ||
         (row.mgmtCd || "").toLowerCase().indexOf(ql) !== -1 ||
         (row.makeModel || "").toLowerCase().indexOf(ql) !== -1 ||
         (row.scheduleMxStatus || "").toLowerCase().indexOf(ql) !== -1
@@ -17634,7 +17640,8 @@ function renderDashboardHtml(): string {
         );
       }
       box.innerHTML =
-        pill("assets", "Assets", "") +
+        pill("planRows", "Plan rows", "") +
+        pill("distinctAssets", "Assets", "") +
         pill("nceCritical", "NCE overdue (critical)", "crit") +
         pill("overdue", "Overdue", "bad") +
         pill("dueSoon", "Due soon (≤30d)", "warn") +
@@ -17680,16 +17687,34 @@ function renderDashboardHtml(): string {
         const mgmtLine = row.mgmtCd
           ? ("Mgmt " + esc(row.mgmtCd) + " · " + row.workOrderCount + " WO")
           : (String(row.workOrderCount) + " WO");
+        const lastNext =
+          (row.elmsLastMaintDateIso ? fmtKeyShort(row.elmsLastMaintDateIso) : "—") +
+          " → " +
+          (row.elmsNextMaintDateIso ? fmtKeyShort(row.elmsNextMaintDateIso) : due);
+        const ut = (row.elmsUtilType || "").trim();
+        const utilLine =
+          (row.elmsCurrentMeter != null ? esc(String(row.elmsCurrentMeter)) : "—") +
+          (ut ? " " + esc(ut) : "") +
+          " · next " +
+          (row.elmsNextUtilQty != null ? esc(String(row.elmsNextUtilQty)) : "—") +
+          (row.scheduleMxUtilRemaining != null
+            ? " (" + (row.scheduleMxUtilRemaining >= 0 ? "rem " : "over ") + Math.abs(row.scheduleMxUtilRemaining) + ")"
+            : "");
         return (
           "<tr" + (trCls ? " class='" + esc(trCls) + "'" : "") + ">" +
             "<td><span class='asset-mono'>" + esc(row.assetId) + "</span>" +
+              (row.planName ? "<div class='remark-snippet'><strong>" + esc(row.planName) + "</strong>" +
+                (row.planId ? " · Plan " + esc(row.planId) : "") + "</div>" : "") +
+              (row.location ? "<div class='remark-snippet'>" + esc(row.location) + "</div>" : "") +
               (row.makeModel ? "<div class='remark-snippet'>" + esc(row.makeModel) + "</div>" : "") +
               "<div class='remark-snippet'>" + mgmtLine + "</div>" +
             "</td>" +
+            "<td><div class='remark-snippet'>" + esc(lastNext) + "</div>" +
+              (ov !== "—" ? "<div class='remark-snippet'>Overdue " + esc(ov) + "</div>" : "") +
+            "</td>" +
+            "<td><div class='remark-snippet'>" + utilLine + "</div></td>" +
             "<td>" + nce + "</td>" +
             "<td>" + esc(row.scheduleMxStatus || "—") + "</td>" +
-            "<td>" + esc(due) + "</td>" +
-            "<td>" + esc(ov) + "</td>" +
             "<td><span class='smx-pill " + esc(pillCls) + "'>" + esc(smxPillLabel(row.scheduleMxBucket)) + "</span></td>" +
           "</tr>"
         );

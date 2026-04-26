@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { RawWorkOrder } from "../src/yardCheck";
 import {
+  analyzeElmsScheduleMxFromRaw,
   calendarDaysBetween,
   classifyMelTier,
   computeMelRecallHintForRow,
@@ -8,6 +9,7 @@ import {
   ingestWorkOrderSnapshot,
   melMgmtCodesMatch,
   parseEticDate,
+  parseScheduleMxCsvToPlanRows,
   parseScheduleMxCsvToRawByAsset,
 } from "../src/workOrderWatch";
 import type { WatchRow } from "../src/workOrderWatch";
@@ -37,21 +39,60 @@ describe("parseEticDate", () => {
   });
 });
 
-describe("parseScheduleMxCsvToRawByAsset", () => {
-  it("maps headers to fleet.* keys and finds Asset Id column", () => {
-    const csv = 'Asset Id,Schedule Mx Status,Next Schedule Mx\nAF01B00001,Overdue,4/15/2026\n';
-    const m = parseScheduleMxCsvToRawByAsset(csv);
-    expect(m.size).toBe(1);
-    const raw = m.get("AF01B00001")!;
-    expect(raw["fleet.schedule mx status"]).toBe("Overdue");
-    expect(raw["fleet.next schedule mx"]).toBe("4/15/2026");
+describe("parseScheduleMxCsvToPlanRows", () => {
+  it("maps headers to fleet.* keys and yields one row per CSV line", () => {
+    const csv =
+      "Asset Id,Maintenance Schedule Id,Plan Name,Next Maint Date\n" +
+      "AF01B00001,SCH1,Oil,2026-05-01\n" +
+      "AF01B00001,SCH2,Brakes,2026-06-01\n";
+    const rows = parseScheduleMxCsvToPlanRows(csv);
+    expect(rows.length).toBe(2);
+    expect(rows[0]!.planRowKey).toBe("SCH1");
+    expect(rows[1]!.planRowKey).toBe("SCH2");
+    expect(rows[0]!.raw["fleet.next maint date"]).toBe("2026-05-01");
   });
 
   it("strips UTF-8 BOM on first header", () => {
-    const csv = "\uFEFFVehicle Id,Status\nAF01B00001,OK\n";
+    const csv = "\uFEFFVehicle Id,Plan Id,Plan Name,Next Maint Date\nAF01B00001,P1,Oil,2026-05-01\n";
+    const rows = parseScheduleMxCsvToPlanRows(csv);
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.planRowKey).toContain("AF01B00001");
+    expect(rows[0]!.raw["fleet.next maint date"]).toBe("2026-05-01");
+  });
+});
+
+describe("parseScheduleMxCsvToRawByAsset (compat)", () => {
+  it("keeps last row per asset only", () => {
+    const csv =
+      "Asset Id,Plan Id,Plan Name\n" +
+      "AF01B00001,P1,A\n" +
+      "AF01B00001,P2,B\n";
     const m = parseScheduleMxCsvToRawByAsset(csv);
-    expect(m.size).toBe(1);
-    expect(m.get("AF01B00001")!["fleet.status"]).toBe("OK");
+    expect(m.get("AF01B00001")!["fleet.plan name"]).toBe("B");
+  });
+});
+
+describe("analyzeElmsScheduleMxFromRaw", () => {
+  it("marks overdue when next maint date is before as-of", () => {
+    const raw = {
+      "fleet.next maint date": "2026-04-01",
+      "fleet.current meter reading": "1000",
+      "fleet.next util qty": "5000",
+    };
+    const a = analyzeElmsScheduleMxFromRaw(raw, "2026-04-25");
+    expect(a.scheduleMxBucket).toBe("overdue");
+    expect(a.scheduleMxOverdueByDays).toBe(24);
+  });
+
+  it("marks util overdue when current meter past next util", () => {
+    const raw = {
+      "fleet.next maint date": "2026-12-01",
+      "fleet.current meter reading": "6000",
+      "fleet.next util qty": "5000",
+    };
+    const a = analyzeElmsScheduleMxFromRaw(raw, "2026-04-25");
+    expect(a.scheduleMxOverdueUtil).toBe(true);
+    expect(a.scheduleMxBucket).toBe("overdue");
   });
 });
 
