@@ -18238,8 +18238,14 @@ function renderDashboardHtml(): string {
       }
     }
 
+    function smxRowOwningUnitDisplay(row) {
+      var aid = row && row.assetId ? String(row.assetId).trim() : "";
+      if (aid.toUpperCase().indexOf("MSX") === 0) return "791 MXS";
+      return row && row.owningUnit ? String(row.owningUnit).trim() : "";
+    }
+
     function smxNormUnitFromRow(row) {
-      var u = (row && row.owningUnit ? String(row.owningUnit) : "").trim();
+      var u = smxRowOwningUnitDisplay(row);
       return u || "(Unknown unit)";
     }
 
@@ -18766,7 +18772,7 @@ function renderDashboardHtml(): string {
         (row.location || "").toLowerCase().indexOf(ql) !== -1 ||
         (row.mgmtCd || "").toLowerCase().indexOf(ql) !== -1 ||
         (row.makeModel || "").toLowerCase().indexOf(ql) !== -1 ||
-        (row.owningUnit || "").toLowerCase().indexOf(ql) !== -1 ||
+        smxRowOwningUnitDisplay(row).toLowerCase().indexOf(ql) !== -1 ||
         (row.vehNomen || "").toLowerCase().indexOf(ql) !== -1 ||
         (row.eticOpenWorkOrderIds || "").toLowerCase().indexOf(ql) !== -1 ||
         (row.scheduleMxStatus || "").toLowerCase().indexOf(ql) !== -1
@@ -19037,7 +19043,7 @@ function renderDashboardHtml(): string {
       const p0 = plans && plans[0];
       if (!p0) return "";
       const pairs = [];
-      pairs.push({ lbl: "Unit", val: p0.owningUnit ? esc(p0.owningUnit) : "—" });
+      pairs.push({ lbl: "Unit", val: smxRowOwningUnitDisplay(p0) ? esc(smxRowOwningUnitDisplay(p0)) : "—" });
       pairs.push({ lbl: "Make / model", val: p0.makeModel ? esc(p0.makeModel) : "—" });
       pairs.push({ lbl: "Vehicle type", val: p0.vehNomen ? esc(p0.vehNomen) : "—" });
       pairs.push({ lbl: "Mgmt code", val: p0.mgmtCd ? esc(p0.mgmtCd) : "—" });

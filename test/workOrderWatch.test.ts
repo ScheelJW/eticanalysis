@@ -8,6 +8,7 @@ import {
   computeScheduleMxAssetStats,
   computeScheduleMxCommanderSummary,
   enrichScheduleMxRowsWithLatestEtic,
+  scheduleMxOwningUnitForAssetId,
   elmsPlanRowKeyFromRaw,
   getChangelogForDisplay,
   ingestWorkOrderSnapshot,
@@ -107,6 +108,64 @@ describe("enrichScheduleMxRowsWithLatestEtic", () => {
     expect(out.workOrderCount).toBe(1);
     expect(out.owningUnit).toBe("1 AMXS");
     expect(out.scheduleMxPlanEffectiveNceCritical).toBe(false);
+  });
+
+  it("forces MSX-prefixed assets to owning unit 791 MXS", () => {
+    const base = analyzeElmsScheduleMxFromRaw({}, "2026-04-25");
+    const row = {
+      assetId: "MSX01B00001",
+      planRowKey: "p1",
+      planId: "",
+      planName: "Oil",
+      planDesc: "",
+      maintenanceScheduleId: "",
+      itemDesc: "",
+      location: "",
+      makeModel: "",
+      mgmtCd: "",
+      workOrderCount: 0,
+      nce: false,
+      nceStatus: "",
+      scheduleMxNceCritical: false,
+      owningUnit: "",
+      vehNomen: "",
+      eticSnapshotDateKey: null,
+      eticOpenWorkOrderIds: "",
+      eticOpenInMaintenance: false,
+      scheduleMxPlanEffectiveBucket: "ok",
+      scheduleMxPlanEffectiveNceCritical: false,
+      scheduleMxSuppressedByOpenWo: false,
+      ...base,
+      scheduleMxBucket: "ok",
+    } as ScheduleMxFleetRow;
+    const byAsset = new Map([
+      [
+        "MSX01B00001",
+        {
+          workOrderIds: [],
+          owningUnit: "OTHER UNIT",
+          makeModel: "Truck",
+          vehNomen: "TRK",
+          mgmtCd: "M16",
+          nce: false,
+          nceStatus: "",
+          inMaintenance: false,
+        },
+      ],
+    ]);
+    const out = enrichScheduleMxRowsWithLatestEtic([row], "2026-04-26", byAsset)[0]!;
+    expect(out.owningUnit).toBe("791 MXS");
+  });
+});
+
+describe("scheduleMxOwningUnitForAssetId", () => {
+  it("returns 791 MXS for MSX-prefixed asset ids (case-insensitive prefix)", () => {
+    expect(scheduleMxOwningUnitForAssetId("MSX99", "X")).toBe("791 MXS");
+    expect(scheduleMxOwningUnitForAssetId("msxlow", "")).toBe("791 MXS");
+  });
+  it("returns extract unit when asset id does not start with MSX", () => {
+    expect(scheduleMxOwningUnitForAssetId("AF01", "91 MW")).toBe("91 MW");
+    expect(scheduleMxOwningUnitForAssetId("AF01", "")).toBe("");
   });
 });
 
@@ -255,6 +314,40 @@ describe("computeScheduleMxCommanderSummary", () => {
     const c = computeScheduleMxCommanderSummary([row]);
     expect(c.wing.totalVehicles).toBe(1);
     expect(c.wing.overdue).toBe(1);
+  });
+
+  it("rolls MSX assets into 791 MXS even when extract owningUnit differs", () => {
+    const base = analyzeElmsScheduleMxFromRaw({}, "2026-04-25");
+    const row: ScheduleMxFleetRow = {
+      assetId: "MSX01",
+      planRowKey: "p1",
+      planId: "",
+      planName: "",
+      planDesc: "",
+      maintenanceScheduleId: "",
+      itemDesc: "",
+      location: "",
+      makeModel: "",
+      mgmtCd: "",
+      workOrderCount: 0,
+      nce: false,
+      nceStatus: "",
+      scheduleMxNceCritical: false,
+      owningUnit: "WRONG UNIT",
+      vehNomen: "",
+      eticSnapshotDateKey: null,
+      eticOpenWorkOrderIds: "",
+      eticOpenInMaintenance: false,
+      scheduleMxPlanEffectiveBucket: "ok",
+      scheduleMxPlanEffectiveNceCritical: false,
+      scheduleMxSuppressedByOpenWo: false,
+      ...base,
+      scheduleMxBucket: "ok",
+    };
+    const c = computeScheduleMxCommanderSummary([row]);
+    expect(c.units.some((u) => u.unit === "WRONG UNIT")).toBe(false);
+    const u791 = c.units.find((x) => x.unit === "791 MXS");
+    expect(u791?.totalVehicles).toBe(1);
   });
 });
 

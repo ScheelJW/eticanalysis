@@ -14,6 +14,15 @@ import { buildLineCompletions } from "./meeting";
 
 export type MelTier = "below" | "at" | "above" | "unknown";
 
+/** ELMS extract sometimes omits or mis-assigns unit for MSX-prefixed assets; force owning unit for rollups and UI. */
+const SCHEDULE_MX_MSX_UNIT = "791 MXS";
+
+export function scheduleMxOwningUnitForAssetId(assetId: string, extractUnit: string): string {
+  const aid = (assetId ?? "").trim();
+  if (aid.toUpperCase().startsWith("MSX")) return SCHEDULE_MX_MSX_UNIT;
+  return (extractUnit ?? "").trim();
+}
+
 /** Default staleness in days between expected remarks. Mirrored in melWatch.ts
  *  so the Settings tab can override these without touching code. */
 const REMARK_INTERVAL_DEFAULT: Record<MelTier, number | null> = {
@@ -1209,7 +1218,10 @@ function applyEticContextToScheduleMxRow(
   eticDateKey: string | null,
 ): ScheduleMxFleetRow {
   const woCount = eticDateKey != null ? (ctx?.workOrderIds.length ?? 0) : row.workOrderCount;
-  const owningUnit = ctx && ctx.owningUnit ? ctx.owningUnit : row.owningUnit;
+  const owningUnit = scheduleMxOwningUnitForAssetId(
+    row.assetId,
+    ctx && ctx.owningUnit ? ctx.owningUnit : row.owningUnit,
+  );
   const makeModel = ctx && ctx.makeModel ? ctx.makeModel : row.makeModel;
   const vehNomen = ctx && ctx.vehNomen ? ctx.vehNomen : row.vehNomen;
   const mgmtCd = ctx && ctx.mgmtCd ? ctx.mgmtCd : row.mgmtCd;
@@ -1342,7 +1354,7 @@ function scheduleMxAssetRawWorstRank(plans: ScheduleMxFleetRow[]): number {
 export function computeScheduleMxCommanderSummary(rows: ScheduleMxFleetRow[]): ScheduleMxCommanderSummary {
   const byAssetInUnit = new Map<string, Map<string, ScheduleMxFleetRow[]>>();
   for (const row of rows) {
-    const u = (row.owningUnit ?? "").trim() || "(Unknown unit)";
+    const u = scheduleMxOwningUnitForAssetId(row.assetId, row.owningUnit ?? "") || "(Unknown unit)";
     const aid = (row.assetId ?? "").trim() || "—";
     let am = byAssetInUnit.get(u);
     if (!am) {
