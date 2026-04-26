@@ -8,6 +8,7 @@ import {
   ingestWorkOrderSnapshot,
   melMgmtCodesMatch,
   parseEticDate,
+  parseScheduleMxCsvToRawByAsset,
 } from "../src/workOrderWatch";
 import type { WatchRow } from "../src/workOrderWatch";
 
@@ -33,6 +34,17 @@ describe("parseEticDate", () => {
   it("parses ISO prefix and US dates", () => {
     expect(parseEticDate("2026-04-20")).toBe("2026-04-20");
     expect(parseEticDate("4/20/2026")).toBe("2026-04-20");
+  });
+});
+
+describe("parseScheduleMxCsvToRawByAsset", () => {
+  it("maps headers to fleet.* keys and finds Asset Id column", () => {
+    const csv = 'Asset Id,Schedule Mx Status,Next Schedule Mx\nAF01B00001,Overdue,4/15/2026\n';
+    const m = parseScheduleMxCsvToRawByAsset(csv);
+    expect(m.size).toBe(1);
+    const raw = m.get("AF01B00001")!;
+    expect(raw["fleet.schedule mx status"]).toBe("Overdue");
+    expect(raw["fleet.next schedule mx"]).toBe("4/15/2026");
   });
 });
 

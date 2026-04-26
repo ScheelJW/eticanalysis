@@ -403,7 +403,7 @@ export type RawWorkOrder = {
 };
 
 /** Lower-case + collapse whitespace so JSON keys are stable across slight header drift. */
-function normalizeHeaderKey(raw: string): string {
+export function normalizeHeaderKey(raw: string): string {
   return raw.toLowerCase().replace(/\s+/g, " ").trim();
 }
 

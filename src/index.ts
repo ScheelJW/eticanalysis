@@ -23,6 +23,8 @@ import {
   getWorkOrderTimeline,
   getFleetPaSnapshotForDate,
   ingestWorkOrderSnapshot,
+  ingestScheduleMxExtractFromAttachment,
+  isPrevmxScheduleMxInbox,
   listFmaFollowUpActionsForReport,
   logWorkOrderAction,
   setWorkOrderActionFollowupDone,
@@ -229,7 +231,61 @@ export default {
     }
 
     const parsed = await PostalMime.parse(message.raw, { attachmentEncoding: "arraybuffer" });
-    const abuseIngest = parseAbuseEmailIngestFromTo(message.to || "");
+    const toAddr = message.to || "";
+    if (isPrevmxScheduleMxInbox(toAddr)) {
+      const prevmxAtt = (parsed.attachments || []).find((a) => {
+        const fn = a.filename?.toLowerCase() ?? "";
+        return fn.endsWith(".csv") || fn.endsWith(".xlsx");
+      });
+      if (!prevmxAtt) {
+        console.warn(
+          JSON.stringify({
+            level: "warn",
+            message: "prevmx: no .csv or .xlsx attachment",
+            from: message.from,
+            to: toAddr,
+            subject: parsed.subject ?? "",
+          }),
+        );
+        return;
+      }
+      const bytes = normalizeAttachmentBinary(prevmxAtt.content);
+      if (bytes.byteLength > parseMaxAttachmentBytes(env.MAX_ATTACHMENT_BYTES)) {
+        message.setReject("Attachment too large");
+        return;
+      }
+      const safeName = sanitizeFileName(prevmxAtt.filename ?? "schedule-mx.csv");
+      const now = new Date();
+      const subject = parsed.subject ?? "";
+      const dateKey = resolveAnalysisDateKey(subject, now, env, safeName);
+      const receivedAtIso = now.toISOString();
+      try {
+        const result = await ingestScheduleMxExtractFromAttachment(env, {
+          bytes,
+          fileName: safeName,
+          dateKey,
+          receivedAtIso,
+          from: message.from,
+          to: toAddr,
+        });
+        console.log(JSON.stringify({ level: "info", message: "prevmx_ingest_ok", ...result }));
+      } catch (err) {
+        console.error(
+          JSON.stringify({
+            level: "error",
+            message: "prevmx_ingest_failed",
+            error: err instanceof Error ? err.message : String(err),
+            from: message.from,
+            to: toAddr,
+            dateKey,
+            fileName: safeName,
+          }),
+        );
+      }
+      return;
+    }
+
+    const abuseIngest = parseAbuseEmailIngestFromTo(toAddr);
     if (abuseIngest) {
       const caseRow = await findCaseByEmailToken(env, abuseIngest.token);
       if (!caseRow) {

@@ -3,9 +3,11 @@ import {
   extractFleetMapsFromBinary,
   extractRawWorkOrdersFromBinary,
   FLEET_SYNONYMS,
+  normalizeHeaderKey,
   WORK_ORDER_SYNONYMS,
   scoreHeaderMatch,
 } from "./yardCheck";
+import ExcelJS from "exceljs";
 import { getStalenessThresholds } from "./melWatch";
 import { buildLineCompletions } from "./meeting";
 
@@ -1115,16 +1117,243 @@ async function scheduleMxFleetRowsFromWorkOrderSnapshotsOnly(
   return sortScheduleMxRows(out);
 }
 
+/** True when mail was addressed to prevmx@ (Schedule Mx / ELMS extract ingest). */
+export function isPrevmxScheduleMxInbox(toHeader: string): boolean {
+  const raw = toHeader.replace(/[<>]/g, " ").toLowerCase();
+  return /\bprevmx@/.test(raw);
+}
+
+function parseCsvSegment(seg: string): string {
+  let t = seg.trim();
+  if (t.length >= 2 && t.startsWith('"') && t.endsWith('"')) {
+    t = t.slice(1, -1).replace(/""/g, '"');
+  }
+  return t.trim();
+}
+
+/** Split one CSV line into fields (handles quoted commas). */
+function parseCsvLine(line: string): string[] {
+  const out: string[] = [];
+  let cur = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i]!;
+    if (inQuotes) {
+      if (c === '"') {
+        if (line[i + 1] === '"') {
+          cur += '"';
+          i++;
+        } else inQuotes = false;
+      } else cur += c;
+    } else if (c === '"') inQuotes = true;
+    else if (c === ",") {
+      out.push(parseCsvSegment(cur));
+      cur = "";
+    } else cur += c;
+  }
+  out.push(parseCsvSegment(cur));
+  return out;
+}
+
+function findAssetColumnIndex(headers: string[]): number {
+  for (let i = 0; i < headers.length; i++) {
+    const n = normalizeHeaderKey(headers[i] ?? "");
+    if (!n) continue;
+    if (n.includes("asset id") || n === "assetid" || n.endsWith("asset_id") || /^asset\s*#?$/.test(n)) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function tableToRawByAsset(headers: string[], dataRows: string[][]): Map<string, Record<string, string>> {
+  const assetIdx = findAssetColumnIndex(headers);
+  if (assetIdx < 0) {
+    throw new Error("prevmx: no Asset Id column (expected a header like Asset Id)");
+  }
+  const headerFleet = headers.map((h) => `fleet.${normalizeHeaderKey(h)}`);
+  const out = new Map<string, Record<string, string>>();
+  for (const cells of dataRows) {
+    if (cells.length <= assetIdx) continue;
+    const aid = (cells[assetIdx] ?? "").trim();
+    if (!aid) continue;
+    const raw: Record<string, string> = {};
+    for (let i = 0; i < headers.length; i++) {
+      const v = (cells[i] ?? "").trim();
+      if (!v) continue;
+      raw[headerFleet[i] ?? `fleet.col${i}`] = v;
+    }
+    out.set(aid, raw);
+  }
+  return out;
+}
+
+/** Parse ELMS / Schedule Mx CSV export: first row = headers, must include Asset Id. */
+export function parseScheduleMxCsvToRawByAsset(csvText: string): Map<string, Record<string, string>> {
+  const lines = csvText.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n").filter((l) => l.trim().length > 0);
+  if (lines.length < 2) return new Map();
+  const headers = parseCsvLine(lines[0]!).map((h) => h.trim());
+  const dataRows: string[][] = [];
+  for (let i = 1; i < lines.length; i++) {
+    dataRows.push(parseCsvLine(lines[i]!));
+  }
+  return tableToRawByAsset(headers, dataRows);
+}
+
+async function parseScheduleMxXlsxToRawByAsset(bytes: ArrayBuffer): Promise<Map<string, Record<string, string>>> {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(bytes);
+  const sheet = wb.worksheets[0];
+  if (!sheet) return new Map();
+  const headerRow = sheet.getRow(1);
+  const colCount = Math.max(headerRow.cellCount, sheet.columnCount ?? 0, 1);
+  const headers: string[] = [];
+  for (let c = 1; c <= colCount; c++) {
+    const v = headerRow.getCell(c).value;
+    headers.push(v == null ? "" : String(v).trim());
+  }
+  while (headers.length && !headers[headers.length - 1]) headers.pop();
+  const dataRows: string[][] = [];
+  const last = sheet.rowCount || 1;
+  for (let r = 2; r <= last; r++) {
+    const row = sheet.getRow(r);
+    const cells: string[] = [];
+    let any = false;
+    for (let c = 1; c <= headers.length; c++) {
+      const v = row.getCell(c).value;
+      const t = v == null ? "" : String(v).trim();
+      if (t) any = true;
+      cells.push(t);
+    }
+    if (any) dataRows.push(cells);
+  }
+  return tableToRawByAsset(headers, dataRows);
+}
+
+/**
+ * Store Schedule Mx / ELMS extract (CSV or XLSX) keyed by snapshot_date_key for historical Schedule Mx.
+ */
+export async function ingestScheduleMxExtractFromAttachment(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  opts: {
+    bytes: ArrayBuffer;
+    fileName: string;
+    dateKey: string;
+    receivedAtIso: string;
+    from: string;
+    to: string;
+  },
+): Promise<{ rowCount: number; dateKey: string }> {
+  const lower = opts.fileName.toLowerCase();
+  let rawByAsset: Map<string, Record<string, string>>;
+  if (lower.endsWith(".csv")) {
+    const text = new TextDecoder("utf-8", { fatal: false }).decode(new Uint8Array(opts.bytes));
+    rawByAsset = parseScheduleMxCsvToRawByAsset(text);
+  } else if (lower.endsWith(".xlsx")) {
+    rawByAsset = await parseScheduleMxXlsxToRawByAsset(opts.bytes);
+  } else {
+    throw new Error("prevmx: attachment must be .csv or .xlsx");
+  }
+  if (rawByAsset.size === 0) {
+    throw new Error("prevmx: no data rows with asset ids found");
+  }
+
+  const stmt = env.ETIC_SNAPSHOTS.prepare(
+    `INSERT INTO schedule_mx_extract_snapshot (
+       snapshot_date_key, asset_id, raw_row_json, source_filename, received_at_iso
+     ) VALUES (?,?,?,?,?)
+     ON CONFLICT(snapshot_date_key, asset_id) DO UPDATE SET
+       raw_row_json = excluded.raw_row_json,
+       source_filename = excluded.source_filename,
+       received_at_iso = excluded.received_at_iso`,
+  );
+  const BATCH = 50;
+  const entries = [...rawByAsset.entries()];
+  for (let i = 0; i < entries.length; i += BATCH) {
+    const chunk = entries.slice(i, i + BATCH);
+    await env.ETIC_SNAPSHOTS.batch(
+      chunk.map(([assetId, raw]) =>
+        stmt.bind(
+          opts.dateKey,
+          assetId,
+          JSON.stringify(raw),
+          opts.fileName,
+          opts.receivedAtIso,
+        ),
+      ),
+    );
+  }
+  console.log(
+    JSON.stringify({
+      level: "info",
+      message: "schedule_mx_prevmx_ingested",
+      dateKey: opts.dateKey,
+      rowCount: rawByAsset.size,
+      fileName: opts.fileName,
+      from: opts.from,
+      to: opts.to,
+    }),
+  );
+  return { rowCount: rawByAsset.size, dateKey: opts.dateKey };
+}
+
+function mergeFleetRawByAsset(
+  base: Map<string, Record<string, string>>,
+  overlay: Map<string, Record<string, string>>,
+): Map<string, Record<string, string>> {
+  const out = new Map<string, Record<string, string>>();
+  for (const [aid, raw] of base) {
+    out.set(aid, { ...raw });
+  }
+  for (const [aid, extra] of overlay) {
+    const cur = out.get(aid) ?? {};
+    const merged = { ...cur };
+    for (const [k, v] of Object.entries(extra)) {
+      const t = String(v ?? "").trim();
+      if (t) merged[k] = t;
+    }
+    out.set(aid, merged);
+  }
+  return out;
+}
+
+async function loadScheduleMxExtractForDate(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  dateKey: string,
+): Promise<Map<string, Record<string, string>>> {
+  const out = new Map<string, Record<string, string>>();
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT asset_id, raw_row_json FROM schedule_mx_extract_snapshot WHERE snapshot_date_key = ?`,
+  )
+    .bind(dateKey)
+    .all<{ asset_id: string; raw_row_json: string }>();
+  for (const row of r.results ?? []) {
+    const aid = (row.asset_id ?? "").trim();
+    if (!aid) continue;
+    let raw: Record<string, string> = {};
+    try {
+      raw = JSON.parse(row.raw_row_json || "{}") as Record<string, string>;
+    } catch {
+      raw = {};
+    }
+    out.set(aid, raw);
+  }
+  return out;
+}
+
 /**
  * Full Fleet (P&A) fleet: reads the stored ETIC workbook from R2 and parses the Fleet sheet
  * so every asset row appears (not only assets with open work orders). WO counts are joined from
  * `work_order_snapshot` when present.
+ * Rows from `schedule_mx_extract_snapshot` (prevmx@ email) for the same date are merged on top
+ * so ELMS exports override workbook Fleet cells for schedule-maintenance fields.
  */
 export async function getScheduleMxFleetForDate(
   env: { ETIC_SNAPSHOTS: D1Database; ETIC_BUCKET: R2Bucket },
   dateKey: string,
 ): Promise<ScheduleMxFleetRow[]> {
   const woCounts = await loadWoCountsPerAsset(env, dateKey);
+  const extractOverlay = await loadScheduleMxExtractForDate(env, dateKey);
 
   const snap = await env.ETIC_SNAPSHOTS.prepare(
     `SELECT workbook_key FROM etic_snapshots WHERE date_key = ? AND deleted_at_iso IS NULL`,
@@ -1139,12 +1368,18 @@ export async function getScheduleMxFleetForDate(
         const bytes = await obj.arrayBuffer();
         const ex = await extractFleetMapsFromBinary(bytes);
         if (ex && ex.rawByAsset.size > 0) {
-          return buildScheduleMxRowsFromFleetSheet(ex.rawByAsset, ex.byAsset, woCounts, dateKey);
+          const rawByAsset = mergeFleetRawByAsset(ex.rawByAsset, extractOverlay);
+          return buildScheduleMxRowsFromFleetSheet(rawByAsset, ex.byAsset, woCounts, dateKey);
         }
       } catch (err) {
         console.error("getScheduleMxFleetForDate: fleet extract failed", err);
       }
     }
+  }
+
+  if (extractOverlay.size > 0) {
+    const emptyTyped = new Map<string, FleetRecord>();
+    return buildScheduleMxRowsFromFleetSheet(extractOverlay, emptyTyped, woCounts, dateKey);
   }
 
   return scheduleMxFleetRowsFromWorkOrderSnapshotsOnly(env, dateKey);
