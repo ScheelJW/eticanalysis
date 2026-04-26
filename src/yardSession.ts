@@ -1475,18 +1475,41 @@ type SightingRow = {
 /**
  * Returns a Map<assetId, YardSighting> with the most-recent 'present' check
  * for every asset that has one. Cheap — one row per asset (D1 GROUP BY).
+ * When `maxAgeDays` is set (>0), drops assets whose latest present check is
+ * older than that many calendar days (Excel / integrations can use e.g. 28).
  */
-export async function getLatestSightings(env: Env): Promise<Map<string, YardSighting>> {
-  const r = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT yc.asset_id, yc.location, yc.checked_by, yc.checked_at_iso
+export async function getLatestSightings(
+  env: Env,
+  opts?: { maxAgeDays?: number },
+): Promise<Map<string, YardSighting>> {
+  const maxAge = opts?.maxAgeDays;
+  const thresholdIso =
+    typeof maxAge === "number" && Number.isFinite(maxAge) && maxAge > 0
+      ? new Date(Date.now() - maxAge * 24 * 60 * 60 * 1000).toISOString()
+      : null;
+
+  const sql =
+    thresholdIso === null
+      ? `SELECT yc.asset_id, yc.location, yc.checked_by, yc.checked_at_iso
        FROM yard_check yc
        JOIN (
          SELECT asset_id, MAX(checked_at_iso) AS m
            FROM yard_check
           WHERE LOWER(COALESCE(status, 'present')) = 'present'
           GROUP BY asset_id
-       ) m ON m.asset_id = yc.asset_id AND m.m = yc.checked_at_iso`,
-  ).all<SightingRow>();
+       ) m ON m.asset_id = yc.asset_id AND m.m = yc.checked_at_iso`
+      : `SELECT yc.asset_id, yc.location, yc.checked_by, yc.checked_at_iso
+       FROM yard_check yc
+       JOIN (
+         SELECT asset_id, MAX(checked_at_iso) AS m
+           FROM yard_check
+          WHERE LOWER(COALESCE(status, 'present')) = 'present'
+          GROUP BY asset_id
+       ) m ON m.asset_id = yc.asset_id AND m.m = yc.checked_at_iso
+       WHERE yc.checked_at_iso >= ?`;
+
+  const stmt = env.ETIC_SNAPSHOTS.prepare(sql);
+  const r = thresholdIso === null ? await stmt.all<SightingRow>() : await stmt.bind(thresholdIso).all<SightingRow>();
   const out = new Map<string, YardSighting>();
   for (const row of r.results ?? []) {
     if (!row.asset_id) continue;

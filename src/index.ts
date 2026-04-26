@@ -604,7 +604,7 @@ export default {
       return handleYardRosterApi(env);
     }
     if (url.pathname === "/api/yard/sightings") {
-      return handleYardSightingsApi(env);
+      return handleYardSightingsApi(env, request);
     }
     if (url.pathname === "/api/yard/photo-latest") {
       return handleYardPhotoLatestApi(env);
@@ -2226,12 +2226,23 @@ async function handleYardRosterApi(env: Env): Promise<Response> {
  * next to the asset id. Single-fetch lookup is intentional: ~390 rows max,
  * gzips to a few KB, cached client-side per tab visit.
  */
-async function handleYardSightingsApi(env: Env): Promise<Response> {
-  const sightings = await getYardLatestSightings(env);
+async function handleYardSightingsApi(env: Env, request: Request): Promise<Response> {
+  const reqUrl = new URL(request.url);
+  const withinRaw = reqUrl.searchParams.get("within_days") ?? reqUrl.searchParams.get("withinDays");
+  let maxAgeDays: number | undefined;
+  if (withinRaw !== null && withinRaw.trim() !== "") {
+    const n = Number.parseInt(withinRaw.trim(), 10);
+    if (Number.isFinite(n) && n > 0) maxAgeDays = Math.min(n, 3650);
+  }
+  const sightings = await getYardLatestSightings(env, maxAgeDays !== undefined ? { maxAgeDays } : undefined);
   const out: Record<string, { location: string; at: string; by: string }> = {};
   for (const [assetId, s] of sightings) out[assetId] = s;
   return Response.json(
-    { generatedAtIso: new Date().toISOString(), sightings: out },
+    {
+      generatedAtIso: new Date().toISOString(),
+      sightings: out,
+      ...(maxAgeDays !== undefined ? { withinDays: maxAgeDays } : {}),
+    },
     { headers: cacheHeaders() },
   );
 }
