@@ -20421,7 +20421,7 @@ function renderDashboardHtml(): string {
         smxCalcRun.dataset.wired = "1";
         smxCalcRun.addEventListener("click", function () { void runSmxShopCalc(); });
       }
-      const smxCalcOpen = document.getElementById("smx-calc-open");
+      const smxCalcOpen = document.getElementById("smx-calc-launch");
       if (smxCalcOpen && !smxCalcOpen.dataset.wired) {
         smxCalcOpen.dataset.wired = "1";
         smxCalcOpen.addEventListener("click", function () {
