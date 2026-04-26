@@ -1083,7 +1083,8 @@ export async function loadScheduleMxEticContextByAsset(
     return { eticDateKey, byAsset };
   }
   const ids = [...new Set(assetIds.map((a) => (a ?? "").trim()).filter(Boolean))];
-  const batchSize = 200;
+  // D1 SQLite bind limit is 100 parameters; leave headroom for snapshot_date_key.
+  const batchSize = 90;
   for (let i = 0; i < ids.length; i += batchSize) {
     const chunk = ids.slice(i, i + batchSize);
     const ph = chunk.map(() => "?").join(",");

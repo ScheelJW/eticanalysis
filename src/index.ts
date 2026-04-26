@@ -1453,13 +1453,28 @@ async function handleSnapshotsList(env: Env): Promise<Response> {
 
 /** MC% time series for charts: fleet (etic_snapshots), unit (Asset Manager label), MEL key, mgmt code, or MEL unit column. */
 async function handleMcSeriesApi(env: Env, url: URL): Promise<Response> {
-  const from = url.searchParams.get("from") || "";
-  const to = url.searchParams.get("to") || "";
+  let from = url.searchParams.get("from") || "";
+  let to = url.searchParams.get("to") || "";
   const mode = (url.searchParams.get("mode") || "fleet").toLowerCase();
   const key = (url.searchParams.get("key") || "").trim();
 
   if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) {
-    return Response.json({ error: "Invalid from/to (use YYYY-MM-DD)" }, { status: 400, headers: cacheHeaders() });
+    const span = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT date_key FROM etic_snapshots
+       WHERE deleted_at_iso IS NULL
+       ORDER BY date_key DESC
+       LIMIT 90`,
+    ).all<{ date_key: string }>();
+    const keys = (span.results ?? []).map((r) => (r.date_key ?? "").trim()).filter(Boolean);
+    if (!keys.length) {
+      return Response.json(
+        { mode, points: [], note: "No ETIC snapshots in range; chart dates were empty." },
+        { headers: cacheHeaders() },
+      );
+    }
+    const asc = keys.slice().sort();
+    from = asc[0]!;
+    to = asc[asc.length - 1]!;
   }
   if (from > to) {
     return Response.json({ error: "from must be <= to" }, { status: 400, headers: cacheHeaders() });
@@ -1635,10 +1650,25 @@ async function handleMcSeriesApi(env: Env, url: URL): Promise<Response> {
 
 /** Distinct slicer values for MC chart (union across snapshots in [from, to]). */
 async function handleMcSeriesDimensionsApi(env: Env, url: URL): Promise<Response> {
-  const from = url.searchParams.get("from") || "";
-  const to = url.searchParams.get("to") || "";
+  let from = url.searchParams.get("from") || "";
+  let to = url.searchParams.get("to") || "";
   if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) {
-    return Response.json({ error: "Invalid from/to (YYYY-MM-DD)" }, { status: 400, headers: cacheHeaders() });
+    const span = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT date_key FROM etic_snapshots
+       WHERE deleted_at_iso IS NULL
+       ORDER BY date_key DESC
+       LIMIT 90`,
+    ).all<{ date_key: string }>();
+    const keys = (span.results ?? []).map((r) => (r.date_key ?? "").trim()).filter(Boolean);
+    if (!keys.length) {
+      return Response.json(
+        { melKeys: [], melUnits: [], mgmtNames: [], amRows: [], note: "No snapshots" },
+        { headers: cacheHeaders() },
+      );
+    }
+    const asc = keys.slice().sort();
+    from = asc[0]!;
+    to = asc[asc.length - 1]!;
   }
   if (from > to) {
     return Response.json({ error: "from must be <= to" }, { status: 400, headers: cacheHeaders() });
@@ -4868,8 +4898,9 @@ async function handleScheduleMxApi(env: Env, request: Request): Promise<Response
     );
   }
   const stats = computeScheduleMxAssetStats(rows);
+  const eticDateKey = rows.length ? rows[0].eticSnapshotDateKey ?? null : null;
   return Response.json(
-    { dateKey, stats, rows, source: "prevmx_extract" },
+    { dateKey, eticDateKey, stats, rows, source: "prevmx_extract" },
     { headers: cacheHeaders() },
   );
 }
