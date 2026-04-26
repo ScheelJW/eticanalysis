@@ -1056,9 +1056,19 @@ function parseUtilNumber(s: string): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+function looksLikeBareAssetId(s: string): boolean {
+  const t = s.trim().toUpperCase();
+  return /^AF\d{2}[A-Z]\d{5,9}$/.test(t) || /^[A-Z]?\d{6,}[A-Z]?$/i.test(t);
+}
+
 /** Stable primary key for one ELMS plan row within an import. */
 export function elmsPlanRowKeyFromRaw(raw: Record<string, string>, assetId: string, rowIndex: number): string {
-  const sched = pickElmsFromRaw(raw, ["maintenance schedule id", "maint schedule id"]).trim();
+  let sched = pickElmsFromRaw(raw, ["maintenance schedule id", "maint schedule id"]).trim();
+  const aid = assetId.trim();
+  if (sched && aid && sched.toUpperCase() === aid.toUpperCase()) sched = "";
+  if (sched && looksLikeBareAssetId(sched) && !sched.includes(" ") && !/MINOT|DF-|LRS/i.test(sched)) {
+    sched = "";
+  }
   if (sched) return sched;
   const pid = pickElmsFromRaw(raw, ["plan id"]).trim();
   const pname = pickElmsFromRaw(raw, ["plan name"]).trim();
@@ -1396,6 +1406,43 @@ function findAssetColumnIndex(headers: string[]): number {
 
 export type ScheduleMxPlanParseRow = { planRowKey: string; assetId: string; raw: Record<string, string> };
 
+function scoreElmsRowForDedupe(r: ScheduleMxPlanParseRow): number {
+  let s = 0;
+  const sched = pickElmsFromRaw(r.raw, ["maintenance schedule id", "maint schedule id"]).trim();
+  if (sched && sched.toUpperCase() !== r.assetId.toUpperCase()) {
+    s += 15;
+    if (/MINOT|DF-|LRS/i.test(sched)) s += 25;
+    if (sched.length > 20) s += 5;
+  }
+  if (looksLikeBareAssetId(sched)) s -= 40;
+  s += Math.min(Object.keys(r.raw).length, 40);
+  return s;
+}
+
+/** Same asset + plan id + plan name: keep the richer row (real DF-… schedule id vs mistaken asset id in that column). */
+function collapseDuplicateElmsPlans(rows: ScheduleMxPlanParseRow[]): ScheduleMxPlanParseRow[] {
+  const byLogical = new Map<string, ScheduleMxPlanParseRow>();
+  const orphans: ScheduleMxPlanParseRow[] = [];
+  for (const r of rows) {
+    const pid = pickElmsFromRaw(r.raw, ["plan id"]).trim();
+    const pname = pickElmsFromRaw(r.raw, ["plan name"]).trim();
+    if (!pid && !pname) {
+      orphans.push(r);
+      continue;
+    }
+    const key = [r.assetId.trim().toUpperCase(), normalizeHeaderKey(pid), normalizeHeaderKey(pname)].join("\x1e");
+    const existing = byLogical.get(key);
+    if (!existing || scoreElmsRowForDedupe(r) > scoreElmsRowForDedupe(existing)) {
+      byLogical.set(key, r);
+    }
+  }
+  const merged = [...byLogical.values(), ...orphans];
+  return merged.map((r, idx) => ({
+    ...r,
+    planRowKey: elmsPlanRowKeyFromRaw(r.raw, r.assetId, idx),
+  }));
+}
+
 function buildPlanRowsFromTable(headers: string[], dataRows: string[][]): ScheduleMxPlanParseRow[] {
   const assetIdx = findAssetColumnIndex(headers);
   if (assetIdx < 0) {
@@ -1445,7 +1492,7 @@ export function parseScheduleMxCsvToPlanRows(csvText: string): ScheduleMxPlanPar
   if (table.length < 2) return [];
   const headers = table[0]!.map((h) => h.trim());
   const dataRows = table.slice(1);
-  return dedupePlanRowKeys(buildPlanRowsFromTable(headers, dataRows));
+  return dedupePlanRowKeys(collapseDuplicateElmsPlans(buildPlanRowsFromTable(headers, dataRows)));
 }
 
 /** @deprecated for tests; use parseScheduleMxCsvToPlanRows — last plan per asset only. */
@@ -1484,7 +1531,7 @@ async function parseScheduleMxXlsxToPlanRows(bytes: ArrayBuffer): Promise<Schedu
     }
     if (any) dataRows.push(cells);
   }
-  return buildPlanRowsFromTable(headers, dataRows);
+  return dedupePlanRowKeys(collapseDuplicateElmsPlans(buildPlanRowsFromTable(headers, dataRows)));
 }
 
 /**
@@ -1514,6 +1561,10 @@ export async function ingestScheduleMxExtractFromAttachment(
   if (planRows.length === 0) {
     throw new Error("prevmx: no data rows with asset ids found");
   }
+
+  await env.ETIC_SNAPSHOTS.prepare(`DELETE FROM schedule_mx_plan_snapshot WHERE snapshot_date_key = ?`)
+    .bind(opts.dateKey)
+    .run();
 
   const stmt = env.ETIC_SNAPSHOTS.prepare(
     `INSERT INTO schedule_mx_plan_snapshot (

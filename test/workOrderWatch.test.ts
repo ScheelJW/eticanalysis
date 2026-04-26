@@ -5,6 +5,7 @@ import {
   calendarDaysBetween,
   classifyMelTier,
   computeMelRecallHintForRow,
+  elmsPlanRowKeyFromRaw,
   getChangelogForDisplay,
   ingestWorkOrderSnapshot,
   melMgmtCodesMatch,
@@ -77,12 +78,35 @@ describe("parseScheduleMxCsvToPlanRows", () => {
     expect(rows[1]!.planRowKey).toBe("SAME#1");
   });
 
+  it("collapses duplicate asset+plan id+plan name when one row has bogus schedule id", () => {
+    const csv =
+      "Asset Id,Maintenance Schedule Id,Plan Id,Plan Name\n" +
+      "AF04L00057,AF04L00057,35AA,INSP/ WHEEL BEARINGS\n" +
+      "AF04L00057,DF-VEHS5 LRS MINOT294497,35AA,INSP/ WHEEL BEARINGS\n";
+    const rows = parseScheduleMxCsvToPlanRows(csv);
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.planRowKey).toContain("MINOT");
+  });
+
   it("strips UTF-8 BOM on first header", () => {
     const csv = "\uFEFFVehicle Id,Plan Id,Plan Name,Next Maint Date\nAF01B00001,P1,Oil,2026-05-01\n";
     const rows = parseScheduleMxCsvToPlanRows(csv);
     expect(rows.length).toBe(1);
     expect(rows[0]!.planRowKey).toContain("AF01B00001");
     expect(rows[0]!.raw["fleet.next maint date"]).toBe("2026-05-01");
+  });
+});
+
+describe("elmsPlanRowKeyFromRaw", () => {
+  it("does not use maintenance schedule cell when it equals asset id", () => {
+    const raw = {
+      "fleet.maintenance schedule id": "AF04L00057",
+      "fleet.plan id": "35AA",
+      "fleet.plan name": "Wheel",
+    };
+    const k = elmsPlanRowKeyFromRaw(raw, "AF04L00057", 0);
+    expect(k).toContain("35AA");
+    expect(k.toUpperCase()).not.toBe("AF04L00057");
   });
 });
 
