@@ -6,6 +6,7 @@ import {
   classifyMelTier,
   computeMelRecallHintForRow,
   computeScheduleMxAssetStats,
+  enrichScheduleMxRowsWithLatestEtic,
   elmsPlanRowKeyFromRaw,
   getChangelogForDisplay,
   ingestWorkOrderSnapshot,
@@ -55,6 +56,59 @@ describe("parseCsvTextToRowArrays", () => {
   });
 });
 
+describe("enrichScheduleMxRowsWithLatestEtic", () => {
+  it("waives overdue when latest ETIC shows an open WO", () => {
+    const base = analyzeElmsScheduleMxFromRaw({}, "2026-04-25");
+    const row = {
+      assetId: "AF01",
+      planRowKey: "p1",
+      planId: "",
+      planName: "Oil",
+      planDesc: "",
+      maintenanceScheduleId: "",
+      itemDesc: "",
+      location: "",
+      makeModel: "",
+      mgmtCd: "",
+      workOrderCount: 0,
+      nce: false,
+      nceStatus: "",
+      scheduleMxNceCritical: true,
+      owningUnit: "",
+      vehNomen: "",
+      eticSnapshotDateKey: null,
+      eticOpenWorkOrderIds: "",
+      eticOpenInMaintenance: false,
+      scheduleMxPlanEffectiveBucket: "overdue",
+      scheduleMxPlanEffectiveNceCritical: true,
+      scheduleMxSuppressedByOpenWo: false,
+      ...base,
+      scheduleMxBucket: "overdue",
+    } as ScheduleMxFleetRow;
+    const byAsset = new Map([
+      [
+        "AF01",
+        {
+          workOrderIds: ["WO-1"],
+          owningUnit: "1 AMXS",
+          makeModel: "F-150",
+          vehNomen: "TRUCK",
+          mgmtCd: "M16",
+          nce: true,
+          nceStatus: "Active",
+          inMaintenance: false,
+        },
+      ],
+    ]);
+    const out = enrichScheduleMxRowsWithLatestEtic([row], "2026-04-26", byAsset)[0]!;
+    expect(out.scheduleMxPlanEffectiveBucket).toBe("ok");
+    expect(out.scheduleMxSuppressedByOpenWo).toBe(true);
+    expect(out.workOrderCount).toBe(1);
+    expect(out.owningUnit).toBe("1 AMXS");
+    expect(out.scheduleMxPlanEffectiveNceCritical).toBe(false);
+  });
+});
+
 describe("computeScheduleMxAssetStats", () => {
   it("counts each asset once using worst plan (not plan-row totals)", () => {
     const base = analyzeElmsScheduleMxFromRaw({}, "2026-04-25");
@@ -63,8 +117,9 @@ describe("computeScheduleMxAssetStats", () => {
       key: string,
       bucket: "overdue" | "ok" | "due_soon" | "missing" | "no_due",
       nceCrit?: boolean,
-    ) =>
-      ({
+    ) => {
+      const nc = !!nceCrit;
+      return {
         assetId,
         planRowKey: key,
         planId: "",
@@ -78,10 +133,19 @@ describe("computeScheduleMxAssetStats", () => {
         workOrderCount: 0,
         nce: false,
         nceStatus: "",
-        scheduleMxNceCritical: !!nceCrit,
+        scheduleMxNceCritical: nc,
+        owningUnit: "",
+        vehNomen: "",
+        eticSnapshotDateKey: null,
+        eticOpenWorkOrderIds: "",
+        eticOpenInMaintenance: false,
+        scheduleMxPlanEffectiveBucket: bucket,
+        scheduleMxPlanEffectiveNceCritical: nc,
+        scheduleMxSuppressedByOpenWo: false,
         ...base,
         scheduleMxBucket: bucket,
-      }) as ScheduleMxFleetRow;
+      } as ScheduleMxFleetRow;
+    };
 
     const rows = [
       mk("AF01", "p1", "ok"),

@@ -14470,7 +14470,7 @@ function renderDashboardHtml(): string {
           <aside class="wo-sidebar">
             <div class="smx-panel-heading">
               <h2 class="smx-panel-title">Schedule maintenance</h2>
-              <p class="smx-panel-hint">Pick an <strong>asset</strong>; all <strong>maintenance plans</strong> for that asset from the ELMS extract (email <code>prevmx@2t3.app</code>) load on the right. Open WO counts use the same calendar date when a workbook exists.</p>
+              <p class="smx-panel-hint">Pick an <strong>asset</strong>; plans come from the ELMS extract (email <code>prevmx@2t3.app</code>). <strong>Unit, type, NCE, and open work orders</strong> come from the <strong>latest ETIC</strong> workbook. Vehicles with an open WO (or in-shop parts status) are not counted overdue for sched mx until sub-WO / plan linkage exists.</p>
             </div>
             <label class="smx-date-field">
               <span class="sr-only">Import date</span>
@@ -17503,6 +17503,8 @@ function renderDashboardHtml(): string {
 
     var smxRows = [];
     var smxStats = null;
+    /** Latest ETIC workbook date used for unit / NCE / open WO enrichment (YYYY-MM-DD). */
+    var smxEticDateKey = null;
     var smxFilter = "all";
     var smxSort = "priority";
     /** Selected asset id for list + detail (matches row.assetId). */
@@ -17510,11 +17512,16 @@ function renderDashboardHtml(): string {
     /** Selected prevmx import date (YYYY-MM-DD); null = use latest from server. */
     var smxSelectedDateKey = null;
 
+    function smxEffBucket(row) {
+      return row.scheduleMxPlanEffectiveBucket || row.scheduleMxBucket || "ok";
+    }
+
     function smxPlanRank(row) {
-      if (row.scheduleMxNceCritical) return 0;
-      if (row.scheduleMxBucket === "overdue") return 1;
-      if (row.scheduleMxBucket === "due_soon") return 2;
-      if (row.scheduleMxBucket === "missing") return 3;
+      if (row.scheduleMxPlanEffectiveNceCritical) return 0;
+      var b = smxEffBucket(row);
+      if (b === "overdue") return 1;
+      if (b === "due_soon") return 2;
+      if (b === "missing") return 3;
       return 4;
     }
 
@@ -17694,7 +17701,7 @@ function renderDashboardHtml(): string {
           anyNce = true;
           if (p.nceStatus && !nceStatus) nceStatus = p.nceStatus;
         }
-        if (p.scheduleMxNceCritical) anyCrit = true;
+        if (p.scheduleMxPlanEffectiveNceCritical) anyCrit = true;
         var r = smxPlanRank(p);
         if (r < worstRank) worstRank = r;
       }
@@ -17712,7 +17719,7 @@ function renderDashboardHtml(): string {
       else if (worstRank === 2) chips.push("<span class='wo-chip tier-at'>Due soon</span>");
       else if (worstRank === 3) chips.push("<span class='wo-chip stale'>Missing data</span>");
       else if (worstRank === 4) {
-        var allNoDue = plans.every(function (x) { return (x.scheduleMxBucket || "") === "no_due"; });
+        var allNoDue = plans.every(function (x) { return smxEffBucket(x) === "no_due"; });
         if (allNoDue && plans.length) chips.push("<span class='wo-chip tier-unknown'>No due date</span>");
         else chips.push("<span class='wo-chip ok'>Current</span>");
       }
@@ -17723,7 +17730,10 @@ function renderDashboardHtml(): string {
           (plans.length === 1 ? "" : "s") +
           "</span>",
       );
-      const wo = plans[0] && plans[0].workOrderCount != null ? plans[0].workOrderCount : 0;
+      const p0 = plans[0];
+      const wo = p0 && p0.workOrderCount != null ? p0.workOrderCount : 0;
+      const unit0 = p0 && p0.owningUnit ? String(p0.owningUnit).trim() : "";
+      const vn0 = p0 && p0.vehNomen ? String(p0.vehNomen).trim() : "";
       const locSet = {};
       const mmSet = {};
       const mgmtSet = {};
@@ -17737,13 +17747,16 @@ function renderDashboardHtml(): string {
       const mms = Object.keys(mmSet);
       const mgmts = Object.keys(mgmtSet);
       const metaParts = [];
+      if (unit0) metaParts.push("Unit " + esc(unit0));
+      if (vn0) metaParts.push(esc(vn0));
       if (mms.length === 1) metaParts.push(esc(mms[0]));
       else if (mms.length > 1) metaParts.push(mms.length + " make/models");
       if (locs.length === 1) metaParts.push(esc(locs[0]));
       else if (locs.length > 1) metaParts.push(locs.length + " locations");
       if (mgmts.length === 1) metaParts.push("Mgmt " + esc(mgmts[0]));
       else if (mgmts.length > 1) metaParts.push(mgmts.length + " mgmt codes");
-      if (wo) metaParts.push(wo + " open WO" + (wo === 1 ? "" : "s") + " (date)");
+      if (wo) metaParts.push(wo + " open WO" + (wo === 1 ? "" : "s") + " (latest ETIC)");
+      if (p0 && p0.eticOpenInMaintenance) metaParts.push("In maintenance (parts)");
       el.innerHTML =
         "<div class='wo-hero-row'>" +
         "<div class='wo-hero-id'>" + esc(assetId) + "</div>" +
@@ -17760,14 +17773,19 @@ function renderDashboardHtml(): string {
     }
 
     function smxFactsHtmlForPlan(row) {
+      const eff = smxEffBucket(row);
+      const rawB = row.scheduleMxBucket || "";
       const sched = [];
       sched.push({ dt: "ELMS status", dd: esc(row.scheduleMxStatus || "—") });
       sched.push({
-        dt: "Health",
+        dt: "Health (for triage)",
         dd:
-          "<span class='smx-pill " + esc(row.scheduleMxBucket || "") + "'>" +
-          esc(smxPillLabel(row.scheduleMxBucket)) +
-          "</span>",
+          "<span class='smx-pill " + esc(eff) + "'>" +
+          esc(smxPillLabel(eff)) +
+          "</span>" +
+          (row.scheduleMxSuppressedByOpenWo && rawB !== eff
+            ? " <span class='facts-sub'>(ELMS was " + esc(smxPillLabel(rawB)) + " — waived: open WO / in shop)</span>"
+            : ""),
       });
       const lastM = row.elmsLastMaintDateIso ? fmtKeyShort(row.elmsLastMaintDateIso) : "—";
       const nextM = row.elmsNextMaintDateIso ? fmtKeyShort(row.elmsNextMaintDateIso) : "—";
@@ -17779,7 +17797,7 @@ function renderDashboardHtml(): string {
       if (row.scheduleMxOverdueByDays != null) {
         sched.push({ dt: "Overdue by", dd: esc(String(row.scheduleMxOverdueByDays) + " days") });
       }
-      if (row.scheduleMxDaysUntil != null && row.scheduleMxBucket === "due_soon") {
+      if (row.scheduleMxDaysUntil != null && eff === "due_soon") {
         sched.push({ dt: "Days until due", dd: esc(String(row.scheduleMxDaysUntil)) });
       }
       const util = [];
@@ -17808,13 +17826,28 @@ function renderDashboardHtml(): string {
       if (row.itemDesc) plan.push({ dt: "Item", dd: esc(row.itemDesc) });
       plan.push({ dt: "Plan row key", dd: "<span class='asset-mono' style='font-size:0.82rem'>" + esc(row.planRowKey || "—") + "</span>" });
       const org = [];
+      if (row.owningUnit) org.push({ dt: "Unit (latest ETIC)", dd: esc(row.owningUnit) });
       if (row.mgmtCd) org.push({ dt: "Mgmt Cd", dd: esc(row.mgmtCd) });
-      if (row.location) org.push({ dt: "Location", dd: esc(row.location) });
-      if (row.makeModel) org.push({ dt: "Make/Model", dd: esc(row.makeModel) });
+      if (row.location) org.push({ dt: "Location (ELMS)", dd: esc(row.location) });
+      if (row.makeModel) org.push({ dt: "Make/Model (ETIC)", dd: esc(row.makeModel) });
+      if (row.vehNomen) org.push({ dt: "Vehicle type / nomen", dd: esc(row.vehNomen) });
+      if (row.nce) {
+        org.push({
+          dt: "NCE (latest ETIC)",
+          dd: "<span class='nce-badge'>Yes</span>" + (row.nceStatus ? " <span class='facts-sub'>" + esc(row.nceStatus) + "</span>" : ""),
+        });
+      }
       org.push({
-        dt: "Open WOs (date)",
-        dd: esc(String(row.workOrderCount ?? 0)),
+        dt: "Open WOs (latest ETIC)",
+        dd:
+          esc(String(row.workOrderCount ?? 0)) +
+          (row.eticOpenWorkOrderIds
+            ? " <span class='facts-sub'>" + esc(row.eticOpenWorkOrderIds) + "</span>"
+            : ""),
       });
+      if (row.eticOpenInMaintenance) {
+        org.push({ dt: "Shop signal", dd: "<span class='facts-sub'>Parts status looks in-shop / maintenance</span>" });
+      }
       function factPair(x) {
         return "<div class='wo-facts-pair'><dt>" + esc(x.dt) + "</dt><dd>" + x.dd + "</dd></div>";
       }
@@ -17844,14 +17877,21 @@ function renderDashboardHtml(): string {
           .map(function (row) {
             const title = ((row.planName || "").trim() || "Maintenance plan");
             const sub = row.planId ? "Plan ID " + esc(row.planId) : "";
+            var effB = smxEffBucket(row);
+            var rawB2 = row.scheduleMxBucket || "";
             var badges =
               (row.nce ? "<span class='chip nce'>NCE</span>" : "") +
-              (row.scheduleMxNceCritical ? "<span class='chip stale'>NCE od</span>" : "") +
+              (row.scheduleMxPlanEffectiveNceCritical ? "<span class='chip stale'>NCE od</span>" : "") +
               "<span class='smx-pill " +
-              esc(row.scheduleMxBucket || "") +
+              esc(effB) +
               "'>" +
-              esc(smxPillLabel(row.scheduleMxBucket)) +
-              "</span>";
+              esc(smxPillLabel(effB)) +
+              "</span>" +
+              (row.scheduleMxSuppressedByOpenWo && rawB2 !== effB
+                ? " <span class='smx-pill " + esc(rawB2) + "' title='Raw ELMS bucket before open-WO waiver'>" +
+                  esc(smxPillLabel(rawB2)) +
+                  "</span>"
+                : "");
             return (
               "<article class='smx-plan-block' aria-label='" + esc(title) + "'>" +
               "<h4 class='smx-plan-block-title'>" +
@@ -17901,7 +17941,10 @@ function renderDashboardHtml(): string {
           dateSel.disabled = dates.length === 0;
         }
         var dk = smxSelectedDateKey || latest || "";
-        if (pill) pill.textContent = dk ? fmtKeyLong(dk) : "No imports";
+        if (pill) {
+          pill.textContent = dk ? fmtKeyLong(dk) : "No imports";
+          pill.removeAttribute("title");
+        }
         if (!dk) {
           if (statsEl) statsEl.textContent = "No Schedule Mx imports yet — send a CSV or XLSX to prevmx@2t3.app.";
           if (listMeta) listMeta.textContent = "";
@@ -17926,6 +17969,13 @@ function renderDashboardHtml(): string {
         }
         smxRows = Array.isArray(j.rows) ? j.rows : [];
         smxStats = j.stats || null;
+        smxEticDateKey = j.eticDateKey || null;
+        if (pill && dk && smxEticDateKey) {
+          pill.setAttribute(
+            "title",
+            "Schedule Mx import " + fmtKeyLong(dk) + " · ETIC context " + fmtKeyLong(smxEticDateKey),
+          );
+        }
         renderScheduleMxStats();
         renderScheduleMxList();
         Promise.all([loadSightings(false), loadWaiverCounts(false)]).then(function () {
@@ -18063,10 +18113,10 @@ function renderDashboardHtml(): string {
 
     function smxMatchesFilter(row, f) {
       if (f === "all") return true;
-      if (f === "nce_critical") return row.scheduleMxNceCritical;
-      if (f === "overdue") return row.scheduleMxBucket === "overdue";
-      if (f === "due_soon") return row.scheduleMxBucket === "due_soon";
-      if (f === "missing") return row.scheduleMxBucket === "missing";
+      if (f === "nce_critical") return row.scheduleMxPlanEffectiveNceCritical;
+      if (f === "overdue") return smxEffBucket(row) === "overdue";
+      if (f === "due_soon") return smxEffBucket(row) === "due_soon";
+      if (f === "missing") return smxEffBucket(row) === "missing";
       return true;
     }
 
@@ -18080,6 +18130,9 @@ function renderDashboardHtml(): string {
         (row.location || "").toLowerCase().indexOf(ql) !== -1 ||
         (row.mgmtCd || "").toLowerCase().indexOf(ql) !== -1 ||
         (row.makeModel || "").toLowerCase().indexOf(ql) !== -1 ||
+        (row.owningUnit || "").toLowerCase().indexOf(ql) !== -1 ||
+        (row.vehNomen || "").toLowerCase().indexOf(ql) !== -1 ||
+        (row.eticOpenWorkOrderIds || "").toLowerCase().indexOf(ql) !== -1 ||
         (row.scheduleMxStatus || "").toLowerCase().indexOf(ql) !== -1
       );
     }
@@ -18105,10 +18158,20 @@ function renderDashboardHtml(): string {
           "crit",
           "Assets with at least one NCE-critical overdue plan",
         ) +
-        pill("overdue", "Overdue", "bad", "Assets whose worst plan is overdue") +
-        pill("dueSoon", "Due soon (≤30d)", "warn", "Assets whose worst plan is due soon") +
+        pill(
+          "overdue",
+          "Overdue",
+          "bad",
+          "Assets whose worst plan is overdue (open WO / in-shop clears sched overdue for now)",
+        ) +
+        pill("dueSoon", "Due soon (≤30d)", "warn", "Assets whose worst plan is due soon (same WO waiver)") +
         pill("missing", "Missing sched data", "warn", "Assets whose worst plan has missing schedule data") +
-        pill("ok", "OK / current", "", "Assets whose worst plan is current or no due date");
+        pill(
+          "ok",
+          "OK / current",
+          "",
+          "Includes assets waived from overdue/due soon because of open WOs",
+        );
     }
 
     function smxPillLabel(bucket) {
@@ -18179,11 +18242,11 @@ function renderDashboardHtml(): string {
             anyNce = true;
             if (p.nceStatus && !nceTitle) nceTitle = p.nceStatus;
           }
-          if (p.scheduleMxNceCritical) anyCrit = true;
+          if (p.scheduleMxPlanEffectiveNceCritical) anyCrit = true;
           var rk = smxPlanRank(p);
           if (rk < worstRank) {
             worstRank = rk;
-            worstBucket = p.scheduleMxBucket || "ok";
+            worstBucket = smxEffBucket(p);
           }
         }
         var nceChip = anyNce
