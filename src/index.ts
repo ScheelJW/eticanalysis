@@ -17987,7 +17987,7 @@ function renderDashboardHtml(): string {
       }
       lines.push("");
       lines.push("— Sent from ETIC dashboard (Schedule maintenance)");
-      return lines.join("\r\n");
+      return lines.join("\\r\\n");
     }
 
     function smxCommanderEmailBodyUnit(row, importKey, eticKey) {
@@ -18012,7 +18012,7 @@ function renderDashboardHtml(): string {
       );
       lines.push("");
       lines.push("— Sent from ETIC dashboard (Schedule maintenance)");
-      return lines.join("\r\n");
+      return lines.join("\\r\\n");
     }
 
     function renderSmxCommander() {
