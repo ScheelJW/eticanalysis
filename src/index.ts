@@ -17894,13 +17894,7 @@ function renderDashboardHtml(): string {
         util.push({ dt: "Util overdue", dd: "<span class='facts-sub'>At or past next util qty</span>" });
       }
       const plan = [];
-      if (row.maintenanceScheduleId) plan.push({ dt: "Maint schedule ID", dd: esc(row.maintenanceScheduleId) });
       if (row.planDesc) plan.push({ dt: "What this plan is", dd: esc(row.planDesc) });
-      var itemT = (row.itemDesc || "").replace(/\s+/g, " ").trim();
-      var mmT = (row.makeModel || "").replace(/\s+/g, " ").trim();
-      if (itemT && itemT.toLowerCase() !== mmT.toLowerCase()) {
-        plan.push({ dt: "Item line", dd: esc(itemT) });
-      }
       function factPair(x) {
         return "<div class='wo-facts-pair'><dt>" + esc(x.dt) + "</dt><dd>" + x.dd + "</dd></div>";
       }
