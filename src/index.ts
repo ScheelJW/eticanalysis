@@ -17922,6 +17922,30 @@ function renderDashboardHtml(): string {
           });
         });
       }
+      syncUrlWithMainTab(which);
+    }
+
+    /** Keeps ?tab= in sync when the main tab changes (incl. paths that skip syncDashboardQuery). */
+    function syncUrlWithMainTab(which) {
+      try {
+        const u = new URL(location.href);
+        const map = {
+          smx: "smx",
+          wo: "wo",
+          mel: "mel",
+          meeting: "meeting",
+          yard: "yard",
+          waivers: "waivers",
+          "abuse-tracker": "abuse-tracker",
+          ask: "ask",
+          settings: "settings",
+          authz: "authz",
+        };
+        const p = map[which];
+        if (p) u.searchParams.set("tab", p);
+        else u.searchParams.delete("tab");
+        history.replaceState(null, "", u.pathname + u.search + u.hash);
+      } catch (_e) {}
     }
 
     var smxRows = [];
