@@ -798,7 +798,7 @@ export function analyzeScheduleMxFromRaw(
   scheduleMxBucket: ScheduleMxBucket;
   scheduleMxNeedsEntry: boolean;
 } {
-  const DUE_SOON_DAYS = 30;
+  const DUE_SOON_DAYS = 60;
   const slicer = findScheduleMxSlicer(raw);
   const status = findScheduleMxStatus(raw);
   const dueText = findScheduleMxDueText(raw);
@@ -979,8 +979,14 @@ export type ScheduleMxFleetRow = {
   itemDesc: string;
   location: string;
   makeModel: string;
+  /** Vehicle type / nomenclature (prefer latest ETIC Fleet P&A when present). */
+  vehNomen: string;
   mgmtCd: string;
   workOrderCount: number;
+  /** Open WO ids from latest ETIC ingest (same date as fleet overlay). */
+  openWorkOrderIds: string[];
+  /** True when asset has ≥1 open WO on latest ETIC — schedule due is suppressed (in maintenance). */
+  scheduleMxInOpenMaintenance: boolean;
   nce: boolean;
   nceStatus: string;
   /** Overdue schedule maintenance on an NCE asset — highest leadership priority. */
@@ -998,6 +1004,134 @@ export type ScheduleMxFleetRow = {
   scheduleMxUtilRemaining: number | null;
 } & ReturnType<typeof analyzeElmsScheduleMxFromRaw>;
 
+/** One dashboard row per asset; `planRows` holds per-plan detail for expand. */
+export type ScheduleMxAssetRollupRow = {
+  assetId: string;
+  makeModel: string;
+  vehNomen: string;
+  mgmtCd: string;
+  workOrderCount: number;
+  openWorkOrderIds: string[];
+  nce: boolean;
+  nceStatus: string;
+  /** Worst problem across plans (mutually exclusive buckets for filtering). */
+  summaryKey: "nce_critical" | "overdue" | "due_soon" | "missing" | "ok";
+  planCount: number;
+  /** Counts by plan-level bucket (sum to planCount). */
+  counts: {
+    overdue: number;
+    dueSoon: number;
+    missing: number;
+    ok: number;
+    noDue: number;
+  };
+  planRows: ScheduleMxFleetRow[];
+};
+
+function smxPlanAttentionRank(r: ScheduleMxFleetRow): number {
+  if (r.scheduleMxNceCritical) return 0;
+  if (r.scheduleMxBucket === "overdue") return 1;
+  if (r.scheduleMxBucket === "due_soon") return 2;
+  if (r.scheduleMxBucket === "missing") return 3;
+  if (r.scheduleMxBucket === "no_due") return 4;
+  return 5;
+}
+
+function smxRankToSummaryKey(rank: number): ScheduleMxAssetRollupRow["summaryKey"] {
+  if (rank <= 0) return "nce_critical";
+  if (rank === 1) return "overdue";
+  if (rank === 2) return "due_soon";
+  if (rank === 3) return "missing";
+  return "ok";
+}
+
+/** Collapse plan-level rows to one row per asset with worst-case summary and per-bucket counts. */
+export function rollupScheduleMxPlansToAssets(
+  planRows: ScheduleMxFleetRow[],
+): ScheduleMxAssetRollupRow[] {
+  const byAsset = new Map<string, ScheduleMxFleetRow[]>();
+  for (const r of planRows) {
+    const aid = (r.assetId ?? "").trim();
+    if (!aid) continue;
+    let arr = byAsset.get(aid);
+    if (!arr) {
+      arr = [];
+      byAsset.set(aid, arr);
+    }
+    arr.push(r);
+  }
+  const out: ScheduleMxAssetRollupRow[] = [];
+  for (const [assetId, plans] of byAsset) {
+    const sortedPlans = sortScheduleMxRows(plans.slice());
+    let minRank = 99;
+    let mgmtCd = "";
+    let makeModel = "";
+    let vehNomen = "";
+    let workOrderCount = 0;
+    const openWoIds: string[] = [];
+    let nce = false;
+    let nceStatus = "";
+    const counts = { overdue: 0, dueSoon: 0, missing: 0, ok: 0, noDue: 0 };
+    for (const p of sortedPlans) {
+      const rk = smxPlanAttentionRank(p);
+      if (rk < minRank) minRank = rk;
+      if (!mgmtCd && (p.mgmtCd ?? "").trim()) mgmtCd = (p.mgmtCd ?? "").trim();
+      if (!makeModel && (p.makeModel ?? "").trim()) makeModel = (p.makeModel ?? "").trim();
+      if (!vehNomen && (p.vehNomen ?? "").trim()) vehNomen = (p.vehNomen ?? "").trim();
+      workOrderCount = Math.max(workOrderCount, Number(p.workOrderCount) || 0);
+      if (openWoIds.length === 0 && Array.isArray(p.openWorkOrderIds) && p.openWorkOrderIds.length) {
+        openWoIds.push.apply(openWoIds, p.openWorkOrderIds);
+      }
+      if (p.nce) {
+        nce = true;
+        if (!nceStatus && (p.nceStatus ?? "").trim()) nceStatus = (p.nceStatus ?? "").trim();
+      }
+      const b = p.scheduleMxBucket;
+      if (b === "overdue") counts.overdue += 1;
+      else if (b === "due_soon") counts.dueSoon += 1;
+      else if (b === "missing") counts.missing += 1;
+      else if (b === "no_due") counts.noDue += 1;
+      else counts.ok += 1;
+    }
+    if (minRank > 5) minRank = 5;
+    out.push({
+      assetId,
+      makeModel,
+      vehNomen,
+      mgmtCd,
+      workOrderCount,
+      openWorkOrderIds: openWoIds,
+      nce,
+      nceStatus,
+      summaryKey: smxRankToSummaryKey(minRank),
+      planCount: sortedPlans.length,
+      counts,
+      planRows: sortedPlans,
+    });
+  }
+  return out;
+}
+
+export function sortScheduleMxAssetRows(rows: ScheduleMxAssetRollupRow[]): ScheduleMxAssetRollupRow[] {
+  function rankKey(a: ScheduleMxAssetRollupRow): number {
+    const m: Record<string, number> = {
+      nce_critical: 0,
+      overdue: 1,
+      due_soon: 2,
+      missing: 3,
+      ok: 4,
+    };
+    return m[a.summaryKey] ?? 9;
+  }
+  rows.sort(function (a, b) {
+    const ra = rankKey(a);
+    const rb = rankKey(b);
+    if (ra !== rb) return ra - rb;
+    return a.assetId.localeCompare(b.assetId);
+  });
+  return rows;
+}
+
 async function loadWoCountsPerAsset(
   env: { ETIC_SNAPSHOTS: D1Database },
   dateKey: string,
@@ -1013,6 +1147,109 @@ async function loadWoCountsPerAsset(
     if (aid) m.set(aid, Number(row.c) || 0);
   }
   return m;
+}
+
+/**
+ * Newest ETIC workbook date that has work-order rows (same notion as “latest ingest” for open WOs).
+ */
+export async function getLatestEticSnapshotDateKeyForScheduleMx(
+  env: { ETIC_SNAPSHOTS: D1Database },
+): Promise<string | null> {
+  const row = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT e.date_key
+       FROM etic_snapshots e
+      WHERE e.deleted_at_iso IS NULL
+        AND EXISTS (SELECT 1 FROM work_order_snapshot w WHERE w.snapshot_date_key = e.date_key)
+      ORDER BY e.date_key DESC
+      LIMIT 1`,
+  ).first<{ date_key: string }>();
+  const k = row?.date_key?.trim() ?? "";
+  return k || null;
+}
+
+type FleetPaOverlayRow = {
+  makeModel: string;
+  vehNomen: string;
+  mgmtCd: string;
+  nce: boolean;
+  nceStatus: string;
+};
+
+async function loadFleetPaSnapshotByAsset(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  eticDateKey: string,
+): Promise<Map<string, FleetPaOverlayRow>> {
+  const m = new Map<string, FleetPaOverlayRow>();
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT asset_id, make_model, veh_nomen, mgmt_cd, raw_row_json
+       FROM fleet_p_a_snapshot
+      WHERE snapshot_date_key = ?`,
+  )
+    .bind(eticDateKey)
+    .all<{ asset_id: string; make_model: string; veh_nomen: string; mgmt_cd: string; raw_row_json: string }>();
+  for (const row of r.results ?? []) {
+    const aid = (row.asset_id ?? "").trim();
+    if (!aid) continue;
+    const rawCols = readRawColumns(row.raw_row_json ?? null);
+    const ex = extractRawExtrasFromColumns(rawCols);
+    const makeModel =
+      (row.make_model ?? "").trim() ||
+      pickRawValue(rawCols, ["fleet.make/model", "fleet.make model", "make model", "fleet.item desc", "item desc"]);
+    m.set(aid, {
+      makeModel,
+      vehNomen: (row.veh_nomen ?? "").trim(),
+      mgmtCd: (row.mgmt_cd ?? "").trim(),
+      nce: ex.nce,
+      nceStatus: ex.nceStatus,
+    });
+  }
+  return m;
+}
+
+async function loadOpenWorkOrdersByAssetLatestEtic(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  eticDateKey: string,
+): Promise<Map<string, { count: number; ids: string[] }>> {
+  const m = new Map<string, { count: number; ids: string[] }>();
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT asset_id, work_order_id
+       FROM work_order_snapshot
+      WHERE snapshot_date_key = ?
+      ORDER BY asset_id ASC, work_order_id ASC`,
+  )
+    .bind(eticDateKey)
+    .all<{ asset_id: string; work_order_id: string }>();
+  for (const row of r.results ?? []) {
+    const aid = (row.asset_id ?? "").trim();
+    const wo = (row.work_order_id ?? "").trim();
+    if (!aid || !wo) continue;
+    let cur = m.get(aid);
+    if (!cur) {
+      cur = { count: 0, ids: [] };
+      m.set(aid, cur);
+    }
+    cur.ids.push(wo);
+    cur.count += 1;
+  }
+  return m;
+}
+
+function applyOpenMaintenanceOverride(row: ScheduleMxFleetRow): ScheduleMxFleetRow {
+  if (!row.scheduleMxInOpenMaintenance) return row;
+  const wasOverdue = row.scheduleMxBucket === "overdue" || row.scheduleMxNceCritical;
+  if (!wasOverdue) return row;
+  const note = "In maintenance (open WO)";
+  const mergedStatus = row.scheduleMxStatus?.trim()
+    ? row.scheduleMxStatus.trim() + " · " + note
+    : note;
+  return {
+    ...row,
+    scheduleMxBucket: "ok",
+    scheduleMxNceCritical: false,
+    scheduleMxOverdueByDays: null,
+    scheduleMxOverdueUtil: false,
+    scheduleMxStatus: mergedStatus,
+  };
 }
 
 function sortScheduleMxRows(out: ScheduleMxFleetRow[]): ScheduleMxFleetRow[] {
@@ -1077,7 +1314,24 @@ export function elmsPlanRowKeyFromRaw(raw: Record<string, string>, assetId: stri
   return assetId + "|r" + String(rowIndex);
 }
 
-const DUE_SOON_DAYS_ELMS = 30;
+/** Calendar: due soon when next maint within this many days (~2 months). */
+const DUE_SOON_DAYS_ELMS = 60;
+/** Utilization: remaining until next service at or below this threshold (miles / ambiguous). */
+const DUE_SOON_UTIL_MILES = 1500;
+/** Utilization: remaining until next service at or below this threshold (hours). */
+const DUE_SOON_UTIL_HOURS = 50;
+
+function elmsUtilDueSoonThreshold(utilType: string): number {
+  const u = (utilType ?? "").toLowerCase();
+  if (/\bhour\b|\bhrs?\b|\bh\b/.test(u)) return DUE_SOON_UTIL_HOURS;
+  if (/\bmile\b|\bmi\b|\bodometer\b|\bodo\b/.test(u)) return DUE_SOON_UTIL_MILES;
+  return DUE_SOON_UTIL_MILES;
+}
+
+export type AnalyzeElmsScheduleMxOpts = {
+  /** When set, use this as current meter instead of the extract cell (shop-floor calculator). */
+  overrideCurrentMeter?: number | null;
+};
 
 /**
  * Merge ELMS date/util signals with legacy Fleet (P&A) schedule fields when present in raw JSON.
@@ -1085,6 +1339,7 @@ const DUE_SOON_DAYS_ELMS = 30;
 export function analyzeElmsScheduleMxFromRaw(
   raw: Record<string, string>,
   asOfDateKey: string,
+  opts?: AnalyzeElmsScheduleMxOpts,
 ): {
   scheduleMxStatus: string;
   scheduleMxDueIso: string | null;
@@ -1118,7 +1373,9 @@ export function analyzeElmsScheduleMxFromRaw(
   let elmsNextMaintDateIso = parseEticDate(nextMaintText);
   const elmsLastUtilQty = parseUtilNumber(lastUtilText);
   const elmsNextUtilQty = parseUtilNumber(nextUtilText);
-  const elmsCurrentMeter = parseUtilNumber(meterText);
+  const ov = opts?.overrideCurrentMeter;
+  const elmsCurrentMeter =
+    typeof ov === "number" && Number.isFinite(ov) ? ov : parseUtilNumber(meterText);
   const elmsUtilType = utilTypeRaw.replace(/\s+/g, " ").trim().toLowerCase();
 
   let dateOverdue = false;
@@ -1157,9 +1414,9 @@ export function analyzeElmsScheduleMxFromRaw(
     const overdue = dateOverdue || scheduleMxOverdueUtil;
     const dateDueSoon = !dateOverdue && elmsNextMaintDateIso != null && daysUntil != null && daysUntil >= 0 && daysUntil <= DUE_SOON_DAYS_ELMS;
     let utilDueSoon = false;
-    if (!scheduleMxOverdueUtil && scheduleMxUtilRemaining != null && scheduleMxUtilRemaining > 0 && elmsNextUtilQty != null && elmsNextUtilQty > 0) {
-      const pct = scheduleMxUtilRemaining / elmsNextUtilQty;
-      utilDueSoon = pct <= 0.05;
+    if (!scheduleMxOverdueUtil && scheduleMxUtilRemaining != null && scheduleMxUtilRemaining > 0) {
+      const thresh = elmsUtilDueSoonThreshold(elmsUtilType);
+      utilDueSoon = scheduleMxUtilRemaining <= thresh;
     }
     if (overdue) {
       bucket = "overdue";
@@ -1229,28 +1486,43 @@ function buildScheduleMxRowsFromFleetSheet(
     const makeModel =
       (typed?.makeModel ?? "").trim() ||
       pickRawValue(merged, ["fleet.make/model", "fleet.make model", "make model", "fleet.item desc", "item desc"]);
+    const vehNomen =
+      (typed?.vehNomen ?? "").trim() ||
+      pickRawValue(merged, [
+        "fleet.veh nomen",
+        "veh nomen",
+        "vehicle nomenclature",
+        "nomenclature",
+        "equipment type",
+      ]);
     const mgmtCd =
       (typed?.mgmtCd ?? "").trim() ||
       pickRawValue(merged, ["fleet.mgmt cd", "fleet.mgmt code", "mgmt cd"]);
     const planName = pickElmsFromRaw(merged, ["plan name"]);
     const planId = pickElmsFromRaw(merged, ["plan id"]);
-    out.push({
-      assetId,
-      planRowKey: assetId,
-      planId,
-      planName,
-      planDesc: pickElmsFromRaw(merged, ["plan desc"]),
-      maintenanceScheduleId: pickElmsFromRaw(merged, ["maintenance schedule id", "maint schedule id"]),
-      itemDesc: pickElmsFromRaw(merged, ["item desc"]),
-      location: pickElmsFromRaw(merged, ["location"]),
-      makeModel,
-      mgmtCd,
-      workOrderCount: woCounts.get(assetId) ?? 0,
-      nce,
-      nceStatus,
-      scheduleMxNceCritical,
-      ...smx,
-    });
+    const woC = woCounts.get(assetId) ?? 0;
+    out.push(
+      applyOpenMaintenanceOverride({
+        assetId,
+        planRowKey: assetId,
+        planId,
+        planName,
+        planDesc: pickElmsFromRaw(merged, ["plan desc"]),
+        maintenanceScheduleId: pickElmsFromRaw(merged, ["maintenance schedule id", "maint schedule id"]),
+        itemDesc: pickElmsFromRaw(merged, ["item desc"]),
+        location: pickElmsFromRaw(merged, ["location"]),
+        makeModel,
+        vehNomen,
+        mgmtCd,
+        workOrderCount: woC,
+        openWorkOrderIds: [],
+        scheduleMxInOpenMaintenance: woC > 0,
+        nce,
+        nceStatus,
+        scheduleMxNceCritical,
+        ...smx,
+      }),
+    );
   }
   return sortScheduleMxRows(out);
 }
@@ -1259,25 +1531,51 @@ function buildScheduleMxRowsFromPlanRows(
   rows: Array<{ planRowKey: string; assetId: string; raw: Record<string, string> }>,
   woCounts: Map<string, number>,
   dateKey: string,
+  opts?: {
+    fleetPaByAsset?: Map<string, FleetPaOverlayRow>;
+    openWoByAsset?: Map<string, { count: number; ids: string[] }>;
+  },
 ): ScheduleMxFleetRow[] {
   const out: ScheduleMxFleetRow[] = [];
   for (const pr of rows) {
     const assetId = pr.assetId;
     const merged = pr.raw;
-    const nceStatus = pickRawValue(merged, [
+    const fp = opts?.fleetPaByAsset?.get(assetId);
+    const woInfo = opts?.openWoByAsset?.get(assetId);
+    const woCount = woInfo?.count ?? woCounts.get(assetId) ?? 0;
+    const openIds = woInfo?.ids ?? [];
+    const inMaint = woCount > 0;
+
+    let nceStatus = pickRawValue(merged, [
       "fleet.nce vehicle listing.status",
       "fleet.nce vehicle listing status",
       "fleet.nce status",
       "fleet.nce",
     ]);
-    const nce = !!nceStatus;
+    let nce = !!nceStatus;
+    if (fp) {
+      nce = fp.nce;
+      nceStatus = fp.nceStatus || nceStatus;
+    }
+
     const smx = analyzeElmsScheduleMxFromRaw(merged, dateKey);
     const scheduleMxNceCritical = nce && smx.scheduleMxBucket === "overdue";
     const makeModel =
+      (fp?.makeModel ?? "").trim() ||
       pickRawValue(merged, ["fleet.make/model", "fleet.make model", "make model"]) ||
       pickElmsFromRaw(merged, ["item desc"]);
-    const mgmtCd = pickRawValue(merged, ["fleet.mgmt cd", "fleet.mgmt code", "mgmt cd"]);
-    out.push({
+    const vehNomen =
+      (fp?.vehNomen ?? "").trim() ||
+      pickRawValue(merged, [
+        "fleet.veh nomen",
+        "veh nomen",
+        "vehicle nomenclature",
+        "nomenclature",
+        "equipment type",
+      ]);
+    const mgmtCd =
+      (fp?.mgmtCd ?? "").trim() || pickRawValue(merged, ["fleet.mgmt cd", "fleet.mgmt code", "mgmt cd"]);
+    const base: ScheduleMxFleetRow = {
       assetId,
       planRowKey: pr.planRowKey,
       planId: pickElmsFromRaw(merged, ["plan id"]),
@@ -1287,13 +1585,17 @@ function buildScheduleMxRowsFromPlanRows(
       itemDesc: pickElmsFromRaw(merged, ["item desc"]),
       location: pickElmsFromRaw(merged, ["location"]),
       makeModel,
+      vehNomen,
       mgmtCd,
-      workOrderCount: woCounts.get(assetId) ?? 0,
+      workOrderCount: woCount,
+      openWorkOrderIds: openIds,
+      scheduleMxInOpenMaintenance: inMaint,
       nce,
       nceStatus,
       scheduleMxNceCritical,
       ...smx,
-    });
+    };
+    out.push(applyOpenMaintenanceOverride(base));
   }
   return sortScheduleMxRows(out);
 }
@@ -1608,6 +1910,111 @@ export async function ingestScheduleMxExtractFromAttachment(
   return { rowCount: assetSet.size, planRows: planRows.length, dateKey: opts.dateKey };
 }
 
+/** Per-plan result for shop-floor “what to add to the WO” calculator (meter override). */
+export type ScheduleMxShopCalcPlanRow = {
+  planRowKey: string;
+  planId: string;
+  planName: string;
+  nextMaintDateIso: string | null;
+  nextUtilQty: number | null;
+  utilType: string;
+  extractMeter: number | null;
+  shopMeter: number;
+  remaining: number | null;
+  bucket: ScheduleMxBucket;
+  recommendWo: boolean;
+  reason: string;
+};
+
+function shopCalcReason(params: {
+  bucket: ScheduleMxBucket;
+  dateOverdue: boolean;
+  utilOverdue: boolean;
+  dateDueSoon: boolean;
+  utilDueSoon: boolean;
+}): string {
+  const parts: string[] = [];
+  if (params.dateOverdue) parts.push("Next maint date is past");
+  if (params.utilOverdue) parts.push("Meter at or past next util interval");
+  if (params.dateDueSoon && !params.dateOverdue) parts.push("Next maint within " + DUE_SOON_DAYS_ELMS + " days");
+  if (params.utilDueSoon && !params.utilOverdue) parts.push("Util remaining within due-soon threshold");
+  if (parts.length) return parts.join(". ") + ".";
+  if (params.bucket === "missing") return "No next maint or util target in extract.";
+  return "Not due on calendar or util at this meter.";
+}
+
+/**
+ * Recompute schedule buckets for one asset’s ELMS plans using a **shop** odometer/hour reading.
+ * Does not apply open-WO suppression (you are already opening maintenance).
+ */
+export async function computeScheduleMxShopFloorPlans(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  scheduleMxDateKey: string,
+  assetId: string,
+  shopMeter: number,
+  asOfDateKey: string,
+): Promise<ScheduleMxShopCalcPlanRow[]> {
+  const aid = assetId.trim().toUpperCase();
+  if (!aid || !/^\d{4}-\d{2}-\d{2}$/.test(scheduleMxDateKey) || !/^\d{4}-\d{2}-\d{2}$/.test(asOfDateKey)) {
+    return [];
+  }
+  const allPlans = await loadScheduleMxPlanRowsForDate(env, scheduleMxDateKey);
+  const rows = allPlans.filter((p) => p.assetId.trim().toUpperCase() === aid);
+  const out: ScheduleMxShopCalcPlanRow[] = [];
+  for (const pr of rows) {
+    const merged = pr.raw;
+    const base = analyzeElmsScheduleMxFromRaw(merged, asOfDateKey);
+    const smx = analyzeElmsScheduleMxFromRaw(merged, asOfDateKey, { overrideCurrentMeter: shopMeter });
+
+    let dateOverdue = false;
+    let dateDueSoon = false;
+    if (base.elmsNextMaintDateIso) {
+      const d = calendarDaysBetween(asOfDateKey, base.elmsNextMaintDateIso);
+      if (d < 0) dateOverdue = true;
+      else if (d >= 0 && d <= DUE_SOON_DAYS_ELMS) dateDueSoon = true;
+    }
+    const utilOverdue = smx.scheduleMxOverdueUtil;
+    let utilDueSoon = false;
+    if (!utilOverdue && smx.scheduleMxUtilRemaining != null && smx.scheduleMxUtilRemaining > 0) {
+      utilDueSoon = smx.scheduleMxUtilRemaining <= elmsUtilDueSoonThreshold(smx.elmsUtilType);
+    }
+    const recommendWo = smx.scheduleMxBucket === "overdue" || smx.scheduleMxBucket === "due_soon";
+    out.push({
+      planRowKey: pr.planRowKey,
+      planId: pickElmsFromRaw(merged, ["plan id"]),
+      planName: pickElmsFromRaw(merged, ["plan name"]),
+      nextMaintDateIso: smx.elmsNextMaintDateIso,
+      nextUtilQty: smx.elmsNextUtilQty,
+      utilType: smx.elmsUtilType,
+      extractMeter: base.elmsCurrentMeter,
+      shopMeter,
+      remaining: smx.scheduleMxUtilRemaining,
+      bucket: smx.scheduleMxBucket,
+      recommendWo,
+      reason: shopCalcReason({
+        bucket: smx.scheduleMxBucket,
+        dateOverdue,
+        utilOverdue,
+        dateDueSoon,
+        utilDueSoon,
+      }),
+    });
+  }
+  function rank(b: ScheduleMxBucket): number {
+    if (b === "overdue") return 0;
+    if (b === "due_soon") return 1;
+    if (b === "missing") return 2;
+    return 3;
+  }
+  out.sort(function (a, b) {
+    const ra = rank(a.bucket);
+    const rb = rank(b.bucket);
+    if (ra !== rb) return ra - rb;
+    return a.planRowKey.localeCompare(b.planRowKey);
+  });
+  return out;
+}
+
 async function loadScheduleMxPlanRowsForDate(
   env: { ETIC_SNAPSHOTS: D1Database },
   dateKey: string,
@@ -1660,8 +2067,16 @@ export async function getScheduleMxFleetForDate(
 ): Promise<ScheduleMxFleetRow[]> {
   const planRows = await loadScheduleMxPlanRowsForDate(env, dateKey);
   if (planRows.length === 0) return [];
-  const woCounts = await loadWoCountsPerAsset(env, dateKey);
-  return buildScheduleMxRowsFromPlanRows(planRows, woCounts, dateKey);
+  const eticKey = await getLatestEticSnapshotDateKeyForScheduleMx(env);
+  const [fleetPaByAsset, openWoByAsset, woCounts] = await Promise.all([
+    eticKey ? loadFleetPaSnapshotByAsset(env, eticKey) : Promise.resolve(new Map<string, FleetPaOverlayRow>()),
+    eticKey ? loadOpenWorkOrdersByAssetLatestEtic(env, eticKey) : Promise.resolve(new Map()),
+    eticKey ? loadWoCountsPerAsset(env, eticKey) : Promise.resolve(new Map<string, number>()),
+  ]);
+  return buildScheduleMxRowsFromPlanRows(planRows, woCounts, dateKey, {
+    fleetPaByAsset,
+    openWoByAsset,
+  });
 }
 
 async function getEarliestSnapshotDate(env: { ETIC_SNAPSHOTS: D1Database }): Promise<string> {

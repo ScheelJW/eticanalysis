@@ -13,8 +13,33 @@ import {
   parseEticDate,
   parseScheduleMxCsvToPlanRows,
   parseScheduleMxCsvToRawByAsset,
+  rollupScheduleMxPlansToAssets,
+  sortScheduleMxAssetRows,
 } from "../src/workOrderWatch";
-import type { WatchRow } from "../src/workOrderWatch";
+import type { ScheduleMxFleetRow, WatchRow } from "../src/workOrderWatch";
+
+function smxPlanRow(partial: Partial<ScheduleMxFleetRow> & Pick<ScheduleMxFleetRow, "assetId" | "planRowKey">): ScheduleMxFleetRow {
+  const smx = analyzeElmsScheduleMxFromRaw({}, "2026-04-25");
+  return {
+    ...smx,
+    planId: "",
+    planName: "",
+    planDesc: "",
+    maintenanceScheduleId: "",
+    itemDesc: "",
+    location: "",
+    makeModel: "",
+    vehNomen: "",
+    mgmtCd: "",
+    workOrderCount: 0,
+    openWorkOrderIds: [],
+    scheduleMxInOpenMaintenance: false,
+    nce: false,
+    nceStatus: "",
+    scheduleMxNceCritical: false,
+    ...partial,
+  };
+}
 
 describe("classifyMelTier", () => {
   it("detects below / at / above from phrases", () => {
@@ -121,6 +146,48 @@ describe("parseScheduleMxCsvToRawByAsset (compat)", () => {
   });
 });
 
+describe("rollupScheduleMxPlansToAssets", () => {
+  it("rolls two plans into one asset with worst summary and per-bucket counts", () => {
+    const rows = [
+      smxPlanRow({
+        assetId: "AF01",
+        planRowKey: "A",
+        planName: "Oil",
+        scheduleMxBucket: "ok",
+      }),
+      smxPlanRow({
+        assetId: "AF01",
+        planRowKey: "B",
+        planName: "Brakes",
+        scheduleMxBucket: "overdue",
+      }),
+    ];
+    const rolled = sortScheduleMxAssetRows(rollupScheduleMxPlansToAssets(rows));
+    expect(rolled.length).toBe(1);
+    expect(rolled[0]!.assetId).toBe("AF01");
+    expect(rolled[0]!.summaryKey).toBe("overdue");
+    expect(rolled[0]!.planCount).toBe(2);
+    expect(rolled[0]!.counts.overdue).toBe(1);
+    expect(rolled[0]!.counts.ok).toBe(1);
+  });
+
+  it("uses nce_critical when NCE asset has an overdue plan", () => {
+    const rows = [
+      smxPlanRow({
+        assetId: "AF02",
+        planRowKey: "P1",
+        nce: true,
+        nceStatus: "Certified",
+        scheduleMxBucket: "overdue",
+        scheduleMxNceCritical: true,
+      }),
+    ];
+    const rolled = rollupScheduleMxPlansToAssets(rows);
+    expect(rolled[0]!.summaryKey).toBe("nce_critical");
+    expect(rolled[0]!.counts.overdue).toBe(1);
+  });
+});
+
 describe("analyzeElmsScheduleMxFromRaw", () => {
   it("marks overdue when next maint date is before as-of", () => {
     const raw = {
@@ -142,6 +209,49 @@ describe("analyzeElmsScheduleMxFromRaw", () => {
     const a = analyzeElmsScheduleMxFromRaw(raw, "2026-04-25");
     expect(a.scheduleMxOverdueUtil).toBe(true);
     expect(a.scheduleMxBucket).toBe("overdue");
+  });
+
+  it("marks due soon when next maint within 60 days", () => {
+    const raw = { "fleet.next maint date": "2026-06-20" };
+    const a = analyzeElmsScheduleMxFromRaw(raw, "2026-04-25");
+    expect(a.scheduleMxBucket).toBe("due_soon");
+  });
+
+  it("marks due soon when miles remaining at or below 1500", () => {
+    const raw = {
+      "fleet.next maint date": "2026-12-01",
+      "fleet.current meter reading": "8600",
+      "fleet.next util qty": "10000",
+      "fleet.utilization type": "Miles",
+    };
+    const a = analyzeElmsScheduleMxFromRaw(raw, "2026-04-25");
+    expect(a.scheduleMxUtilRemaining).toBe(1400);
+    expect(a.scheduleMxBucket).toBe("due_soon");
+  });
+
+  it("marks due soon when hours remaining at or below 50", () => {
+    const raw = {
+      "fleet.next maint date": "2026-12-01",
+      "fleet.current meter reading": "990",
+      "fleet.next util qty": "1035",
+      "fleet.utilization type": "Hours",
+    };
+    const a = analyzeElmsScheduleMxFromRaw(raw, "2026-04-25");
+    expect(a.scheduleMxUtilRemaining).toBe(45);
+    expect(a.scheduleMxBucket).toBe("due_soon");
+  });
+
+  it("overrideCurrentMeter replaces extract reading for util math", () => {
+    const raw = {
+      "fleet.next maint date": "2026-12-01",
+      "fleet.current meter reading": "1000",
+      "fleet.next util qty": "5000",
+      "fleet.utilization type": "Miles",
+    };
+    const a = analyzeElmsScheduleMxFromRaw(raw, "2026-04-25", { overrideCurrentMeter: 4900 });
+    expect(a.elmsCurrentMeter).toBe(4900);
+    expect(a.scheduleMxUtilRemaining).toBe(100);
+    expect(a.scheduleMxBucket).toBe("due_soon");
   });
 });
 

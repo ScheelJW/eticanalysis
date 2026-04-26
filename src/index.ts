@@ -18,7 +18,11 @@ import {
   getWatchRowByIdForDate,
   getWatchRowsForDate,
   getScheduleMxFleetForDate,
+  getLatestEticSnapshotDateKeyForScheduleMx,
+  rollupScheduleMxPlansToAssets,
+  sortScheduleMxAssetRows,
   getLatestScheduleMxExtractDateKey,
+  computeScheduleMxShopFloorPlans,
   listScheduleMxExtractDateKeysDesc,
   getWatchRowsLatest,
   getWorkOrderActions,
@@ -4829,8 +4833,57 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
 }
 
 async function handleScheduleMxApi(env: Env, request: Request): Promise<Response> {
-  if (request.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
   const url = new URL(request.url);
+  if (request.method === "POST" && url.searchParams.get("shop_calc") === "1") {
+    let body: {
+      assetId?: string;
+      shopMeter?: number;
+      scheduleMxDateKey?: string;
+      asOfDateKey?: string;
+    };
+    try {
+      body = (await request.json()) as typeof body;
+    } catch {
+      return Response.json({ error: "Invalid JSON body." }, { status: 400, headers: cacheHeaders() });
+    }
+    const assetId = String(body.assetId ?? "").trim();
+    const shopMeter = Number(body.shopMeter);
+    if (!assetId) {
+      return Response.json({ error: "assetId is required." }, { status: 400, headers: cacheHeaders() });
+    }
+    if (!Number.isFinite(shopMeter)) {
+      return Response.json({ error: "shopMeter must be a number." }, { status: 400, headers: cacheHeaders() });
+    }
+    let scheduleMxDateKey = String(body.scheduleMxDateKey ?? "").trim();
+    if (!scheduleMxDateKey) scheduleMxDateKey = (await getLatestScheduleMxExtractDateKey(env)) ?? "";
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(scheduleMxDateKey)) {
+      return Response.json(
+        { error: "No Schedule Mx import date. Pick an import or send scheduleMxDateKey." },
+        { status: 404, headers: cacheHeaders() },
+      );
+    }
+    let asOfDateKey = String(body.asOfDateKey ?? "").trim();
+    if (!asOfDateKey) asOfDateKey = new Date().toISOString().slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(asOfDateKey)) {
+      return Response.json({ error: "asOfDateKey must be YYYY-MM-DD." }, { status: 400, headers: cacheHeaders() });
+    }
+    const plans = await computeScheduleMxShopFloorPlans(env, scheduleMxDateKey, assetId, shopMeter, asOfDateKey);
+    const recommend = plans.filter((p) => p.recommendWo);
+    return Response.json(
+      {
+        assetId,
+        shopMeter,
+        scheduleMxDateKey,
+        asOfDateKey,
+        planCount: plans.length,
+        recommendCount: recommend.length,
+        plans,
+        recommend,
+      },
+      { headers: cacheHeaders() },
+    );
+  }
+  if (request.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
   if (url.searchParams.get("dates") === "1") {
     const dates = await listScheduleMxExtractDateKeysDesc(env);
     const latest = dates[0] ?? null;
@@ -4853,8 +4906,8 @@ async function handleScheduleMxApi(env: Env, request: Request): Promise<Response
       { status: 404, headers: cacheHeaders() },
     );
   }
-  const rows = await getScheduleMxFleetForDate(env, dateKey);
-  if (rows.length === 0) {
+  const planRows = await getScheduleMxFleetForDate(env, dateKey);
+  if (planRows.length === 0) {
     return Response.json(
       {
         error: "No Schedule Mx rows stored for that date.",
@@ -4866,17 +4919,26 @@ async function handleScheduleMxApi(env: Env, request: Request): Promise<Response
       { status: 404, headers: cacheHeaders() },
     );
   }
-  const distinctAssets = new Set(rows.map((r) => r.assetId)).size;
+  const rows = sortScheduleMxAssetRows(rollupScheduleMxPlansToAssets(planRows));
+  const distinctAssets = rows.length;
+  const nceCritical = rows.filter((r) => r.summaryKey === "nce_critical").length;
+  const overdueAssets = rows.filter(
+    (r) => r.summaryKey === "overdue" || r.summaryKey === "nce_critical",
+  ).length;
+  const eticAsOfDateKey = await getLatestEticSnapshotDateKeyForScheduleMx(env);
+  const inMaintenanceAssets = rows.filter((r) => (r.workOrderCount || 0) > 0).length;
   const stats = {
-    planRows: rows.length,
+    planRows: planRows.length,
     distinctAssets,
     assets: distinctAssets,
-    missing: rows.filter((r) => r.scheduleMxBucket === "missing").length,
-    noDue: rows.filter((r) => r.scheduleMxBucket === "no_due").length,
-    overdue: rows.filter((r) => r.scheduleMxBucket === "overdue").length,
-    dueSoon: rows.filter((r) => r.scheduleMxBucket === "due_soon").length,
-    ok: rows.filter((r) => r.scheduleMxBucket === "ok").length,
-    nceCritical: rows.filter((r) => r.scheduleMxNceCritical).length,
+    missing: rows.filter((r) => r.summaryKey === "missing").length,
+    noDue: planRows.filter((r) => r.scheduleMxBucket === "no_due").length,
+    overdue: overdueAssets,
+    dueSoon: rows.filter((r) => r.summaryKey === "due_soon").length,
+    ok: rows.filter((r) => r.summaryKey === "ok").length,
+    nceCritical,
+    inMaintenanceAssets,
+    eticAsOfDateKey,
   };
   return Response.json(
     { dateKey, stats, rows, source: "prevmx_extract" },
@@ -13896,55 +13958,435 @@ function renderDashboardHtml(): string {
       position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
       clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
     }
-    .smx-header {
-      display: flex; justify-content: space-between; align-items: flex-start; gap: 16px;
-      flex-wrap: wrap; margin-bottom: 16px;
+    .smx-shell {
+      display: grid;
+      gap: 18px;
+      margin-top: 2px;
     }
-    .smx-title { margin: 0 0 6px; font-size: 1.35rem; }
-    .smx-sub { margin: 0; color: var(--muted); font-size: 0.9rem; line-height: 1.45; max-width: 860px; }
+    .smx-overview {
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px 20px;
+      background: linear-gradient(170deg, rgba(0,58,140,0.05) 0%, var(--card) 46%);
+    }
+    .smx-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 14px 18px;
+      flex-wrap: wrap;
+      margin-bottom: 14px;
+    }
+    .smx-title { margin: 0 0 4px; font-size: 1.38rem; letter-spacing: -0.02em; }
+    .smx-sub {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.89rem;
+      line-height: 1.45;
+      max-width: 58rem;
+    }
+    .smx-header-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .smx-date-select select {
+      font: inherit;
+      font-size: 0.86rem;
+      font-weight: 700;
+      padding: 8px 10px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      min-width: 128px;
+    }
     .nce-inline { font-weight: 800; color: var(--accent); }
     .smx-asof-pill {
-      font-size: 0.72rem; font-weight: 700; padding: 6px 12px; border-radius: 999px;
-      background: rgba(0,58,140,0.12); color: var(--accent); border: 1px solid rgba(0,58,140,0.3);
+      font-size: 0.72rem;
+      font-weight: 700;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: rgba(0,58,140,0.12);
+      color: var(--accent);
+      border: 1px solid rgba(0,58,140,0.3);
     }
-    .smx-stats { display: flex; flex-wrap: wrap; gap: 10px 14px; margin-bottom: 14px; }
+    .smx-stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 10px;
+    }
     .smx-stat {
-      background: var(--card); border: 1px solid var(--border); border-radius: 10px;
-      padding: 10px 14px; min-width: 118px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      min-height: 74px;
     }
-    .smx-stat .lbl { display: block; font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
-    .smx-stat .v { font-size: 1.28rem; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.2; }
+    .smx-stat .lbl {
+      display: block;
+      font-size: 0.62rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .smx-stat .v {
+      font-size: 1.3rem;
+      font-weight: 800;
+      font-variant-numeric: tabular-nums;
+      line-height: 1.22;
+    }
     .smx-stat.bad .v { color: var(--danger); }
     .smx-stat.warn .v { color: var(--warn); }
     .smx-stat.crit .v { color: #7a1020; }
-    .smx-toolbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 12px; }
+    .smx-workspace {
+      display: grid;
+      grid-template-columns: minmax(0, 1.4fr) minmax(260px, 0.8fr);
+      gap: 16px;
+      align-items: start;
+    }
+    .smx-future-panel {
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: var(--card);
+      padding: 16px;
+      min-height: 220px;
+      display: grid;
+      gap: 10px;
+    }
+    .smx-future-panel h3 {
+      margin: 0;
+      font-size: 1.02rem;
+      letter-spacing: -0.01em;
+    }
+    .smx-future-panel p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.84rem;
+      line-height: 1.45;
+    }
+    .smx-future-slot {
+      border: 1px dashed var(--border);
+      border-radius: 10px;
+      padding: 12px;
+      min-height: 58px;
+      display: grid;
+      align-content: center;
+      gap: 4px;
+      background: rgba(0,0,0,0.015);
+    }
+    .smx-future-slot strong {
+      font-size: 0.83rem;
+      font-weight: 700;
+    }
+    .smx-future-slot small {
+      color: var(--muted);
+      font-size: 0.76rem;
+    }
+    .smx-calc-trigger {
+      font: inherit;
+      font-size: 0.82rem;
+      font-weight: 700;
+      padding: 7px 13px;
+      border-radius: 9px;
+      border: 1px solid rgba(0,58,140,0.34);
+      color: var(--accent);
+      background: rgba(0,58,140,0.08);
+      cursor: pointer;
+    }
+    .smx-calc-trigger:hover { background: rgba(0,58,140,0.13); }
+    .smx-calc-modal {
+      position: fixed;
+      inset: 0;
+      z-index: 90;
+      display: grid;
+      place-items: center;
+      padding: 16px;
+    }
+    .smx-calc-modal.hidden { display: none; }
+    .smx-calc-backdrop {
+      position: absolute;
+      inset: 0;
+      background: rgba(10,18,34,0.54);
+      backdrop-filter: blur(2px);
+    }
+    .smx-calc-sheet {
+      position: relative;
+      z-index: 1;
+      width: min(980px, calc(100vw - 28px));
+      max-height: min(92vh, 900px);
+      overflow: auto;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: var(--card);
+      box-shadow: 0 24px 60px rgba(0,0,0,0.25);
+      padding: 18px 18px 16px;
+    }
+    .smx-calc-sheet-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .smx-calc-sheet-head h3 {
+      margin: 0 0 4px;
+      font-size: 1.06rem;
+      font-weight: 800;
+      letter-spacing: -0.01em;
+    }
+    .smx-calc-sheet-head p {
+      margin: 0;
+      font-size: 0.86rem;
+      line-height: 1.42;
+      color: var(--muted);
+      max-width: 52rem;
+    }
+    .smx-calc-close {
+      font: inherit;
+      font-size: 0.8rem;
+      padding: 7px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .smx-calc-grid {
+      display: grid;
+      grid-template-columns: minmax(170px, 1.2fr) minmax(140px, 0.9fr) minmax(165px, 0.85fr) auto;
+      gap: 10px 12px;
+      align-items: end;
+    }
+    .smx-calc-field label {
+      display: block;
+      font-size: 0.7rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .smx-calc-hint {
+      font-weight: 500;
+      text-transform: none;
+      letter-spacing: 0;
+      color: var(--muted);
+      opacity: 0.86;
+    }
+    .smx-calc-field input[type="text"],
+    .smx-calc-field input[type="number"],
+    .smx-calc-field input[type="date"] {
+      width: 100%;
+      box-sizing: border-box;
+      font: inherit;
+      font-size: 0.92rem;
+      padding: 10px 11px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+    }
+    .smx-calc-field input:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(0,58,140,0.15);
+    }
+    .smx-calc-actions { display: flex; align-items: flex-end; }
+    .smx-calc-run {
+      font: inherit;
+      font-size: 0.92rem;
+      font-weight: 700;
+      padding: 10px 18px;
+      border-radius: 10px;
+      border: none;
+      background: var(--accent);
+      color: var(--accent-contrast, #fff);
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .smx-calc-run:hover { filter: brightness(1.06); }
+    .smx-calc-rules {
+      margin: 10px 0 0;
+      padding: 11px 14px 11px 1.6rem;
+      font-size: 0.8rem;
+      line-height: 1.5;
+      color: var(--muted);
+      background: rgba(0,0,0,0.02);
+      border-radius: 10px;
+      border: 1px solid var(--border);
+    }
+    .smx-calc-rules li { margin: 3px 0; }
+    .smx-calc-status {
+      margin: 12px 0 0;
+      min-height: 1.35em;
+      font-size: 0.88rem;
+      font-weight: 600;
+    }
+    .smx-calc-results {
+      margin-top: 10px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      overflow: auto;
+      max-height: min(48vh, 420px);
+      background: var(--bg);
+    }
+    .smx-calc-results-summary {
+      padding: 12px 14px;
+      font-size: 0.87rem;
+      border-bottom: 1px solid var(--border);
+      background: var(--card);
+    }
+    .smx-calc-table { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
+    .smx-calc-table th,
+    .smx-calc-table td {
+      padding: 10px 12px;
+      border-top: 1px solid var(--border);
+      text-align: left;
+      vertical-align: top;
+    }
+    .smx-calc-table th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: var(--bg2);
+      color: var(--muted);
+      font-size: 0.63rem;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+    }
+    .smx-calc-table tr:hover td { background: rgba(0,58,140,0.04); }
+    body.smx-calc-open { overflow: hidden; }
+    .smx-assets-panel {
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: var(--card);
+      padding: 14px;
+      display: grid;
+      gap: 12px;
+    }
+    .smx-assets-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+    }
+    .smx-assets-head h3 {
+      margin: 0;
+      font-size: 1rem;
+      letter-spacing: -0.01em;
+    }
+    .smx-assets-head p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+    .smx-toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .smx-reset-filters {
+      font: inherit;
+      font-size: 0.81rem;
+      padding: 6px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--text);
+      cursor: pointer;
+    }
+    .smx-reset-filters:hover { border-color: var(--muted); }
     .smx-search input {
-      min-width: 220px; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border);
-      background: var(--bg); font: inherit;
+      min-width: 230px;
+      padding: 8px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      font: inherit;
     }
     .smx-filters { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
     .smx-filter-btn {
-      padding: 6px 12px; border-radius: 999px; border: 1px solid var(--border);
-      background: var(--bg1); font: inherit; font-size: 0.82rem; cursor: pointer;
+      padding: 6px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--bg1);
+      font: inherit;
+      font-size: 0.8rem;
+      cursor: pointer;
     }
     .smx-filter-btn.active {
-      border-color: var(--accent); background: rgba(0,58,140,0.08); color: var(--accent); font-weight: 700;
+      border-color: var(--accent);
+      background: rgba(0,58,140,0.08);
+      color: var(--accent);
+      font-weight: 700;
     }
     .smx-n { opacity: 0.8; font-weight: 600; margin-left: 4px; font-variant-numeric: tabular-nums; }
     .smx-table-wrap {
-      overflow: auto; border: 1px solid var(--border); border-radius: 10px;
-      max-height: min(70vh, 720px);
+      overflow: auto;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      max-height: min(52vh, 560px);
     }
-    .smx-table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+    .smx-table { width: 100%; border-collapse: collapse; font-size: 0.86rem; }
     .smx-table th {
-      text-align: left; padding: 10px 12px; background: var(--bg2); position: sticky; top: 0; z-index: 1;
-      font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted);
+      text-align: left;
+      padding: 10px 12px;
+      background: var(--bg2);
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      font-size: 0.64rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
     }
     .smx-table td { padding: 10px 12px; border-top: 1px solid var(--border); vertical-align: top; }
     .smx-table tr.smx-row-nce-crit td { box-shadow: inset 3px 0 0 #8b1538; }
     .smx-table tr.smx-row-nce-crit { background: rgba(176,0,32,0.09); }
     .smx-table tr.smx-row-overdue { background: rgba(176,0,32,0.04); }
+    .smx-table tr.smx-row-due-soon { background: rgba(245,199,84,0.08); }
     .smx-table .asset-mono { font-family: var(--font-mono); font-weight: 700; }
+    .smx-plan-lines { margin: 0; padding-left: 1.1rem; color: var(--muted); font-size: 0.82rem; line-height: 1.45; }
+    .smx-plan-lines li { margin: 2px 0; }
+    .smx-nested summary {
+      cursor: pointer; font-size: 0.78rem; color: var(--muted); margin-top: 6px; user-select: none;
+    }
+    .smx-nested summary:hover { color: var(--text); }
+    .smx-nested .smx-nested-inner { margin-top: 8px; padding-left: 8px; border-left: 2px solid var(--border); }
+    .smx-mini-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; margin-top: 6px; }
+    .smx-mini-table th, .smx-mini-table td { padding: 6px 8px; border-top: 1px solid var(--border); text-align: left; vertical-align: top; }
+    .smx-mini-table th { color: var(--muted); font-weight: 600; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.06em; }
+    @media (max-width: 1100px) {
+      .smx-workspace {
+        grid-template-columns: 1fr;
+      }
+    }
+    @media (max-width: 860px) {
+      .smx-overview,
+      .smx-assets-panel,
+      .smx-calc-panel,
+      .smx-future-panel {
+        padding: 14px;
+      }
+      .smx-calc-grid {
+        grid-template-columns: 1fr 1fr;
+      }
+      .smx-calc-actions {
+        grid-column: 1 / -1;
+      }
+    }
+    @media (max-width: 560px) {
+      .smx-stats {
+        grid-template-columns: 1fr 1fr;
+      }
+      .smx-search input {
+        min-width: 100%;
+      }
+      .smx-calc-grid {
+        grid-template-columns: 1fr;
+      }
+    }
     .smx-pill {
       display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 0.72rem; font-weight: 700;
       text-transform: uppercase; letter-spacing: 0.04em;
@@ -14403,7 +14845,7 @@ function renderDashboardHtml(): string {
         <div class="smx-header">
           <div>
             <h2 class="smx-title">Schedule Maintenance Status</h2>
-            <p class="smx-sub">Each row is one <strong>maintenance plan</strong> per asset from the <strong>ELMS extract</strong> (email <code>prevmx@2t3.app</code>). Due/overdue uses <strong>next maint date</strong> and <strong>current meter</strong> vs <strong>next util qty</strong> when those columns exist. Same import date as Work Orders is only used for optional open WO counts. Sub work order tie-in (Plan ID) comes later.</p>
+            <p class="smx-sub">One row per <strong>asset</strong> from the <strong>ELMS extract</strong> (email <code>prevmx@2t3.app</code>). Counts roll up every maintenance plan; expand for plan detail. <strong>Open work orders</strong> come from the <strong>latest ETIC ingest</strong> — those assets are not counted overdue on preventive schedule (in maintenance). <strong>NCE</strong>, make/model, and mgmt code prefer that same ETIC Fleet P&amp;A snapshot when available.</p>
           </div>
           <span class="smx-asof-pill" id="smx-asof-pill" title="Latest prevmx import date">Latest import</span>
           <label class="smx-search" style="margin-left:10px"><span class="sr-only">Import date</span>
@@ -14411,33 +14853,79 @@ function renderDashboardHtml(): string {
           </label>
         </div>
         <div class="smx-stats" id="smx-stats" role="status">Loading…</div>
-        <div class="smx-toolbar">
-          <label class="smx-search"><span class="sr-only">Filter rows</span>
-            <input type="text" id="smx-query" placeholder="Filter asset, plan, location…" autocomplete="off" />
-          </label>
-          <div class="smx-filters" id="smx-filters" role="tablist" aria-label="Schedule maintenance filters">
-            <button type="button" class="smx-filter-btn active" data-smx-filter="all">All <span class="smx-n" data-smx-c="all">0</span></button>
-            <button type="button" class="smx-filter-btn" data-smx-filter="nce_critical"><span class="nce-inline">NCE</span> overdue <span class="smx-n" data-smx-c="nce_critical">0</span></button>
-            <button type="button" class="smx-filter-btn" data-smx-filter="overdue">Overdue <span class="smx-n" data-smx-c="overdue">0</span></button>
-            <button type="button" class="smx-filter-btn" data-smx-filter="due_soon">Due soon <span class="smx-n" data-smx-c="due_soon">0</span></button>
-            <button type="button" class="smx-filter-btn" data-smx-filter="missing">Missing data <span class="smx-n" data-smx-c="missing">0</span></button>
+        <div class="smx-workspace-grid">
+          <section class="smx-control-surface" aria-label="Schedule maintenance filters">
+            <div class="smx-toolbar">
+              <label class="smx-search"><span class="sr-only">Filter rows</span>
+                <input type="text" id="smx-query" placeholder="Filter asset, WO id, type…" autocomplete="off" />
+              </label>
+              <button type="button" class="smx-calc-launch" id="smx-calc-launch" aria-haspopup="dialog" aria-controls="smx-calc-modal">Is it due?</button>
+              <button type="button" class="smx-reset-filters" id="smx-reset-filters">Reset filters</button>
+              <div class="smx-filters" id="smx-filters" role="tablist" aria-label="Schedule maintenance filters">
+                <button type="button" class="smx-filter-btn active" data-smx-filter="all">All <span class="smx-n" data-smx-c="all">0</span></button>
+                <button type="button" class="smx-filter-btn" data-smx-filter="nce_critical"><span class="nce-inline">NCE</span> overdue <span class="smx-n" data-smx-c="nce_critical">0</span></button>
+                <button type="button" class="smx-filter-btn" data-smx-filter="overdue">Overdue <span class="smx-n" data-smx-c="overdue">0</span></button>
+                <button type="button" class="smx-filter-btn" data-smx-filter="due_soon">Due soon <span class="smx-n" data-smx-c="due_soon">0</span></button>
+                <button type="button" class="smx-filter-btn" data-smx-filter="missing">Missing data <span class="smx-n" data-smx-c="missing">0</span></button>
+              </div>
+            </div>
+            <p class="smx-toolbar-note">Start with the high-level counts, then drill into assets and plans. This area stays compact to leave room for chart panels below.</p>
+          </section>
+          <aside class="smx-chart-reserve" aria-label="Future chart workspace">
+            <div class="smx-chart-card">
+              <h3>Readiness trend workspace</h3>
+              <p>Reserved for timeline charts (overdue / due soon / in maintenance by date).</p>
+              <div class="smx-chart-ghost" aria-hidden="true"></div>
+            </div>
+            <div class="smx-chart-card">
+              <h3>Plan mix workspace</h3>
+              <p>Reserved for plan-type mix, NCE split, and WO tie-in visuals.</p>
+              <div class="smx-chart-ghost" aria-hidden="true"></div>
+            </div>
+          </aside>
+        </div>
+        <div id="smx-calc-modal" class="smx-calc-modal hidden" role="dialog" aria-modal="true" aria-labelledby="smx-calc-heading">
+          <div class="smx-calc-modal-backdrop" data-smx-calc-close="1"></div>
+          <section class="smx-calc-panel" id="smx-shop-calc" aria-label="Is it due calculator">
+            <div class="smx-calc-modal-head">
+              <h3 id="smx-calc-heading">Is it due? Shop calculator</h3>
+              <button type="button" class="smx-calc-close" id="smx-calc-close" aria-label="Close calculator">×</button>
+            </div>
+            <p class="smx-calc-lede">Enter the asset and the <strong>reading on the truck right now</strong> (odometer or hour meter). We compare that to each plan on the <strong>Schedule Mx import</strong> you picked above and list which preventive plans to add to the work order.</p>
+            <div class="smx-calc-grid">
+              <div class="smx-calc-field">
+                <label for="smx-calc-asset">Asset ID</label>
+                <input type="text" id="smx-calc-asset" placeholder="e.g. AF00C00831" autocomplete="off" spellcheck="false" />
+              </div>
+              <div class="smx-calc-field">
+                <label for="smx-calc-meter">Current meter <span class="smx-calc-hint">(mi or hr)</span></label>
+                <input type="number" id="smx-calc-meter" placeholder="Reading on vehicle" step="any" min="0" />
+              </div>
+              <div class="smx-calc-field">
+                <label for="smx-calc-asof">As-of date <span class="smx-calc-hint">(for calendar due)</span></label>
+                <input type="date" id="smx-calc-asof" />
+              </div>
+              <div class="smx-calc-actions">
+                <button type="button" class="smx-calc-run" id="smx-calc-run">Run calculator</button>
+              </div>
+            </div>
+            <ul class="smx-calc-rules">
+              <li><strong>Add to WO</strong> when a plan is overdue or due soon: next maint within <strong>60 days</strong> of as-of, or util remaining ≤ <strong>1,500 mi</strong> (≤ <strong>50 hr</strong> when ELMS says hours).</li>
+              <li>As-of defaults to <strong>latest ETIC</strong> after the grid loads; if there is no ETIC row yet, we use the <strong>import date</strong> or <strong>today</strong> so you never have to fight the date picker.</li>
+            </ul>
+            <p class="smx-calc-status" id="smx-calc-status" role="status"></p>
+            <div id="smx-calc-results" class="smx-calc-results" aria-live="polite"></div>
+          </section>
+        </div>
+        <section class="smx-data-section" aria-label="Schedule maintenance assets">
+          <div class="smx-data-head">
+            <h3>Asset workload</h3>
+            <p>Card layout keeps space for upcoming charts while still letting you open full plan detail per asset.</p>
           </div>
-        </div>
-        <div class="smx-table-wrap">
-          <table class="smx-table" aria-label="Schedule maintenance by plan">
-            <thead>
-              <tr>
-                <th>Asset / plan</th>
-                <th>Last / next</th>
-                <th>Utilization</th>
-                <th>NCE</th>
-                <th>Status</th>
-                <th>State</th>
-              </tr>
-            </thead>
-            <tbody id="smx-tbody"><tr><td colspan="6">Loading…</td></tr></tbody>
-          </table>
-        </div>
+          <div class="smx-table-wrap smx-feed-wrap">
+            <div id="smx-feed" class="smx-asset-feed"><div class="smx-empty">Loading…</div></div>
+          </div>
+        </section>
       </div>
 
       <div id="panel-authz" class="hidden">
@@ -17435,7 +17923,7 @@ function renderDashboardHtml(): string {
       const pill = document.getElementById("smx-asof-pill");
       const dateSel = document.getElementById("smx-date-select");
       const statsEl = document.getElementById("smx-stats");
-      const tbody = document.getElementById("smx-tbody");
+      const tbody = document.getElementById("smx-queue-tbody");
       if (statsEl) {
         statsEl.innerHTML = "<span class='smx-stat'><span class='lbl'>Loading</span><span class='v'>…</span></span>";
       }
@@ -17478,10 +17966,29 @@ function renderDashboardHtml(): string {
         smxStats = j.stats || null;
         renderScheduleMxStats();
         renderScheduleMxTable();
+        syncSmxShopCalcAsOf();
       } catch (e) {
         if (statsEl) statsEl.textContent = "Could not load schedule maintenance.";
         if (tbody) tbody.innerHTML = "<tr><td colspan='6'>Could not load.</td></tr>";
       }
+    }
+
+    function smxCalcDefaultAsOfDateKey() {
+      var etic = smxStats && smxStats.eticAsOfDateKey;
+      if (etic && /^\d{4}-\d{2}-\d{2}$/.test(etic)) return etic;
+      var imp = smxSelectedDateKey;
+      if (!imp && document.getElementById("smx-date-select")) {
+        var sel = document.getElementById("smx-date-select");
+        imp = sel && sel.value ? sel.value : null;
+      }
+      if (imp && /^\d{4}-\d{2}-\d{2}$/.test(imp)) return imp;
+      return new Date().toISOString().slice(0, 10);
+    }
+
+    function syncSmxShopCalcAsOf() {
+      const inp = document.getElementById("smx-calc-asof");
+      if (!inp || !(inp instanceof HTMLInputElement)) return;
+      inp.value = smxCalcDefaultAsOfDateKey();
     }
 
     var authzPayload = null;
@@ -17607,31 +18114,39 @@ function renderDashboardHtml(): string {
 
     function smxMatchesFilter(row, f) {
       if (f === "all") return true;
-      if (f === "nce_critical") return row.scheduleMxNceCritical;
-      if (f === "overdue") return row.scheduleMxBucket === "overdue";
-      if (f === "due_soon") return row.scheduleMxBucket === "due_soon";
-      if (f === "missing") return row.scheduleMxBucket === "missing";
+      if (f === "nce_critical") return row.summaryKey === "nce_critical";
+      if (f === "overdue") return row.summaryKey === "overdue" || row.summaryKey === "nce_critical";
+      if (f === "due_soon") return row.summaryKey === "due_soon";
+      if (f === "missing") return row.summaryKey === "missing";
       return true;
     }
 
     function smxMatchesQuery(row, q) {
       if (!q) return true;
       const ql = q.toLowerCase();
-      return (
-        (row.assetId || "").toLowerCase().indexOf(ql) !== -1 ||
-        (row.planName || "").toLowerCase().indexOf(ql) !== -1 ||
-        (row.planId || "").toLowerCase().indexOf(ql) !== -1 ||
-        (row.location || "").toLowerCase().indexOf(ql) !== -1 ||
-        (row.mgmtCd || "").toLowerCase().indexOf(ql) !== -1 ||
-        (row.makeModel || "").toLowerCase().indexOf(ql) !== -1 ||
-        (row.scheduleMxStatus || "").toLowerCase().indexOf(ql) !== -1
-      );
+      if ((row.assetId || "").toLowerCase().indexOf(ql) !== -1) return true;
+      if ((row.mgmtCd || "").toLowerCase().indexOf(ql) !== -1) return true;
+      if ((row.makeModel || "").toLowerCase().indexOf(ql) !== -1) return true;
+      if ((row.vehNomen || "").toLowerCase().indexOf(ql) !== -1) return true;
+      var ids = row.openWorkOrderIds || [];
+      for (var wi = 0; wi < ids.length; wi++) {
+        if ((ids[wi] || "").toLowerCase().indexOf(ql) !== -1) return true;
+      }
+      const plans = row.planRows || [];
+      for (var pi = 0; pi < plans.length; pi++) {
+        var p = plans[pi];
+        if ((p.planName || "").toLowerCase().indexOf(ql) !== -1) return true;
+        if ((p.planId || "").toLowerCase().indexOf(ql) !== -1) return true;
+        if ((p.scheduleMxStatus || "").toLowerCase().indexOf(ql) !== -1) return true;
+      }
+      return false;
     }
 
     function renderScheduleMxStats() {
       const box = document.getElementById("smx-stats");
-      if (!box || !smxStats) return;
-      function pill(k, label, cls) {
+      const glance = document.getElementById("smx-glance");
+      if ((!box && !glance) || !smxStats) return;
+      function metric(k, label, cls) {
         return (
           "<div class='smx-stat " + cls + "'>" +
             "<span class='lbl'>" + esc(label) + "</span>" +
@@ -17639,14 +18154,29 @@ function renderDashboardHtml(): string {
           "</div>"
         );
       }
-      box.innerHTML =
-        pill("planRows", "Plan rows", "") +
-        pill("distinctAssets", "Assets", "") +
-        pill("nceCritical", "NCE overdue (critical)", "crit") +
-        pill("overdue", "Overdue", "bad") +
-        pill("dueSoon", "Due soon (≤30d)", "warn") +
-        pill("missing", "Missing sched data", "warn") +
-        pill("ok", "OK / current", "");
+      var eticLbl = smxStats.eticAsOfDateKey ? fmtKeyLong(smxStats.eticAsOfDateKey) : "—";
+      if (box) {
+        box.innerHTML =
+          "<div class='smx-kpi-head'>" +
+            "<h3 class='smx-kpi-title'>Readiness overview</h3>" +
+            "<p class='smx-kpi-note'>All cards below are asset-level rollups; due soon uses 60-day calendar or utilization thresholds.</p>" +
+          "</div>" +
+          "<div class='smx-kpi-grid'>" +
+            metric("overdue", "Overdue assets", "bad") +
+            metric("dueSoon", "Due soon", "warn") +
+            metric("nceCritical", "NCE overdue", "crit") +
+            metric("inMaintenanceAssets", "In maintenance", "") +
+            metric("missing", "Missing data", "warn") +
+            metric("ok", "Current", "") +
+          "</div>";
+      }
+      if (glance) {
+        glance.innerHTML =
+          "<div class='smx-glance-item'><span class='k'>Schedule Mx import</span><strong>" + esc(smxSelectedDateKey ? fmtKeyLong(smxSelectedDateKey) : "—") + "</strong></div>" +
+          "<div class='smx-glance-item'><span class='k'>ETIC reference</span><strong>" + esc(eticLbl) + "</strong></div>" +
+          "<div class='smx-glance-item'><span class='k'>Assets</span><strong>" + esc(String(smxStats.distinctAssets ?? 0)) + "</strong></div>" +
+          "<div class='smx-glance-item'><span class='k'>Maint plans</span><strong>" + esc(String(smxStats.planRows ?? 0)) + "</strong></div>";
+      }
     }
 
     function smxPillLabel(bucket) {
@@ -17656,9 +18186,258 @@ function renderDashboardHtml(): string {
       return bucket || "—";
     }
 
+    function renderSmxShopCalcResults(j) {
+      const box = document.getElementById("smx-calc-results");
+      if (!box) return;
+      const plans = Array.isArray(j.plans) ? j.plans : [];
+      const rec = Array.isArray(j.recommend) ? j.recommend : [];
+      if (!plans.length) {
+        box.innerHTML =
+          "<div class='smx-calc-results-summary'>No plans found for <strong>" +
+          esc(j.assetId || "") +
+          "</strong> on this import. Check the asset ID matches ELMS (e.g. AF prefix).</div>";
+        return;
+      }
+      var head =
+        "<div class='smx-calc-results-summary'><strong>" +
+        rec.length +
+        "</strong> plan" +
+        (rec.length === 1 ? "" : "s") +
+        " to add to the WO (overdue or due soon at your reading). Calendar as-of <strong>" +
+        esc(j.asOfDateKey || "") +
+        "</strong>.</div>" +
+        "<table class='smx-calc-table'><thead><tr>" +
+        "<th>Add?</th><th>Plan</th><th>Next maint</th><th>Next util</th><th>Remaining</th><th>State</th><th>Why</th>" +
+        "</tr></thead><tbody>";
+      var body = plans
+        .map(function (p) {
+          var add = p.recommendWo ? "Yes" : "—";
+          var pname = (p.planName || "").trim();
+          var pid = (p.planId || "").trim();
+          var plab = pname ? esc(pname) + (pid ? " (" + esc(pid) + ")" : "") : (pid ? esc(pid) : "—");
+          var nm = p.nextMaintDateIso ? fmtKeyShort(p.nextMaintDateIso) : "—";
+          var ut = (p.utilType || "").trim();
+          var nu =
+            p.nextUtilQty != null
+              ? esc(String(p.nextUtilQty)) + (ut ? " " + esc(ut) : "")
+              : "—";
+          var rem =
+            p.remaining != null
+              ? esc(String(p.remaining)) + (ut ? " " + esc(ut) : "")
+              : "—";
+          return (
+            "<tr>" +
+            "<td><strong>" +
+            esc(add) +
+            "</strong></td>" +
+            "<td>" +
+            plab +
+            "</td>" +
+            "<td>" +
+            esc(nm) +
+            "</td>" +
+            "<td>" +
+            nu +
+            "</td>" +
+            "<td>" +
+            rem +
+            "</td>" +
+            "<td><span class='smx-pill " +
+            esc(p.bucket || "") +
+            "'>" +
+            esc(smxPillLabel(p.bucket)) +
+            "</span></td>" +
+            "<td>" +
+            esc(p.reason || "") +
+            "</td>" +
+            "</tr>"
+          );
+        })
+        .join("");
+      box.innerHTML = head + body + "</tbody></table>";
+    }
+
+    function openSmxCalcModal() {
+      var m = document.getElementById("smx-calc-modal");
+      if (!m) return;
+      m.classList.remove("hidden");
+      m.setAttribute("aria-hidden", "false");
+      syncSmxShopCalcAsOf();
+      setTimeout(function () {
+        var a = document.getElementById("smx-calc-asset");
+        if (a && typeof a.focus === "function") a.focus();
+      }, 20);
+    }
+
+    function closeSmxCalcModal() {
+      var m = document.getElementById("smx-calc-modal");
+      if (!m) return;
+      m.classList.add("hidden");
+      m.setAttribute("aria-hidden", "true");
+    }
+
+    async function runSmxShopCalc() {
+      const st = document.getElementById("smx-calc-status");
+      const box = document.getElementById("smx-calc-results");
+      const assetEl = document.getElementById("smx-calc-asset");
+      const meterEl = document.getElementById("smx-calc-meter");
+      const asofEl = document.getElementById("smx-calc-asof");
+      if (!assetEl || !meterEl || !asofEl) return;
+      const assetId = (assetEl.value || "").trim();
+      const shopMeter = Number(String(meterEl.value || "").replace(/,/g, ""));
+      let asOf = (asofEl.value || "").trim();
+      if (st) st.textContent = "";
+      if (box) box.innerHTML = "";
+      if (!assetId) {
+        if (st) st.textContent = "Enter an asset ID.";
+        return;
+      }
+      if (!Number.isFinite(shopMeter)) {
+        if (st) st.textContent = "Enter the current odometer or hour reading.";
+        return;
+      }
+      if (!asOf || !/^\d{4}-\d{2}-\d{2}$/.test(asOf)) {
+        asOf = smxCalcDefaultAsOfDateKey();
+        if (asofEl instanceof HTMLInputElement) asofEl.value = asOf;
+      }
+      var dk = smxSelectedDateKey;
+      if (!dk && document.getElementById("smx-date-select")) {
+        var sel = document.getElementById("smx-date-select");
+        dk = sel && sel.value ? sel.value : null;
+      }
+      if (!dk) {
+        if (st) st.textContent = "Load Schedule Mx data first (select an import date).";
+        return;
+      }
+      if (st) st.textContent = "Calculating…";
+      try {
+        const r = await fetch("/api/schedule-mx?shop_calc=1", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            assetId: assetId,
+            shopMeter: shopMeter,
+            scheduleMxDateKey: dk,
+            asOfDateKey: asOf,
+          }),
+        });
+        const j = await r.json();
+        if (!r.ok) {
+          if (st) st.textContent = j.error || "Request failed.";
+          return;
+        }
+        if (st) {
+          st.textContent =
+            "Shop reading " +
+            shopMeter +
+            " · " +
+            (j.planCount || 0) +
+            " plan" +
+            ((j.planCount || 0) === 1 ? "" : "s") +
+            " · " +
+            (j.recommendCount || 0) +
+            " to add.";
+        }
+        renderSmxShopCalcResults(j);
+      } catch (e) {
+        if (st) st.textContent = e && e.message ? e.message : "Could not calculate.";
+      }
+    }
+
+    function smxAssetSummaryLine(row) {
+      const c = row.counts || { overdue: 0, dueSoon: 0, missing: 0, ok: 0, noDue: 0 };
+      const parts = [];
+      if (c.overdue) parts.push(c.overdue + " overdue");
+      if (c.dueSoon) parts.push(c.dueSoon + " due soon");
+      if (c.missing) parts.push(c.missing + " missing data");
+      if (c.ok) parts.push(c.ok + " OK");
+      if (c.noDue) parts.push(c.noDue + " no due");
+      return parts.length ? parts.join(" · ") : "—";
+    }
+
+    function smxAssetWorstPill(row) {
+      const sk = row.summaryKey || "ok";
+      if (sk === "nce_critical") return { cls: "overdue", label: "NCE overdue" };
+      if (sk === "overdue") return { cls: "overdue", label: "Overdue" };
+      if (sk === "due_soon") return { cls: "due_soon", label: "Due soon" };
+      if (sk === "missing") return { cls: "missing", label: "Missing data" };
+      if ((row.workOrderCount || 0) > 0) return { cls: "ok", label: "OK (in WO)" };
+      return { cls: "ok", label: "OK" };
+    }
+
+    function smxRenderPlanMiniTable(plans) {
+      if (!plans || !plans.length) return "";
+      var head =
+        "<table class='smx-mini-table'><thead><tr>" +
+        "<th>Plan</th><th>Due / status</th><th>State</th>" +
+        "</tr></thead><tbody>";
+      var body = plans.map(function (p) {
+        var pname = (p.planName || "").trim();
+        var pid = (p.planId || "").trim();
+        var planLabel = pname ? esc(pname) + (pid ? " (" + esc(pid) + ")" : "") : (pid ? esc(pid) : "—");
+        var dueBit = p.scheduleMxDueIso ? fmtKeyShort(p.scheduleMxDueIso) : "—";
+        var overdueExtra = "";
+        if (p.scheduleMxOverdueByDays != null && p.scheduleMxOverdueByDays > 0) {
+          overdueExtra = " · " + p.scheduleMxOverdueByDays + " d late";
+        } else if (p.scheduleMxOverdueUtil) {
+          overdueExtra = " · util overdue";
+        }
+        var statusLine = esc(dueBit + overdueExtra);
+        var ut = (p.elmsUtilType || "").trim();
+        var hasUtil =
+          p.elmsCurrentMeter != null ||
+          p.elmsNextUtilQty != null ||
+          p.scheduleMxUtilRemaining != null;
+        if (hasUtil) {
+          var uParts = [];
+          if (p.elmsCurrentMeter != null) {
+            uParts.push("Meter " + p.elmsCurrentMeter + (ut ? " " + ut : ""));
+          }
+          if (p.elmsNextUtilQty != null) {
+            uParts.push("next svc " + p.elmsNextUtilQty + (ut ? " " + ut : ""));
+          }
+          if (p.scheduleMxUtilRemaining != null) {
+            uParts.push(
+              (p.scheduleMxUtilRemaining >= 0 ? "Rem " : "Over ") +
+                Math.abs(p.scheduleMxUtilRemaining) +
+                (ut ? " " + ut : ""),
+            );
+          }
+          statusLine =
+            statusLine + "<div class='remark-snippet util-line'>" + esc(uParts.join(" · ")) + "</div>";
+        }
+        var daysT = p.scheduleMxDaysUntil;
+        var calSoon =
+          daysT != null && Number.isFinite(daysT) && daysT >= 0 && daysT <= 60;
+        if (p.scheduleMxBucket === "due_soon" && !calSoon && hasUtil) {
+          statusLine =
+            statusLine +
+            "<div class='remark-snippet'>" +
+            esc("Due soon by utilization (calendar date is farther out).") +
+            "</div>";
+        } else if (p.scheduleMxBucket === "due_soon" && calSoon && daysT != null) {
+          statusLine =
+            statusLine +
+            "<div class='remark-snippet'>" + esc("Next maint in " + daysT + " d.") + "</div>";
+        }
+        if ((p.scheduleMxStatus || "").trim()) {
+          statusLine = statusLine + "<div class='remark-snippet'>" + esc(p.scheduleMxStatus) + "</div>";
+        }
+        return (
+          "<tr>" +
+          "<td>" + planLabel + "</td>" +
+          "<td>" + statusLine + "</td>" +
+          "<td><span class='smx-pill " + esc(p.scheduleMxBucket || "") + "'>" +
+          esc(smxPillLabel(p.scheduleMxBucket)) + "</span></td>" +
+          "</tr>"
+        );
+      }).join("");
+      return head + body + "</tbody></table>";
+    }
+
     function renderScheduleMxTable() {
-      const tbody = document.getElementById("smx-tbody");
-      if (!tbody) return;
+      const feed = document.getElementById("smx-feed");
+      if (!feed) return;
       const qel = document.getElementById("smx-query");
       const q = (qel && qel.value) ? qel.value.trim() : "";
       const filtered = smxRows.filter(function (row) {
@@ -17671,52 +18450,57 @@ function renderDashboardHtml(): string {
         el.textContent = n;
       });
       if (!filtered.length) {
-        tbody.innerHTML = "<tr><td colspan='6'>No rows match.</td></tr>";
+        feed.innerHTML = "<div class='smx-empty'>No assets match your filters.</div>";
         return;
       }
-      tbody.innerHTML = filtered.map(function (row) {
-        const nce = row.nce
-          ? ("<span class='nce-inline' title='" + esc(row.nceStatus || "NCE") + "'>NCE</span>")
-          : "—";
-        const due = row.scheduleMxDueIso ? fmtKeyShort(row.scheduleMxDueIso) : "—";
-        const ov = row.scheduleMxOverdueByDays != null ? row.scheduleMxOverdueByDays + " d" : "—";
-        const pillCls = row.scheduleMxBucket || "";
+      feed.innerHTML = filtered.map(function (row) {
+        var nceBadge = "—";
+        if (row.nce) {
+          nceBadge =
+            "<span class='nce-inline' title='" + esc(row.nceStatus || "NCE") + "'>NCE</span>" +
+            ((row.nceStatus || "").trim()
+              ? "<div class='remark-snippet'>" + esc(row.nceStatus) + "</div>"
+              : "");
+        }
+        const wp = smxAssetWorstPill(row);
         let trCls = "";
-        if (row.scheduleMxNceCritical) trCls = "smx-row-nce-crit";
-        else if (row.scheduleMxBucket === "overdue") trCls = "smx-row-overdue";
-        const mgmtLine = row.mgmtCd
-          ? ("Mgmt " + esc(row.mgmtCd) + " · " + row.workOrderCount + " WO")
-          : (String(row.workOrderCount) + " WO");
-        const lastNext =
-          (row.elmsLastMaintDateIso ? fmtKeyShort(row.elmsLastMaintDateIso) : "—") +
-          " → " +
-          (row.elmsNextMaintDateIso ? fmtKeyShort(row.elmsNextMaintDateIso) : due);
-        const ut = (row.elmsUtilType || "").trim();
-        const utilLine =
-          (row.elmsCurrentMeter != null ? esc(String(row.elmsCurrentMeter)) : "—") +
-          (ut ? " " + esc(ut) : "") +
-          " · next " +
-          (row.elmsNextUtilQty != null ? esc(String(row.elmsNextUtilQty)) : "—") +
-          (row.scheduleMxUtilRemaining != null
-            ? " (" + (row.scheduleMxUtilRemaining >= 0 ? "rem " : "over ") + Math.abs(row.scheduleMxUtilRemaining) + ")"
-            : "");
+        if (row.summaryKey === "nce_critical") trCls = "smx-row-nce-crit";
+        else if (row.summaryKey === "overdue") trCls = "smx-row-overdue";
+        else if (row.summaryKey === "due_soon") trCls = "smx-row-due-soon";
+        var woIds = row.openWorkOrderIds || [];
+        var woLine = "";
+        if (woIds.length) {
+          woLine =
+            "<div class='remark-snippet'>Open WO: " +
+            woIds
+              .map(function (w) {
+                return "<a class='wo-id' href='#wo=" + encodeURIComponent(w) + "'>" + esc(w) + "</a>";
+              })
+              .join(", ") +
+            "</div>";
+        }
+        const plans = row.planRows || [];
+        const nested =
+          "<details class='smx-nested'>" +
+          "<summary>Show " + plans.length + " maint plan" + (plans.length === 1 ? "" : "s") + "</summary>" +
+          "<div class='smx-nested-inner'>" + smxRenderPlanMiniTable(plans) + "</div>" +
+          "</details>";
         return (
-          "<tr" + (trCls ? " class='" + esc(trCls) + "'" : "") + ">" +
-            "<td><span class='asset-mono'>" + esc(row.assetId) + "</span>" +
-              (row.planName ? "<div class='remark-snippet'><strong>" + esc(row.planName) + "</strong>" +
-                (row.planId ? " · Plan " + esc(row.planId) : "") + "</div>" : "") +
-              (row.location ? "<div class='remark-snippet'>" + esc(row.location) + "</div>" : "") +
-              (row.makeModel ? "<div class='remark-snippet'>" + esc(row.makeModel) + "</div>" : "") +
-              "<div class='remark-snippet'>" + mgmtLine + "</div>" +
-            "</td>" +
-            "<td><div class='remark-snippet'>" + esc(lastNext) + "</div>" +
-              (ov !== "—" ? "<div class='remark-snippet'>Overdue " + esc(ov) + "</div>" : "") +
-            "</td>" +
-            "<td><div class='remark-snippet'>" + utilLine + "</div></td>" +
-            "<td>" + nce + "</td>" +
-            "<td>" + esc(row.scheduleMxStatus || "—") + "</td>" +
-            "<td><span class='smx-pill " + esc(pillCls) + "'>" + esc(smxPillLabel(row.scheduleMxBucket)) + "</span></td>" +
-          "</tr>"
+          "<article class='smx-feed-row" + (trCls ? " " + esc(trCls) : "") + "'>" +
+            "<div class='smx-feed-asset-cell'><div class='smx-feed-asset'>" +
+              "<span class='asset-mono'>" + esc(row.assetId) + "</span>" +
+              "<span class='smx-feed-state smx-pill " + esc(wp.cls) + "'>" + esc(wp.label) + "</span>" +
+            "</div>" +
+            (row.vehNomen ? "<div class='remark-snippet'>" + esc(row.vehNomen) + "</div>" : "") +
+            (row.makeModel ? "<div class='remark-snippet'>" + esc(row.makeModel) + "</div>" : "") +
+            (row.mgmtCd ? "<div class='remark-snippet'>Mgmt " + esc(row.mgmtCd) + "</div>" : "") +
+            woLine +
+            "</div>" +
+            "<div><div class='smx-feed-count'>" + String(row.planCount || plans.length) + "</div>" +
+            "<div class='remark-snippet'>" + esc(smxAssetSummaryLine(row)) + "</div></div>" +
+            "<div>" + nceBadge + "</div>" +
+            "<div class='smx-feed-detail'>" + nested + "</div>" +
+          "</article>"
         );
       }).join("");
     }
@@ -17935,7 +18719,7 @@ function renderDashboardHtml(): string {
           smxChips += "<span class='chip smx-overdue" + (r.nce ? " smx-nce-critical" : "") +
             "' title='Scheduled maintenance overdue'>Sched Mx overdue" + od + (r.nce ? " · NCE" : "") + "</span>";
         } else if (r.scheduleMxBucket === "due_soon") {
-          smxChips += "<span class='chip smx-soon' title='Due within ~30 days'>Sched Mx due soon</span>";
+          smxChips += "<span class='chip smx-soon' title='Due within ~60 days, or util within 1500 mi / 50 hr'>Sched Mx due soon</span>";
         }
         var recallChip = "";
         if (r.melRecallHint) {
@@ -19607,6 +20391,21 @@ function renderDashboardHtml(): string {
           renderScheduleMxTable();
         });
       }
+      const smxReset = document.getElementById("smx-reset-filters");
+      if (smxReset && !smxReset.dataset.wired) {
+        smxReset.dataset.wired = "1";
+        smxReset.addEventListener("click", function () {
+          smxFilter = "all";
+          const q = document.getElementById("smx-query");
+          if (q) q.value = "";
+          if (smxFilt) {
+            smxFilt.querySelectorAll(".smx-filter-btn").forEach(function (x) {
+              x.classList.toggle("active", x.getAttribute("data-smx-filter") === "all");
+            });
+          }
+          renderScheduleMxTable();
+        });
+      }
       const smxQ = document.getElementById("smx-query");
       if (smxQ) smxQ.addEventListener("input", function () { renderScheduleMxTable(); });
       const smxDateSel = document.getElementById("smx-date-select");
@@ -19617,6 +20416,45 @@ function renderDashboardHtml(): string {
           loadScheduleMxTab();
         });
       }
+      const smxCalcRun = document.getElementById("smx-calc-run");
+      if (smxCalcRun && !smxCalcRun.dataset.wired) {
+        smxCalcRun.dataset.wired = "1";
+        smxCalcRun.addEventListener("click", function () { void runSmxShopCalc(); });
+      }
+      const smxCalcOpen = document.getElementById("smx-calc-launch");
+      if (smxCalcOpen && !smxCalcOpen.dataset.wired) {
+        smxCalcOpen.dataset.wired = "1";
+        smxCalcOpen.addEventListener("click", function () {
+          const modal = document.getElementById("smx-calc-modal");
+          if (!modal) return;
+          modal.classList.remove("hidden");
+          syncSmxShopCalcAsOf();
+          setTimeout(function () {
+            const a = document.getElementById("smx-calc-asset");
+            if (a && a.focus) a.focus();
+          }, 20);
+        });
+      }
+      const smxCalcClose = document.getElementById("smx-calc-close");
+      if (smxCalcClose && !smxCalcClose.dataset.wired) {
+        smxCalcClose.dataset.wired = "1";
+        smxCalcClose.addEventListener("click", function () {
+          const modal = document.getElementById("smx-calc-modal");
+          if (modal) modal.classList.add("hidden");
+        });
+      }
+      const smxCalcBackdrop = document.getElementById("smx-calc-modal");
+      if (smxCalcBackdrop && !smxCalcBackdrop.dataset.wired) {
+        smxCalcBackdrop.dataset.wired = "1";
+        smxCalcBackdrop.addEventListener("click", function (ev) {
+          if (ev.target === smxCalcBackdrop) smxCalcBackdrop.classList.add("hidden");
+        });
+      }
+      document.addEventListener("keydown", function (ev) {
+        if (ev.key !== "Escape") return;
+        const modal = document.getElementById("smx-calc-modal");
+        if (modal && !modal.classList.contains("hidden")) modal.classList.add("hidden");
+      });
       const melTabBtn = document.getElementById("tab-mel");
       if (melTabBtn) melTabBtn.addEventListener("click", function () { setMainTab("mel"); syncDashboardQuery("mel"); });
       const meetTabBtn = document.getElementById("tab-meeting");
