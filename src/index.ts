@@ -17733,6 +17733,43 @@ function renderDashboardHtml(): string {
           overdueExtra = " · util overdue";
         }
         var statusLine = esc(dueBit + overdueExtra);
+        var ut = (p.elmsUtilType || "").trim();
+        var hasUtil =
+          p.elmsCurrentMeter != null ||
+          p.elmsNextUtilQty != null ||
+          p.scheduleMxUtilRemaining != null;
+        if (hasUtil) {
+          var uParts = [];
+          if (p.elmsCurrentMeter != null) {
+            uParts.push("Meter " + p.elmsCurrentMeter + (ut ? " " + ut : ""));
+          }
+          if (p.elmsNextUtilQty != null) {
+            uParts.push("next svc " + p.elmsNextUtilQty + (ut ? " " + ut : ""));
+          }
+          if (p.scheduleMxUtilRemaining != null) {
+            uParts.push(
+              (p.scheduleMxUtilRemaining >= 0 ? "Rem " : "Over ") +
+                Math.abs(p.scheduleMxUtilRemaining) +
+                (ut ? " " + ut : ""),
+            );
+          }
+          statusLine =
+            statusLine + "<div class='remark-snippet util-line'>" + esc(uParts.join(" · ")) + "</div>";
+        }
+        var daysT = p.scheduleMxDaysUntil;
+        var calSoon =
+          daysT != null && Number.isFinite(daysT) && daysT >= 0 && daysT <= 60;
+        if (p.scheduleMxBucket === "due_soon" && !calSoon && hasUtil) {
+          statusLine =
+            statusLine +
+            "<div class='remark-snippet'>" +
+            esc("Due soon by utilization (calendar date is farther out).") +
+            "</div>";
+        } else if (p.scheduleMxBucket === "due_soon" && calSoon && daysT != null) {
+          statusLine =
+            statusLine +
+            "<div class='remark-snippet'>" + esc("Next maint in " + daysT + " d.") + "</div>";
+        }
         if ((p.scheduleMxStatus || "").trim()) {
           statusLine = statusLine + "<div class='remark-snippet'>" + esc(p.scheduleMxStatus) + "</div>";
         }
