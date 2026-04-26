@@ -186,8 +186,8 @@ describe("computeScheduleMxCommanderSummary", () => {
         makeModel: "",
         mgmtCd: "",
         workOrderCount: 0,
-        nce: false,
-        nceStatus: "",
+        nce: nceCrit,
+        nceStatus: nceCrit ? "Yes" : "",
         scheduleMxNceCritical: nceCrit,
         owningUnit: unit,
         vehNomen: "",
@@ -222,6 +222,39 @@ describe("computeScheduleMxCommanderSummary", () => {
     const u791 = c.units.find((x) => x.unit === "791 MXS");
     expect(u791?.nceOverdue).toBe(1);
     expect(u791?.overdue).toBe(1);
+  });
+
+  it("counts raw extract overdue even when triage waives effective bucket", () => {
+    const base = analyzeElmsScheduleMxFromRaw({}, "2026-04-25");
+    const row: ScheduleMxFleetRow = {
+      assetId: "AF99",
+      planRowKey: "p1",
+      planId: "",
+      planName: "",
+      planDesc: "",
+      maintenanceScheduleId: "",
+      itemDesc: "",
+      location: "",
+      makeModel: "",
+      mgmtCd: "",
+      workOrderCount: 1,
+      nce: false,
+      nceStatus: "",
+      scheduleMxNceCritical: false,
+      owningUnit: "TEST",
+      vehNomen: "",
+      eticSnapshotDateKey: "2026-04-26",
+      eticOpenWorkOrderIds: "WO-1",
+      eticOpenInMaintenance: false,
+      scheduleMxPlanEffectiveBucket: "ok",
+      scheduleMxPlanEffectiveNceCritical: false,
+      scheduleMxSuppressedByOpenWo: true,
+      ...base,
+      scheduleMxBucket: "overdue",
+    };
+    const c = computeScheduleMxCommanderSummary([row]);
+    expect(c.wing.totalVehicles).toBe(1);
+    expect(c.wing.overdue).toBe(1);
   });
 });
 

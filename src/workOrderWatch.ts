@@ -1314,9 +1314,30 @@ function scheduleMxAssetWorstRank(plans: ScheduleMxFleetRow[]): number {
 }
 
 /**
+ * Raw ELMS / extract bucket only (no open-WO triage waiver). Matches wing commander-style
+ * compliance reports; can be higher than triage "effective" overdue counts.
+ */
+function scheduleMxPlanRawWorstRank(row: ScheduleMxFleetRow): number {
+  const b = row.scheduleMxBucket;
+  if (row.nce && b === "overdue") return 0;
+  if (b === "overdue") return 1;
+  if (b === "due_soon") return 2;
+  if (b === "missing") return 3;
+  return 4;
+}
+
+function scheduleMxAssetRawWorstRank(plans: ScheduleMxFleetRow[]): number {
+  let worst = 4;
+  for (const p of plans) {
+    const r = scheduleMxPlanRawWorstRank(p);
+    if (r < worst) worst = r;
+  }
+  return worst;
+}
+
+/**
  * Commander summary: one row per owning unit + wing totals.
- * Overdue = asset worst rank is overdue (rank 1) or NCE-overdue (rank 0).
- * NCE overdue = rank 0 only (subset of overdue).
+ * Overdue / NCE overdue use **raw** extract buckets (not open-WO-waived effective buckets).
  */
 export function computeScheduleMxCommanderSummary(rows: ScheduleMxFleetRow[]): ScheduleMxCommanderSummary {
   const byAssetInUnit = new Map<string, Map<string, ScheduleMxFleetRow[]>>();
@@ -1348,7 +1369,7 @@ export function computeScheduleMxCommanderSummary(rows: ScheduleMxFleetRow[]): S
     let nceOverdue = 0;
     for (const [, plans] of am) {
       total += 1;
-      const wr = scheduleMxAssetWorstRank(plans);
+      const wr = scheduleMxAssetRawWorstRank(plans);
       if (wr <= 1) overdue += 1;
       if (wr === 0) nceOverdue += 1;
     }

@@ -17980,7 +17980,7 @@ function renderDashboardHtml(): string {
       var ek = smxEticDateKey || "";
       if (sub) {
         sub.textContent =
-          "Rollup by owning unit from this maintenance import. Each vehicle counts once (worst plan). Import " +
+          "Rollup by owning unit from this maintenance import. Each vehicle counts once (worst plan by raw ELMS/extract status — not the open-WO triage waiver). Import " +
           (dk ? fmtKeyLong(dk) : "—") +
           " · Fleet book " +
           (ek ? fmtKeyLong(ek) : "—") +
