@@ -1568,15 +1568,6 @@ export function analyzeElmsScheduleMxFromRaw(
     if (elmsCurrentMeter >= elmsNextUtilQty) scheduleMxOverdueUtil = true;
   }
 
-  /** Meter interval says we are still before the next util target (authoritative vs stale calendar cells). */
-  const utilSaysNotOverdue =
-    elmsNextUtilQty != null && elmsCurrentMeter != null && elmsCurrentMeter < elmsNextUtilQty;
-  if (dateOverdue && utilSaysNotOverdue) {
-    dateOverdue = false;
-    dateOverdueByDays = null;
-    daysUntil = null;
-  }
-
   const legacy = analyzeScheduleMxFromRaw(raw, asOfDateKey);
   const hasElmsSignal =
     !!elmsNextMaintDateIso ||
@@ -1595,7 +1586,7 @@ export function analyzeElmsScheduleMxFromRaw(
   let needsEntry = legacy.scheduleMxNeedsEntry;
 
   if (hasElmsSignal) {
-    /** Due if **either** calendar or utilization says so (OR). Util overdue is never cleared by a future calendar date. */
+    /** Due if **either** next maint date is past (calendar) **or** meter is at/past next util (OR). Meter before target does not cancel calendar overdue. */
     const overdue = dateOverdue || scheduleMxOverdueUtil;
     const dateDueSoon = !dateOverdue && elmsNextMaintDateIso != null && daysUntil != null && daysUntil >= 0 && daysUntil <= DUE_SOON_DAYS_ELMS;
     let utilDueSoon = false;

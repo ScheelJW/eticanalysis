@@ -19056,35 +19056,19 @@ function renderDashboardHtml(): string {
       }
       const calPast = smxCalendarPastNextMaintDate(row);
       const calDays = smxCalendarDaysPastNextMaint(row);
-      const effOver = eff === "overdue";
-      const extractOver = row.scheduleMxBucket === "overdue";
-      if (effOver || (calPast && extractOver)) {
+      if (calPast) {
         const d =
           row.scheduleMxOverdueByDays != null
             ? row.scheduleMxOverdueByDays + " day" + (row.scheduleMxOverdueByDays === 1 ? "" : "s")
             : calDays != null
               ? calDays + " day" + (calDays === 1 ? "" : "s")
               : "some time";
-        return "Next calendar service date was " + nextM + " (" + d + " past that date).";
-      }
-      if (calPast && !extractOver) {
-        const d =
-          calDays != null
-            ? calDays + " day" + (calDays === 1 ? "" : "s")
-            : "some time";
-        var tail =
-          " Extract treats the plan as current because the meter is still before the next utilization target.";
-        if (row.scheduleMxSuppressedByOpenWo) {
-          tail = " Fleet status shows the vehicle in maintenance — triage treats schedule items as covered.";
+        var line = "Next calendar service date was " + nextM + " (" + d + " past that date).";
+        if (eff === "ok" && row.scheduleMxSuppressedByOpenWo) {
+          line +=
+            " Fleet status shows the vehicle in maintenance — triage may show OK while the calendar date is past.";
         }
-        return (
-          "Next calendar service date was " +
-          nextM +
-          " (" +
-          d +
-          " past that date)." +
-          tail
-        );
+        return line;
       }
       if (eff === "due_soon" && row.scheduleMxDaysUntil != null) {
         return "Next calendar service date is " + nextM + " (about " + row.scheduleMxDaysUntil + " day" + (row.scheduleMxDaysUntil === 1 ? "" : "s") + " away).";

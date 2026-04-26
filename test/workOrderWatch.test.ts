@@ -470,14 +470,15 @@ describe("analyzeElmsScheduleMxFromRaw", () => {
     expect(a.scheduleMxBucket).toBe("ok");
   });
 
-  it("trusts meter over a stale parsed next-maint date when still before next util qty", () => {
+  it("calendar past next maint date is overdue even when meter is before next util (OR, date wins)", () => {
     const raw = {
       "fleet.next maint date": "2026-04-01",
       "fleet.current meter reading": "1000",
       "fleet.next util qty": "5000",
     };
     const a = analyzeElmsScheduleMxFromRaw(raw, "2026-04-25");
-    expect(a.scheduleMxBucket).toBe("ok");
+    expect(a.scheduleMxBucket).toBe("overdue");
+    expect(a.scheduleMxOverdueByDays).toBe(24);
     expect(a.scheduleMxOverdueUtil).toBe(false);
   });
 });
