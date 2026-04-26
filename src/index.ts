@@ -7144,17 +7144,17 @@ function renderYardAppHtml(): string {
       return escapeHtml(s.slice(0, n)) + "\u2026";
     }
     function deskRollPillHtml(a){
-      if (a.isNeverChecked) return "<span class=\\"yard-pill yard-pill-never\\">Never</span>";
-      if (a.rollingState === "overdue") return "<span class=\\"yard-pill yard-pill-overdue\\">Overdue</span>";
-      if (a.rollingState === "due") return "<span class=\\"yard-pill yard-pill-due\\">Due</span>";
-      return "<span class=\\"yard-pill yard-pill-fresh\\">OK</span>";
+      if (a.isNeverChecked) return '<span class="yard-pill yard-pill-never">Never</span>';
+      if (a.rollingState === "overdue") return '<span class="yard-pill yard-pill-overdue">Overdue</span>';
+      if (a.rollingState === "due") return '<span class="yard-pill yard-pill-due">Due</span>';
+      return '<span class="yard-pill yard-pill-fresh">OK</span>';
     }
     function renderDeskTable(){
       var tb = document.getElementById("yard-desk-tbody");
       if (!tb) return;
       var rows = applyFilter();
       if (!rows.length) {
-        tb.innerHTML = "<tr><td colspan=\\"4\\" style=\\"text-align:center;color:var(--muted);padding:24px\\">No vehicles match.</td></tr>";
+        tb.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:24px">No vehicles match.</td></tr>';
         return;
       }
       var h = "";
@@ -7164,14 +7164,14 @@ function renderYardAppHtml(): string {
           ? escapeHtml(a.lastLocation)
           : '<span class="yard-desk-loc-unknown">No location yet</span>';
         var notesRaw = (a.lastNotes || "").trim();
-        var notesCell = notesRaw ? truncDeskHtml(notesRaw, 160) : "<span style=\\"color:var(--subtle)\\">\u2014</span>";
+        var notesCell = notesRaw ? truncDeskHtml(notesRaw, 160) : '<span style="color:var(--subtle)">\u2014</span>';
         var active = state.deskSelectedId === a.assetId ? " yard-desk-active" : "";
-        h += "<tr class=\\"yard-desk-tr" + active + "\\" data-id=\\"" + escapeHtml(a.assetId) + "\\">" +
-          "<td class=\\"col-asset\\">" + escapeHtml(a.assetId) + "</td>" +
-          "<td class=\\"col-loc\\">" + loc + "</td>" +
-          "<td class=\\"col-notes\\">" + notesCell + "</td>" +
-          "<td class=\\"col-meta\\">" + deskRollPillHtml(a) +
-          (a.isNeverChecked ? "" : (" <span style=\\"color:var(--subtle)\\">" + escapeHtml(fmtAge(a.daysSinceLastCheck, false)) + "</span>")) +
+        h += '<tr class="yard-desk-tr' + active + '" data-id="' + escapeHtml(a.assetId) + '">' +
+          '<td class="col-asset">' + escapeHtml(a.assetId) + "</td>" +
+          '<td class="col-loc">' + loc + "</td>" +
+          '<td class="col-notes">' + notesCell + "</td>" +
+          '<td class="col-meta">' + deskRollPillHtml(a) +
+          (a.isNeverChecked ? "" : (' <span style="color:var(--subtle)">' + escapeHtml(fmtAge(a.daysSinceLastCheck, false)) + "</span>")) +
           "</td>" +
           "</tr>";
       }
@@ -7228,9 +7228,9 @@ function renderYardAppHtml(): string {
       state.deskHistChecks = checks;
       state.deskHistEdits = (d && d.checkEdits) ? d.checkEdits.slice() : [];
       if (!checks.length) {
-        sel.innerHTML = "<option value=\\"\\">No past checks</option>";
+        sel.innerHTML = '<option value="">No past checks</option>';
         sel.disabled = true;
-        if (detailBox) detailBox.innerHTML = "<p style=\\"color:var(--muted);margin:0\\">No check history yet.</p>";
+        if (detailBox) detailBox.innerHTML = '<p style="color:var(--muted);margin:0">No check history yet.</p>';
         if (deskEdit) { deskEdit.disabled = true; deskEdit.removeAttribute("data-edit-check"); }
         return;
       }
@@ -7240,7 +7240,7 @@ function renderYardAppHtml(): string {
         var c = checks[i];
         var loc = (c.location || "").trim() || "\u2014";
         var t = fmtRel(c.checkedAtIso) + " \u00B7 " + loc;
-        opts.push("<option value=\\"" + i + "\\">" + escapeHtml(t) + "</option>");
+        opts.push('<option value="' + i + '">' + escapeHtml(t) + "</option>");
       }
       sel.innerHTML = opts.join("");
       sel.selectedIndex = 0;
@@ -7293,19 +7293,19 @@ function renderYardAppHtml(): string {
         if (wAt0.length) {
           var lines0 = wAt0.map(function(w){
             var rmk = (w.remarks || "").trim();
-            return "<div class=\\"wo-mini\\"><strong>WO " + escapeHtml(String(w.workOrderId)) + "</strong>" +
+            return '<div class="wo-mini"><strong>WO ' + escapeHtml(String(w.workOrderId)) + "</strong>" +
               (w.shop ? " \u00B7 " + escapeHtml(w.shop) : "") +
-              (rmk ? "<div class=\\"wo-rmk\\">" + escapeHtml(rmk) + "</div>" : "") + "</div>";
+              (rmk ? '<div class="wo-rmk">' + escapeHtml(rmk) + "</div>" : "") + "</div>";
           }).join("");
-          eticBlock2 = "<div style=\\"margin-top:10px\\"><strong>ETIC book (when checked)</strong> " + escapeHtml(fmtYardSnapshotKey(sk0)) + "</div>" + lines0;
+          eticBlock2 = '<div style="margin-top:10px"><strong>ETIC book (when checked)</strong> ' + escapeHtml(fmtYardSnapshotKey(sk0)) + "</div>" + lines0;
         } else {
-          eticBlock2 = "<div style=\\"margin-top:10px;color:var(--muted);\\">ETIC snapshot " + escapeHtml(fmtYardSnapshotKey(sk0)) + " had no open work orders for this asset in the book.</div>";
+          eticBlock2 = '<div style="margin-top:10px;color:var(--muted);">ETIC snapshot ' + escapeHtml(fmtYardSnapshotKey(sk0)) + " had no open work orders for this asset in the book.</div>";
         }
       }
       box.innerHTML =
-        "<div class=\\"h-when\\">" + escapeHtml(when) + "</div>" +
+        '<div class="h-when">' + escapeHtml(when) + "</div>" +
         "<div><strong>Location:</strong> " + escapeHtml(loc) + "</div>" +
-        (disc ? "<div style=\\"margin-top:8px;white-space:pre-wrap\\"><strong>Notes:</strong> " + escapeHtml(disc) + "</div>" : "") +
+        (disc ? '<div style="margin-top:8px;white-space:pre-wrap"><strong>Notes:</strong> ' + escapeHtml(disc) + "</div>" : "") +
         photoBlock +
         eticBlock2 +
         (chg || "");
@@ -7318,7 +7318,7 @@ function renderYardAppHtml(): string {
       var sel = document.getElementById("yard-hist-sel");
       var detailBox = document.getElementById("yard-hist-detail");
       if (sel) {
-        sel.innerHTML = "<option value=\\"\\">Loading history\u2026</option>";
+        sel.innerHTML = '<option value="">Loading history\u2026</option>';
         sel.disabled = true;
       }
       if (detailBox) detailBox.textContent = "";
@@ -7341,10 +7341,10 @@ function renderYardAppHtml(): string {
         .catch(function(){
           if (state.deskSelectedId !== assetId) return;
           if (sel) {
-            sel.innerHTML = "<option value=\\"\\">Could not load history</option>";
+            sel.innerHTML = '<option value="">Could not load history</option>';
             sel.disabled = true;
           }
-          if (detailBox) detailBox.innerHTML = "<p style=\\"color:var(--danger);margin:0\\">Could not load history.</p>";
+          if (detailBox) detailBox.innerHTML = '<p style="color:var(--danger);margin:0">Could not load history.</p>';
         });
     }
     function wireYardDesk(){
@@ -13921,12 +13921,67 @@ function renderDashboardHtml(): string {
     }
     /* Commander summary (wing / unit scheduled maintenance compliance) */
     .smx-commander-wrap {
-      margin-bottom: 20px;
-      padding: 16px 18px 18px;
+      margin-bottom: 16px;
+      padding: 10px 14px 12px;
       background: var(--card);
       border: 1px solid var(--border);
       border-radius: 14px;
       box-shadow: 0 1px 0 rgba(15, 30, 60, 0.04);
+    }
+    .smx-commander-details {
+      margin: 0;
+      padding: 0;
+      border: none;
+    }
+    .smx-commander-details > summary {
+      list-style: none;
+      cursor: pointer;
+      margin: 0;
+      padding: 0;
+    }
+    .smx-commander-details > summary::-webkit-details-marker {
+      display: none;
+    }
+    .smx-commander-summary-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px 14px;
+    }
+    .smx-commander-summary-main {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+      flex: 1;
+    }
+    .smx-commander-summary-caret {
+      flex-shrink: 0;
+      width: 0.45em;
+      height: 0.45em;
+      border-right: 2px solid var(--muted);
+      border-bottom: 2px solid var(--muted);
+      transform: rotate(-45deg);
+      margin-top: -0.15em;
+      transition: transform 0.15s ease;
+      opacity: 0.75;
+    }
+    .smx-commander-details[open] .smx-commander-summary-caret {
+      transform: rotate(45deg);
+      margin-top: 0.1em;
+    }
+    .smx-commander-summary-line {
+      font-size: 0.84rem;
+      font-weight: 700;
+      color: var(--text);
+      letter-spacing: -0.01em;
+      line-height: 1.35;
+      min-width: 0;
+    }
+    .smx-commander-body {
+      margin-top: 12px;
+      padding-top: 2px;
     }
     .smx-commander-head {
       display: flex;
@@ -13951,6 +14006,15 @@ function renderDashboardHtml(): string {
       max-width: 720px;
     }
     .smx-commander-actions { flex-shrink: 0; }
+    .smx-commander-actions--mail {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      justify-content: flex-end;
+    }
+    .smx-copy-status { font-size: 0.72rem; color: var(--muted); max-width: 220px; line-height: 1.3; }
+    .smx-cmd-mail-btns { display: flex; flex-direction: column; gap: 4px; align-items: stretch; }
     .smx-btn-outlook {
       display: inline-flex;
       align-items: center;
@@ -14010,9 +14074,10 @@ function renderDashboardHtml(): string {
       color: var(--muted);
     }
     .smx-commander-table-scroll {
-      overflow-x: auto;
+      overflow: auto;
       border-radius: 10px;
       border: 1px solid var(--border);
+      max-height: min(48vh, 420px);
     }
     .smx-commander-table {
       width: 100%;
@@ -14302,6 +14367,9 @@ function renderDashboardHtml(): string {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 6px 8px;
+    }
+    .smx-schedule-metrics {
+      grid-template-columns: repeat(auto-fit, minmax(104px, 1fr));
     }
     @media (max-width: 520px) {
       .smx-util-metrics { grid-template-columns: 1fr; }
@@ -14849,38 +14917,54 @@ function renderDashboardHtml(): string {
 
       <div id="panel-schedule-mx" class="hidden">
         <div id="smx-commander-wrap" class="smx-commander-wrap hidden" aria-label="Wing maintenance status">
-          <div class="smx-commander-head">
-            <div class="smx-commander-titles">
-              <h2 class="smx-commander-title" id="smx-commander-title">Wing maintenance status</h2>
-              <p class="smx-commander-sub" id="smx-commander-sub"></p>
+          <details id="smx-commander-details" class="smx-commander-details">
+            <summary class="smx-commander-summary">
+              <div class="smx-commander-summary-row">
+                <div class="smx-commander-summary-main">
+                  <span class="smx-commander-summary-caret" aria-hidden="true"></span>
+                  <span class="smx-commander-summary-line" id="smx-commander-summary-line"></span>
+                </div>
+                <div class="smx-commander-actions smx-commander-actions--mail">
+                  <button type="button" class="btn smx-btn-outlook" id="smx-commander-mail-wing" title="Opens default mail app with a plain-text summary (use Copy HTML table for a real table in Outlook)">
+                    RTS Outlook — wing summary
+                  </button>
+                  <button type="button" class="btn secondary" id="smx-commander-copy-html-wing" title="Copies an HTML table — paste into Outlook message body (Ctrl+V)">
+                    Copy HTML table
+                  </button>
+                  <span class="smx-copy-status hidden" id="smx-commander-copy-status" role="status"></span>
+                </div>
+              </div>
+            </summary>
+            <div class="smx-commander-body">
+              <div class="smx-commander-head">
+                <div class="smx-commander-titles">
+                  <h2 class="smx-commander-title" id="smx-commander-title">Wing maintenance status</h2>
+                  <p class="smx-commander-sub" id="smx-commander-sub"></p>
+                </div>
+              </div>
+              <div class="smx-commander-kpis" id="smx-commander-kpis"></div>
+              <p class="smx-commander-filter-hint hidden" id="smx-commander-filter-hint">
+                <span id="smx-commander-filter-label"></span>
+                <button type="button" class="linkish" id="smx-commander-clear-unit">Clear unit filter</button>
+              </p>
+              <div class="smx-commander-table-scroll">
+                <table class="smx-commander-table" id="smx-commander-table" aria-label="Scheduled maintenance by unit">
+                  <thead>
+                    <tr>
+                      <th scope="col">Unit</th>
+                      <th scope="col" class="smx-cmd-num">Total</th>
+                      <th scope="col" class="smx-cmd-num">Not overdue</th>
+                      <th scope="col" class="smx-cmd-num">% OK</th>
+                      <th scope="col" class="smx-cmd-num">Overdue</th>
+                      <th scope="col" class="smx-cmd-num">NCE od</th>
+                      <th scope="col" class="smx-cmd-mail-col">RTS</th>
+                    </tr>
+                  </thead>
+                  <tbody id="smx-commander-tbody"></tbody>
+                </table>
+              </div>
             </div>
-            <div class="smx-commander-actions">
-              <button type="button" class="btn smx-btn-outlook" id="smx-commander-mail-wing" title="Open Outlook with a pre-filled commander summary">
-                RTS Outlook — wing summary
-              </button>
-            </div>
-          </div>
-          <div class="smx-commander-kpis" id="smx-commander-kpis"></div>
-          <p class="smx-commander-filter-hint hidden" id="smx-commander-filter-hint">
-            <span id="smx-commander-filter-label"></span>
-            <button type="button" class="linkish" id="smx-commander-clear-unit">Clear unit filter</button>
-          </p>
-          <div class="smx-commander-table-scroll">
-            <table class="smx-commander-table" id="smx-commander-table" aria-label="Scheduled maintenance by unit">
-              <thead>
-                <tr>
-                  <th scope="col">Unit</th>
-                  <th scope="col" class="smx-cmd-num">Total</th>
-                  <th scope="col" class="smx-cmd-num">Not overdue</th>
-                  <th scope="col" class="smx-cmd-num">% OK</th>
-                  <th scope="col" class="smx-cmd-num">Overdue</th>
-                  <th scope="col" class="smx-cmd-num">NCE od</th>
-                  <th scope="col" class="smx-cmd-mail-col">RTS</th>
-                </tr>
-              </thead>
-              <tbody id="smx-commander-tbody"></tbody>
-            </table>
-          </div>
+          </details>
         </div>
         <div class="wo-layout smx-layout">
           <aside class="wo-sidebar">
@@ -16307,27 +16391,19 @@ function renderDashboardHtml(): string {
       if (raw === "abuse-tracker" || raw === "aa-tracker") {
         return { tab: "abuse-tracker", dateKey: null, workOrderId: null, abuseCaseId: null };
       }
+      if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+        return { tab: "snapshot", dateKey: raw, workOrderId: null, abuseCaseId: null };
+      }
+
       const qs = new URLSearchParams(location.search);
       const qTab = String(qs.get("tab") || "").trim().toLowerCase();
-      const isHashDate = /^\d{4}-\d{2}-\d{2}$/.test(raw);
-      const hashDate = isHashDate ? raw : null;
-
-      if (qTab === "waivers") return { tab: "waivers", dateKey: hashDate, workOrderId: null, abuseCaseId: null };
+      if (qTab === "waivers") return { tab: "waivers", dateKey: null, workOrderId: null };
       if (qTab === "yard") {
         let yv = String(qs.get("yard") || qs.get("yv") || "").trim().toLowerCase();
         if (yv === "needs-fix" || yv === "needsfix") yv = "findings";
-        return { tab: "yard", dateKey: hashDate, workOrderId: null, abuseCaseId: null, yardSub: yv || null };
+        return { tab: "yard", dateKey: null, workOrderId: null, abuseCaseId: null, yardSub: yv || null };
       }
-      if (qTab === "smx" || qTab === "schedule-mx" || qTab === "schedule") {
-        return { tab: "smx", dateKey: hashDate, workOrderId: null, abuseCaseId: null };
-      }
-      if (raw === "smx" || raw === "schedule-mx") {
-        return { tab: "smx", dateKey: null, workOrderId: null, abuseCaseId: null };
-      }
-      if (qTab) return { tab: qTab, dateKey: hashDate, workOrderId: null, abuseCaseId: null };
-      if (isHashDate) {
-        return { tab: "snapshot", dateKey: hashDate, workOrderId: null, abuseCaseId: null };
-      }
+      if (qTab) return { tab: qTab, dateKey: null, workOrderId: null, abuseCaseId: null };
       if (!raw) return { tab: "snapshot", dateKey: null, workOrderId: null, abuseCaseId: null };
       return { tab: "snapshot", dateKey: null, workOrderId: null, abuseCaseId: null };
     }
@@ -17988,8 +18064,226 @@ function renderDashboardHtml(): string {
       return "mailto:?subject=" + encodeURIComponent(subject) + "&body=" + encodeURIComponent(body);
     }
 
-    function smxCommanderPlainTableRow(cells) {
-      return cells.join("\t");
+    function smxCmdEmailNarrativeLines() {
+      return [
+        "Good afternoon,",
+        "",
+        "BLUF",
+        "Vehicle Management (VM) has created a biweekly commander scheduled maintenance summary to help communication with users on vehicles and hopefully reduce write ups for units.",
+        "",
+        "DISCUSSION",
+        "VM came up with the below scheduled MX roll up for unit commanders to give oversight of your vehicles. We see this tool being a great communication bridge between our leadership teams. " +
+          "The hope with this is that making the commanders aware will reduce the amount of overdue Preventative Maintenance and Inspections (PM&I's) and special inspections, therefore reducing the write ups on owning units for overdue inspections. " +
+          'According to DAFI 24-302, Vehicle Management, 4.1.8.5. "Owning/using organizations will make vehicles available for PM&I and Special Inspections or make other arrangements with servicing VM prior to due date/time. (T-3)". ' +
+          "The VCO SAC in MICT can help your VCO's better understand their part of the process regarding routine Mx requirements.",
+      ];
+    }
+
+    function smxHtmlTableEsc(s) {
+      return String(s ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    /** Fixed-width ASCII table: Outlook collapses tabs in mailto bodies. */
+    function smxAsciiTableLines(headers, dataRows) {
+      var cols = headers.length;
+      var cap = [26, 7, 7, 7, 7, 6];
+      var widths = [];
+      var c;
+      for (c = 0; c < cols; c++) {
+        var w = String(headers[c]).length;
+        for (var r = 0; r < dataRows.length; r++) {
+          w = Math.max(w, String(dataRows[r][c] ?? "").length);
+        }
+        var mx = cap[c] != null ? cap[c] : 18;
+        widths.push(Math.min(mx, Math.max(3, w)));
+      }
+      function padCell(str, width, right) {
+        var s = String(str ?? "");
+        if (s.length > width) {
+          s = s.slice(0, Math.max(1, width - 1)) + "~";
+        }
+        var pad = width - s.length;
+        return right ? " ".repeat(pad) + s : s + " ".repeat(pad);
+      }
+      function rowLine(values) {
+        var out = "|";
+        for (c = 0; c < cols; c++) {
+          var right = c > 0;
+          out += " " + padCell(values[c], widths[c], right) + " |";
+        }
+        return out;
+      }
+      function sepLine() {
+        var out = "+";
+        for (c = 0; c < cols; c++) {
+          out += "-".repeat(widths[c] + 2) + "+";
+        }
+        return out;
+      }
+      var lines = [];
+      lines.push(sepLine());
+      lines.push(rowLine(headers));
+      lines.push(sepLine());
+      for (var ri = 0; ri < dataRows.length; ri++) {
+        lines.push(rowLine(dataRows[ri]));
+      }
+      lines.push(sepLine());
+      return lines;
+    }
+
+    function smxCommanderAsciiUnitTableLines(units) {
+      var headers = ["Unit", "Total", "Not od", "% OK", "Overdue", "NCE od"];
+      var rows = [];
+      for (var i = 0; i < units.length; i++) {
+        var u = units[i];
+        rows.push([
+          u.unit,
+          String(u.totalVehicles),
+          String(u.notOverdue),
+          smxFmtPct2(u.pctNotOverdue),
+          String(u.overdue),
+          String(u.nceOverdue),
+        ]);
+      }
+      return smxAsciiTableLines(headers, rows);
+    }
+
+    function smxCommanderHtmlUnitsTable(units) {
+      var h =
+        "<table border='1' cellpadding='5' cellspacing='0' style='border-collapse:collapse;font-size:11pt;font-family:Segoe UI,Arial,sans-serif'>" +
+        "<thead><tr>" +
+        "<th align='left'>Unit</th>" +
+        "<th align='right'>Total vehicles</th>" +
+        "<th align='right'>Not overdue</th>" +
+        "<th align='right'>% Not overdue</th>" +
+        "<th align='right'>Overdue</th>" +
+        "<th align='right'>NCE overdue</th>" +
+        "</tr></thead><tbody>";
+      for (var i = 0; i < units.length; i++) {
+        var u = units[i];
+        h +=
+          "<tr><td>" +
+          smxHtmlTableEsc(u.unit) +
+          "</td><td align='right'>" +
+          smxHtmlTableEsc(String(u.totalVehicles)) +
+          "</td><td align='right'>" +
+          smxHtmlTableEsc(String(u.notOverdue)) +
+          "</td><td align='right'>" +
+          smxHtmlTableEsc(smxFmtPct2(u.pctNotOverdue)) +
+          "</td><td align='right'>" +
+          smxHtmlTableEsc(String(u.overdue)) +
+          "</td><td align='right'>" +
+          smxHtmlTableEsc(String(u.nceOverdue)) +
+          "</td></tr>";
+      }
+      return h + "</tbody></table>";
+    }
+
+    function smxCmdNarrativeHtml() {
+      var parts = [];
+      var lines = smxCmdEmailNarrativeLines();
+      for (var i = 0; i < lines.length; i++) {
+        var L = lines[i];
+        if (L === "") {
+          parts.push("<br/>");
+        } else if (L === "BLUF" || L === "DISCUSSION") {
+          parts.push("<p style='margin:12px 0 6px 0'><strong>" + smxHtmlTableEsc(L) + "</strong></p>");
+        } else {
+          parts.push("<p style='margin:0 0 8px 0'>" + smxHtmlTableEsc(L) + "</p>");
+        }
+      }
+      return parts.join("");
+    }
+
+    function smxCommanderEmailHtmlWing(cmd, importKey, eticKey) {
+      var w = cmd.wing;
+      var h =
+        "<html><body style='font-size:11pt;font-family:Segoe UI,Arial,sans-serif;color:#222'>" +
+        "<p><strong>" +
+        smxHtmlTableEsc(smxCommanderReportTitle()) +
+        "</strong></p>" +
+        smxCmdNarrativeHtml() +
+        "<p style='margin:10px 0 4px 0'><strong>Scheduled maintenance import:</strong> " +
+        smxHtmlTableEsc(importKey ? fmtKeyLong(importKey) : "—") +
+        "<br/><strong>Fleet book (ETIC) context:</strong> " +
+        smxHtmlTableEsc(eticKey ? fmtKeyLong(eticKey) : "—") +
+        "</p>" +
+        "<p style='margin:8px 0'><strong>Wing totals</strong> — Total vehicles: " +
+        smxHtmlTableEsc(String(w.totalVehicles)) +
+        " · Not overdue: " +
+        smxHtmlTableEsc(String(w.notOverdue)) +
+        " · % not overdue: " +
+        smxHtmlTableEsc(smxFmtPct2(w.pctNotOverdue)) +
+        "% · Overdue: " +
+        smxHtmlTableEsc(String(w.overdue)) +
+        " · NCE overdue: " +
+        smxHtmlTableEsc(String(w.nceOverdue)) +
+        "</p>" +
+        smxCommanderHtmlUnitsTable(cmd.units || []) +
+        "<p style='margin:14px 0 8px 0'>As always, Vehicle Management Team are available and happy to help!</p>" +
+        "<p style='color:#555;font-size:10pt'>— Sent from ETIC dashboard (Schedule maintenance)</p>" +
+        "</body></html>";
+      return h;
+    }
+
+    function smxCommanderEmailHtmlUnit(row, importKey, eticKey) {
+      var h =
+        "<html><body style='font-size:11pt;font-family:Segoe UI,Arial,sans-serif;color:#222'>" +
+        "<p><strong>" +
+        smxHtmlTableEsc(smxCommanderReportTitle()) +
+        "</strong></p>" +
+        smxCmdNarrativeHtml() +
+        "<p style='margin:10px 0 4px 0'><strong>Scheduled maintenance import:</strong> " +
+        smxHtmlTableEsc(importKey ? fmtKeyLong(importKey) : "—") +
+        "<br/><strong>Fleet book (ETIC) context:</strong> " +
+        smxHtmlTableEsc(eticKey ? fmtKeyLong(eticKey) : "—") +
+        "</p>" +
+        "<p style='margin:8px 0'><strong>Unit:</strong> " +
+        smxHtmlTableEsc(row.unit) +
+        "</p>" +
+        smxCommanderHtmlUnitsTable([row]) +
+        "<p style='margin:14px 0 8px 0'>As always, Vehicle Management Team are available and happy to help!</p>" +
+        "<p style='color:#555;font-size:10pt'>— Sent from ETIC dashboard (Schedule maintenance)</p>" +
+        "</body></html>";
+      return h;
+    }
+
+    function smxFlashCommanderCopyStatus(msg) {
+      var el = document.getElementById("smx-commander-copy-status");
+      if (!el) return;
+      el.textContent = msg;
+      el.classList.remove("hidden");
+      if (el._smxT) clearTimeout(el._smxT);
+      el._smxT = setTimeout(function () {
+        el.classList.add("hidden");
+      }, 3200);
+    }
+
+    function smxCopyCommanderHtml(html, plainFallback) {
+      if (navigator.clipboard && window.ClipboardItem) {
+        return navigator.clipboard
+          .write([
+            new ClipboardItem({
+              "text/html": new Blob([html], { type: "text/html" }),
+              "text/plain": new Blob([plainFallback], { type: "text/plain" }),
+            }),
+          ])
+          .then(function () {
+            return true;
+          })
+          .catch(function () {
+            return navigator.clipboard.writeText(plainFallback).then(function () {
+              return true;
+            });
+          });
+      }
+      return navigator.clipboard.writeText(plainFallback).then(function () {
+        return true;
+      });
     }
 
     function smxCommanderEmailBodyWing(cmd, importKey, eticKey) {
@@ -17997,26 +18291,27 @@ function renderDashboardHtml(): string {
       var lines = [];
       lines.push(smxCommanderReportTitle());
       lines.push("");
+      lines = lines.concat(smxCmdEmailNarrativeLines());
+      lines.push("");
       lines.push("Scheduled maintenance import: " + (importKey ? fmtKeyLong(importKey) : "—"));
       lines.push("Fleet book (ETIC) context: " + (eticKey ? fmtKeyLong(eticKey) : "—"));
       lines.push("");
-      lines.push("Wing totals — Total vehicles: " + w.totalVehicles + " · Not overdue: " + w.notOverdue + " · % not overdue: " + smxFmtPct2(w.pctNotOverdue) + "% · Overdue: " + w.overdue + " · NCE overdue: " + w.nceOverdue);
+      lines.push(
+        "Wing totals — Total vehicles: " +
+          w.totalVehicles +
+          " · Not overdue: " +
+          w.notOverdue +
+          " · % not overdue: " +
+          smxFmtPct2(w.pctNotOverdue) +
+          "% · Overdue: " +
+          w.overdue +
+          " · NCE overdue: " +
+          w.nceOverdue,
+      );
+      lines.push("By unit (fixed-width table — mailto cannot send HTML):");
+      lines = lines.concat(smxCommanderAsciiUnitTableLines(cmd.units || []));
       lines.push("");
-      lines.push(smxCommanderPlainTableRow(["Unit", "Total vehicles", "Not overdue", "% Not overdue", "Overdue", "NCE overdue"]));
-      var units = cmd.units || [];
-      for (var i = 0; i < units.length; i++) {
-        var u = units[i];
-        lines.push(
-          smxCommanderPlainTableRow([
-            u.unit,
-            String(u.totalVehicles),
-            String(u.notOverdue),
-            smxFmtPct2(u.pctNotOverdue),
-            String(u.overdue),
-            String(u.nceOverdue),
-          ]),
-        );
-      }
+      lines.push("As always, Vehicle Management Team are available and happy to help!");
       lines.push("");
       lines.push("— Sent from ETIC dashboard (Schedule maintenance)");
       return lines.join("\\r\\n");
@@ -18026,22 +18321,16 @@ function renderDashboardHtml(): string {
       var lines = [];
       lines.push(smxCommanderReportTitle());
       lines.push("");
+      lines = lines.concat(smxCmdEmailNarrativeLines());
+      lines.push("");
       lines.push("Scheduled maintenance import: " + (importKey ? fmtKeyLong(importKey) : "—"));
       lines.push("Fleet book (ETIC) context: " + (eticKey ? fmtKeyLong(eticKey) : "—"));
       lines.push("");
       lines.push("Unit: " + row.unit);
       lines.push("");
-      lines.push(smxCommanderPlainTableRow(["Unit", "Total vehicles", "Not overdue", "% Not overdue", "Overdue", "NCE overdue"]));
-      lines.push(
-        smxCommanderPlainTableRow([
-          row.unit,
-          String(row.totalVehicles),
-          String(row.notOverdue),
-          smxFmtPct2(row.pctNotOverdue),
-          String(row.overdue),
-          String(row.nceOverdue),
-        ]),
-      );
+      lines = lines.concat(smxCommanderAsciiUnitTableLines([row]));
+      lines.push("");
+      lines.push("As always, Vehicle Management Team are available and happy to help!");
       lines.push("");
       lines.push("— Sent from ETIC dashboard (Schedule maintenance)");
       return lines.join("\\r\\n");
@@ -18054,6 +18343,8 @@ function renderDashboardHtml(): string {
       var tbody = document.getElementById("smx-commander-tbody");
       var hint = document.getElementById("smx-commander-filter-hint");
       var hintLbl = document.getElementById("smx-commander-filter-label");
+      var sumLine = document.getElementById("smx-commander-summary-line");
+      var detEl = document.getElementById("smx-commander-details");
       if (!wrap || !kpis || !tbody) return;
       if (!smxCommander || !smxRows.length) {
         wrap.classList.add("hidden");
@@ -18071,6 +18362,18 @@ function renderDashboardHtml(): string {
           ".";
       }
       var w = smxCommander.wing;
+      if (sumLine) {
+        var sumBits = [
+          "Wing rollup",
+          String(w.totalVehicles) + " vehicles",
+          smxFmtPct2(w.pctNotOverdue) + "% OK",
+          String(w.overdue) + " overdue",
+        ];
+        if (w.nceOverdue > 0) sumBits.push(String(w.nceOverdue) + " NCE od");
+        if (smxCommanderFilterUnit) sumBits.push("list: " + smxCommanderFilterUnit);
+        sumLine.textContent = sumBits.join(" · ") + " — expand for units";
+      }
+      if (detEl && smxCommanderFilterUnit) detEl.open = true;
       kpis.innerHTML =
         "<div class='smx-cmd-kpi'><span class='lbl'>Total vehicles</span><span class='v'>" +
         esc(String(w.totalVehicles)) +
@@ -18132,9 +18435,13 @@ function renderDashboardHtml(): string {
             "<td class='smx-cmd-num'>" +
             esc(String(u.nceOverdue)) +
             "</td>" +
-            "<td class='smx-cmd-mail-col'><button type='button' class='btn smx-btn-outlook smx-btn-outlook--sm smx-cmd-mail-unit' data-smx-mail-unit='" +
+            "<td class='smx-cmd-mail-col'><div class='smx-cmd-mail-btns'>" +
+            "<button type='button' class='btn smx-btn-outlook smx-btn-outlook--sm smx-cmd-mail-unit' data-smx-mail-unit='" +
             esc(u.unit) +
-            "'>RTS Outlook</button></td>" +
+            "' title='Plain-text mailto (use Copy HTML for a table)'>RTS Outlook</button>" +
+            "<button type='button' class='btn secondary smx-cmd-copy-html-unit' data-smx-copy-html-unit='" +
+            esc(u.unit) +
+            "' title='Copy HTML table for this unit'>Copy HTML</button></div></td>" +
             "</tr>"
           );
         })
@@ -18150,8 +18457,14 @@ function renderDashboardHtml(): string {
       }
     }
 
+    function smxRowOwningUnitDisplay(row) {
+      var aid = row && row.assetId ? String(row.assetId).trim() : "";
+      if (aid.toUpperCase().indexOf("MSX") === 0) return "791 MXS";
+      return row && row.owningUnit ? String(row.owningUnit).trim() : "";
+    }
+
     function smxNormUnitFromRow(row) {
-      var u = (row && row.owningUnit ? String(row.owningUnit) : "").trim();
+      var u = smxRowOwningUnitDisplay(row);
       return u || "(Unknown unit)";
     }
 
@@ -18386,38 +18699,6 @@ function renderDashboardHtml(): string {
     }
 
     function smxFactsHtmlForPlan(row) {
-      const eff = smxEffBucket(row);
-      const rawB = row.scheduleMxBucket || "";
-      const sched = [];
-      sched.push({ dt: "Source status", dd: esc(row.scheduleMxStatus || "—") });
-      sched.push({
-        dt: "Health (for triage)",
-        dd:
-          "<span class='smx-pill " + esc(eff) + "'>" +
-          esc(smxPillLabel(eff)) +
-          "</span>" +
-          (row.scheduleMxSuppressedByOpenWo && rawB !== eff
-            ? " <span class='facts-sub'>(Was " + esc(smxPillLabel(rawB)) + " — waived: open WO / in shop)</span>"
-            : ""),
-      });
-      const lastM = row.elmsLastMaintDateIso ? fmtKeyShort(row.elmsLastMaintDateIso) : "—";
-      const nextM = row.elmsNextMaintDateIso ? fmtKeyShort(row.elmsNextMaintDateIso) : "—";
-      sched.push({ dt: "Last maint", dd: esc(lastM) });
-      sched.push({ dt: "Next maint", dd: esc(nextM) });
-      if (row.location && String(row.location).trim()) {
-        sched.push({ dt: "Location", dd: esc(String(row.location).trim()) });
-      }
-      if (row.scheduleMxDueIso && row.scheduleMxDueIso !== row.elmsNextMaintDateIso) {
-        sched.push({ dt: "Computed due", dd: esc(fmtKeyShort(row.scheduleMxDueIso)) });
-      }
-      if (row.scheduleMxOverdueByDays != null) {
-        sched.push({ dt: "Overdue by", dd: esc(String(row.scheduleMxOverdueByDays) + " days") });
-      }
-      if (row.scheduleMxDaysUntil != null && eff === "due_soon") {
-        sched.push({ dt: "Days until due", dd: esc(String(row.scheduleMxDaysUntil)) });
-      }
-      var plainCal = smxPlainDateLine(row);
-      if (plainCal) sched.push({ dt: "Calendar (plain language)", dd: esc(plainCal) });
       const plan = [];
       if (row.planDesc) plan.push({ dt: "What this plan is", dd: esc(row.planDesc) });
       function factPair(x) {
@@ -18432,11 +18713,7 @@ function renderDashboardHtml(): string {
           "</section>"
         );
       }
-      return (
-        factGroup("Schedule", sched) +
-        smxPlainUtilBlock(row) +
-        factGroup("This maintenance plan", plan)
-      );
+      return smxPlainScheduleBlock(row) + smxPlainUtilBlock(row) + factGroup("This maintenance plan", plan);
     }
 
     function renderSmxPlansWrap(plans) {
@@ -18714,7 +18991,7 @@ function renderDashboardHtml(): string {
         (row.location || "").toLowerCase().indexOf(ql) !== -1 ||
         (row.mgmtCd || "").toLowerCase().indexOf(ql) !== -1 ||
         (row.makeModel || "").toLowerCase().indexOf(ql) !== -1 ||
-        (row.owningUnit || "").toLowerCase().indexOf(ql) !== -1 ||
+        smxRowOwningUnitDisplay(row).toLowerCase().indexOf(ql) !== -1 ||
         (row.vehNomen || "").toLowerCase().indexOf(ql) !== -1 ||
         (row.eticOpenWorkOrderIds || "").toLowerCase().indexOf(ql) !== -1 ||
         (row.scheduleMxStatus || "").toLowerCase().indexOf(ql) !== -1
@@ -18761,27 +19038,200 @@ function renderDashboardHtml(): string {
     /** Human label for utilization type (avoid generic "units"). */
     function smxUtilUomLabel(utRaw) {
       const s = String(utRaw || "").toLowerCase().replace(/\s+/g, " ").trim();
-      if (!s) return "";
-      if (/\bmile|\bmi\b|mph/.test(s)) return "miles";
-      if (/\bhour|\bhr\b|hrs|operating hour/.test(s)) return "hours";
+      if (!s) return "miles";
+      if (/\bmile|\bmi\b|mph|odometer/.test(s)) return "miles";
+      if (/\bhour|\bhr\b|hrs|operating hour|engine hour/.test(s)) return "hours";
       if (/\bkm\b|kilometer|kilomet/.test(s)) return "km";
-      return s;
+      if (s.length <= 14) return s;
+      return "miles";
+    }
+
+    /** True when today is after next calendar maint date (independent of meter / open-WO triage). */
+    function smxCalendarPastNextMaintDate(row) {
+      var nextIso = row.elmsNextMaintDateIso;
+      if (!nextIso) return false;
+      var t1 = Date.parse(String(nextIso).slice(0, 10) + "T12:00:00.000Z");
+      if (!Number.isFinite(t1)) return false;
+      return Date.now() > t1;
+    }
+
+    /** Whole days since next calendar date (minimum 1 when past). */
+    function smxCalendarDaysPastNextMaint(row) {
+      var nextIso = row.elmsNextMaintDateIso;
+      if (!nextIso) return null;
+      var t1 = Date.parse(String(nextIso).slice(0, 10) + "T12:00:00.000Z");
+      if (!Number.isFinite(t1)) return null;
+      var now = Date.now();
+      if (now <= t1) return null;
+      return Math.max(1, Math.ceil((now - t1) / 86400000));
+    }
+
+    function smxPlainDateLine(row) {
+      const eff = smxEffBucket(row);
+      if (eff === "missing") {
+        return "";
+      }
+      const nextM = row.elmsNextMaintDateIso ? fmtKeyShort(row.elmsNextMaintDateIso) : "";
+      if (!nextM) {
+        if (eff === "ok" || eff === "no_due") {
+          return "";
+        }
+        return "";
+      }
+      const calPast = smxCalendarPastNextMaintDate(row);
+      const calDays = smxCalendarDaysPastNextMaint(row);
+      if (calPast) {
+        const d =
+          row.scheduleMxOverdueByDays != null
+            ? row.scheduleMxOverdueByDays + " day" + (row.scheduleMxOverdueByDays === 1 ? "" : "s")
+            : calDays != null
+              ? calDays + " day" + (calDays === 1 ? "" : "s")
+              : "some time";
+        var line = "Next calendar service date was " + nextM + " (" + d + " past that date).";
+        if (eff === "ok" && row.scheduleMxSuppressedByOpenWo) {
+          line +=
+            " Fleet status shows the vehicle in maintenance — triage may show OK while the calendar date is past.";
+        }
+        return line;
+      }
+      if (eff === "due_soon" && row.scheduleMxDaysUntil != null) {
+        return "Next calendar service date is " + nextM + " (about " + row.scheduleMxDaysUntil + " day" + (row.scheduleMxDaysUntil === 1 ? "" : "s") + " away).";
+      }
+      if (eff === "ok" || eff === "no_due") {
+        if (calPast) {
+          return "";
+        }
+        return "Next calendar service date: " + nextM + ".";
+      }
+      return "";
+    }
+
+    function smxRowHasCalendarContent(row) {
+      var eff = smxEffBucket(row);
+      if (row.elmsLastMaintDateIso || row.elmsNextMaintDateIso || row.scheduleMxDueIso) return true;
+      if (row.scheduleMxOverdueByDays != null) return true;
+      if (row.scheduleMxDaysUntil != null && eff === "due_soon") return true;
+      return !!smxPlainDateLine(row);
+    }
+
+    function smxRowHasUtilMeterContent(row) {
+      return row.elmsCurrentMeter != null && row.elmsNextUtilQty != null;
+    }
+
+    /** Calendar section: same boxed metric + progress pattern as service meter. */
+    function smxPlainScheduleBlock(row) {
+      if (!smxRowHasCalendarContent(row)) return "";
+      const eff = smxEffBucket(row);
+      var srcRaw = row.scheduleMxStatus || "—";
+      var calPast = smxCalendarPastNextMaintDate(row);
+      var src = srcRaw;
+      if (calPast && /current/i.test(String(srcRaw))) {
+        src = "Past next calendar date (see note below)";
+      }
+      const lastM = row.elmsLastMaintDateIso ? fmtKeyShort(row.elmsLastMaintDateIso) : "—";
+      const nextM = row.elmsNextMaintDateIso ? fmtKeyShort(row.elmsNextMaintDateIso) : "—";
+      var metrics =
+        "<div class='smx-util-metrics smx-schedule-metrics'>" +
+        "<div class='smx-util-metric'><span class='smx-util-m-lbl'>Extract calendar status</span><span class='smx-util-m-val'>" +
+        esc(src) +
+        "</span></div>" +
+        "<div class='smx-util-metric'><span class='smx-util-m-lbl'>Last maint</span><span class='smx-util-m-val'>" +
+        esc(lastM) +
+        "</span></div>" +
+        "<div class='smx-util-metric'><span class='smx-util-m-lbl'>Next maint</span><span class='smx-util-m-val'>" +
+        esc(nextM) +
+        "</span></div>";
+      if (row.scheduleMxDueIso && row.scheduleMxDueIso !== row.elmsNextMaintDateIso) {
+        metrics +=
+          "<div class='smx-util-metric'><span class='smx-util-m-lbl'>Computed due</span><span class='smx-util-m-val'>" +
+          esc(fmtKeyShort(row.scheduleMxDueIso)) +
+          "</span></div>";
+      }
+      if (row.scheduleMxOverdueByDays != null) {
+        metrics +=
+          "<div class='smx-util-metric'><span class='smx-util-m-lbl'>Overdue by</span><span class='smx-util-m-val'>" +
+          esc(String(row.scheduleMxOverdueByDays) + " days") +
+          "</span></div>";
+      } else if (calPast) {
+        var calOd = smxCalendarDaysPastNextMaint(row);
+        if (calOd != null) {
+          metrics +=
+            "<div class='smx-util-metric'><span class='smx-util-m-lbl'>Calendar date passed</span><span class='smx-util-m-val'>" +
+            esc(String(calOd) + " day" + (calOd === 1 ? "" : "s") + " ago") +
+            "</span></div>";
+        }
+      } else if (row.scheduleMxDaysUntil != null && eff === "due_soon") {
+        metrics +=
+          "<div class='smx-util-metric'><span class='smx-util-m-lbl'>Days until due</span><span class='smx-util-m-val'>" +
+          esc(String(row.scheduleMxDaysUntil)) +
+          "</span></div>";
+      }
+      metrics += "</div>";
+      var lastIso = row.elmsLastMaintDateIso;
+      var nextIso = row.elmsNextMaintDateIso;
+      var barW = 0;
+      var barCls = "";
+      var showDateBar = false;
+      var lead = smxPlainDateLine(row);
+      if (lastIso && nextIso) {
+        var t0 = Date.parse(String(lastIso).slice(0, 10) + "T12:00:00.000Z");
+        var t1 = Date.parse(String(nextIso).slice(0, 10) + "T12:00:00.000Z");
+        var now = Date.now();
+        if (Number.isFinite(t0) && Number.isFinite(t1) && t1 > t0) {
+          showDateBar = true;
+          var frac = (now - t0) / (t1 - t0);
+          if (eff === "overdue" || calPast) {
+            barW = 100;
+            barCls = "danger";
+          } else {
+            barW = Math.max(now > t0 && frac * 100 < 2 ? 2 : 0, Math.min(100, Math.round(frac * 100)));
+            if (frac >= 1) barCls = "danger";
+            else if (frac >= 0.92) barCls = "warn";
+          }
+        }
+      }
+      var leadCls =
+        "smx-plain-lead" +
+        (eff === "overdue" || (calPast && row.scheduleMxBucket === "overdue") ? " smx-plain-lead--warn" : "");
+      if (calPast && eff !== "overdue") {
+        leadCls += " smx-plain-lead--warn";
+      }
+      var calloutCls =
+        "smx-plain-callout smx-plain-callout--compact" +
+        (eff === "overdue" || (calPast && row.scheduleMxBucket === "overdue") ? " smx-plain-callout--warn" : "");
+      if (calPast && eff !== "overdue") {
+        calloutCls += " smx-plain-callout--warn";
+      }
+      return (
+        "<section class='wo-facts-group smx-util-section' aria-label='Calendar schedule'>" +
+        "<h4 class='wo-facts-group-h'>Calendar</h4>" +
+        "<div class='" +
+        esc(calloutCls) +
+        "' role='status'>" +
+        metrics +
+        (showDateBar
+          ? "<div class='smx-util-progress-wrap'>" +
+            "<div class='smx-util-progress-label'>Calendar interval (last service date to next)</div>" +
+            "<div class='smx-util-progress " +
+            esc(barCls) +
+            "'><i style='width:" +
+            barW +
+            "%'></i></div></div>"
+          : "") +
+        (lead
+          ? "<p class='" + esc(leadCls) + "'>" + esc(lead) + "</p>"
+          : "") +
+        "</div></section>"
+      );
     }
 
     /** Compact service-meter card: metrics + thin progress + one short line. */
     function smxPlainUtilBlock(row) {
+      if (!smxRowHasUtilMeterContent(row)) return "";
       const uom = smxUtilUomLabel(row.elmsUtilType);
       const cur = row.elmsCurrentMeter;
       const nxt = row.elmsNextUtilQty;
-      const uSuffix = uom ? " " + uom : "";
-      if (cur == null || nxt == null) {
-        return (
-          "<section class='wo-facts-group smx-util-section' aria-label='Service meter'>" +
-          "<h4 class='wo-facts-group-h'>Service meter</h4>" +
-          "<div class='smx-plain-callout smx-plain-callout--compact' role='status'>No current reading and next target on this row.</div>" +
-          "</section>"
-        );
-      }
+      const uSuffix = " " + uom;
       const rem = row.scheduleMxUtilRemaining != null ? row.scheduleMxUtilRemaining : nxt - cur;
       const overUtil = row.scheduleMxOverdueUtil || rem < 0;
       const safeNxt = Math.max(1, nxt);
@@ -18792,7 +19242,7 @@ function renderDashboardHtml(): string {
       const curS = smxFmtNum(cur) + uSuffix;
       const nxtS = smxFmtNum(nxt) + uSuffix;
       const remS =
-        rem >= 0 ? smxFmtNum(rem) + uSuffix + " left" : smxFmtNum(Math.abs(rem)) + uSuffix + " over";
+        rem >= 0 ? smxFmtNum(rem) + " " + uom + " left" : smxFmtNum(Math.abs(rem)) + " " + uom + " over";
       var lead = "";
       var leadCls = "smx-plain-lead";
       if (overUtil) {
@@ -18825,7 +19275,7 @@ function renderDashboardHtml(): string {
         "</span></div>" +
         "</div>" +
         "<div class='smx-util-progress-wrap'>" +
-        "<div class='smx-util-progress-label'>Progress</div>" +
+        "<div class='smx-util-progress-label'>Meter interval (current reading to next target)</div>" +
         "<div class='smx-util-progress " +
         esc(barCls) +
         "' title='" +
@@ -18870,7 +19320,7 @@ function renderDashboardHtml(): string {
       const p0 = plans && plans[0];
       if (!p0) return "";
       const pairs = [];
-      pairs.push({ lbl: "Unit", val: p0.owningUnit ? esc(p0.owningUnit) : "—" });
+      pairs.push({ lbl: "Unit", val: smxRowOwningUnitDisplay(p0) ? esc(smxRowOwningUnitDisplay(p0)) : "—" });
       pairs.push({ lbl: "Make / model", val: p0.makeModel ? esc(p0.makeModel) : "—" });
       pairs.push({ lbl: "Vehicle type", val: p0.vehNomen ? esc(p0.vehNomen) : "—" });
       pairs.push({ lbl: "Mgmt code", val: p0.mgmtCd ? esc(p0.mgmtCd) : "—" });
@@ -18911,34 +19361,6 @@ function renderDashboardHtml(): string {
           .join("") +
         "</div>"
       );
-    }
-
-    function smxPlainDateLine(row) {
-      const eff = smxEffBucket(row);
-      if (eff === "missing") {
-        return "Not enough schedule data on this plan.";
-      }
-      const nextM = row.elmsNextMaintDateIso ? fmtKeyShort(row.elmsNextMaintDateIso) : "";
-      if (!nextM) {
-        if (eff === "ok" || eff === "no_due") {
-          if (row.elmsNextUtilQty != null) {
-            return "This plan is tracked by the service meter, not a calendar date. See the meter section below.";
-          }
-          return "No next calendar service date on this plan.";
-        }
-        return "";
-      }
-      if (eff === "overdue") {
-        const d = row.scheduleMxOverdueByDays != null ? row.scheduleMxOverdueByDays + " day" + (row.scheduleMxOverdueByDays === 1 ? "" : "s") : "some time";
-        return "Next calendar service date was " + nextM + " (" + d + " past that date).";
-      }
-      if (eff === "due_soon" && row.scheduleMxDaysUntil != null) {
-        return "Next calendar service date is " + nextM + " (about " + row.scheduleMxDaysUntil + " day" + (row.scheduleMxDaysUntil === 1 ? "" : "s") + " away).";
-      }
-      if (eff === "ok" || eff === "no_due") {
-        return "Next calendar service date: " + nextM + ".";
-      }
-      return "";
     }
 
     function renderScheduleMxList() {
@@ -20214,31 +20636,6 @@ function renderDashboardHtml(): string {
         }
         return;
       }
-      if (r.tab === "wo") {
-        setMainTab("wo");
-        if (selectedDate) await loadAndRenderWoList(selectedDate);
-        return;
-      }
-      if (r.tab === "smx") {
-        setMainTab("smx");
-        return;
-      }
-      if (r.tab === "mel") {
-        setMainTab("mel");
-        return;
-      }
-      if (r.tab === "meeting") {
-        setMainTab("meeting");
-        return;
-      }
-      if (r.tab === "ask") {
-        setMainTab("ask");
-        return;
-      }
-      if (r.tab === "settings") {
-        setMainTab("settings");
-        return;
-      }
       setMainTab("snapshot");
       if (r.dateKey && historyEntries.some((e) => e.dateKey === r.dateKey)) {
         await selectDate(r.dateKey, false);
@@ -20775,7 +21172,7 @@ function renderDashboardHtml(): string {
       const sorted = activeHistoryDesc();
       const route = readHashRoute();
       const start =
-        route.dateKey && sorted.some((e) => e.dateKey === route.dateKey)
+        route.tab === "snapshot" && route.dateKey && sorted.some((e) => e.dateKey === route.dateKey)
           ? route.dateKey
           : sorted[0].dateKey;
       selectedDate = start;
@@ -21027,13 +21424,35 @@ function renderDashboardHtml(): string {
       const smxMailWing = document.getElementById("smx-commander-mail-wing");
       if (smxMailWing && !smxMailWing.dataset.wired) {
         smxMailWing.dataset.wired = "1";
-        smxMailWing.addEventListener("click", function () {
+        smxMailWing.addEventListener("click", function (ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
           if (!smxCommander) return;
           var dk = smxSelectedDateKey || "";
           var ek = smxEticDateKey || "";
           var subj = smxCommanderReportTitle();
           var body = smxCommanderEmailBodyWing(smxCommander, dk, ek);
           window.location.href = smxMailtoUrl(subj, body);
+        });
+      }
+      const smxCopyWingHtml = document.getElementById("smx-commander-copy-html-wing");
+      if (smxCopyWingHtml && !smxCopyWingHtml.dataset.wired) {
+        smxCopyWingHtml.dataset.wired = "1";
+        smxCopyWingHtml.addEventListener("click", function (ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          if (!smxCommander) return;
+          var dk = smxSelectedDateKey || "";
+          var ek = smxEticDateKey || "";
+          var html = smxCommanderEmailHtmlWing(smxCommander, dk, ek);
+          var plain = smxCommanderEmailBodyWing(smxCommander, dk, ek);
+          smxCopyCommanderHtml(html, plain)
+            .then(function () {
+              smxFlashCommanderCopyStatus("Copied HTML. In Outlook, click in the message body and paste (Ctrl+V) for a real table.");
+            })
+            .catch(function () {
+              smxFlashCommanderCopyStatus("Copy failed — check browser permission or use RTS Outlook for plain text.");
+            });
         });
       }
       const smxClearCmdUnit = document.getElementById("smx-commander-clear-unit");
@@ -21078,6 +21497,34 @@ function renderDashboardHtml(): string {
             var subj2 = smxCommanderReportTitle() + " — " + unit;
             var body2 = smxCommanderEmailBodyUnit(row, dk2, ek2);
             window.location.href = smxMailtoUrl(subj2, body2);
+            return;
+          }
+          var copyHtmlBtn = ev.target.closest(".smx-cmd-copy-html-unit");
+          if (copyHtmlBtn) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            if (!smxCommander) return;
+            var unitC = (copyHtmlBtn.getAttribute("data-smx-copy-html-unit") || "").trim();
+            var rowsC = smxCommander.units || [];
+            var rowC = null;
+            for (var ci = 0; ci < rowsC.length; ci++) {
+              if (rowsC[ci].unit === unitC) {
+                rowC = rowsC[ci];
+                break;
+              }
+            }
+            if (!rowC) return;
+            var dk3 = smxSelectedDateKey || "";
+            var ek3 = smxEticDateKey || "";
+            var htmlC = smxCommanderEmailHtmlUnit(rowC, dk3, ek3);
+            var plainC = smxCommanderEmailBodyUnit(rowC, dk3, ek3);
+            smxCopyCommanderHtml(htmlC, plainC)
+              .then(function () {
+                smxFlashCommanderCopyStatus("Copied HTML for " + unitC + ". Paste into Outlook (Ctrl+V).");
+              })
+              .catch(function () {
+                smxFlashCommanderCopyStatus("Copy failed — try RTS Outlook for this unit.");
+              });
           }
         });
       }
