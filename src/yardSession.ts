@@ -356,6 +356,33 @@ function detectNce(raw: Record<string, unknown>): boolean {
   return false;
 }
 
+/** NCE flag + a display string from stored Fleet P&A or WO snapshot `raw_row_json`. */
+export function nceInfoFromSnapshotRawJson(rawRowJson: string | null): { nce: boolean; nceStatus: string } {
+  if (!rawRowJson) return { nce: false, nceStatus: "" };
+  try {
+    const raw = JSON.parse(rawRowJson) as Record<string, unknown>;
+    if (!detectNce(raw)) return { nce: false, nceStatus: "" };
+    let nceStatus = "";
+    for (const [k, v] of Object.entries(raw)) {
+      const kl = k.toLowerCase();
+      if (
+        EXACT_NCE_KEYS.has(kl) ||
+        /(^|[^a-z])nce([^a-z]|$)/i.test(kl) ||
+        /(^|[^a-z])nuclear([^a-z]|$)/i.test(kl)
+      ) {
+        const s = String(v ?? "").trim();
+        if (s) {
+          nceStatus = s;
+          break;
+        }
+      }
+    }
+    return { nce: true, nceStatus };
+  } catch {
+    return { nce: false, nceStatus: "" };
+  }
+}
+
 type YardRosterSourceRow = {
   asset_id: string;
   owning_unit: string | null;

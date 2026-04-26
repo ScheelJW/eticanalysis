@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { getRollingRoster, getYardRosterForDate, listOpenFindings, recordCheck } from "../src/yardSession";
+import {
+  getRollingRoster,
+  getYardRosterForDate,
+  listOpenFindings,
+  nceInfoFromSnapshotRawJson,
+  recordCheck,
+} from "../src/yardSession";
 
 type Row = Record<string, unknown>;
 
@@ -251,6 +257,13 @@ describe("Yard roster", () => {
     const env = { ETIC_SNAPSHOTS: db, ETIC_BUCKET: {} };
     const result = await listOpenFindings(env as never);
     expect(result.findings.some((f) => f.kind === "unlisted" && f.assetId === "AF123")).toBe(false);
+  });
+
+  it("nceInfoFromSnapshotRawJson reads Fleet P&A style NCE columns", () => {
+    const raw = JSON.stringify({ "fleet.nce vehicle listing.status": "No" });
+    expect(nceInfoFromSnapshotRawJson(raw)).toEqual({ nce: false, nceStatus: "" });
+    const rawY = JSON.stringify({ "fleet.nce vehicle listing.status": "Yes" });
+    expect(nceInfoFromSnapshotRawJson(rawY)).toEqual({ nce: true, nceStatus: "Yes" });
   });
 
   it("does not flag unlisted when snapshot JSON is empty but source_date_key WO count > 0", async () => {

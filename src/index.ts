@@ -14584,7 +14584,7 @@ function renderDashboardHtml(): string {
           <aside class="wo-sidebar">
             <div class="smx-panel-heading">
               <h2 class="smx-panel-title">Schedule maintenance</h2>
-              <p class="smx-panel-hint">Pick an <strong>asset</strong>; plans come from the ELMS extract (email <code>prevmx@2t3.app</code>). <strong>Unit, type, NCE, and open work orders</strong> come from the <strong>latest ETIC</strong> workbook. Vehicles with an open WO (or in-shop parts status) are not counted overdue for sched mx until sub-WO / plan linkage exists.</p>
+              <p class="smx-panel-hint">Pick an <strong>asset</strong>; plans come from the ELMS extract (email <code>prevmx@2t3.app</code>). <strong>Unit, make/model, vehicle type, mgmt code, and NCE</strong> come from the <strong>Fleet P&amp;A</strong> sheet on the latest ETIC workbook; <strong>open work orders</strong> come from <strong>WO Inquiry</strong> on that same day. Vehicles with an open WO (or in-shop parts status) are not counted overdue for sched mx until sub-WO / plan linkage exists.</p>
             </div>
             <label class="smx-date-field">
               <span class="sr-only">Import date</span>
@@ -17869,7 +17869,7 @@ function renderDashboardHtml(): string {
       else if (locs.length > 1) metaParts.push(locs.length + " locations");
       if (mgmts.length === 1) metaParts.push("Mgmt " + esc(mgmts[0]));
       else if (mgmts.length > 1) metaParts.push(mgmts.length + " mgmt codes");
-      if (wo) metaParts.push(wo + " open WO" + (wo === 1 ? "" : "s") + " (latest ETIC)");
+      if (wo) metaParts.push(wo + " open WO" + (wo === 1 ? "" : "s") + " (WO Inquiry)");
       if (p0 && p0.eticOpenInMaintenance) metaParts.push("In maintenance (parts)");
       el.innerHTML =
         "<div class='wo-hero-row'>" +
@@ -17877,6 +17877,7 @@ function renderDashboardHtml(): string {
         chips.join("") +
         "</div>" +
         smxAssetLaymanSummary(plans) +
+        smxAssetIdentityStripFromPlans(plans) +
         "<div class='wo-hero-sub wo-hero-sub-primary'>" +
         renderSightingBadge(assetId) +
         " " +
@@ -17906,6 +17907,9 @@ function renderDashboardHtml(): string {
       const nextM = row.elmsNextMaintDateIso ? fmtKeyShort(row.elmsNextMaintDateIso) : "—";
       sched.push({ dt: "Last maint (ELMS)", dd: esc(lastM) });
       sched.push({ dt: "Next maint (ELMS)", dd: esc(nextM) });
+      if (row.location && String(row.location).trim()) {
+        sched.push({ dt: "Location (ELMS plan)", dd: esc(String(row.location).trim()) });
+      }
       if (row.scheduleMxDueIso && row.scheduleMxDueIso !== row.elmsNextMaintDateIso) {
         sched.push({ dt: "Computed due", dd: esc(fmtKeyShort(row.scheduleMxDueIso)) });
       }
@@ -17958,7 +17962,6 @@ function renderDashboardHtml(): string {
         );
       }
       return (
-        smxPlanIdentityStrip(row) +
         factGroup("Schedule", sched) +
         smxPlainUtilBlock(row) +
         factGroup("Utilization (ELMS raw)", util) +
@@ -18367,38 +18370,37 @@ function renderDashboardHtml(): string {
       );
     }
 
-    function smxPlanIdentityStrip(row) {
+    function smxAssetIdentityStripFromPlans(plans) {
+      const p0 = plans && plans[0];
+      if (!p0) return "";
       const pairs = [];
-      pairs.push({ lbl: "Unit", val: row.owningUnit ? esc(row.owningUnit) : "—" });
-      pairs.push({ lbl: "Make / model", val: row.makeModel ? esc(row.makeModel) : "—" });
-      pairs.push({ lbl: "Vehicle type", val: row.vehNomen ? esc(row.vehNomen) : "—" });
-      pairs.push({ lbl: "Mgmt code", val: row.mgmtCd ? esc(row.mgmtCd) : "—" });
-      if (row.nce) {
+      pairs.push({ lbl: "Unit (Fleet P&A)", val: p0.owningUnit ? esc(p0.owningUnit) : "—" });
+      pairs.push({ lbl: "Make / model (Fleet P&A)", val: p0.makeModel ? esc(p0.makeModel) : "—" });
+      pairs.push({ lbl: "Vehicle type (Fleet P&A)", val: p0.vehNomen ? esc(p0.vehNomen) : "—" });
+      pairs.push({ lbl: "Mgmt code (Fleet P&A)", val: p0.mgmtCd ? esc(p0.mgmtCd) : "—" });
+      if (p0.nce) {
         pairs.push({
           lbl: "NCE",
           val:
             "<span class='nce-badge'>Yes</span>" +
-            (row.nceStatus ? " <span class='facts-sub'>" + esc(row.nceStatus) + "</span>" : ""),
+            (p0.nceStatus ? " <span class='facts-sub'>" + esc(p0.nceStatus) + "</span>" : ""),
         });
       } else {
         pairs.push({ lbl: "NCE", val: "No" });
       }
       pairs.push({
-        lbl: "Open WOs (latest ETIC)",
+        lbl: "Open WOs (WO Inquiry)",
         val:
-          esc(String(row.workOrderCount ?? 0)) +
-          (row.eticOpenWorkOrderIds
-            ? " <span class='facts-sub'>" + esc(row.eticOpenWorkOrderIds) + "</span>"
+          esc(String(p0.workOrderCount ?? 0)) +
+          (p0.eticOpenWorkOrderIds
+            ? " <span class='facts-sub'>" + esc(p0.eticOpenWorkOrderIds) + "</span>"
             : ""),
       });
-      if (row.eticOpenInMaintenance) {
-        pairs.push({ lbl: "Shop", val: "<span class='facts-sub'>Parts status looks in-shop</span>" });
-      }
-      if (row.location && String(row.location).trim()) {
-        pairs.push({ lbl: "Location (ELMS)", val: esc(String(row.location).trim()) });
+      if (p0.eticOpenInMaintenance) {
+        pairs.push({ lbl: "Shop signal", val: "<span class='facts-sub'>WO parts status looks in-shop</span>" });
       }
       return (
-        "<div class='smx-plan-identity' aria-label='Vehicle from latest ETIC'>" +
+        "<div class='smx-plan-identity' aria-label='Asset from latest ETIC workbook'>" +
         pairs
           .map(function (p) {
             return (

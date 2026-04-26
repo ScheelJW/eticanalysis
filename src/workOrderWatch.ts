@@ -1,4 +1,5 @@
 import type { FleetRecord, RawWorkOrder } from "./yardCheck";
+import { nceInfoFromSnapshotRawJson } from "./yardSession";
 import {
   extractFleetMapsFromBinary,
   extractRawWorkOrdersFromBinary,
@@ -1070,8 +1071,10 @@ export type ScheduleMxEticAssetContext = {
 };
 
 /**
- * Per-asset context from the **latest** ETIC ingest (unit, type, NCE, open WOs).
- * Used to enrich Schedule Mx rows regardless of prevmx import date.
+ * Per-asset context from the **latest** ETIC workbook: **Fleet P&A** row for unit /
+ * make-model / type / mgmt / NCE, plus **Work Order Inquiry** rows for open WO ids and
+ * in-shop parts status. Used to enrich Schedule Mx (ELMS plans) without trusting ELMS
+ * item lines for fleet identity.
  */
 export async function loadScheduleMxEticContextByAsset(
   env: { ETIC_SNAPSHOTS: D1Database },
@@ -1085,6 +1088,43 @@ export async function loadScheduleMxEticContextByAsset(
   const ids = [...new Set(assetIds.map((a) => (a ?? "").trim()).filter(Boolean))];
   // D1 SQLite bind limit is 100 parameters; leave headroom for snapshot_date_key.
   const batchSize = 90;
+
+  type FleetPaRow = {
+    asset_id: string;
+    owning_unit: string | null;
+    make_model: string | null;
+    veh_nomen: string | null;
+    mgmt_cd: string | null;
+    raw_row_json: string | null;
+  };
+  const fleetByAsset = new Map<string, FleetPaRow>();
+  for (let i = 0; i < ids.length; i += batchSize) {
+    const chunk = ids.slice(i, i + batchSize);
+    const ph = chunk.map(() => "?").join(",");
+    const r = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT asset_id, owning_unit, make_model, veh_nomen, mgmt_cd, raw_row_json
+       FROM fleet_p_a_snapshot
+       WHERE snapshot_date_key = ? AND asset_id IN (${ph})`,
+    )
+      .bind(eticDateKey, ...chunk)
+      .all<FleetPaRow>();
+    for (const row of r.results ?? []) {
+      const aid = (row.asset_id ?? "").trim();
+      if (aid) fleetByAsset.set(aid, row);
+    }
+  }
+
+  type WoAgg = {
+    workOrderIds: string[];
+    inMaintenance: boolean;
+    owningUnit: string;
+    makeModel: string;
+    vehNomen: string;
+    mgmtCd: string;
+    nce: boolean;
+    nceStatus: string;
+  };
+  const woByAsset = new Map<string, WoAgg>();
   for (let i = 0; i < ids.length; i += batchSize) {
     const chunk = ids.slice(i, i + batchSize);
     const ph = chunk.map(() => "?").join(",");
@@ -1108,28 +1148,24 @@ export async function loadScheduleMxEticContextByAsset(
     for (const row of r.results ?? []) {
       const aid = (row.asset_id ?? "").trim();
       if (!aid) continue;
-      const rawCols = readRawColumns(row.raw_row_json);
-      const ex = extractRawExtrasFromColumns(rawCols);
-      let ctx = byAsset.get(aid);
+      let ctx = woByAsset.get(aid);
       if (!ctx) {
         ctx = {
           workOrderIds: [],
+          inMaintenance: false,
           owningUnit: "",
           makeModel: "",
           vehNomen: "",
           mgmtCd: "",
           nce: false,
           nceStatus: "",
-          inMaintenance: false,
         };
-        byAsset.set(aid, ctx);
+        woByAsset.set(aid, ctx);
       }
       const wid = (row.work_order_id ?? "").trim();
       if (wid && !ctx.workOrderIds.includes(wid)) ctx.workOrderIds.push(wid);
-      if (ex.nce) {
-        ctx.nce = true;
-        if (ex.nceStatus) ctx.nceStatus = ex.nceStatus;
-      }
+      const ps = (row.parts_status ?? "").trim();
+      if (partsStatusLooksInMaintenance(ps)) ctx.inMaintenance = true;
       const ou = (row.owning_unit ?? "").trim();
       if (ou && !ctx.owningUnit) ctx.owningUnit = ou;
       const mm = (row.make_model ?? "").trim();
@@ -1138,9 +1174,31 @@ export async function loadScheduleMxEticContextByAsset(
       if (vn && !ctx.vehNomen) ctx.vehNomen = vn;
       const mg = (row.mgmt_cd ?? "").trim();
       if (mg && !ctx.mgmtCd) ctx.mgmtCd = mg;
-      const ps = (row.parts_status ?? "").trim();
-      if (partsStatusLooksInMaintenance(ps)) ctx.inMaintenance = true;
+      const ni = nceInfoFromSnapshotRawJson(row.raw_row_json);
+      if (ni.nce) {
+        ctx.nce = true;
+        if (ni.nceStatus && !ctx.nceStatus) ctx.nceStatus = ni.nceStatus;
+      }
     }
+  }
+
+  for (const aid of ids) {
+    const f = fleetByAsset.get(aid);
+    const w = woByAsset.get(aid);
+    if (!f && (!w || w.workOrderIds.length === 0)) continue;
+    const fpNce = f ? nceInfoFromSnapshotRawJson(f.raw_row_json) : { nce: false, nceStatus: "" };
+    const nce = fpNce.nce || !!w?.nce;
+    const nceStatus = (fpNce.nceStatus || w?.nceStatus || "").trim();
+    byAsset.set(aid, {
+      workOrderIds: w?.workOrderIds ?? [],
+      owningUnit: (f?.owning_unit ?? "").trim() || (w?.owningUnit ?? ""),
+      makeModel: (f?.make_model ?? "").trim() || (w?.makeModel ?? ""),
+      vehNomen: (f?.veh_nomen ?? "").trim() || (w?.vehNomen ?? ""),
+      mgmtCd: (f?.mgmt_cd ?? "").trim() || (w?.mgmtCd ?? ""),
+      nce,
+      nceStatus,
+      inMaintenance: w?.inMaintenance ?? false,
+    });
   }
   return { eticDateKey, byAsset };
 }
@@ -1150,11 +1208,10 @@ function applyEticContextToScheduleMxRow(
   ctx: ScheduleMxEticAssetContext | undefined,
   eticDateKey: string | null,
 ): ScheduleMxFleetRow {
-  const woCount =
-    eticDateKey != null ? (ctx ? ctx.workOrderIds.length : 0) : row.workOrderCount;
-  const owningUnit = ctx && ctx.owningUnit ? ctx.owningUnit : "";
+  const woCount = eticDateKey != null ? (ctx?.workOrderIds.length ?? 0) : row.workOrderCount;
+  const owningUnit = ctx && ctx.owningUnit ? ctx.owningUnit : row.owningUnit;
   const makeModel = ctx && ctx.makeModel ? ctx.makeModel : row.makeModel;
-  const vehNomen = ctx && ctx.vehNomen ? ctx.vehNomen : "";
+  const vehNomen = ctx && ctx.vehNomen ? ctx.vehNomen : row.vehNomen;
   const mgmtCd = ctx && ctx.mgmtCd ? ctx.mgmtCd : row.mgmtCd;
   const nce = ctx ? ctx.nce : row.nce;
   const nceStatus = ctx ? ctx.nceStatus : row.nceStatus;
