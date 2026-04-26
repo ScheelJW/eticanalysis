@@ -14085,29 +14085,80 @@ function renderDashboardHtml(): string {
       color: var(--muted);
       font-size: 0.76rem;
     }
-    .smx-calc-panel {
-      padding: 20px 20px 18px;
+    .smx-calc-trigger {
+      font: inherit;
+      font-size: 0.82rem;
+      font-weight: 700;
+      padding: 7px 13px;
+      border-radius: 9px;
+      border: 1px solid rgba(0,58,140,0.34);
+      color: var(--accent);
+      background: rgba(0,58,140,0.08);
+      cursor: pointer;
+    }
+    .smx-calc-trigger:hover { background: rgba(0,58,140,0.13); }
+    .smx-calc-modal {
+      position: fixed;
+      inset: 0;
+      z-index: 90;
+      display: grid;
+      place-items: center;
+      padding: 16px;
+    }
+    .smx-calc-modal.hidden { display: none; }
+    .smx-calc-backdrop {
+      position: absolute;
+      inset: 0;
+      background: rgba(10,18,34,0.54);
+      backdrop-filter: blur(2px);
+    }
+    .smx-calc-sheet {
+      position: relative;
+      z-index: 1;
+      width: min(980px, calc(100vw - 28px));
+      max-height: min(92vh, 900px);
+      overflow: auto;
       border-radius: 14px;
       border: 1px solid var(--border);
-      background: linear-gradient(165deg, rgba(0,58,140,0.05) 0%, var(--card) 52%);
+      background: var(--card);
+      box-shadow: 0 24px 60px rgba(0,0,0,0.25);
+      padding: 18px 18px 16px;
     }
-    .smx-calc-panel-head { margin-bottom: 14px; max-width: 52rem; }
-    .smx-calc-panel-head h3 {
-      margin: 0 0 6px;
-      font-size: 1.08rem;
+    .smx-calc-sheet-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .smx-calc-sheet-head h3 {
+      margin: 0 0 4px;
+      font-size: 1.06rem;
       font-weight: 800;
       letter-spacing: -0.01em;
     }
-    .smx-calc-lede {
+    .smx-calc-sheet-head p {
       margin: 0;
-      font-size: 0.88rem;
-      line-height: 1.48;
+      font-size: 0.86rem;
+      line-height: 1.42;
       color: var(--muted);
+      max-width: 52rem;
+    }
+    .smx-calc-close {
+      font: inherit;
+      font-size: 0.8rem;
+      padding: 7px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      cursor: pointer;
+      white-space: nowrap;
     }
     .smx-calc-grid {
       display: grid;
-      grid-template-columns: minmax(180px, 1.2fr) minmax(150px, 0.9fr) minmax(170px, 0.85fr) auto;
-      gap: 12px 14px;
+      grid-template-columns: minmax(170px, 1.2fr) minmax(140px, 0.9fr) minmax(165px, 0.85fr) auto;
+      gap: 10px 12px;
       align-items: end;
     }
     .smx-calc-field label {
@@ -14159,7 +14210,7 @@ function renderDashboardHtml(): string {
     }
     .smx-calc-run:hover { filter: brightness(1.06); }
     .smx-calc-rules {
-      margin: 12px 0 0;
+      margin: 10px 0 0;
       padding: 11px 14px 11px 1.6rem;
       font-size: 0.8rem;
       line-height: 1.5;
@@ -14180,7 +14231,7 @@ function renderDashboardHtml(): string {
       border-radius: 12px;
       border: 1px solid var(--border);
       overflow: auto;
-      max-height: min(46vh, 440px);
+      max-height: min(48vh, 420px);
       background: var(--bg);
     }
     .smx-calc-results-summary {
@@ -14208,6 +14259,7 @@ function renderDashboardHtml(): string {
       letter-spacing: 0.07em;
     }
     .smx-calc-table tr:hover td { background: rgba(0,58,140,0.04); }
+    body.smx-calc-open { overflow: hidden; }
     .smx-assets-panel {
       border: 1px solid var(--border);
       border-radius: 14px;
@@ -14807,6 +14859,7 @@ function renderDashboardHtml(): string {
               <label class="smx-search"><span class="sr-only">Filter rows</span>
                 <input type="text" id="smx-query" placeholder="Filter asset, WO id, type…" autocomplete="off" />
               </label>
+              <button type="button" class="smx-calc-launch" id="smx-calc-launch" aria-haspopup="dialog" aria-controls="smx-calc-modal">Is it due?</button>
               <button type="button" class="smx-reset-filters" id="smx-reset-filters">Reset filters</button>
               <div class="smx-filters" id="smx-filters" role="tablist" aria-label="Schedule maintenance filters">
                 <button type="button" class="smx-filter-btn active" data-smx-filter="all">All <span class="smx-n" data-smx-c="all">0</span></button>
@@ -14831,35 +14884,39 @@ function renderDashboardHtml(): string {
             </div>
           </aside>
         </div>
-        <section class="smx-calc-panel" id="smx-shop-calc" aria-labelledby="smx-calc-heading">
-          <div class="smx-calc-panel-head">
-            <h3 id="smx-calc-heading">Is it due? Shop calculator</h3>
+        <div id="smx-calc-modal" class="smx-calc-modal hidden" role="dialog" aria-modal="true" aria-labelledby="smx-calc-heading">
+          <div class="smx-calc-modal-backdrop" data-smx-calc-close="1"></div>
+          <section class="smx-calc-panel" id="smx-shop-calc" aria-label="Is it due calculator">
+            <div class="smx-calc-modal-head">
+              <h3 id="smx-calc-heading">Is it due? Shop calculator</h3>
+              <button type="button" class="smx-calc-close" id="smx-calc-close" aria-label="Close calculator">×</button>
+            </div>
             <p class="smx-calc-lede">Enter the asset and the <strong>reading on the truck right now</strong> (odometer or hour meter). We compare that to each plan on the <strong>Schedule Mx import</strong> you picked above and list which preventive plans to add to the work order.</p>
-          </div>
-          <div class="smx-calc-grid">
-            <div class="smx-calc-field">
-              <label for="smx-calc-asset">Asset ID</label>
-              <input type="text" id="smx-calc-asset" placeholder="e.g. AF00C00831" autocomplete="off" spellcheck="false" />
+            <div class="smx-calc-grid">
+              <div class="smx-calc-field">
+                <label for="smx-calc-asset">Asset ID</label>
+                <input type="text" id="smx-calc-asset" placeholder="e.g. AF00C00831" autocomplete="off" spellcheck="false" />
+              </div>
+              <div class="smx-calc-field">
+                <label for="smx-calc-meter">Current meter <span class="smx-calc-hint">(mi or hr)</span></label>
+                <input type="number" id="smx-calc-meter" placeholder="Reading on vehicle" step="any" min="0" />
+              </div>
+              <div class="smx-calc-field">
+                <label for="smx-calc-asof">As-of date <span class="smx-calc-hint">(for calendar due)</span></label>
+                <input type="date" id="smx-calc-asof" />
+              </div>
+              <div class="smx-calc-actions">
+                <button type="button" class="smx-calc-run" id="smx-calc-run">Run calculator</button>
+              </div>
             </div>
-            <div class="smx-calc-field">
-              <label for="smx-calc-meter">Current meter <span class="smx-calc-hint">(mi or hr)</span></label>
-              <input type="number" id="smx-calc-meter" placeholder="Reading on vehicle" step="any" min="0" />
-            </div>
-            <div class="smx-calc-field">
-              <label for="smx-calc-asof">As-of date <span class="smx-calc-hint">(for calendar due)</span></label>
-              <input type="date" id="smx-calc-asof" />
-            </div>
-            <div class="smx-calc-actions">
-              <button type="button" class="smx-calc-run" id="smx-calc-run">Run calculator</button>
-            </div>
-          </div>
-          <ul class="smx-calc-rules">
-            <li><strong>Add to WO</strong> when a plan is overdue or due soon: next maint within <strong>60 days</strong> of as-of, or util remaining ≤ <strong>1,500 mi</strong> (≤ <strong>50 hr</strong> when ELMS says hours).</li>
-            <li>As-of defaults to <strong>latest ETIC</strong> after the grid loads; if there is no ETIC row yet, we use the <strong>import date</strong> or <strong>today</strong> so you never have to fight the date picker.</li>
-          </ul>
-          <p class="smx-calc-status" id="smx-calc-status" role="status"></p>
-          <div id="smx-calc-results" class="smx-calc-results" aria-live="polite"></div>
-        </section>
+            <ul class="smx-calc-rules">
+              <li><strong>Add to WO</strong> when a plan is overdue or due soon: next maint within <strong>60 days</strong> of as-of, or util remaining ≤ <strong>1,500 mi</strong> (≤ <strong>50 hr</strong> when ELMS says hours).</li>
+              <li>As-of defaults to <strong>latest ETIC</strong> after the grid loads; if there is no ETIC row yet, we use the <strong>import date</strong> or <strong>today</strong> so you never have to fight the date picker.</li>
+            </ul>
+            <p class="smx-calc-status" id="smx-calc-status" role="status"></p>
+            <div id="smx-calc-results" class="smx-calc-results" aria-live="polite"></div>
+          </section>
+        </div>
         <section class="smx-data-section" aria-label="Schedule maintenance assets">
           <div class="smx-data-head">
             <h3>Asset workload</h3>
@@ -18200,6 +18257,25 @@ function renderDashboardHtml(): string {
       box.innerHTML = head + body + "</tbody></table>";
     }
 
+    function openSmxCalcModal() {
+      var m = document.getElementById("smx-calc-modal");
+      if (!m) return;
+      m.classList.remove("hidden");
+      m.setAttribute("aria-hidden", "false");
+      syncSmxShopCalcAsOf();
+      setTimeout(function () {
+        var a = document.getElementById("smx-calc-asset");
+        if (a && typeof a.focus === "function") a.focus();
+      }, 20);
+    }
+
+    function closeSmxCalcModal() {
+      var m = document.getElementById("smx-calc-modal");
+      if (!m) return;
+      m.classList.add("hidden");
+      m.setAttribute("aria-hidden", "true");
+    }
+
     async function runSmxShopCalc() {
       const st = document.getElementById("smx-calc-status");
       const box = document.getElementById("smx-calc-results");
@@ -20345,6 +20421,40 @@ function renderDashboardHtml(): string {
         smxCalcRun.dataset.wired = "1";
         smxCalcRun.addEventListener("click", function () { void runSmxShopCalc(); });
       }
+      const smxCalcOpen = document.getElementById("smx-calc-open");
+      if (smxCalcOpen && !smxCalcOpen.dataset.wired) {
+        smxCalcOpen.dataset.wired = "1";
+        smxCalcOpen.addEventListener("click", function () {
+          const modal = document.getElementById("smx-calc-modal");
+          if (!modal) return;
+          modal.classList.remove("hidden");
+          syncSmxShopCalcAsOf();
+          setTimeout(function () {
+            const a = document.getElementById("smx-calc-asset");
+            if (a && a.focus) a.focus();
+          }, 20);
+        });
+      }
+      const smxCalcClose = document.getElementById("smx-calc-close");
+      if (smxCalcClose && !smxCalcClose.dataset.wired) {
+        smxCalcClose.dataset.wired = "1";
+        smxCalcClose.addEventListener("click", function () {
+          const modal = document.getElementById("smx-calc-modal");
+          if (modal) modal.classList.add("hidden");
+        });
+      }
+      const smxCalcBackdrop = document.getElementById("smx-calc-modal");
+      if (smxCalcBackdrop && !smxCalcBackdrop.dataset.wired) {
+        smxCalcBackdrop.dataset.wired = "1";
+        smxCalcBackdrop.addEventListener("click", function (ev) {
+          if (ev.target === smxCalcBackdrop) smxCalcBackdrop.classList.add("hidden");
+        });
+      }
+      document.addEventListener("keydown", function (ev) {
+        if (ev.key !== "Escape") return;
+        const modal = document.getElementById("smx-calc-modal");
+        if (modal && !modal.classList.contains("hidden")) modal.classList.add("hidden");
+      });
       const melTabBtn = document.getElementById("tab-mel");
       if (melTabBtn) melTabBtn.addEventListener("click", function () { setMainTab("mel"); syncDashboardQuery("mel"); });
       const meetTabBtn = document.getElementById("tab-meeting");
