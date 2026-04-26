@@ -7144,17 +7144,17 @@ function renderYardAppHtml(): string {
       return escapeHtml(s.slice(0, n)) + "\u2026";
     }
     function deskRollPillHtml(a){
-      if (a.isNeverChecked) return "<span class=\\"yard-pill yard-pill-never\\">Never</span>";
-      if (a.rollingState === "overdue") return "<span class=\\"yard-pill yard-pill-overdue\\">Overdue</span>";
-      if (a.rollingState === "due") return "<span class=\\"yard-pill yard-pill-due\\">Due</span>";
-      return "<span class=\\"yard-pill yard-pill-fresh\\">OK</span>";
+      if (a.isNeverChecked) return '<span class="yard-pill yard-pill-never">Never</span>';
+      if (a.rollingState === "overdue") return '<span class="yard-pill yard-pill-overdue">Overdue</span>';
+      if (a.rollingState === "due") return '<span class="yard-pill yard-pill-due">Due</span>';
+      return '<span class="yard-pill yard-pill-fresh">OK</span>';
     }
     function renderDeskTable(){
       var tb = document.getElementById("yard-desk-tbody");
       if (!tb) return;
       var rows = applyFilter();
       if (!rows.length) {
-        tb.innerHTML = "<tr><td colspan=\\"4\\" style=\\"text-align:center;color:var(--muted);padding:24px\\">No vehicles match.</td></tr>";
+        tb.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:24px">No vehicles match.</td></tr>';
         return;
       }
       var h = "";
@@ -7164,14 +7164,14 @@ function renderYardAppHtml(): string {
           ? escapeHtml(a.lastLocation)
           : '<span class="yard-desk-loc-unknown">No location yet</span>';
         var notesRaw = (a.lastNotes || "").trim();
-        var notesCell = notesRaw ? truncDeskHtml(notesRaw, 160) : "<span style=\\"color:var(--subtle)\\">\u2014</span>";
+        var notesCell = notesRaw ? truncDeskHtml(notesRaw, 160) : '<span style="color:var(--subtle)">\u2014</span>';
         var active = state.deskSelectedId === a.assetId ? " yard-desk-active" : "";
-        h += "<tr class=\\"yard-desk-tr" + active + "\\" data-id=\\"" + escapeHtml(a.assetId) + "\\">" +
-          "<td class=\\"col-asset\\">" + escapeHtml(a.assetId) + "</td>" +
-          "<td class=\\"col-loc\\">" + loc + "</td>" +
-          "<td class=\\"col-notes\\">" + notesCell + "</td>" +
-          "<td class=\\"col-meta\\">" + deskRollPillHtml(a) +
-          (a.isNeverChecked ? "" : (" <span style=\\"color:var(--subtle)\\">" + escapeHtml(fmtAge(a.daysSinceLastCheck, false)) + "</span>")) +
+        h += '<tr class="yard-desk-tr' + active + '" data-id="' + escapeHtml(a.assetId) + '">' +
+          '<td class="col-asset">' + escapeHtml(a.assetId) + "</td>" +
+          '<td class="col-loc">' + loc + "</td>" +
+          '<td class="col-notes">' + notesCell + "</td>" +
+          '<td class="col-meta">' + deskRollPillHtml(a) +
+          (a.isNeverChecked ? "" : (' <span style="color:var(--subtle)">' + escapeHtml(fmtAge(a.daysSinceLastCheck, false)) + "</span>")) +
           "</td>" +
           "</tr>";
       }
@@ -7228,9 +7228,9 @@ function renderYardAppHtml(): string {
       state.deskHistChecks = checks;
       state.deskHistEdits = (d && d.checkEdits) ? d.checkEdits.slice() : [];
       if (!checks.length) {
-        sel.innerHTML = "<option value=\\"\\">No past checks</option>";
+        sel.innerHTML = '<option value="">No past checks</option>';
         sel.disabled = true;
-        if (detailBox) detailBox.innerHTML = "<p style=\\"color:var(--muted);margin:0\\">No check history yet.</p>";
+        if (detailBox) detailBox.innerHTML = '<p style="color:var(--muted);margin:0">No check history yet.</p>';
         if (deskEdit) { deskEdit.disabled = true; deskEdit.removeAttribute("data-edit-check"); }
         return;
       }
@@ -7240,7 +7240,7 @@ function renderYardAppHtml(): string {
         var c = checks[i];
         var loc = (c.location || "").trim() || "\u2014";
         var t = fmtRel(c.checkedAtIso) + " \u00B7 " + loc;
-        opts.push("<option value=\\"" + i + "\\">" + escapeHtml(t) + "</option>");
+        opts.push('<option value="' + i + '">' + escapeHtml(t) + "</option>");
       }
       sel.innerHTML = opts.join("");
       sel.selectedIndex = 0;
@@ -7293,19 +7293,19 @@ function renderYardAppHtml(): string {
         if (wAt0.length) {
           var lines0 = wAt0.map(function(w){
             var rmk = (w.remarks || "").trim();
-            return "<div class=\\"wo-mini\\"><strong>WO " + escapeHtml(String(w.workOrderId)) + "</strong>" +
+            return '<div class="wo-mini"><strong>WO ' + escapeHtml(String(w.workOrderId)) + "</strong>" +
               (w.shop ? " \u00B7 " + escapeHtml(w.shop) : "") +
-              (rmk ? "<div class=\\"wo-rmk\\">" + escapeHtml(rmk) + "</div>" : "") + "</div>";
+              (rmk ? '<div class="wo-rmk">' + escapeHtml(rmk) + "</div>" : "") + "</div>";
           }).join("");
-          eticBlock2 = "<div style=\\"margin-top:10px\\"><strong>ETIC book (when checked)</strong> " + escapeHtml(fmtYardSnapshotKey(sk0)) + "</div>" + lines0;
+          eticBlock2 = '<div style="margin-top:10px"><strong>ETIC book (when checked)</strong> ' + escapeHtml(fmtYardSnapshotKey(sk0)) + "</div>" + lines0;
         } else {
-          eticBlock2 = "<div style=\\"margin-top:10px;color:var(--muted);\\">ETIC snapshot " + escapeHtml(fmtYardSnapshotKey(sk0)) + " had no open work orders for this asset in the book.</div>";
+          eticBlock2 = '<div style="margin-top:10px;color:var(--muted);">ETIC snapshot ' + escapeHtml(fmtYardSnapshotKey(sk0)) + " had no open work orders for this asset in the book.</div>";
         }
       }
       box.innerHTML =
-        "<div class=\\"h-when\\">" + escapeHtml(when) + "</div>" +
+        '<div class="h-when">' + escapeHtml(when) + "</div>" +
         "<div><strong>Location:</strong> " + escapeHtml(loc) + "</div>" +
-        (disc ? "<div style=\\"margin-top:8px;white-space:pre-wrap\\"><strong>Notes:</strong> " + escapeHtml(disc) + "</div>" : "") +
+        (disc ? '<div style="margin-top:8px;white-space:pre-wrap"><strong>Notes:</strong> ' + escapeHtml(disc) + "</div>" : "") +
         photoBlock +
         eticBlock2 +
         (chg || "");
@@ -7318,7 +7318,7 @@ function renderYardAppHtml(): string {
       var sel = document.getElementById("yard-hist-sel");
       var detailBox = document.getElementById("yard-hist-detail");
       if (sel) {
-        sel.innerHTML = "<option value=\\"\\">Loading history\u2026</option>";
+        sel.innerHTML = '<option value="">Loading history\u2026</option>';
         sel.disabled = true;
       }
       if (detailBox) detailBox.textContent = "";
@@ -7341,10 +7341,10 @@ function renderYardAppHtml(): string {
         .catch(function(){
           if (state.deskSelectedId !== assetId) return;
           if (sel) {
-            sel.innerHTML = "<option value=\\"\\">Could not load history</option>";
+            sel.innerHTML = '<option value="">Could not load history</option>';
             sel.disabled = true;
           }
-          if (detailBox) detailBox.innerHTML = "<p style=\\"color:var(--danger);margin:0\\">Could not load history.</p>";
+          if (detailBox) detailBox.innerHTML = '<p style="color:var(--danger);margin:0">Could not load history.</p>';
         });
     }
     function wireYardDesk(){
