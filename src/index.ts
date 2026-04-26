@@ -17829,41 +17829,6 @@ function renderDashboardHtml(): string {
           (plans.length === 1 ? "" : "s") +
           "</span>",
       );
-      const p0 = plans[0];
-      const wo = p0 && p0.workOrderCount != null ? p0.workOrderCount : 0;
-      const unit0 = p0 && p0.owningUnit ? String(p0.owningUnit).trim() : "";
-      const vn0 = p0 && p0.vehNomen ? String(p0.vehNomen).trim() : "";
-      const locSet = {};
-      const mmSet = {};
-      const mgmtSet = {};
-      for (var j = 0; j < plans.length; j++) {
-        var q = plans[j];
-        if (q.location && String(q.location).trim()) locSet[String(q.location).trim()] = 1;
-        if (q.makeModel && String(q.makeModel).trim()) mmSet[String(q.makeModel).trim()] = 1;
-        if (q.mgmtCd && String(q.mgmtCd).trim()) mgmtSet[String(q.mgmtCd).trim()] = 1;
-      }
-      const locs = Object.keys(locSet);
-      const mms = Object.keys(mmSet);
-      const mgmts = Object.keys(mgmtSet);
-      const metaParts = [];
-      if (unit0) metaParts.push("Unit " + esc(unit0));
-      if (vn0) metaParts.push(esc(vn0));
-      if (mms.length === 1) metaParts.push(esc(mms[0]));
-      else if (mms.length > 1) metaParts.push(mms.length + " make/models");
-      if (locs.length === 1) metaParts.push(esc(locs[0]));
-      else if (locs.length > 1) metaParts.push(locs.length + " locations");
-      if (mgmts.length === 1) metaParts.push("Mgmt " + esc(mgmts[0]));
-      else if (mgmts.length > 1) metaParts.push(mgmts.length + " mgmt codes");
-      if (wo) {
-        var woLinks = smxOpenWoLinksHtml(p0 && p0.eticOpenWorkOrderIds);
-        metaParts.push(
-          wo +
-            " open WO" +
-            (wo === 1 ? "" : "s") +
-            (woLinks ? " · " + woLinks : ""),
-        );
-      }
-      if (p0 && p0.eticOpenInMaintenance) metaParts.push("In maintenance (parts)");
       el.innerHTML =
         "<div class='wo-hero-row'>" +
         "<div class='wo-hero-id'>" + esc(assetId) + "</div>" +
@@ -17872,10 +17837,7 @@ function renderDashboardHtml(): string {
         smxAssetIdentityStripFromPlans(plans) +
         "<div class='wo-hero-sub wo-hero-sub-primary'>" +
         renderSightingBadge(assetId) +
-        "</div>" +
-        (metaParts.length
-          ? "<div class='wo-hero-sub wo-hero-sub-meta'>" + metaParts.join("<span class='dot'>·</span>") + "</div>"
-          : "");
+        "</div>";
     }
 
     function smxFactsHtmlForPlan(row) {
