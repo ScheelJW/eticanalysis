@@ -1002,6 +1002,8 @@ export type ScheduleMxFleetRow = {
   eticOpenWorkOrderIds: string;
   /** True when any open WO parts status looks like in-shop maintenance. */
   eticOpenInMaintenance: boolean;
+  /** Latest ETIC: at least one open WO line reads as NMC (in maintenance, not in use). */
+  eticOpenNmc: boolean;
   /**
    * After rules: open WO (or in-shop maintenance) clears sched-mx overdue / due-soon noise.
    * KPIs, filters, and badges use this bucket.
@@ -1064,6 +1066,31 @@ function partsStatusLooksInMaintenance(partsStatus: string): boolean {
   );
 }
 
+/** Open WO (parts line or raw) indicates NMC / not mission capable — vehicle is in maintenance, not in use. */
+function workOrderRowLooksNmc(partsStatus: string, rawRowJson: string | null | undefined): boolean {
+  const s = (partsStatus ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+  if (/\bnmc\b/.test(s)) return true;
+  if (s.includes("non-mission") || s.includes("nonmission")) return true;
+  if (s === "not mc" || s.includes("not mission")) return true;
+  if (s === "down" || /^down\b/.test(s) || s.includes("down for")) return true;
+  if (!rawRowJson || !String(rawRowJson).trim()) return false;
+  try {
+    const raw = JSON.parse(rawRowJson) as Record<string, string>;
+    for (const [k, v] of Object.entries(raw)) {
+      const kn = (k ?? "").toLowerCase();
+      if (!/mc|mission|fmc|nmc|operational|status|capable|ready|not\s*mc|vehicle/.test(kn)) continue;
+      const vv = String(v ?? "")
+        .toLowerCase()
+        .replace(/\s+/g, " ")
+        .trim();
+      if (/\bnmc\b/.test(vv) || vv.includes("non-mission") || /^nmc\b/.test(vv) || vv === "not mc") return true;
+    }
+  } catch {
+    /* ignore */
+  }
+  return false;
+}
+
 export type ScheduleMxEticAssetContext = {
   workOrderIds: string[];
   owningUnit: string;
@@ -1073,6 +1100,8 @@ export type ScheduleMxEticAssetContext = {
   nce: boolean;
   nceStatus: string;
   inMaintenance: boolean;
+  /** At least one open WO on latest ETIC shows NMC. */
+  nmcOnOpenWorkOrder: boolean;
 };
 
 /**
@@ -1122,6 +1151,7 @@ export async function loadScheduleMxEticContextByAsset(
   type WoAgg = {
     workOrderIds: string[];
     inMaintenance: boolean;
+    nmcOnOpenWorkOrder: boolean;
     owningUnit: string;
     makeModel: string;
     vehNomen: string;
@@ -1158,6 +1188,7 @@ export async function loadScheduleMxEticContextByAsset(
         ctx = {
           workOrderIds: [],
           inMaintenance: false,
+          nmcOnOpenWorkOrder: false,
           owningUnit: "",
           makeModel: "",
           vehNomen: "",
@@ -1171,6 +1202,7 @@ export async function loadScheduleMxEticContextByAsset(
       if (wid && !ctx.workOrderIds.includes(wid)) ctx.workOrderIds.push(wid);
       const ps = (row.parts_status ?? "").trim();
       if (partsStatusLooksInMaintenance(ps)) ctx.inMaintenance = true;
+      if (workOrderRowLooksNmc(ps, row.raw_row_json)) ctx.nmcOnOpenWorkOrder = true;
       const ou = (row.owning_unit ?? "").trim();
       if (ou && !ctx.owningUnit) ctx.owningUnit = ou;
       const mm = (row.make_model ?? "").trim();
@@ -1203,6 +1235,7 @@ export async function loadScheduleMxEticContextByAsset(
       nce,
       nceStatus,
       inMaintenance: w?.inMaintenance ?? false,
+      nmcOnOpenWorkOrder: w?.nmcOnOpenWorkOrder ?? false,
     });
   }
   return { eticDateKey, byAsset };
@@ -1224,6 +1257,7 @@ function applyEticContextToScheduleMxRow(
   const nce = ctx ? ctx.nce : row.nce;
   const nceStatus = ctx ? ctx.nceStatus : row.nceStatus;
   const inMaint = ctx ? ctx.inMaintenance : false;
+  const nmcOpen = ctx ? ctx.nmcOnOpenWorkOrder : false;
   const openWoSample = ctx ? ctx.workOrderIds.slice(0, 8).join(", ") : "";
   const base = row.scheduleMxBucket;
   let effective: ScheduleMxBucket = base;
@@ -1245,6 +1279,7 @@ function applyEticContextToScheduleMxRow(
     eticSnapshotDateKey: eticDateKey,
     eticOpenWorkOrderIds: openWoSample,
     eticOpenInMaintenance: inMaint,
+    eticOpenNmc: nmcOpen,
     scheduleMxPlanEffectiveBucket: effective,
     scheduleMxPlanEffectiveNceCritical: nceCrit,
     scheduleMxNceCritical: nceCrit,
@@ -1344,8 +1379,19 @@ function scheduleMxAssetRawWorstRank(plans: ScheduleMxFleetRow[]): number {
 }
 
 /**
+ * Commander rollup: same raw ELMS extract as {@link scheduleMxAssetRawWorstRank}, but assets with
+ * an open **NMC** work order on latest ETIC are treated as in maintenance (not in wing overdue / NCE od).
+ */
+function scheduleMxAssetCommanderRawWorstRank(plans: ScheduleMxFleetRow[]): number {
+  const wr = scheduleMxAssetRawWorstRank(plans);
+  const inMaintNmc = plans.some((p) => p.eticOpenNmc && p.workOrderCount > 0);
+  if (inMaintNmc && wr <= 1) return 4;
+  return wr;
+}
+
+/**
  * Commander summary: one row per owning unit + wing totals.
- * Overdue / NCE overdue use **raw** extract buckets (not open-WO-waived effective buckets).
+ * Overdue / NCE overdue use **raw** extract, adjusted so open **NMC** WOs (latest ETIC) are not counted overdue.
  */
 export function computeScheduleMxCommanderSummary(rows: ScheduleMxFleetRow[]): ScheduleMxCommanderSummary {
   const byAssetInUnit = new Map<string, Map<string, ScheduleMxFleetRow[]>>();
@@ -1377,7 +1423,7 @@ export function computeScheduleMxCommanderSummary(rows: ScheduleMxFleetRow[]): S
     let nceOverdue = 0;
     for (const [, plans] of am) {
       total += 1;
-      const wr = scheduleMxAssetRawWorstRank(plans);
+      const wr = scheduleMxAssetCommanderRawWorstRank(plans);
       if (wr <= 1) overdue += 1;
       if (wr === 0) nceOverdue += 1;
     }
@@ -1693,6 +1739,7 @@ function buildScheduleMxRowsFromFleetSheet(
       eticSnapshotDateKey: null,
       eticOpenWorkOrderIds: "",
       eticOpenInMaintenance: false,
+      eticOpenNmc: false,
       scheduleMxPlanEffectiveBucket: smx.scheduleMxBucket,
       scheduleMxPlanEffectiveNceCritical: scheduleMxNceCritical,
       scheduleMxSuppressedByOpenWo: false,
@@ -1744,6 +1791,7 @@ function buildScheduleMxRowsFromPlanRows(
       eticSnapshotDateKey: null,
       eticOpenWorkOrderIds: "",
       eticOpenInMaintenance: false,
+      eticOpenNmc: false,
       scheduleMxPlanEffectiveBucket: smx.scheduleMxBucket,
       scheduleMxPlanEffectiveNceCritical: scheduleMxNceCritical,
       scheduleMxSuppressedByOpenWo: false,

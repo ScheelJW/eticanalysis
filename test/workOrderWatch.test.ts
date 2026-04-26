@@ -81,6 +81,7 @@ describe("enrichScheduleMxRowsWithLatestEtic", () => {
       eticSnapshotDateKey: null,
       eticOpenWorkOrderIds: "",
       eticOpenInMaintenance: false,
+      eticOpenNmc: false,
       scheduleMxPlanEffectiveBucket: "overdue",
       scheduleMxPlanEffectiveNceCritical: true,
       scheduleMxSuppressedByOpenWo: false,
@@ -99,6 +100,7 @@ describe("enrichScheduleMxRowsWithLatestEtic", () => {
           nce: true,
           nceStatus: "Active",
           inMaintenance: false,
+          nmcOnOpenWorkOrder: false,
         },
       ],
     ]);
@@ -132,6 +134,7 @@ describe("enrichScheduleMxRowsWithLatestEtic", () => {
       eticSnapshotDateKey: null,
       eticOpenWorkOrderIds: "",
       eticOpenInMaintenance: false,
+      eticOpenNmc: false,
       scheduleMxPlanEffectiveBucket: "ok",
       scheduleMxPlanEffectiveNceCritical: false,
       scheduleMxSuppressedByOpenWo: false,
@@ -150,6 +153,7 @@ describe("enrichScheduleMxRowsWithLatestEtic", () => {
           nce: false,
           nceStatus: "",
           inMaintenance: false,
+          nmcOnOpenWorkOrder: false,
         },
       ],
     ]);
@@ -199,6 +203,7 @@ describe("computeScheduleMxAssetStats", () => {
         eticSnapshotDateKey: null,
         eticOpenWorkOrderIds: "",
         eticOpenInMaintenance: false,
+        eticOpenNmc: false,
         scheduleMxPlanEffectiveBucket: bucket,
         scheduleMxPlanEffectiveNceCritical: nc,
         scheduleMxSuppressedByOpenWo: false,
@@ -253,6 +258,7 @@ describe("computeScheduleMxCommanderSummary", () => {
         eticSnapshotDateKey: null,
         eticOpenWorkOrderIds: "",
         eticOpenInMaintenance: false,
+        eticOpenNmc: false,
         scheduleMxPlanEffectiveBucket: bucket,
         scheduleMxPlanEffectiveNceCritical: nceCrit,
         scheduleMxSuppressedByOpenWo: false,
@@ -305,6 +311,7 @@ describe("computeScheduleMxCommanderSummary", () => {
       eticSnapshotDateKey: "2026-04-26",
       eticOpenWorkOrderIds: "WO-1",
       eticOpenInMaintenance: false,
+      eticOpenNmc: false,
       scheduleMxPlanEffectiveBucket: "ok",
       scheduleMxPlanEffectiveNceCritical: false,
       scheduleMxSuppressedByOpenWo: true,
@@ -314,6 +321,42 @@ describe("computeScheduleMxCommanderSummary", () => {
     const c = computeScheduleMxCommanderSummary([row]);
     expect(c.wing.totalVehicles).toBe(1);
     expect(c.wing.overdue).toBe(1);
+  });
+
+  it("excludes NMC open WOs from commander raw overdue (in maintenance, not in use)", () => {
+    const base = analyzeElmsScheduleMxFromRaw({}, "2026-04-25");
+    const row: ScheduleMxFleetRow = {
+      assetId: "AF99",
+      planRowKey: "p1",
+      planId: "",
+      planName: "",
+      planDesc: "",
+      maintenanceScheduleId: "",
+      itemDesc: "",
+      location: "",
+      makeModel: "",
+      mgmtCd: "",
+      workOrderCount: 1,
+      nce: true,
+      nceStatus: "Yes",
+      scheduleMxNceCritical: true,
+      owningUnit: "5 CES",
+      vehNomen: "",
+      eticSnapshotDateKey: "2026-04-26",
+      eticOpenWorkOrderIds: "WO-1",
+      eticOpenInMaintenance: false,
+      eticOpenNmc: true,
+      scheduleMxPlanEffectiveBucket: "overdue",
+      scheduleMxPlanEffectiveNceCritical: true,
+      scheduleMxSuppressedByOpenWo: false,
+      ...base,
+      scheduleMxBucket: "overdue",
+    };
+    const c = computeScheduleMxCommanderSummary([row]);
+    expect(c.wing.totalVehicles).toBe(1);
+    expect(c.wing.overdue).toBe(0);
+    expect(c.wing.nceOverdue).toBe(0);
+    expect(c.wing.notOverdue).toBe(1);
   });
 
   it("rolls MSX assets into 791 MXS even when extract owningUnit differs", () => {
@@ -338,6 +381,7 @@ describe("computeScheduleMxCommanderSummary", () => {
       eticSnapshotDateKey: null,
       eticOpenWorkOrderIds: "",
       eticOpenInMaintenance: false,
+      eticOpenNmc: false,
       scheduleMxPlanEffectiveBucket: "ok",
       scheduleMxPlanEffectiveNceCritical: false,
       scheduleMxSuppressedByOpenWo: false,
