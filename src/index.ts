@@ -14097,6 +14097,34 @@ function renderDashboardHtml(): string {
     }
     .smx-util-progress.warn > i { background: linear-gradient(90deg, var(--warn) 0%, #c98a00 100%); }
     .smx-util-progress.danger > i { background: linear-gradient(90deg, var(--danger) 0%, #8b1538 100%); }
+    .smx-plan-identity {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
+      gap: 10px 18px;
+      margin: 0 0 14px;
+      padding: 12px 14px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      font-size: 0.78rem;
+    }
+    .smx-plan-identity .smx-id-pair { min-width: 0; }
+    .smx-plan-identity .smx-id-lbl {
+      display: block;
+      font-size: 0.58rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      color: var(--muted);
+      margin-bottom: 3px;
+    }
+    .smx-plan-identity .smx-id-val {
+      font-size: 0.88rem;
+      font-weight: 600;
+      color: var(--text);
+      line-height: 1.35;
+      word-break: break-word;
+    }
     .smx-pill {
       display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.62rem; font-weight: 700;
       text-transform: uppercase; letter-spacing: 0.04em;
@@ -17888,7 +17916,7 @@ function renderDashboardHtml(): string {
         sched.push({ dt: "Days until due", dd: esc(String(row.scheduleMxDaysUntil)) });
       }
       var plainCal = smxPlainDateLine(row);
-      if (plainCal) sched.push({ dt: "Plain language (calendar)", dd: esc(plainCal) });
+      if (plainCal) sched.push({ dt: "Calendar (plain language)", dd: esc(plainCal) });
       const util = [];
       const ut = (row.elmsUtilType || "").trim();
       util.push({
@@ -17911,31 +17939,11 @@ function renderDashboardHtml(): string {
       }
       const plan = [];
       if (row.maintenanceScheduleId) plan.push({ dt: "Maint schedule ID", dd: esc(row.maintenanceScheduleId) });
-      if (row.planDesc) plan.push({ dt: "Plan description", dd: esc(row.planDesc) });
-      if (row.itemDesc) plan.push({ dt: "Item", dd: esc(row.itemDesc) });
-      plan.push({ dt: "Plan row key", dd: "<span class='asset-mono' style='font-size:0.82rem'>" + esc(row.planRowKey || "—") + "</span>" });
-      const org = [];
-      if (row.owningUnit) org.push({ dt: "Unit (latest ETIC)", dd: esc(row.owningUnit) });
-      if (row.mgmtCd) org.push({ dt: "Mgmt Cd", dd: esc(row.mgmtCd) });
-      if (row.location) org.push({ dt: "Location (ELMS)", dd: esc(row.location) });
-      if (row.makeModel) org.push({ dt: "Make/Model (ETIC)", dd: esc(row.makeModel) });
-      if (row.vehNomen) org.push({ dt: "Vehicle type / nomen", dd: esc(row.vehNomen) });
-      if (row.nce) {
-        org.push({
-          dt: "NCE (latest ETIC)",
-          dd: "<span class='nce-badge'>Yes</span>" + (row.nceStatus ? " <span class='facts-sub'>" + esc(row.nceStatus) + "</span>" : ""),
-        });
-      }
-      org.push({
-        dt: "Open WOs (latest ETIC)",
-        dd:
-          esc(String(row.workOrderCount ?? 0)) +
-          (row.eticOpenWorkOrderIds
-            ? " <span class='facts-sub'>" + esc(row.eticOpenWorkOrderIds) + "</span>"
-            : ""),
-      });
-      if (row.eticOpenInMaintenance) {
-        org.push({ dt: "Shop signal", dd: "<span class='facts-sub'>Parts status looks in-shop / maintenance</span>" });
+      if (row.planDesc) plan.push({ dt: "What this plan is", dd: esc(row.planDesc) });
+      var itemT = (row.itemDesc || "").replace(/\s+/g, " ").trim();
+      var mmT = (row.makeModel || "").replace(/\s+/g, " ").trim();
+      if (itemT && itemT.toLowerCase() !== mmT.toLowerCase()) {
+        plan.push({ dt: "ELMS item line", dd: esc(itemT) });
       }
       function factPair(x) {
         return "<div class='wo-facts-pair'><dt>" + esc(x.dt) + "</dt><dd>" + x.dd + "</dd></div>";
@@ -17950,11 +17958,11 @@ function renderDashboardHtml(): string {
         );
       }
       return (
+        smxPlanIdentityStrip(row) +
         factGroup("Schedule", sched) +
         smxPlainUtilBlock(row) +
-        factGroup("Utilization", util) +
-        factGroup("Plan", plan) +
-        factGroup("Organization", org)
+        factGroup("Utilization (ELMS raw)", util) +
+        factGroup("This maintenance plan", plan)
       );
     }
 
@@ -17988,10 +17996,10 @@ function renderDashboardHtml(): string {
               esc(title) +
               (sub ? "<span class='smx-plan-sub'>" + sub + "</span>" : "") +
               "</h4>" +
-              "<div class='badges' style='margin-bottom:10px'>" +
+              "<div class='badges' style='margin-bottom:12px'>" +
               badges +
               "</div>" +
-              "<div class='wo-facts'>" +
+              "<div class='wo-facts' style='padding-top:0'>" +
               smxFactsHtmlForPlan(row) +
               "</div>" +
               "</article>"
@@ -18279,62 +18287,130 @@ function renderDashboardHtml(): string {
       }
     }
 
-    /** Plain English + optional progress bar for meter vs next util qty. */
+    /** Human label for ELMS utilization type (avoid generic "units"). */
+    function smxUtilUomLabel(utRaw) {
+      const s = String(utRaw || "").toLowerCase().replace(/\s+/g, " ").trim();
+      if (!s) return "";
+      if (/\bmile|\bmi\b|mph/.test(s)) return "miles";
+      if (/\bhour|\bhr\b|hrs|operating hour/.test(s)) return "hours";
+      if (/\bkm\b|kilometer|kilomet/.test(s)) return "km";
+      return s;
+    }
+
+    /** Plain English for meter vs next util qty (ELMS interval targets). */
     function smxPlainUtilBlock(row) {
-      const ut = (row.elmsUtilType || "").trim();
-      const utPhrase = ut ? ut : "units";
+      const uom = smxUtilUomLabel(row.elmsUtilType);
       const cur = row.elmsCurrentMeter;
       const nxt = row.elmsNextUtilQty;
       if (cur == null || nxt == null) {
         return (
-          "<p class='smx-plain-callout'><strong>Utilization</strong> — This extract does not show both a current reading and a next target for this plan, so we cannot say how far along the interval you are.</p>"
+          "<p class='smx-plain-callout'><strong>Service meter</strong> — This extract does not show both a current reading and the next ELMS target, so we cannot estimate distance to the next interval.</p>"
         );
       }
       if (row.scheduleMxOverdueUtil || (row.scheduleMxUtilRemaining != null && row.scheduleMxUtilRemaining < 0)) {
         const over = row.scheduleMxUtilRemaining != null ? Math.abs(row.scheduleMxUtilRemaining) : 0;
+        const a = smxFmtNum(cur);
+        const b = smxFmtNum(nxt);
+        const u = uom ? " " + uom : "";
         return (
-          "<p class='smx-plain-callout'><strong>Over the service interval.</strong> The reading is at or past the next target (" +
-          smxFmtNum(cur) +
-          " vs " +
-          smxFmtNum(nxt) +
-          " " +
-          esc(utPhrase) +
-          ")." +
-          (over ? " About " + smxFmtNum(over) + " " + esc(utPhrase) + " past that target." : "") +
+          "<p class='smx-plain-callout'><strong>Past the ELMS interval target.</strong> Reading is <strong>" +
+          a +
+          u +
+          "</strong>; ELMS target was <strong>" +
+          b +
+          u +
+          "</strong>." +
+          (over ? " About <strong>" + smxFmtNum(over) + u + "</strong> past that target." : "") +
           "</p>"
         );
       }
-      const span = Math.max(1, nxt);
-      const pct = Math.min(100, Math.max(0, Math.round((cur / span) * 100)));
       const rem = row.scheduleMxUtilRemaining != null ? row.scheduleMxUtilRemaining : nxt - cur;
-      const barCls = pct >= 95 ? "danger" : pct >= 85 ? "warn" : "";
+      const safeNxt = Math.max(1, nxt);
+      const frac = Math.min(1, Math.max(0, cur / safeNxt));
+      const pctToward = Math.round(frac * 100);
+      const barW = Math.max(cur > 0 && pctToward < 2 ? 2 : 0, Math.min(100, pctToward));
+      const barCls = pctToward >= 95 ? "danger" : pctToward >= 85 ? "warn" : "";
+      const a = smxFmtNum(cur);
+      const b = smxFmtNum(nxt);
+      const u = uom ? " " + uom : "";
+      var pctLine = "";
+      if (pctToward < 1) {
+        pctLine = " You are still early (under 1% of the way from this reading to the ELMS target).";
+      } else if (pctToward < 10) {
+        pctLine = " You are still early in the interval (about " + pctToward + "% of the distance from this reading to the ELMS target).";
+      } else {
+        pctLine = " About <strong>" + pctToward + "%</strong> of the distance from this reading to the ELMS target.";
+      }
       return (
         "<div class='smx-plain-callout' role='status'>" +
-        "<strong>How close to the next service reading?</strong> " +
-        "You are about <strong>" +
-        pct +
-        "%</strong> of the way from zero to the next target reading " +
-        "(" +
-        smxFmtNum(cur) +
-        " of " +
-        smxFmtNum(nxt) +
-        " " +
-        esc(utPhrase) +
-        "). " +
-        "Roughly <strong>" +
+        "<strong>Service meter (ELMS)</strong> — Current reading <strong>" +
+        a +
+        u +
+        "</strong>. Next interval target in this extract <strong>" +
+        b +
+        u +
+        "</strong>. About <strong>" +
         smxFmtNum(Math.max(0, rem)) +
-        " " +
-        esc(utPhrase) +
-        "</strong> left before you reach that reading." +
+        u +
+        "</strong> to go before you reach that target." +
+        pctLine +
+        " <span class='facts-sub'>(Targets come from ELMS; wording is simplified for triage.)</span>" +
         "<div class='smx-util-progress-wrap'>" +
-        "<div class='smx-util-progress-label'>Progress toward next util target</div>" +
+        "<div class='smx-util-progress-label'>How much of this ELMS interval is used (by reading)</div>" +
         "<div class='smx-util-progress " +
         esc(barCls) +
         "' title='" +
-        esc(String(pct) + "% of interval used") +
+        esc(String(pctToward) + "% toward target reading") +
         "'><i style='width:" +
-        pct +
+        barW +
         "%'></i></div></div></div>"
+      );
+    }
+
+    function smxPlanIdentityStrip(row) {
+      const pairs = [];
+      pairs.push({ lbl: "Unit", val: row.owningUnit ? esc(row.owningUnit) : "—" });
+      pairs.push({ lbl: "Make / model", val: row.makeModel ? esc(row.makeModel) : "—" });
+      pairs.push({ lbl: "Vehicle type", val: row.vehNomen ? esc(row.vehNomen) : "—" });
+      pairs.push({ lbl: "Mgmt code", val: row.mgmtCd ? esc(row.mgmtCd) : "—" });
+      if (row.nce) {
+        pairs.push({
+          lbl: "NCE",
+          val:
+            "<span class='nce-badge'>Yes</span>" +
+            (row.nceStatus ? " <span class='facts-sub'>" + esc(row.nceStatus) + "</span>" : ""),
+        });
+      } else {
+        pairs.push({ lbl: "NCE", val: "No" });
+      }
+      pairs.push({
+        lbl: "Open WOs (latest ETIC)",
+        val:
+          esc(String(row.workOrderCount ?? 0)) +
+          (row.eticOpenWorkOrderIds
+            ? " <span class='facts-sub'>" + esc(row.eticOpenWorkOrderIds) + "</span>"
+            : ""),
+      });
+      if (row.eticOpenInMaintenance) {
+        pairs.push({ lbl: "Shop", val: "<span class='facts-sub'>Parts status looks in-shop</span>" });
+      }
+      if (row.location && String(row.location).trim()) {
+        pairs.push({ lbl: "Location (ELMS)", val: esc(String(row.location).trim()) });
+      }
+      return (
+        "<div class='smx-plan-identity' aria-label='Vehicle from latest ETIC'>" +
+        pairs
+          .map(function (p) {
+            return (
+              "<div class='smx-id-pair'><span class='smx-id-lbl'>" +
+              esc(p.lbl) +
+              "</span><span class='smx-id-val'>" +
+              p.val +
+              "</span></div>"
+            );
+          })
+          .join("") +
+        "</div>"
       );
     }
 
