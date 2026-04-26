@@ -979,8 +979,14 @@ export type ScheduleMxFleetRow = {
   itemDesc: string;
   location: string;
   makeModel: string;
+  /** Vehicle type / nomenclature (prefer latest ETIC Fleet P&A when present). */
+  vehNomen: string;
   mgmtCd: string;
   workOrderCount: number;
+  /** Open WO ids from latest ETIC ingest (same date as fleet overlay). */
+  openWorkOrderIds: string[];
+  /** True when asset has ≥1 open WO on latest ETIC — schedule due is suppressed (in maintenance). */
+  scheduleMxInOpenMaintenance: boolean;
   nce: boolean;
   nceStatus: string;
   /** Overdue schedule maintenance on an NCE asset — highest leadership priority. */
@@ -1001,8 +1007,11 @@ export type ScheduleMxFleetRow = {
 /** One dashboard row per asset; `planRows` holds per-plan detail for expand. */
 export type ScheduleMxAssetRollupRow = {
   assetId: string;
+  makeModel: string;
+  vehNomen: string;
   mgmtCd: string;
   workOrderCount: number;
+  openWorkOrderIds: string[];
   nce: boolean;
   nceStatus: string;
   /** Worst problem across plans (mutually exclusive buckets for filtering). */
@@ -1056,7 +1065,10 @@ export function rollupScheduleMxPlansToAssets(
     const sortedPlans = sortScheduleMxRows(plans.slice());
     let minRank = 99;
     let mgmtCd = "";
+    let makeModel = "";
+    let vehNomen = "";
     let workOrderCount = 0;
+    const openWoIds: string[] = [];
     let nce = false;
     let nceStatus = "";
     const counts = { overdue: 0, dueSoon: 0, missing: 0, ok: 0, noDue: 0 };
@@ -1064,7 +1076,12 @@ export function rollupScheduleMxPlansToAssets(
       const rk = smxPlanAttentionRank(p);
       if (rk < minRank) minRank = rk;
       if (!mgmtCd && (p.mgmtCd ?? "").trim()) mgmtCd = (p.mgmtCd ?? "").trim();
+      if (!makeModel && (p.makeModel ?? "").trim()) makeModel = (p.makeModel ?? "").trim();
+      if (!vehNomen && (p.vehNomen ?? "").trim()) vehNomen = (p.vehNomen ?? "").trim();
       workOrderCount = Math.max(workOrderCount, Number(p.workOrderCount) || 0);
+      if (openWoIds.length === 0 && Array.isArray(p.openWorkOrderIds) && p.openWorkOrderIds.length) {
+        openWoIds.push.apply(openWoIds, p.openWorkOrderIds);
+      }
       if (p.nce) {
         nce = true;
         if (!nceStatus && (p.nceStatus ?? "").trim()) nceStatus = (p.nceStatus ?? "").trim();
@@ -1079,8 +1096,11 @@ export function rollupScheduleMxPlansToAssets(
     if (minRank > 5) minRank = 5;
     out.push({
       assetId,
+      makeModel,
+      vehNomen,
       mgmtCd,
       workOrderCount,
+      openWorkOrderIds: openWoIds,
       nce,
       nceStatus,
       summaryKey: smxRankToSummaryKey(minRank),
@@ -1127,6 +1147,109 @@ async function loadWoCountsPerAsset(
     if (aid) m.set(aid, Number(row.c) || 0);
   }
   return m;
+}
+
+/**
+ * Newest ETIC workbook date that has work-order rows (same notion as “latest ingest” for open WOs).
+ */
+export async function getLatestEticSnapshotDateKeyForScheduleMx(
+  env: { ETIC_SNAPSHOTS: D1Database },
+): Promise<string | null> {
+  const row = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT e.date_key
+       FROM etic_snapshots e
+      WHERE e.deleted_at_iso IS NULL
+        AND EXISTS (SELECT 1 FROM work_order_snapshot w WHERE w.snapshot_date_key = e.date_key)
+      ORDER BY e.date_key DESC
+      LIMIT 1`,
+  ).first<{ date_key: string }>();
+  const k = row?.date_key?.trim() ?? "";
+  return k || null;
+}
+
+type FleetPaOverlayRow = {
+  makeModel: string;
+  vehNomen: string;
+  mgmtCd: string;
+  nce: boolean;
+  nceStatus: string;
+};
+
+async function loadFleetPaSnapshotByAsset(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  eticDateKey: string,
+): Promise<Map<string, FleetPaOverlayRow>> {
+  const m = new Map<string, FleetPaOverlayRow>();
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT asset_id, make_model, veh_nomen, mgmt_cd, raw_row_json
+       FROM fleet_p_a_snapshot
+      WHERE snapshot_date_key = ?`,
+  )
+    .bind(eticDateKey)
+    .all<{ asset_id: string; make_model: string; veh_nomen: string; mgmt_cd: string; raw_row_json: string }>();
+  for (const row of r.results ?? []) {
+    const aid = (row.asset_id ?? "").trim();
+    if (!aid) continue;
+    const rawCols = readRawColumns(row.raw_row_json ?? null);
+    const ex = extractRawExtrasFromColumns(rawCols);
+    const makeModel =
+      (row.make_model ?? "").trim() ||
+      pickRawValue(rawCols, ["fleet.make/model", "fleet.make model", "make model", "fleet.item desc", "item desc"]);
+    m.set(aid, {
+      makeModel,
+      vehNomen: (row.veh_nomen ?? "").trim(),
+      mgmtCd: (row.mgmt_cd ?? "").trim(),
+      nce: ex.nce,
+      nceStatus: ex.nceStatus,
+    });
+  }
+  return m;
+}
+
+async function loadOpenWorkOrdersByAssetLatestEtic(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  eticDateKey: string,
+): Promise<Map<string, { count: number; ids: string[] }>> {
+  const m = new Map<string, { count: number; ids: string[] }>();
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT asset_id, work_order_id
+       FROM work_order_snapshot
+      WHERE snapshot_date_key = ?
+      ORDER BY asset_id ASC, work_order_id ASC`,
+  )
+    .bind(eticDateKey)
+    .all<{ asset_id: string; work_order_id: string }>();
+  for (const row of r.results ?? []) {
+    const aid = (row.asset_id ?? "").trim();
+    const wo = (row.work_order_id ?? "").trim();
+    if (!aid || !wo) continue;
+    let cur = m.get(aid);
+    if (!cur) {
+      cur = { count: 0, ids: [] };
+      m.set(aid, cur);
+    }
+    cur.ids.push(wo);
+    cur.count += 1;
+  }
+  return m;
+}
+
+function applyOpenMaintenanceOverride(row: ScheduleMxFleetRow): ScheduleMxFleetRow {
+  if (!row.scheduleMxInOpenMaintenance) return row;
+  const wasOverdue = row.scheduleMxBucket === "overdue" || row.scheduleMxNceCritical;
+  if (!wasOverdue) return row;
+  const note = "In maintenance (open WO)";
+  const mergedStatus = row.scheduleMxStatus?.trim()
+    ? row.scheduleMxStatus.trim() + " · " + note
+    : note;
+  return {
+    ...row,
+    scheduleMxBucket: "ok",
+    scheduleMxNceCritical: false,
+    scheduleMxOverdueByDays: null,
+    scheduleMxOverdueUtil: false,
+    scheduleMxStatus: mergedStatus,
+  };
 }
 
 function sortScheduleMxRows(out: ScheduleMxFleetRow[]): ScheduleMxFleetRow[] {
@@ -1343,28 +1466,43 @@ function buildScheduleMxRowsFromFleetSheet(
     const makeModel =
       (typed?.makeModel ?? "").trim() ||
       pickRawValue(merged, ["fleet.make/model", "fleet.make model", "make model", "fleet.item desc", "item desc"]);
+    const vehNomen =
+      (typed?.vehNomen ?? "").trim() ||
+      pickRawValue(merged, [
+        "fleet.veh nomen",
+        "veh nomen",
+        "vehicle nomenclature",
+        "nomenclature",
+        "equipment type",
+      ]);
     const mgmtCd =
       (typed?.mgmtCd ?? "").trim() ||
       pickRawValue(merged, ["fleet.mgmt cd", "fleet.mgmt code", "mgmt cd"]);
     const planName = pickElmsFromRaw(merged, ["plan name"]);
     const planId = pickElmsFromRaw(merged, ["plan id"]);
-    out.push({
-      assetId,
-      planRowKey: assetId,
-      planId,
-      planName,
-      planDesc: pickElmsFromRaw(merged, ["plan desc"]),
-      maintenanceScheduleId: pickElmsFromRaw(merged, ["maintenance schedule id", "maint schedule id"]),
-      itemDesc: pickElmsFromRaw(merged, ["item desc"]),
-      location: pickElmsFromRaw(merged, ["location"]),
-      makeModel,
-      mgmtCd,
-      workOrderCount: woCounts.get(assetId) ?? 0,
-      nce,
-      nceStatus,
-      scheduleMxNceCritical,
-      ...smx,
-    });
+    const woC = woCounts.get(assetId) ?? 0;
+    out.push(
+      applyOpenMaintenanceOverride({
+        assetId,
+        planRowKey: assetId,
+        planId,
+        planName,
+        planDesc: pickElmsFromRaw(merged, ["plan desc"]),
+        maintenanceScheduleId: pickElmsFromRaw(merged, ["maintenance schedule id", "maint schedule id"]),
+        itemDesc: pickElmsFromRaw(merged, ["item desc"]),
+        location: pickElmsFromRaw(merged, ["location"]),
+        makeModel,
+        vehNomen,
+        mgmtCd,
+        workOrderCount: woC,
+        openWorkOrderIds: [],
+        scheduleMxInOpenMaintenance: woC > 0,
+        nce,
+        nceStatus,
+        scheduleMxNceCritical,
+        ...smx,
+      }),
+    );
   }
   return sortScheduleMxRows(out);
 }
@@ -1373,25 +1511,51 @@ function buildScheduleMxRowsFromPlanRows(
   rows: Array<{ planRowKey: string; assetId: string; raw: Record<string, string> }>,
   woCounts: Map<string, number>,
   dateKey: string,
+  opts?: {
+    fleetPaByAsset?: Map<string, FleetPaOverlayRow>;
+    openWoByAsset?: Map<string, { count: number; ids: string[] }>;
+  },
 ): ScheduleMxFleetRow[] {
   const out: ScheduleMxFleetRow[] = [];
   for (const pr of rows) {
     const assetId = pr.assetId;
     const merged = pr.raw;
-    const nceStatus = pickRawValue(merged, [
+    const fp = opts?.fleetPaByAsset?.get(assetId);
+    const woInfo = opts?.openWoByAsset?.get(assetId);
+    const woCount = woInfo?.count ?? woCounts.get(assetId) ?? 0;
+    const openIds = woInfo?.ids ?? [];
+    const inMaint = woCount > 0;
+
+    let nceStatus = pickRawValue(merged, [
       "fleet.nce vehicle listing.status",
       "fleet.nce vehicle listing status",
       "fleet.nce status",
       "fleet.nce",
     ]);
-    const nce = !!nceStatus;
+    let nce = !!nceStatus;
+    if (fp) {
+      nce = fp.nce;
+      nceStatus = fp.nceStatus || nceStatus;
+    }
+
     const smx = analyzeElmsScheduleMxFromRaw(merged, dateKey);
     const scheduleMxNceCritical = nce && smx.scheduleMxBucket === "overdue";
     const makeModel =
+      (fp?.makeModel ?? "").trim() ||
       pickRawValue(merged, ["fleet.make/model", "fleet.make model", "make model"]) ||
       pickElmsFromRaw(merged, ["item desc"]);
-    const mgmtCd = pickRawValue(merged, ["fleet.mgmt cd", "fleet.mgmt code", "mgmt cd"]);
-    out.push({
+    const vehNomen =
+      (fp?.vehNomen ?? "").trim() ||
+      pickRawValue(merged, [
+        "fleet.veh nomen",
+        "veh nomen",
+        "vehicle nomenclature",
+        "nomenclature",
+        "equipment type",
+      ]);
+    const mgmtCd =
+      (fp?.mgmtCd ?? "").trim() || pickRawValue(merged, ["fleet.mgmt cd", "fleet.mgmt code", "mgmt cd"]);
+    const base: ScheduleMxFleetRow = {
       assetId,
       planRowKey: pr.planRowKey,
       planId: pickElmsFromRaw(merged, ["plan id"]),
@@ -1401,13 +1565,17 @@ function buildScheduleMxRowsFromPlanRows(
       itemDesc: pickElmsFromRaw(merged, ["item desc"]),
       location: pickElmsFromRaw(merged, ["location"]),
       makeModel,
+      vehNomen,
       mgmtCd,
-      workOrderCount: woCounts.get(assetId) ?? 0,
+      workOrderCount: woCount,
+      openWorkOrderIds: openIds,
+      scheduleMxInOpenMaintenance: inMaint,
       nce,
       nceStatus,
       scheduleMxNceCritical,
       ...smx,
-    });
+    };
+    out.push(applyOpenMaintenanceOverride(base));
   }
   return sortScheduleMxRows(out);
 }
@@ -1774,8 +1942,16 @@ export async function getScheduleMxFleetForDate(
 ): Promise<ScheduleMxFleetRow[]> {
   const planRows = await loadScheduleMxPlanRowsForDate(env, dateKey);
   if (planRows.length === 0) return [];
-  const woCounts = await loadWoCountsPerAsset(env, dateKey);
-  return buildScheduleMxRowsFromPlanRows(planRows, woCounts, dateKey);
+  const eticKey = await getLatestEticSnapshotDateKeyForScheduleMx(env);
+  const [fleetPaByAsset, openWoByAsset, woCounts] = await Promise.all([
+    eticKey ? loadFleetPaSnapshotByAsset(env, eticKey) : Promise.resolve(new Map<string, FleetPaOverlayRow>()),
+    eticKey ? loadOpenWorkOrdersByAssetLatestEtic(env, eticKey) : Promise.resolve(new Map()),
+    eticKey ? loadWoCountsPerAsset(env, eticKey) : Promise.resolve(new Map<string, number>()),
+  ]);
+  return buildScheduleMxRowsFromPlanRows(planRows, woCounts, dateKey, {
+    fleetPaByAsset,
+    openWoByAsset,
+  });
 }
 
 async function getEarliestSnapshotDate(env: { ETIC_SNAPSHOTS: D1Database }): Promise<string> {

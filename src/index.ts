@@ -18,6 +18,7 @@ import {
   getWatchRowByIdForDate,
   getWatchRowsForDate,
   getScheduleMxFleetForDate,
+  getLatestEticSnapshotDateKeyForScheduleMx,
   rollupScheduleMxPlansToAssets,
   sortScheduleMxAssetRows,
   getLatestScheduleMxExtractDateKey,
@@ -4874,6 +4875,8 @@ async function handleScheduleMxApi(env: Env, request: Request): Promise<Response
   const overdueAssets = rows.filter(
     (r) => r.summaryKey === "overdue" || r.summaryKey === "nce_critical",
   ).length;
+  const eticAsOfDateKey = await getLatestEticSnapshotDateKeyForScheduleMx(env);
+  const inMaintenanceAssets = rows.filter((r) => (r.workOrderCount || 0) > 0).length;
   const stats = {
     planRows: planRows.length,
     distinctAssets,
@@ -4884,6 +4887,8 @@ async function handleScheduleMxApi(env: Env, request: Request): Promise<Response
     dueSoon: rows.filter((r) => r.summaryKey === "due_soon").length,
     ok: rows.filter((r) => r.summaryKey === "ok").length,
     nceCritical,
+    inMaintenanceAssets,
+    eticAsOfDateKey,
   };
   return Response.json(
     { dateKey, stats, rows, source: "prevmx_extract" },
@@ -14426,7 +14431,7 @@ function renderDashboardHtml(): string {
         <div class="smx-header">
           <div>
             <h2 class="smx-title">Schedule Maintenance Status</h2>
-            <p class="smx-sub">One row per <strong>asset</strong> from the <strong>ELMS extract</strong> (email <code>prevmx@2t3.app</code>). Counts roll up every maintenance plan on that asset; expand a row to see plan detail. Due/overdue uses next maint date and meter vs next util when present. Open WO counts use Work Orders on the same calendar date when available.</p>
+            <p class="smx-sub">One row per <strong>asset</strong> from the <strong>ELMS extract</strong> (email <code>prevmx@2t3.app</code>). Counts roll up every maintenance plan; expand for plan detail. <strong>Open work orders</strong> come from the <strong>latest ETIC ingest</strong> — those assets are not counted overdue on preventive schedule (in maintenance). <strong>NCE</strong>, make/model, and mgmt code prefer that same ETIC Fleet P&amp;A snapshot when available.</p>
           </div>
           <span class="smx-asof-pill" id="smx-asof-pill" title="Latest prevmx import date">Latest import</span>
           <label class="smx-search" style="margin-left:10px"><span class="sr-only">Import date</span>
@@ -17642,6 +17647,12 @@ function renderDashboardHtml(): string {
       const ql = q.toLowerCase();
       if ((row.assetId || "").toLowerCase().indexOf(ql) !== -1) return true;
       if ((row.mgmtCd || "").toLowerCase().indexOf(ql) !== -1) return true;
+      if ((row.makeModel || "").toLowerCase().indexOf(ql) !== -1) return true;
+      if ((row.vehNomen || "").toLowerCase().indexOf(ql) !== -1) return true;
+      var ids = row.openWorkOrderIds || [];
+      for (var wi = 0; wi < ids.length; wi++) {
+        if ((ids[wi] || "").toLowerCase().indexOf(ql) !== -1) return true;
+      }
       const plans = row.planRows || [];
       for (var pi = 0; pi < plans.length; pi++) {
         var p = plans[pi];
@@ -17663,9 +17674,12 @@ function renderDashboardHtml(): string {
           "</div>"
         );
       }
+      var eticLbl = smxStats.eticAsOfDateKey ? fmtKeyLong(smxStats.eticAsOfDateKey) : "—";
       box.innerHTML =
         pill("planRows", "Maint plans (rows in file)", "") +
         pill("distinctAssets", "Assets", "") +
+        "<div class='smx-stat'><span class='lbl'>ETIC ref (WO / fleet)</span><span class='v'>" + esc(eticLbl) + "</span></div>" +
+        pill("inMaintenanceAssets", "Assets w/ open WO", "") +
         pill("nceCritical", "NCE + overdue (assets)", "crit") +
         pill("overdue", "Overdue assets (any plan)", "bad") +
         pill("dueSoon", "Due soon assets (≤30d)", "warn") +
@@ -17697,6 +17711,7 @@ function renderDashboardHtml(): string {
       if (sk === "overdue") return { cls: "overdue", label: "Overdue" };
       if (sk === "due_soon") return { cls: "due_soon", label: "Due soon" };
       if (sk === "missing") return { cls: "missing", label: "Missing data" };
+      if ((row.workOrderCount || 0) > 0) return { cls: "ok", label: "OK (in WO)" };
       return { cls: "ok", label: "OK" };
     }
 
@@ -17752,18 +17767,31 @@ function renderDashboardHtml(): string {
         return;
       }
       tbody.innerHTML = filtered.map(function (row) {
-        const nce = row.nce
-          ? ("<span class='nce-inline' title='" + esc(row.nceStatus || "NCE") + "'>NCE</span>")
-          : "—";
+        var nceBody = "—";
+        if (row.nce) {
+          nceBody =
+            "<span class='nce-inline' title='" + esc(row.nceStatus || "NCE") + "'>NCE</span>" +
+            ((row.nceStatus || "").trim()
+              ? "<div class='remark-snippet'>" + esc(row.nceStatus) + "</div>"
+              : "");
+        }
         const wp = smxAssetWorstPill(row);
         let trCls = "";
         if (row.summaryKey === "nce_critical") trCls = "smx-row-nce-crit";
         else if (row.summaryKey === "overdue") trCls = "smx-row-overdue";
         else if (row.summaryKey === "due_soon") trCls = "smx-row-due-soon";
-        const mgmtWo =
-          (row.mgmtCd ? "Mgmt " + esc(row.mgmtCd) : "") +
-          (row.mgmtCd && row.workOrderCount ? " · " : "") +
-          (row.workOrderCount ? row.workOrderCount + " open WO" : "");
+        var woIds = row.openWorkOrderIds || [];
+        var woLine = "";
+        if (woIds.length) {
+          woLine =
+            "<div class='remark-snippet'>Open WO: " +
+            woIds
+              .map(function (w) {
+                return "<a class='wo-id' href='#wo=" + encodeURIComponent(w) + "'>" + esc(w) + "</a>";
+              })
+              .join(", ") +
+            "</div>";
+        }
         const plans = row.planRows || [];
         const nested =
           "<details class='smx-nested'>" +
@@ -17773,11 +17801,14 @@ function renderDashboardHtml(): string {
         return (
           "<tr" + (trCls ? " class='" + esc(trCls) + "'" : "") + ">" +
             "<td><span class='asset-mono'>" + esc(row.assetId) + "</span>" +
-              (mgmtWo ? "<div class='remark-snippet'>" + mgmtWo + "</div>" : "") +
+              (row.vehNomen ? "<div class='remark-snippet'>" + esc(row.vehNomen) + "</div>" : "") +
+              (row.makeModel ? "<div class='remark-snippet'>" + esc(row.makeModel) + "</div>" : "") +
+              (row.mgmtCd ? "<div class='remark-snippet'>Mgmt " + esc(row.mgmtCd) + "</div>" : "") +
+              woLine +
             "</td>" +
             "<td>" + String(row.planCount || plans.length) + "</td>" +
             "<td>" + esc(smxAssetSummaryLine(row)) + "</td>" +
-            "<td>" + nce + "</td>" +
+            "<td>" + nceBody + "</td>" +
             "<td><span class='smx-pill " + esc(wp.cls) + "'>" + esc(wp.label) + "</span>" + nested + "</td>" +
           "</tr>"
         );
