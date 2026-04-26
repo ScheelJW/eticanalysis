@@ -14038,6 +14038,26 @@ function renderDashboardHtml(): string {
       color: var(--muted);
       margin-top: 4px;
     }
+    .smx-plan-facts.wo-facts {
+      gap: 12px;
+      padding: 10px 12px;
+    }
+    .smx-plan-facts .wo-facts-group-h {
+      margin: 0 0 6px;
+      font-size: 0.58rem;
+      letter-spacing: 0.07em;
+    }
+    .smx-plan-facts .wo-facts-dl {
+      gap: 8px 14px;
+    }
+    .smx-plan-facts .wo-facts-pair dt {
+      font-size: 0.55rem;
+      margin: 0 0 2px;
+    }
+    .smx-plan-facts .wo-facts-pair dd {
+      font-size: 0.82rem;
+      line-height: 1.3;
+    }
     .smx-plain-callout {
       margin: 0 0 10px;
       padding: 10px 12px;
@@ -14047,6 +14067,54 @@ function renderDashboardHtml(): string {
       font-size: 0.86rem;
       line-height: 1.45;
       color: var(--text);
+    }
+    .smx-plain-callout--compact {
+      margin: 0 0 8px;
+      padding: 8px 10px;
+      font-size: 0.78rem;
+      line-height: 1.35;
+    }
+    .smx-plain-callout--warn {
+      background: rgba(176,0,32,0.06);
+      border-color: rgba(176,0,32,0.2);
+    }
+    .smx-plain-lead {
+      margin: 8px 0 0;
+      font-size: 0.76rem;
+      color: var(--text);
+    }
+    .smx-plain-lead--warn { color: var(--danger); font-weight: 600; }
+    .smx-util-metrics {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 6px 8px;
+    }
+    @media (max-width: 520px) {
+      .smx-util-metrics { grid-template-columns: 1fr; }
+    }
+    .smx-util-metric {
+      min-width: 0;
+      padding: 6px 8px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+    .smx-util-m-lbl {
+      display: block;
+      font-size: 0.55rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      margin-bottom: 2px;
+    }
+    .smx-util-m-val {
+      display: block;
+      font-size: 0.8rem;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
+      line-height: 1.25;
     }
     .smx-plain-callout .smx-util-progress-wrap {
       margin-top: 8px;
@@ -14059,7 +14127,7 @@ function renderDashboardHtml(): string {
       margin-bottom: 4px;
     }
     .smx-util-progress {
-      height: 8px;
+      height: 6px;
       border-radius: 999px;
       background: var(--border);
       overflow: hidden;
@@ -17873,26 +17941,6 @@ function renderDashboardHtml(): string {
       }
       var plainCal = smxPlainDateLine(row);
       if (plainCal) sched.push({ dt: "Calendar (plain language)", dd: esc(plainCal) });
-      const util = [];
-      const ut = (row.elmsUtilType || "").trim();
-      util.push({
-        dt: "Current meter",
-        dd: esc(row.elmsCurrentMeter != null ? String(row.elmsCurrentMeter) + (ut ? " " + ut : "") : "—"),
-      });
-      util.push({
-        dt: "Next util qty",
-        dd: esc(row.elmsNextUtilQty != null ? String(row.elmsNextUtilQty) : "—"),
-      });
-      if (row.scheduleMxUtilRemaining != null) {
-        const rem = row.scheduleMxUtilRemaining;
-        util.push({
-          dt: "Util remaining",
-          dd: esc((rem >= 0 ? "" : "over ") + Math.abs(rem) + (ut ? " " + ut : "")),
-        });
-      }
-      if (row.scheduleMxOverdueUtil) {
-        util.push({ dt: "Util overdue", dd: "<span class='facts-sub'>At or past next util qty</span>" });
-      }
       const plan = [];
       if (row.planDesc) plan.push({ dt: "What this plan is", dd: esc(row.planDesc) });
       function factPair(x) {
@@ -17910,7 +17958,6 @@ function renderDashboardHtml(): string {
       return (
         factGroup("Schedule", sched) +
         smxPlainUtilBlock(row) +
-        factGroup("Utilization", util) +
         factGroup("This maintenance plan", plan)
       );
     }
@@ -17948,7 +17995,7 @@ function renderDashboardHtml(): string {
               "<div class='badges' style='margin-bottom:12px'>" +
               badges +
               "</div>" +
-              "<div class='wo-facts' style='padding-top:0'>" +
+              "<div class='wo-facts smx-plan-facts' style='padding-top:0'>" +
               smxFactsHtmlForPlan(row) +
               "</div>" +
               "</article>"
@@ -18228,72 +18275,77 @@ function renderDashboardHtml(): string {
       return s;
     }
 
-    /** Plain English for meter vs next utilization target. */
+    /** Compact service-meter card: metrics + thin progress + one short line. */
     function smxPlainUtilBlock(row) {
       const uom = smxUtilUomLabel(row.elmsUtilType);
       const cur = row.elmsCurrentMeter;
       const nxt = row.elmsNextUtilQty;
+      const uSuffix = uom ? " " + uom : "";
       if (cur == null || nxt == null) {
         return (
-          "<p class='smx-plain-callout'><strong>Service meter</strong> — No current reading and next target together on this row.</p>"
-        );
-      }
-      if (row.scheduleMxOverdueUtil || (row.scheduleMxUtilRemaining != null && row.scheduleMxUtilRemaining < 0)) {
-        const over = row.scheduleMxUtilRemaining != null ? Math.abs(row.scheduleMxUtilRemaining) : 0;
-        const a = smxFmtNum(cur);
-        const b = smxFmtNum(nxt);
-        const u = uom ? " " + uom : "";
-        return (
-          "<p class='smx-plain-callout'><strong>Past the interval target.</strong> Reading is <strong>" +
-          a +
-          u +
-          "</strong>; target was <strong>" +
-          b +
-          u +
-          "</strong>." +
-          (over ? " About <strong>" + smxFmtNum(over) + u + "</strong> past that target." : "") +
-          "</p>"
+          "<section class='wo-facts-group smx-util-section' aria-label='Service meter'>" +
+          "<h4 class='wo-facts-group-h'>Service meter</h4>" +
+          "<div class='smx-plain-callout smx-plain-callout--compact' role='status'>No current reading and next target on this row.</div>" +
+          "</section>"
         );
       }
       const rem = row.scheduleMxUtilRemaining != null ? row.scheduleMxUtilRemaining : nxt - cur;
+      const overUtil = row.scheduleMxOverdueUtil || rem < 0;
       const safeNxt = Math.max(1, nxt);
       const frac = Math.min(1, Math.max(0, cur / safeNxt));
       const pctToward = Math.round(frac * 100);
       const barW = Math.max(cur > 0 && pctToward < 2 ? 2 : 0, Math.min(100, pctToward));
-      const barCls = pctToward >= 95 ? "danger" : pctToward >= 85 ? "warn" : "";
-      const a = smxFmtNum(cur);
-      const b = smxFmtNum(nxt);
-      const u = uom ? " " + uom : "";
-      var pctLine = "";
-      if (pctToward < 1) {
-        pctLine = " You are still early (under 1% of the way from this reading to the target).";
+      const barCls = overUtil ? "danger" : pctToward >= 95 ? "danger" : pctToward >= 85 ? "warn" : "";
+      const curS = smxFmtNum(cur) + uSuffix;
+      const nxtS = smxFmtNum(nxt) + uSuffix;
+      const remS =
+        rem >= 0 ? smxFmtNum(rem) + uSuffix + " left" : smxFmtNum(Math.abs(rem)) + uSuffix + " over";
+      var lead = "";
+      var leadCls = "smx-plain-lead";
+      if (overUtil) {
+        leadCls += " smx-plain-lead--warn";
+        lead = "Past next target — open a work order or update the meter.";
+      } else if (pctToward < 1) {
+        lead = "Early in the interval (under 1% toward target).";
       } else if (pctToward < 10) {
-        pctLine = " You are still early in the interval (about " + pctToward + "% of the distance from this reading to the target).";
+        lead = "Early — about " + pctToward + "% toward target.";
       } else {
-        pctLine = " About <strong>" + pctToward + "%</strong> of the distance from this reading to the target.";
+        lead = "About " + pctToward + "% toward target.";
       }
+      const calloutCls =
+        "smx-plain-callout smx-plain-callout--compact" + (overUtil ? " smx-plain-callout--warn" : "");
       return (
-        "<div class='smx-plain-callout' role='status'>" +
-        "<strong>Service meter</strong> — Current reading <strong>" +
-        a +
-        u +
-        "</strong>. Next interval target <strong>" +
-        b +
-        u +
-        "</strong>. About <strong>" +
-        smxFmtNum(Math.max(0, rem)) +
-        u +
-        "</strong> to go before you reach that target." +
-        pctLine +
+        "<section class='wo-facts-group smx-util-section' aria-label='Service meter'>" +
+        "<h4 class='wo-facts-group-h'>Service meter</h4>" +
+        "<div class='" +
+        esc(calloutCls) +
+        "' role='status'>" +
+        "<div class='smx-util-metrics'>" +
+        "<div class='smx-util-metric'><span class='smx-util-m-lbl'>Current</span><span class='smx-util-m-val'>" +
+        esc(curS) +
+        "</span></div>" +
+        "<div class='smx-util-metric'><span class='smx-util-m-lbl'>Next target</span><span class='smx-util-m-val'>" +
+        esc(nxtS) +
+        "</span></div>" +
+        "<div class='smx-util-metric'><span class='smx-util-m-lbl'>Remaining</span><span class='smx-util-m-val'>" +
+        esc(remS) +
+        "</span></div>" +
+        "</div>" +
         "<div class='smx-util-progress-wrap'>" +
-        "<div class='smx-util-progress-label'>Progress toward next target (by reading)</div>" +
+        "<div class='smx-util-progress-label'>Progress</div>" +
         "<div class='smx-util-progress " +
         esc(barCls) +
         "' title='" +
-        esc(String(pctToward) + "% toward target reading") +
+        esc(String(pctToward) + "%") +
         "'><i style='width:" +
         barW +
-        "%'></i></div></div></div>"
+        "%'></i></div></div>" +
+        "<p class='" +
+        esc(leadCls) +
+        "'>" +
+        lead +
+        "</p>" +
+        "</div></section>"
       );
     }
 
