@@ -18827,6 +18827,26 @@ function renderDashboardHtml(): string {
       return "miles";
     }
 
+    /** True when today is after next calendar maint date (independent of meter / open-WO triage). */
+    function smxCalendarPastNextMaintDate(row) {
+      var nextIso = row.elmsNextMaintDateIso;
+      if (!nextIso) return false;
+      var t1 = Date.parse(String(nextIso).slice(0, 10) + "T12:00:00.000Z");
+      if (!Number.isFinite(t1)) return false;
+      return Date.now() > t1;
+    }
+
+    /** Whole days since next calendar date (minimum 1 when past). */
+    function smxCalendarDaysPastNextMaint(row) {
+      var nextIso = row.elmsNextMaintDateIso;
+      if (!nextIso) return null;
+      var t1 = Date.parse(String(nextIso).slice(0, 10) + "T12:00:00.000Z");
+      if (!Number.isFinite(t1)) return null;
+      var now = Date.now();
+      if (now <= t1) return null;
+      return Math.max(1, Math.ceil((now - t1) / 86400000));
+    }
+
     function smxPlainDateLine(row) {
       const eff = smxEffBucket(row);
       if (eff === "missing") {
@@ -18839,14 +18859,45 @@ function renderDashboardHtml(): string {
         }
         return "";
       }
-      if (eff === "overdue") {
-        const d = row.scheduleMxOverdueByDays != null ? row.scheduleMxOverdueByDays + " day" + (row.scheduleMxOverdueByDays === 1 ? "" : "s") : "some time";
+      const calPast = smxCalendarPastNextMaintDate(row);
+      const calDays = smxCalendarDaysPastNextMaint(row);
+      const effOver = eff === "overdue";
+      const extractOver = row.scheduleMxBucket === "overdue";
+      if (effOver || (calPast && extractOver)) {
+        const d =
+          row.scheduleMxOverdueByDays != null
+            ? row.scheduleMxOverdueByDays + " day" + (row.scheduleMxOverdueByDays === 1 ? "" : "s")
+            : calDays != null
+              ? calDays + " day" + (calDays === 1 ? "" : "s")
+              : "some time";
         return "Next calendar service date was " + nextM + " (" + d + " past that date).";
+      }
+      if (calPast && !extractOver) {
+        const d =
+          calDays != null
+            ? calDays + " day" + (calDays === 1 ? "" : "s")
+            : "some time";
+        var tail =
+          " Extract treats the plan as current because the meter is still before the next utilization target.";
+        if (row.scheduleMxSuppressedByOpenWo) {
+          tail = " Fleet status shows the vehicle in maintenance — triage treats schedule items as covered.";
+        }
+        return (
+          "Next calendar service date was " +
+          nextM +
+          " (" +
+          d +
+          " past that date)." +
+          tail
+        );
       }
       if (eff === "due_soon" && row.scheduleMxDaysUntil != null) {
         return "Next calendar service date is " + nextM + " (about " + row.scheduleMxDaysUntil + " day" + (row.scheduleMxDaysUntil === 1 ? "" : "s") + " away).";
       }
       if (eff === "ok" || eff === "no_due") {
+        if (calPast) {
+          return "";
+        }
         return "Next calendar service date: " + nextM + ".";
       }
       return "";
@@ -18868,12 +18919,17 @@ function renderDashboardHtml(): string {
     function smxPlainScheduleBlock(row) {
       if (!smxRowHasCalendarContent(row)) return "";
       const eff = smxEffBucket(row);
-      const src = row.scheduleMxStatus || "—";
+      var srcRaw = row.scheduleMxStatus || "—";
+      var calPast = smxCalendarPastNextMaintDate(row);
+      var src = srcRaw;
+      if (calPast && /current/i.test(String(srcRaw))) {
+        src = "Past next calendar date (see note below)";
+      }
       const lastM = row.elmsLastMaintDateIso ? fmtKeyShort(row.elmsLastMaintDateIso) : "—";
       const nextM = row.elmsNextMaintDateIso ? fmtKeyShort(row.elmsNextMaintDateIso) : "—";
       var metrics =
         "<div class='smx-util-metrics smx-schedule-metrics'>" +
-        "<div class='smx-util-metric'><span class='smx-util-m-lbl'>Source status</span><span class='smx-util-m-val'>" +
+        "<div class='smx-util-metric'><span class='smx-util-m-lbl'>Extract calendar status</span><span class='smx-util-m-val'>" +
         esc(src) +
         "</span></div>" +
         "<div class='smx-util-metric'><span class='smx-util-m-lbl'>Last maint</span><span class='smx-util-m-val'>" +
@@ -18893,6 +18949,14 @@ function renderDashboardHtml(): string {
           "<div class='smx-util-metric'><span class='smx-util-m-lbl'>Overdue by</span><span class='smx-util-m-val'>" +
           esc(String(row.scheduleMxOverdueByDays) + " days") +
           "</span></div>";
+      } else if (calPast) {
+        var calOd = smxCalendarDaysPastNextMaint(row);
+        if (calOd != null) {
+          metrics +=
+            "<div class='smx-util-metric'><span class='smx-util-m-lbl'>Calendar date passed</span><span class='smx-util-m-val'>" +
+            esc(String(calOd) + " day" + (calOd === 1 ? "" : "s") + " ago") +
+            "</span></div>";
+        }
       } else if (row.scheduleMxDaysUntil != null && eff === "due_soon") {
         metrics +=
           "<div class='smx-util-metric'><span class='smx-util-m-lbl'>Days until due</span><span class='smx-util-m-val'>" +
@@ -18913,7 +18977,7 @@ function renderDashboardHtml(): string {
         if (Number.isFinite(t0) && Number.isFinite(t1) && t1 > t0) {
           showDateBar = true;
           var frac = (now - t0) / (t1 - t0);
-          if (eff === "overdue") {
+          if (eff === "overdue" || calPast) {
             barW = 100;
             barCls = "danger";
           } else {
@@ -18923,8 +18987,18 @@ function renderDashboardHtml(): string {
           }
         }
       }
-      var leadCls = "smx-plain-lead" + (eff === "overdue" ? " smx-plain-lead--warn" : "");
-      var calloutCls = "smx-plain-callout smx-plain-callout--compact" + (eff === "overdue" ? " smx-plain-callout--warn" : "");
+      var leadCls =
+        "smx-plain-lead" +
+        (eff === "overdue" || (calPast && row.scheduleMxBucket === "overdue") ? " smx-plain-lead--warn" : "");
+      if (calPast && eff !== "overdue") {
+        leadCls += " smx-plain-lead--warn";
+      }
+      var calloutCls =
+        "smx-plain-callout smx-plain-callout--compact" +
+        (eff === "overdue" || (calPast && row.scheduleMxBucket === "overdue") ? " smx-plain-callout--warn" : "");
+      if (calPast && eff !== "overdue") {
+        calloutCls += " smx-plain-callout--warn";
+      }
       return (
         "<section class='wo-facts-group smx-util-section' aria-label='Calendar schedule'>" +
         "<h4 class='wo-facts-group-h'>Calendar</h4>" +
@@ -18934,7 +19008,7 @@ function renderDashboardHtml(): string {
         metrics +
         (showDateBar
           ? "<div class='smx-util-progress-wrap'>" +
-            "<div class='smx-util-progress-label'>Progress to next date</div>" +
+            "<div class='smx-util-progress-label'>Calendar interval (last service date to next)</div>" +
             "<div class='smx-util-progress " +
             esc(barCls) +
             "'><i style='width:" +
@@ -18998,7 +19072,7 @@ function renderDashboardHtml(): string {
         "</span></div>" +
         "</div>" +
         "<div class='smx-util-progress-wrap'>" +
-        "<div class='smx-util-progress-label'>Progress</div>" +
+        "<div class='smx-util-progress-label'>Meter interval (current reading to next target)</div>" +
         "<div class='smx-util-progress " +
         esc(barCls) +
         "' title='" +
