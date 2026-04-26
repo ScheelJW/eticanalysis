@@ -14101,6 +14101,16 @@ function renderDashboardHtml(): string {
       line-height: 1.35;
       word-break: break-word;
     }
+    .smx-plan-identity a.wo-id,
+    .smx-wo-inline a.wo-id {
+      font-family: var(--font-mono);
+      font-weight: 600;
+      color: var(--accent);
+      text-decoration: none;
+    }
+    .smx-plan-identity a.wo-id:hover,
+    .smx-wo-inline a.wo-id:hover { text-decoration: underline; }
+    .smx-wo-inline { display: inline; }
     .smx-pill {
       display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.62rem; font-weight: 700;
       text-transform: uppercase; letter-spacing: 0.04em;
@@ -17844,7 +17854,15 @@ function renderDashboardHtml(): string {
       else if (locs.length > 1) metaParts.push(locs.length + " locations");
       if (mgmts.length === 1) metaParts.push("Mgmt " + esc(mgmts[0]));
       else if (mgmts.length > 1) metaParts.push(mgmts.length + " mgmt codes");
-      if (wo) metaParts.push(wo + " open WO" + (wo === 1 ? "" : "s"));
+      if (wo) {
+        var woLinks = smxOpenWoLinksHtml(p0 && p0.eticOpenWorkOrderIds);
+        metaParts.push(
+          wo +
+            " open WO" +
+            (wo === 1 ? "" : "s") +
+            (woLinks ? " · " + woLinks : ""),
+        );
+      }
       if (p0 && p0.eticOpenInMaintenance) metaParts.push("In maintenance (parts)");
       el.innerHTML =
         "<div class='wo-hero-row'>" +
@@ -17854,8 +17872,6 @@ function renderDashboardHtml(): string {
         smxAssetIdentityStripFromPlans(plans) +
         "<div class='wo-hero-sub wo-hero-sub-primary'>" +
         renderSightingBadge(assetId) +
-        " " +
-        renderWaiverBadge(assetId) +
         "</div>" +
         (metaParts.length
           ? "<div class='wo-hero-sub wo-hero-sub-meta'>" + metaParts.join("<span class='dot'>·</span>") + "</div>"
@@ -18050,7 +18066,7 @@ function renderDashboardHtml(): string {
         }
         renderScheduleMxStats();
         renderScheduleMxList();
-        Promise.all([loadSightings(false), loadWaiverCounts(false)]).then(function () {
+        loadSightings(false).then(function () {
           const p = document.getElementById("panel-schedule-mx");
           if (!p || p.classList.contains("hidden")) return;
           renderScheduleMxList();
@@ -18325,6 +18341,30 @@ function renderDashboardHtml(): string {
       );
     }
 
+    function smxOpenWoLinksHtml(idsCsv) {
+      const raw = String(idsCsv || "")
+        .split(/[,\s]+/)
+        .map(function (s) {
+          return s.trim();
+        })
+        .filter(Boolean);
+      if (!raw.length) return "";
+      const parts = [];
+      for (var i = 0; i < raw.length; i++) {
+        const w = raw[i];
+        parts.push(
+          "<a href='#wo=" +
+            encodeURIComponent(w) +
+            "' class='wo-id smx-open-wo' data-smx-open-wo='" +
+            esc(w) +
+            "'>" +
+            esc(w) +
+            "</a>",
+        );
+      }
+      return '<span class="smx-wo-inline">' + parts.join(", ") + "</span>";
+    }
+
     function smxAssetIdentityStripFromPlans(plans) {
       const p0 = plans && plans[0];
       if (!p0) return "";
@@ -18343,13 +18383,14 @@ function renderDashboardHtml(): string {
       } else {
         pairs.push({ lbl: "NCE", val: "No" });
       }
+      var woN = p0.workOrderCount != null ? Number(p0.workOrderCount) : 0;
+      var woVal =
+        woN > 0
+          ? smxOpenWoLinksHtml(p0.eticOpenWorkOrderIds) || esc(String(woN))
+          : "—";
       pairs.push({
         lbl: "Open WOs",
-        val:
-          esc(String(p0.workOrderCount ?? 0)) +
-          (p0.eticOpenWorkOrderIds
-            ? " <span class='facts-sub'>" + esc(p0.eticOpenWorkOrderIds) + "</span>"
-            : ""),
+        val: woVal,
       });
       if (p0.eticOpenInMaintenance) {
         pairs.push({ lbl: "Shop signal", val: "<span class='facts-sub'>Parts status looks in-shop</span>" });
@@ -18494,18 +18535,27 @@ function renderDashboardHtml(): string {
           "<span class='asset-mono'>" + esc(assetId) + "</span>" +
           "<span class='badges'>" + nceChip + critChip + aggPill + "</span>" +
           "</div>" +
-          "<div class='wo-meta-line'>" + renderSightingBadge(assetId, { compact: true }) + renderWaiverBadge(assetId) + "</div>" +
+          "<div class='wo-meta-line'>" + renderSightingBadge(assetId, { compact: true }) + "</div>" +
           "<div class='meta'>" + metaBits.join("") + "</div>" +
           "</button>"
         );
       }).join("");
       list.querySelectorAll(".smx-card").forEach(function (el) {
-        el.addEventListener("click", function () {
+        el.addEventListener("click", function (ev) {
+          if (ev.target.closest("a.smx-open-wo")) return;
           var aid = el.getAttribute("data-smx-asset") || "";
           selectSmxAsset(aid, true);
           list.querySelectorAll(".smx-card").forEach(function (c) {
             c.classList.toggle("active", c.getAttribute("data-smx-asset") === smxSelectedAssetId);
           });
+        });
+      });
+      list.querySelectorAll("a.smx-open-wo").forEach(function (a) {
+        a.addEventListener("click", function (ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          var w = (a.getAttribute("data-smx-open-wo") || "").trim();
+          if (w) setHashWorkOrder(w);
         });
       });
       if (!smxSelectedAssetId && visibleAssetIds.length) smxSelectedAssetId = visibleAssetIds[0];
@@ -20417,6 +20467,18 @@ function renderDashboardHtml(): string {
         smxDateSel.addEventListener("change", function () {
           smxSelectedDateKey = smxDateSel.value || null;
           loadScheduleMxTab();
+        });
+      }
+      const panelSmx = document.getElementById("panel-schedule-mx");
+      if (panelSmx && !panelSmx.dataset.smxWoNav) {
+        panelSmx.dataset.smxWoNav = "1";
+        panelSmx.addEventListener("click", function (ev) {
+          const a = ev.target.closest("a.smx-open-wo");
+          if (!a) return;
+          if (ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.altKey || ev.button !== 0) return;
+          ev.preventDefault();
+          const w = (a.getAttribute("data-smx-open-wo") || "").trim();
+          if (w) setHashWorkOrder(w);
         });
       }
       const melTabBtn = document.getElementById("tab-mel");
