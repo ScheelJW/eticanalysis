@@ -1282,6 +1282,104 @@ function sortScheduleMxRows(out: ScheduleMxFleetRow[]): ScheduleMxFleetRow[] {
  * KPI counts by **asset** (vehicle): each asset is classified by its **worst** plan row.
  * Matches sidebar card logic so tiles are not inflated by multiple plans per asset.
  */
+/** Wing / unit rollup for commander-style scheduled maintenance compliance (by asset worst plan). */
+export type ScheduleMxCommanderUnitRow = {
+  unit: string;
+  totalVehicles: number;
+  notOverdue: number;
+  pctNotOverdue: number;
+  overdue: number;
+  nceOverdue: number;
+};
+
+export type ScheduleMxCommanderSummary = {
+  wing: {
+    totalVehicles: number;
+    notOverdue: number;
+    pctNotOverdue: number;
+    overdue: number;
+    nceOverdue: number;
+  };
+  units: ScheduleMxCommanderUnitRow[];
+};
+
+/** Worst rank for an asset across its plan rows (same scale as scheduleMxPlanWorstRank). */
+function scheduleMxAssetWorstRank(plans: ScheduleMxFleetRow[]): number {
+  let worst = 4;
+  for (const p of plans) {
+    const r = scheduleMxPlanWorstRank(p);
+    if (r < worst) worst = r;
+  }
+  return worst;
+}
+
+/**
+ * Commander summary: one row per owning unit + wing totals.
+ * Overdue = asset worst rank is overdue (rank 1) or NCE-overdue (rank 0).
+ * NCE overdue = rank 0 only (subset of overdue).
+ */
+export function computeScheduleMxCommanderSummary(rows: ScheduleMxFleetRow[]): ScheduleMxCommanderSummary {
+  const byAssetInUnit = new Map<string, Map<string, ScheduleMxFleetRow[]>>();
+  for (const row of rows) {
+    const u = (row.owningUnit ?? "").trim() || "(Unknown unit)";
+    const aid = (row.assetId ?? "").trim() || "—";
+    let am = byAssetInUnit.get(u);
+    if (!am) {
+      am = new Map();
+      byAssetInUnit.set(u, am);
+    }
+    let al = am.get(aid);
+    if (!al) {
+      al = [];
+      am.set(aid, al);
+    }
+    al.push(row);
+  }
+  const units: ScheduleMxCommanderUnitRow[] = [];
+  let wingTotal = 0;
+  let wingNotOd = 0;
+  let wingOd = 0;
+  let wingNceOd = 0;
+  const sortedUnitNames = [...byAssetInUnit.keys()].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  for (const unit of sortedUnitNames) {
+    const am = byAssetInUnit.get(unit)!;
+    let total = 0;
+    let overdue = 0;
+    let nceOverdue = 0;
+    for (const [, plans] of am) {
+      total += 1;
+      const wr = scheduleMxAssetWorstRank(plans);
+      if (wr <= 1) overdue += 1;
+      if (wr === 0) nceOverdue += 1;
+    }
+    const notOverdue = total - overdue;
+    const pct = total > 0 ? Math.round((notOverdue / total) * 10000) / 100 : 0;
+    units.push({
+      unit,
+      totalVehicles: total,
+      notOverdue,
+      pctNotOverdue: pct,
+      overdue,
+      nceOverdue,
+    });
+    wingTotal += total;
+    wingNotOd += notOverdue;
+    wingOd += overdue;
+    wingNceOd += nceOverdue;
+  }
+  const wingPct = wingTotal > 0 ? Math.round((wingNotOd / wingTotal) * 10000) / 100 : 0;
+  return {
+    wing: {
+      totalVehicles: wingTotal,
+      notOverdue: wingNotOd,
+      pctNotOverdue: wingPct,
+      overdue: wingOd,
+      nceOverdue: wingNceOd,
+    },
+    units,
+  };
+}
+
 export function computeScheduleMxAssetStats(rows: ScheduleMxFleetRow[]): {
   planRows: number;
   distinctAssets: number;

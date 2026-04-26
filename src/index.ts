@@ -19,6 +19,7 @@ import {
   getWatchRowsForDate,
   getScheduleMxFleetForDate,
   computeScheduleMxAssetStats,
+  computeScheduleMxCommanderSummary,
   getLatestScheduleMxExtractDateKey,
   listScheduleMxExtractDateKeysDesc,
   getWatchRowsLatest,
@@ -4898,9 +4899,10 @@ async function handleScheduleMxApi(env: Env, request: Request): Promise<Response
     );
   }
   const stats = computeScheduleMxAssetStats(rows);
+  const commander = computeScheduleMxCommanderSummary(rows);
   const eticDateKey = rows.length ? rows[0].eticSnapshotDateKey ?? null : null;
   return Response.json(
-    { dateKey, eticDateKey, stats, rows, source: "prevmx_extract" },
+    { dateKey, eticDateKey, stats, commander, rows, source: "prevmx_extract" },
     { headers: cacheHeaders() },
   );
 }
@@ -13917,6 +13919,178 @@ function renderDashboardHtml(): string {
       position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
       clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
     }
+    /* Commander summary (wing / unit scheduled maintenance compliance) */
+    .smx-commander-wrap {
+      margin-bottom: 20px;
+      padding: 16px 18px 18px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      box-shadow: 0 1px 0 rgba(15, 30, 60, 0.04);
+    }
+    .smx-commander-head {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px 16px;
+      margin-bottom: 14px;
+    }
+    .smx-commander-title {
+      margin: 0 0 4px;
+      font-size: 1.08rem;
+      font-weight: 800;
+      color: var(--text);
+      letter-spacing: -0.02em;
+    }
+    .smx-commander-sub {
+      margin: 0;
+      font-size: 0.78rem;
+      color: var(--muted);
+      line-height: 1.4;
+      max-width: 720px;
+    }
+    .smx-commander-actions { flex-shrink: 0; }
+    .smx-btn-outlook {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 14px;
+      font-size: 0.78rem;
+      font-weight: 700;
+      border-radius: 10px;
+      border: 1px solid rgba(0, 58, 140, 0.35);
+      background: linear-gradient(180deg, rgba(0, 58, 140, 0.12) 0%, rgba(0, 58, 140, 0.06) 100%);
+      color: var(--accent-strong);
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .smx-btn-outlook:hover { filter: brightness(1.05); }
+    .smx-btn-outlook--sm {
+      padding: 5px 10px;
+      font-size: 0.68rem;
+      border-radius: 8px;
+    }
+    .smx-commander-kpis {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .smx-cmd-kpi {
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      min-width: 0;
+    }
+    .smx-cmd-kpi .lbl {
+      display: block;
+      font-size: 0.55rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .smx-cmd-kpi .v {
+      font-size: 1.15rem;
+      font-weight: 800;
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
+      line-height: 1.15;
+    }
+    .smx-cmd-kpi.good .v { color: var(--success); }
+    .smx-cmd-kpi.warn .v { color: var(--warn); }
+    .smx-cmd-kpi.bad .v { color: var(--danger); }
+    .smx-cmd-kpi.crit .v { color: #7a1020; }
+    .smx-commander-filter-hint {
+      margin: 0 0 10px;
+      font-size: 0.76rem;
+      color: var(--muted);
+    }
+    .smx-commander-table-scroll {
+      overflow-x: auto;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+    }
+    .smx-commander-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.8rem;
+    }
+    .smx-commander-table th,
+    .smx-commander-table td {
+      padding: 10px 12px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+    }
+    .smx-commander-table th {
+      font-size: 0.58rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      background: var(--bg1);
+    }
+    .smx-commander-table tbody tr:last-child td { border-bottom: none; }
+    .smx-commander-table .smx-cmd-num {
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+    .smx-commander-table .smx-cmd-mail-col { width: 1%; white-space: nowrap; }
+    .smx-commander-table tbody tr.smx-cmd-row--ok { background: rgba(34, 160, 90, 0.06); }
+    .smx-commander-table tbody tr.smx-cmd-row--warn { background: rgba(245, 199, 84, 0.12); }
+    .smx-commander-table tbody tr.smx-cmd-row--bad { background: rgba(176, 0, 32, 0.07); }
+    .smx-commander-table tbody tr.smx-cmd-row--active {
+      outline: 2px solid var(--accent);
+      outline-offset: -2px;
+    }
+    .smx-cmd-unit-btn {
+      display: inline;
+      padding: 0;
+      margin: 0;
+      border: none;
+      background: none;
+      font: inherit;
+      font-weight: 700;
+      color: var(--accent);
+      cursor: pointer;
+      text-align: left;
+      text-decoration: underline;
+      text-underline-offset: 2px;
+    }
+    .smx-cmd-unit-btn:hover { color: var(--accent-strong); }
+    .smx-cmd-pct {
+      display: inline-flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      width: 100%;
+    }
+    .smx-cmd-pct-bar {
+      flex: 1;
+      max-width: 72px;
+      height: 6px;
+      border-radius: 999px;
+      background: var(--border);
+      overflow: hidden;
+    }
+    .smx-cmd-pct-bar > i {
+      display: block;
+      height: 100%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, var(--success) 0%, #1a9a52 100%);
+      max-width: 100%;
+    }
+    .smx-cmd-pct-bar.warn > i {
+      background: linear-gradient(90deg, var(--warn) 0%, #c98a00 100%);
+    }
+    .smx-cmd-pct-bar.bad > i {
+      background: linear-gradient(90deg, var(--danger) 0%, #8b1538 100%);
+    }
+
     /* Schedule Mx tab — same split-pane rhythm as Work Orders */
     .smx-layout .smx-panel-heading { margin-bottom: 10px; }
     .smx-panel-title { margin: 0 0 4px; font-size: 1.05rem; font-weight: 700; color: var(--text); }
@@ -14634,6 +14808,40 @@ function renderDashboardHtml(): string {
       </div>
 
       <div id="panel-schedule-mx" class="hidden">
+        <div id="smx-commander-wrap" class="smx-commander-wrap hidden" aria-label="Wing maintenance status">
+          <div class="smx-commander-head">
+            <div class="smx-commander-titles">
+              <h2 class="smx-commander-title" id="smx-commander-title">Wing maintenance status</h2>
+              <p class="smx-commander-sub" id="smx-commander-sub"></p>
+            </div>
+            <div class="smx-commander-actions">
+              <button type="button" class="btn smx-btn-outlook" id="smx-commander-mail-wing" title="Open Outlook with a pre-filled commander summary">
+                RTS Outlook — wing summary
+              </button>
+            </div>
+          </div>
+          <div class="smx-commander-kpis" id="smx-commander-kpis"></div>
+          <p class="smx-commander-filter-hint hidden" id="smx-commander-filter-hint">
+            <span id="smx-commander-filter-label"></span>
+            <button type="button" class="linkish" id="smx-commander-clear-unit">Clear unit filter</button>
+          </p>
+          <div class="smx-commander-table-scroll">
+            <table class="smx-commander-table" id="smx-commander-table" aria-label="Scheduled maintenance by unit">
+              <thead>
+                <tr>
+                  <th scope="col">Unit</th>
+                  <th scope="col" class="smx-cmd-num">Total</th>
+                  <th scope="col" class="smx-cmd-num">Not overdue</th>
+                  <th scope="col" class="smx-cmd-num">% OK</th>
+                  <th scope="col" class="smx-cmd-num">Overdue</th>
+                  <th scope="col" class="smx-cmd-num">NCE od</th>
+                  <th scope="col" class="smx-cmd-mail-col">RTS</th>
+                </tr>
+              </thead>
+              <tbody id="smx-commander-tbody"></tbody>
+            </table>
+          </div>
+        </div>
         <div class="wo-layout smx-layout">
           <aside class="wo-sidebar">
             <div class="smx-panel-heading">
@@ -17678,6 +17886,190 @@ function renderDashboardHtml(): string {
     var smxSelectedAssetId = "";
     /** Selected prevmx import date (YYYY-MM-DD); null = use latest from server. */
     var smxSelectedDateKey = null;
+    /** Wing commander summary from API + optional unit filter for asset list. */
+    var smxCommander = null;
+    var smxCommanderFilterUnit = "";
+
+    function smxFmtPct2(n) {
+      var x = Number(n);
+      if (!Number.isFinite(x)) return "0.00";
+      return x.toFixed(2);
+    }
+
+    function smxCommanderReportTitle() {
+      return "Biweekly Scheduled Maintenance Commander Summary (Including NCE)";
+    }
+
+    function smxMailtoUrl(subject, body) {
+      return "mailto:?subject=" + encodeURIComponent(subject) + "&body=" + encodeURIComponent(body);
+    }
+
+    function smxCommanderPlainTableRow(cells) {
+      return cells.join("\t");
+    }
+
+    function smxCommanderEmailBodyWing(cmd, importKey, eticKey) {
+      var w = cmd.wing;
+      var lines = [];
+      lines.push(smxCommanderReportTitle());
+      lines.push("");
+      lines.push("Scheduled maintenance import: " + (importKey ? fmtKeyLong(importKey) : "—"));
+      lines.push("Fleet book (ETIC) context: " + (eticKey ? fmtKeyLong(eticKey) : "—"));
+      lines.push("");
+      lines.push("Wing totals — Total vehicles: " + w.totalVehicles + " · Not overdue: " + w.notOverdue + " · % not overdue: " + smxFmtPct2(w.pctNotOverdue) + "% · Overdue: " + w.overdue + " · NCE overdue: " + w.nceOverdue);
+      lines.push("");
+      lines.push(smxCommanderPlainTableRow(["Unit", "Total vehicles", "Not overdue", "% Not overdue", "Overdue", "NCE overdue"]));
+      var units = cmd.units || [];
+      for (var i = 0; i < units.length; i++) {
+        var u = units[i];
+        lines.push(
+          smxCommanderPlainTableRow([
+            u.unit,
+            String(u.totalVehicles),
+            String(u.notOverdue),
+            smxFmtPct2(u.pctNotOverdue),
+            String(u.overdue),
+            String(u.nceOverdue),
+          ]),
+        );
+      }
+      lines.push("");
+      lines.push("— Sent from ETIC dashboard (Schedule maintenance)");
+      return lines.join("\r\n");
+    }
+
+    function smxCommanderEmailBodyUnit(row, importKey, eticKey) {
+      var lines = [];
+      lines.push(smxCommanderReportTitle());
+      lines.push("");
+      lines.push("Scheduled maintenance import: " + (importKey ? fmtKeyLong(importKey) : "—"));
+      lines.push("Fleet book (ETIC) context: " + (eticKey ? fmtKeyLong(eticKey) : "—"));
+      lines.push("");
+      lines.push("Unit: " + row.unit);
+      lines.push("");
+      lines.push(smxCommanderPlainTableRow(["Unit", "Total vehicles", "Not overdue", "% Not overdue", "Overdue", "NCE overdue"]));
+      lines.push(
+        smxCommanderPlainTableRow([
+          row.unit,
+          String(row.totalVehicles),
+          String(row.notOverdue),
+          smxFmtPct2(row.pctNotOverdue),
+          String(row.overdue),
+          String(row.nceOverdue),
+        ]),
+      );
+      lines.push("");
+      lines.push("— Sent from ETIC dashboard (Schedule maintenance)");
+      return lines.join("\r\n");
+    }
+
+    function renderSmxCommander() {
+      var wrap = document.getElementById("smx-commander-wrap");
+      var sub = document.getElementById("smx-commander-sub");
+      var kpis = document.getElementById("smx-commander-kpis");
+      var tbody = document.getElementById("smx-commander-tbody");
+      var hint = document.getElementById("smx-commander-filter-hint");
+      var hintLbl = document.getElementById("smx-commander-filter-label");
+      if (!wrap || !kpis || !tbody) return;
+      if (!smxCommander || !smxRows.length) {
+        wrap.classList.add("hidden");
+        return;
+      }
+      wrap.classList.remove("hidden");
+      var dk = smxSelectedDateKey || "";
+      var ek = smxEticDateKey || "";
+      if (sub) {
+        sub.textContent =
+          "Rollup by owning unit from this maintenance import. Each vehicle counts once (worst plan). Import " +
+          (dk ? fmtKeyLong(dk) : "—") +
+          " · Fleet book " +
+          (ek ? fmtKeyLong(ek) : "—") +
+          ".";
+      }
+      var w = smxCommander.wing;
+      kpis.innerHTML =
+        "<div class='smx-cmd-kpi'><span class='lbl'>Total vehicles</span><span class='v'>" +
+        esc(String(w.totalVehicles)) +
+        "</span></div>" +
+        "<div class='smx-cmd-kpi good'><span class='lbl'>Not overdue</span><span class='v'>" +
+        esc(String(w.notOverdue)) +
+        "</span></div>" +
+        "<div class='smx-cmd-kpi good'><span class='lbl'>Wing % OK</span><span class='v'>" +
+        esc(smxFmtPct2(w.pctNotOverdue)) +
+        "%</span></div>" +
+        "<div class='smx-cmd-kpi " +
+        (w.overdue > 0 ? "bad" : "") +
+        "'><span class='lbl'>Overdue</span><span class='v'>" +
+        esc(String(w.overdue)) +
+        "</span></div>" +
+        "<div class='smx-cmd-kpi " +
+        (w.nceOverdue > 0 ? "crit" : "") +
+        "'><span class='lbl'>NCE overdue</span><span class='v'>" +
+        esc(String(w.nceOverdue)) +
+        "</span></div>";
+      var units = smxCommander.units || [];
+      tbody.innerHTML = units
+        .map(function (u) {
+          var pct = u.pctNotOverdue;
+          var rowCls = "smx-cmd-row--ok";
+          if (u.nceOverdue > 0) rowCls = "smx-cmd-row--bad";
+          else if (u.overdue > 0) rowCls = "smx-cmd-row--warn";
+          if (smxCommanderFilterUnit && smxCommanderFilterUnit === u.unit) rowCls += " smx-cmd-row--active";
+          var barCls = "smx-cmd-pct-bar";
+          if (pct < 85) barCls += " bad";
+          else if (pct < 100) barCls += " warn";
+          return (
+            "<tr class='" +
+            esc(rowCls) +
+            "' data-smx-cmd-unit='" +
+            esc(u.unit) +
+            "'>" +
+            "<td><button type='button' class='smx-cmd-unit-btn' data-smx-cmd-unit='" +
+            esc(u.unit) +
+            "' title='Filter asset list to this unit'>" +
+            esc(u.unit) +
+            "</button></td>" +
+            "<td class='smx-cmd-num'>" +
+            esc(String(u.totalVehicles)) +
+            "</td>" +
+            "<td class='smx-cmd-num'>" +
+            esc(String(u.notOverdue)) +
+            "</td>" +
+            "<td class='smx-cmd-num'><span class='smx-cmd-pct'><span class='" +
+            esc(barCls) +
+            "'><i style='width:" +
+            esc(String(Math.min(100, Math.max(0, pct)))) +
+            "%'></i></span>" +
+            esc(smxFmtPct2(pct)) +
+            "%</span></td>" +
+            "<td class='smx-cmd-num'>" +
+            esc(String(u.overdue)) +
+            "</td>" +
+            "<td class='smx-cmd-num'>" +
+            esc(String(u.nceOverdue)) +
+            "</td>" +
+            "<td class='smx-cmd-mail-col'><button type='button' class='btn smx-btn-outlook smx-btn-outlook--sm smx-cmd-mail-unit' data-smx-mail-unit='" +
+            esc(u.unit) +
+            "'>RTS Outlook</button></td>" +
+            "</tr>"
+          );
+        })
+        .join("");
+      if (hint && hintLbl) {
+        if (smxCommanderFilterUnit) {
+          hint.classList.remove("hidden");
+          hintLbl.textContent = "Asset list filtered to unit " + smxCommanderFilterUnit + ". ";
+        } else {
+          hint.classList.add("hidden");
+          hintLbl.textContent = "";
+        }
+      }
+    }
+
+    function smxNormUnitFromRow(row) {
+      var u = (row && row.owningUnit ? String(row.owningUnit) : "").trim();
+      return u || "(Unknown unit)";
+    }
 
     function smxEffBucket(row) {
       return row.scheduleMxPlanEffectiveBucket || row.scheduleMxBucket || "ok";
@@ -17717,6 +18109,7 @@ function renderDashboardHtml(): string {
       const qel = document.getElementById("smx-query");
       const q = (qel && qel.value) ? qel.value.trim() : "";
       return smxRows.filter(function (row) {
+        if (smxCommanderFilterUnit && smxNormUnitFromRow(row) !== smxCommanderFilterUnit) return false;
         return smxMatchesFilter(row, smxFilter) && smxMatchesQuery(row, q);
       });
     }
@@ -18047,6 +18440,9 @@ function renderDashboardHtml(): string {
           }
           smxRows = [];
           smxStats = null;
+          smxCommander = null;
+          smxCommanderFilterUnit = "";
+          renderSmxCommander();
           return;
         }
         const r = await fetch("/api/schedule-mx?date=" + encodeURIComponent(dk), { cache: "no-store" });
@@ -18059,14 +18455,25 @@ function renderDashboardHtml(): string {
           }
           smxRows = [];
           smxStats = null;
+          smxCommander = null;
+          smxCommanderFilterUnit = "";
+          renderSmxCommander();
           return;
         }
         smxRows = Array.isArray(j.rows) ? j.rows : [];
         smxStats = j.stats || null;
+        smxCommander = j.commander || null;
+        smxCommanderFilterUnit = "";
         smxEticDateKey = j.eticDateKey || null;
         if (pill && dk && smxEticDateKey) {
           pill.setAttribute("title", "Import " + fmtKeyLong(dk) + " · Fleet book " + fmtKeyLong(smxEticDateKey));
         }
+        var titleEl = document.getElementById("smx-commander-title");
+        if (titleEl) {
+          titleEl.textContent =
+            "Wing maintenance status" + (dk ? " · " + fmtKeyLong(dk) : "");
+        }
+        renderSmxCommander();
         renderScheduleMxStats();
         renderScheduleMxList();
         loadSightings(false).then(function () {
@@ -20487,6 +20894,63 @@ function renderDashboardHtml(): string {
           ev.preventDefault();
           const w = (a.getAttribute("data-smx-open-wo") || "").trim();
           if (w) setHashWorkOrder(w);
+        });
+      }
+      const smxMailWing = document.getElementById("smx-commander-mail-wing");
+      if (smxMailWing && !smxMailWing.dataset.wired) {
+        smxMailWing.dataset.wired = "1";
+        smxMailWing.addEventListener("click", function () {
+          if (!smxCommander) return;
+          var dk = smxSelectedDateKey || "";
+          var ek = smxEticDateKey || "";
+          var subj = smxCommanderReportTitle();
+          var body = smxCommanderEmailBodyWing(smxCommander, dk, ek);
+          window.location.href = smxMailtoUrl(subj, body);
+        });
+      }
+      const smxClearCmdUnit = document.getElementById("smx-commander-clear-unit");
+      if (smxClearCmdUnit && !smxClearCmdUnit.dataset.wired) {
+        smxClearCmdUnit.dataset.wired = "1";
+        smxClearCmdUnit.addEventListener("click", function () {
+          smxCommanderFilterUnit = "";
+          renderSmxCommander();
+          renderScheduleMxList();
+        });
+      }
+      const smxCmdTable = document.getElementById("smx-commander-table");
+      if (smxCmdTable && !smxCmdTable.dataset.wired) {
+        smxCmdTable.dataset.wired = "1";
+        smxCmdTable.addEventListener("click", function (ev) {
+          var unitBtn = ev.target.closest(".smx-cmd-unit-btn");
+          if (unitBtn) {
+            ev.preventDefault();
+            var u = (unitBtn.getAttribute("data-smx-cmd-unit") || "").trim();
+            smxCommanderFilterUnit = smxCommanderFilterUnit === u ? "" : u;
+            renderSmxCommander();
+            renderScheduleMxList();
+            return;
+          }
+          var mailBtn = ev.target.closest(".smx-cmd-mail-unit");
+          if (mailBtn) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            if (!smxCommander) return;
+            var unit = (mailBtn.getAttribute("data-smx-mail-unit") || "").trim();
+            var rowsU = smxCommander.units || [];
+            var row = null;
+            for (var ri = 0; ri < rowsU.length; ri++) {
+              if (rowsU[ri].unit === unit) {
+                row = rowsU[ri];
+                break;
+              }
+            }
+            if (!row) return;
+            var dk2 = smxSelectedDateKey || "";
+            var ek2 = smxEticDateKey || "";
+            var subj2 = smxCommanderReportTitle() + " — " + unit;
+            var body2 = smxCommanderEmailBodyUnit(row, dk2, ek2);
+            window.location.href = smxMailtoUrl(subj2, body2);
+          }
         });
       }
       const melTabBtn = document.getElementById("tab-mel");

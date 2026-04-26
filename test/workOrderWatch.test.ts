@@ -6,6 +6,7 @@ import {
   classifyMelTier,
   computeMelRecallHintForRow,
   computeScheduleMxAssetStats,
+  computeScheduleMxCommanderSummary,
   enrichScheduleMxRowsWithLatestEtic,
   elmsPlanRowKeyFromRaw,
   getChangelogForDisplay,
@@ -160,6 +161,67 @@ describe("computeScheduleMxAssetStats", () => {
     expect(s.ok).toBe(1);
     expect(s.dueSoon).toBe(0);
     expect(s.missing).toBe(0);
+  });
+});
+
+describe("computeScheduleMxCommanderSummary", () => {
+  it("rolls up by owning unit and counts NCE overdue separately", () => {
+    const base = analyzeElmsScheduleMxFromRaw({}, "2026-04-25");
+    const row = (
+      assetId: string,
+      unit: string,
+      bucket: "overdue" | "ok",
+      nceCrit: boolean,
+      key: string,
+    ): ScheduleMxFleetRow =>
+      ({
+        assetId,
+        planRowKey: key,
+        planId: "",
+        planName: "",
+        planDesc: "",
+        maintenanceScheduleId: "",
+        itemDesc: "",
+        location: "",
+        makeModel: "",
+        mgmtCd: "",
+        workOrderCount: 0,
+        nce: false,
+        nceStatus: "",
+        scheduleMxNceCritical: nceCrit,
+        owningUnit: unit,
+        vehNomen: "",
+        eticSnapshotDateKey: null,
+        eticOpenWorkOrderIds: "",
+        eticOpenInMaintenance: false,
+        scheduleMxPlanEffectiveBucket: bucket,
+        scheduleMxPlanEffectiveNceCritical: nceCrit,
+        scheduleMxSuppressedByOpenWo: false,
+        ...base,
+        scheduleMxBucket: bucket,
+      }) as ScheduleMxFleetRow;
+
+    const rows = [
+      row("A1", "91 MW", "ok", false, "p1"),
+      row("A1", "91 MW", "ok", false, "p2"),
+      row("B1", "5 CES", "overdue", false, "p3"),
+      row("C1", "5 CES", "ok", false, "p4"),
+      row("D1", "791 MXS", "overdue", true, "p5"),
+    ];
+    const c = computeScheduleMxCommanderSummary(rows);
+    expect(c.wing.totalVehicles).toBe(4);
+    expect(c.wing.overdue).toBe(2);
+    expect(c.wing.nceOverdue).toBe(1);
+    expect(c.wing.notOverdue).toBe(2);
+    const u91 = c.units.find((x) => x.unit === "91 MW");
+    expect(u91?.totalVehicles).toBe(1);
+    expect(u91?.overdue).toBe(0);
+    const u5 = c.units.find((x) => x.unit === "5 CES");
+    expect(u5?.totalVehicles).toBe(2);
+    expect(u5?.overdue).toBe(1);
+    const u791 = c.units.find((x) => x.unit === "791 MXS");
+    expect(u791?.nceOverdue).toBe(1);
+    expect(u791?.overdue).toBe(1);
   });
 });
 
