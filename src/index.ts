@@ -4875,7 +4875,7 @@ async function handleScheduleMxApi(env: Env, request: Request): Promise<Response
   if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) {
     return Response.json(
       {
-        error: "No Schedule Mx import for that date. Send a CSV or XLSX to prevmx@2t3.app, or pass date=YYYY-MM-DD.",
+        error: "No schedule maintenance import for that date.",
         dateKey: null,
         stats: null,
         rows: [],
@@ -13920,10 +13920,6 @@ function renderDashboardHtml(): string {
     /* Schedule Mx tab — same split-pane rhythm as Work Orders */
     .smx-layout .smx-panel-heading { margin-bottom: 10px; }
     .smx-panel-title { margin: 0 0 4px; font-size: 1.05rem; font-weight: 700; color: var(--text); }
-    .smx-panel-hint {
-      margin: 0; font-size: 0.72rem; color: var(--muted); line-height: 1.45;
-    }
-    .smx-panel-hint code { font-size: 0.68rem; }
     .smx-date-field { display: block; margin-bottom: 12px; }
     .smx-date-field .wo-refine-sel { width: 100%; }
     .smx-refine-one {
@@ -14041,26 +14037,6 @@ function renderDashboardHtml(): string {
       font-weight: 500;
       color: var(--muted);
       margin-top: 4px;
-    }
-    .smx-layman-strip {
-      margin: 12px 0 4px;
-      padding: 12px 14px;
-      border-radius: 10px;
-      border: 1px solid var(--border);
-      background: linear-gradient(180deg, rgba(0,58,140,0.06) 0%, rgba(15,30,60,0.03) 100%);
-      font-size: 0.9rem;
-      line-height: 1.5;
-      color: var(--text);
-    }
-    .smx-layman-strip .smx-layman-lead {
-      font-weight: 700;
-      margin-bottom: 6px;
-      color: var(--text);
-    }
-    .smx-layman-strip .smx-layman-sub {
-      font-size: 0.82rem;
-      color: var(--muted);
-      margin: 0;
     }
     .smx-plain-callout {
       margin: 0 0 10px;
@@ -14584,7 +14560,6 @@ function renderDashboardHtml(): string {
           <aside class="wo-sidebar">
             <div class="smx-panel-heading">
               <h2 class="smx-panel-title">Schedule maintenance</h2>
-              <p class="smx-panel-hint">Pick an <strong>asset</strong>; plans come from the ELMS extract (email <code>prevmx@2t3.app</code>). <strong>Unit, make/model, vehicle type, mgmt code, and NCE</strong> come from the <strong>Fleet P&amp;A</strong> sheet on the latest ETIC workbook; <strong>open work orders</strong> come from <strong>WO Inquiry</strong> on that same day. Vehicles with an open WO (or in-shop parts status) are not counted overdue for sched mx until sub-WO / plan linkage exists.</p>
             </div>
             <label class="smx-date-field">
               <span class="sr-only">Import date</span>
@@ -14593,7 +14568,7 @@ function renderDashboardHtml(): string {
             <div class="smx-stats" id="smx-stats" role="status">Loading…</div>
             <div class="wo-searchbar">
               <input type="text" id="smx-query" placeholder="Search asset, plan, location…" autocomplete="off" aria-label="Search schedule maintenance by asset or plan" />
-              <span class="wo-asof-pill" id="smx-asof-pill" title="Selected prevmx import date">—</span>
+              <span class="wo-asof-pill" id="smx-asof-pill" title="Import date">—</span>
             </div>
             <div class="wo-filters" id="smx-filters" role="tablist" aria-label="Schedule maintenance filters">
               <button type="button" class="wo-filter-btn active" data-smx-filter="all">All <span class="count smx-n" data-smx-c="all">0</span></button>
@@ -14616,7 +14591,7 @@ function renderDashboardHtml(): string {
             <div class="wo-list" id="smx-list"></div>
           </aside>
           <section class="wo-detail-pane">
-            <div id="smx-detail-empty" class="wo-empty">Select an asset to see every maintenance plan, dates, utilization, and ELMS status.</div>
+            <div id="smx-detail-empty" class="wo-empty">Select an asset to see maintenance plans.</div>
             <div id="smx-detail" class="hidden wo-detail-inner">
               <section class="wo-detail-overview" aria-label="Asset schedule maintenance summary">
                 <div class="wo-hero" id="smx-hero"></div>
@@ -17869,14 +17844,13 @@ function renderDashboardHtml(): string {
       else if (locs.length > 1) metaParts.push(locs.length + " locations");
       if (mgmts.length === 1) metaParts.push("Mgmt " + esc(mgmts[0]));
       else if (mgmts.length > 1) metaParts.push(mgmts.length + " mgmt codes");
-      if (wo) metaParts.push(wo + " open WO" + (wo === 1 ? "" : "s") + " (WO Inquiry)");
+      if (wo) metaParts.push(wo + " open WO" + (wo === 1 ? "" : "s"));
       if (p0 && p0.eticOpenInMaintenance) metaParts.push("In maintenance (parts)");
       el.innerHTML =
         "<div class='wo-hero-row'>" +
         "<div class='wo-hero-id'>" + esc(assetId) + "</div>" +
         chips.join("") +
         "</div>" +
-        smxAssetLaymanSummary(plans) +
         smxAssetIdentityStripFromPlans(plans) +
         "<div class='wo-hero-sub wo-hero-sub-primary'>" +
         renderSightingBadge(assetId) +
@@ -17892,7 +17866,7 @@ function renderDashboardHtml(): string {
       const eff = smxEffBucket(row);
       const rawB = row.scheduleMxBucket || "";
       const sched = [];
-      sched.push({ dt: "ELMS status", dd: esc(row.scheduleMxStatus || "—") });
+      sched.push({ dt: "Source status", dd: esc(row.scheduleMxStatus || "—") });
       sched.push({
         dt: "Health (for triage)",
         dd:
@@ -17900,15 +17874,15 @@ function renderDashboardHtml(): string {
           esc(smxPillLabel(eff)) +
           "</span>" +
           (row.scheduleMxSuppressedByOpenWo && rawB !== eff
-            ? " <span class='facts-sub'>(ELMS was " + esc(smxPillLabel(rawB)) + " — waived: open WO / in shop)</span>"
+            ? " <span class='facts-sub'>(Was " + esc(smxPillLabel(rawB)) + " — waived: open WO / in shop)</span>"
             : ""),
       });
       const lastM = row.elmsLastMaintDateIso ? fmtKeyShort(row.elmsLastMaintDateIso) : "—";
       const nextM = row.elmsNextMaintDateIso ? fmtKeyShort(row.elmsNextMaintDateIso) : "—";
-      sched.push({ dt: "Last maint (ELMS)", dd: esc(lastM) });
-      sched.push({ dt: "Next maint (ELMS)", dd: esc(nextM) });
+      sched.push({ dt: "Last maint", dd: esc(lastM) });
+      sched.push({ dt: "Next maint", dd: esc(nextM) });
       if (row.location && String(row.location).trim()) {
-        sched.push({ dt: "Location (ELMS plan)", dd: esc(String(row.location).trim()) });
+        sched.push({ dt: "Location", dd: esc(String(row.location).trim()) });
       }
       if (row.scheduleMxDueIso && row.scheduleMxDueIso !== row.elmsNextMaintDateIso) {
         sched.push({ dt: "Computed due", dd: esc(fmtKeyShort(row.scheduleMxDueIso)) });
@@ -17947,7 +17921,7 @@ function renderDashboardHtml(): string {
       var itemT = (row.itemDesc || "").replace(/\s+/g, " ").trim();
       var mmT = (row.makeModel || "").replace(/\s+/g, " ").trim();
       if (itemT && itemT.toLowerCase() !== mmT.toLowerCase()) {
-        plan.push({ dt: "ELMS item line", dd: esc(itemT) });
+        plan.push({ dt: "Item line", dd: esc(itemT) });
       }
       function factPair(x) {
         return "<div class='wo-facts-pair'><dt>" + esc(x.dt) + "</dt><dd>" + x.dd + "</dd></div>";
@@ -17964,7 +17938,7 @@ function renderDashboardHtml(): string {
       return (
         factGroup("Schedule", sched) +
         smxPlainUtilBlock(row) +
-        factGroup("Utilization (ELMS raw)", util) +
+        factGroup("Utilization", util) +
         factGroup("This maintenance plan", plan)
       );
     }
@@ -17989,7 +17963,7 @@ function renderDashboardHtml(): string {
               esc(smxPillLabel(effB)) +
               "</span>" +
               (row.scheduleMxSuppressedByOpenWo && rawB2 !== effB
-                ? " <span class='smx-pill " + esc(rawB2) + "' title='Raw ELMS bucket before open-WO waiver'>" +
+                ? " <span class='smx-pill " + esc(rawB2) + "' title='Raw bucket before open-WO waiver'>" +
                   esc(smxPillLabel(rawB2)) +
                   "</span>"
                 : "");
@@ -18047,7 +18021,7 @@ function renderDashboardHtml(): string {
           pill.removeAttribute("title");
         }
         if (!dk) {
-          if (statsEl) statsEl.textContent = "No Schedule Mx imports yet — send a CSV or XLSX to prevmx@2t3.app.";
+          if (statsEl) statsEl.textContent = "No schedule maintenance imports yet.";
           if (listMeta) listMeta.textContent = "";
           if (list) {
             list.innerHTML = "<div class='problem-empty' style='padding:18px 4px'>No imports yet.</div>";
@@ -18072,10 +18046,7 @@ function renderDashboardHtml(): string {
         smxStats = j.stats || null;
         smxEticDateKey = j.eticDateKey || null;
         if (pill && dk && smxEticDateKey) {
-          pill.setAttribute(
-            "title",
-            "Schedule Mx import " + fmtKeyLong(dk) + " · ETIC context " + fmtKeyLong(smxEticDateKey),
-          );
+          pill.setAttribute("title", "Import " + fmtKeyLong(dk) + " · Fleet book " + fmtKeyLong(smxEticDateKey));
         }
         renderScheduleMxStats();
         renderScheduleMxList();
@@ -18251,28 +18222,13 @@ function renderDashboardHtml(): string {
         );
       }
       box.innerHTML =
-        pill("distinctAssets", "Assets", "", "Vehicles in this import (one row per asset id)") +
-        pill("planRows", "Plans", "", "Total maintenance plan rows (multiple per asset)") +
-        pill(
-          "nceCritical",
-          "NCE overdue (critical)",
-          "crit",
-          "Assets with at least one NCE-critical overdue plan",
-        ) +
-        pill(
-          "overdue",
-          "Overdue",
-          "bad",
-          "Assets whose worst plan is overdue (open WO / in-shop clears sched overdue for now)",
-        ) +
-        pill("dueSoon", "Due soon (≤30d)", "warn", "Assets whose worst plan is due soon (same WO waiver)") +
-        pill("missing", "Missing sched data", "warn", "Assets whose worst plan has missing schedule data") +
-        pill(
-          "ok",
-          "OK / current",
-          "",
-          "Includes assets waived from overdue/due soon because of open WOs",
-        );
+        pill("distinctAssets", "Assets", "", "") +
+        pill("planRows", "Plans", "", "") +
+        pill("nceCritical", "NCE overdue (critical)", "crit", "") +
+        pill("overdue", "Overdue", "bad", "") +
+        pill("dueSoon", "Due soon (≤30d)", "warn", "") +
+        pill("missing", "Missing sched data", "warn", "") +
+        pill("ok", "OK / current", "", "");
     }
 
     function smxPillLabel(bucket) {
@@ -18290,7 +18246,7 @@ function renderDashboardHtml(): string {
       }
     }
 
-    /** Human label for ELMS utilization type (avoid generic "units"). */
+    /** Human label for utilization type (avoid generic "units"). */
     function smxUtilUomLabel(utRaw) {
       const s = String(utRaw || "").toLowerCase().replace(/\s+/g, " ").trim();
       if (!s) return "";
@@ -18300,14 +18256,14 @@ function renderDashboardHtml(): string {
       return s;
     }
 
-    /** Plain English for meter vs next util qty (ELMS interval targets). */
+    /** Plain English for meter vs next utilization target. */
     function smxPlainUtilBlock(row) {
       const uom = smxUtilUomLabel(row.elmsUtilType);
       const cur = row.elmsCurrentMeter;
       const nxt = row.elmsNextUtilQty;
       if (cur == null || nxt == null) {
         return (
-          "<p class='smx-plain-callout'><strong>Service meter</strong> — This extract does not show both a current reading and the next ELMS target, so we cannot estimate distance to the next interval.</p>"
+          "<p class='smx-plain-callout'><strong>Service meter</strong> — No current reading and next target together on this row.</p>"
         );
       }
       if (row.scheduleMxOverdueUtil || (row.scheduleMxUtilRemaining != null && row.scheduleMxUtilRemaining < 0)) {
@@ -18316,10 +18272,10 @@ function renderDashboardHtml(): string {
         const b = smxFmtNum(nxt);
         const u = uom ? " " + uom : "";
         return (
-          "<p class='smx-plain-callout'><strong>Past the ELMS interval target.</strong> Reading is <strong>" +
+          "<p class='smx-plain-callout'><strong>Past the interval target.</strong> Reading is <strong>" +
           a +
           u +
-          "</strong>; ELMS target was <strong>" +
+          "</strong>; target was <strong>" +
           b +
           u +
           "</strong>." +
@@ -18338,18 +18294,18 @@ function renderDashboardHtml(): string {
       const u = uom ? " " + uom : "";
       var pctLine = "";
       if (pctToward < 1) {
-        pctLine = " You are still early (under 1% of the way from this reading to the ELMS target).";
+        pctLine = " You are still early (under 1% of the way from this reading to the target).";
       } else if (pctToward < 10) {
-        pctLine = " You are still early in the interval (about " + pctToward + "% of the distance from this reading to the ELMS target).";
+        pctLine = " You are still early in the interval (about " + pctToward + "% of the distance from this reading to the target).";
       } else {
-        pctLine = " About <strong>" + pctToward + "%</strong> of the distance from this reading to the ELMS target.";
+        pctLine = " About <strong>" + pctToward + "%</strong> of the distance from this reading to the target.";
       }
       return (
         "<div class='smx-plain-callout' role='status'>" +
-        "<strong>Service meter (ELMS)</strong> — Current reading <strong>" +
+        "<strong>Service meter</strong> — Current reading <strong>" +
         a +
         u +
-        "</strong>. Next interval target in this extract <strong>" +
+        "</strong>. Next interval target <strong>" +
         b +
         u +
         "</strong>. About <strong>" +
@@ -18357,9 +18313,8 @@ function renderDashboardHtml(): string {
         u +
         "</strong> to go before you reach that target." +
         pctLine +
-        " <span class='facts-sub'>(Targets come from ELMS; wording is simplified for triage.)</span>" +
         "<div class='smx-util-progress-wrap'>" +
-        "<div class='smx-util-progress-label'>How much of this ELMS interval is used (by reading)</div>" +
+        "<div class='smx-util-progress-label'>Progress toward next target (by reading)</div>" +
         "<div class='smx-util-progress " +
         esc(barCls) +
         "' title='" +
@@ -18374,10 +18329,10 @@ function renderDashboardHtml(): string {
       const p0 = plans && plans[0];
       if (!p0) return "";
       const pairs = [];
-      pairs.push({ lbl: "Unit (Fleet P&A)", val: p0.owningUnit ? esc(p0.owningUnit) : "—" });
-      pairs.push({ lbl: "Make / model (Fleet P&A)", val: p0.makeModel ? esc(p0.makeModel) : "—" });
-      pairs.push({ lbl: "Vehicle type (Fleet P&A)", val: p0.vehNomen ? esc(p0.vehNomen) : "—" });
-      pairs.push({ lbl: "Mgmt code (Fleet P&A)", val: p0.mgmtCd ? esc(p0.mgmtCd) : "—" });
+      pairs.push({ lbl: "Unit", val: p0.owningUnit ? esc(p0.owningUnit) : "—" });
+      pairs.push({ lbl: "Make / model", val: p0.makeModel ? esc(p0.makeModel) : "—" });
+      pairs.push({ lbl: "Vehicle type", val: p0.vehNomen ? esc(p0.vehNomen) : "—" });
+      pairs.push({ lbl: "Mgmt code", val: p0.mgmtCd ? esc(p0.mgmtCd) : "—" });
       if (p0.nce) {
         pairs.push({
           lbl: "NCE",
@@ -18389,7 +18344,7 @@ function renderDashboardHtml(): string {
         pairs.push({ lbl: "NCE", val: "No" });
       }
       pairs.push({
-        lbl: "Open WOs (WO Inquiry)",
+        lbl: "Open WOs",
         val:
           esc(String(p0.workOrderCount ?? 0)) +
           (p0.eticOpenWorkOrderIds
@@ -18397,10 +18352,10 @@ function renderDashboardHtml(): string {
             : ""),
       });
       if (p0.eticOpenInMaintenance) {
-        pairs.push({ lbl: "Shop signal", val: "<span class='facts-sub'>WO parts status looks in-shop</span>" });
+        pairs.push({ lbl: "Shop signal", val: "<span class='facts-sub'>Parts status looks in-shop</span>" });
       }
       return (
-        "<div class='smx-plan-identity' aria-label='Asset from latest ETIC workbook'>" +
+        "<div class='smx-plan-identity' aria-label='Asset details'>" +
         pairs
           .map(function (p) {
             return (
@@ -18419,15 +18374,15 @@ function renderDashboardHtml(): string {
     function smxPlainDateLine(row) {
       const eff = smxEffBucket(row);
       if (eff === "missing") {
-        return "ELMS does not show enough schedule data on this plan to judge it — check the extract or fleet system.";
+        return "Not enough schedule data on this plan.";
       }
       const nextM = row.elmsNextMaintDateIso ? fmtKeyShort(row.elmsNextMaintDateIso) : "";
       if (!nextM) {
         if (eff === "ok" || eff === "no_due") {
           if (row.elmsNextUtilQty != null) {
-            return "This plan is driven by utilization (meter), not a calendar date in ELMS. Use the service meter section below for how far you are from the next reading.";
+            return "This plan is tracked by the service meter, not a calendar date. See the meter section below.";
           }
-          return "No next calendar service date is listed in ELMS for this plan.";
+          return "No next calendar service date on this plan.";
         }
         return "";
       }
@@ -18439,60 +18394,9 @@ function renderDashboardHtml(): string {
         return "Next calendar service date is " + nextM + " (about " + row.scheduleMxDaysUntil + " day" + (row.scheduleMxDaysUntil === 1 ? "" : "s") + " away).";
       }
       if (eff === "ok" || eff === "no_due") {
-        return "Next calendar service date in ELMS: " + nextM + ".";
+        return "Next calendar service date: " + nextM + ".";
       }
       return "";
-    }
-
-    function smxAssetLaymanSummary(plans) {
-      var od = 0;
-      var ds = 0;
-      var miss = 0;
-      var waived = 0;
-      var okish = 0;
-      for (var i = 0; i < plans.length; i++) {
-        var p = plans[i];
-        var e = smxEffBucket(p);
-        if (e === "overdue") od++;
-        else if (e === "due_soon") ds++;
-        else if (e === "missing") miss++;
-        else okish++;
-        if (p.scheduleMxSuppressedByOpenWo) waived++;
-      }
-      var wo = plans[0] && plans[0].workOrderCount != null ? plans[0].workOrderCount : 0;
-      var needAttention = od + ds + miss;
-      var lead = "";
-      if (needAttention === 0) {
-        lead = "No plans on this asset need attention right now (after open-WO / shop rules).";
-      } else {
-        var bits = [];
-        if (od) bits.push(od + " overdue");
-        if (ds) bits.push(ds + " due soon");
-        if (miss) bits.push(miss + " missing schedule data");
-        lead = "This asset needs attention on " + needAttention + " maintenance plan" + (needAttention === 1 ? "" : "s") + " (" + bits.join(", ") + ").";
-      }
-      var subParts = [];
-      if (waived) {
-        subParts.push(
-          waived +
-            " plan" +
-            (waived === 1 ? " looks" : "s look") +
-            " overdue or due soon in ELMS but " +
-            (waived === 1 ? "is" : "are") +
-            " treated as OK while the truck has an open work order or in-shop parts status. When you can tie plans to sub-WOs, confirm the right plan is on the WO.",
-        );
-      }
-      if (wo === 0 && (od > 0 || ds > 0)) {
-        subParts.push("Latest ETIC shows no open work order — consider opening one for the overdue or due-soon work.");
-      }
-      return (
-        "<div class='smx-layman-strip'>" +
-        "<div class='smx-layman-lead'>" +
-        esc(lead) +
-        "</div>" +
-        (subParts.length ? "<p class='smx-layman-sub'>" + esc(subParts.join(" ")) + "</p>" : "") +
-        "</div>"
-      );
     }
 
     function renderScheduleMxList() {
