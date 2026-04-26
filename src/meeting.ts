@@ -136,6 +136,8 @@ function mergeCompletionsOnTextChange(
   return serializeLineCompletions({ n, d });
 }
 
+import { owningUnitForAssetId } from "./msxUnit";
+
 type Env = { ETIC_SNAPSHOTS: D1Database };
 
 export async function createMeeting(env: Env, input: CreateMeetingInput): Promise<MeetingRow> {
@@ -173,7 +175,7 @@ export async function createMeeting(env: Env, input: CreateMeetingInput): Promis
           id,
           wid,
           (wo.assetId ?? "").trim(),
-          (wo.owningUnit ?? "").trim(),
+          owningUnitForAssetId((wo.assetId ?? "").trim(), (wo.owningUnit ?? "").trim()),
           (wo.melKey ?? "").trim(),
           (wo.melTier ?? "").trim(),
           (wo.shop ?? "").trim(),
@@ -468,7 +470,7 @@ export async function addWorkOrdersToMeeting(
         meetingId,
         wid,
         (wo.assetId ?? "").trim(),
-        (wo.owningUnit ?? "").trim(),
+        owningUnitForAssetId((wo.assetId ?? "").trim(), (wo.owningUnit ?? "").trim()),
         (wo.melKey ?? "").trim(),
         (wo.melTier ?? "").trim(),
         (wo.shop ?? "").trim(),

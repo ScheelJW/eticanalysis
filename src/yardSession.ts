@@ -6,6 +6,8 @@
 // also persist the active asset row JSON so later ingests cannot change what
 // the walker saw when they marked that vehicle present.
 
+import { owningUnitForAssetId } from "./msxUnit";
+
 type Env = { ETIC_SNAPSHOTS: D1Database; ETIC_BUCKET: R2Bucket };
 
 export type YardSessionStatus = "open" | "closed";
@@ -459,7 +461,7 @@ export async function getYardRosterForDate(env: Env, dateKey: string): Promise<Y
     const { prevLoc, vin, nce } = readYardAssetRow(row);
     grouped.set(canonicalYardAssetKey(id), {
       assetId: id,
-      owningUnit: row.owning_unit ?? "",
+      owningUnit: owningUnitForAssetId(id, row.owning_unit ?? ""),
       shop: row.shop ?? "",
       mgmtCd: row.mgmt_cd ?? "",
       makeModel: row.make_model ?? "",
@@ -483,7 +485,7 @@ export async function getYardRosterForDate(env: Env, dateKey: string): Promise<Y
     if (!existing) {
       grouped.set(canon, {
         assetId: id,
-        owningUnit: row.owning_unit ?? "",
+        owningUnit: owningUnitForAssetId(id, row.owning_unit ?? ""),
         shop: row.shop ?? "",
         mgmtCd: row.mgmt_cd ?? "",
         makeModel: row.make_model ?? "",
@@ -498,7 +500,7 @@ export async function getYardRosterForDate(env: Env, dateKey: string): Promise<Y
       continue;
     }
     existing.openWoCount += 1;
-    if (row.owning_unit) existing.owningUnit = row.owning_unit;
+    if (row.owning_unit) existing.owningUnit = owningUnitForAssetId(id, row.owning_unit);
     if (row.shop) existing.shop = row.shop;
     if (row.mgmt_cd) existing.mgmtCd = row.mgmt_cd;
     if (row.make_model) existing.makeModel = row.make_model;

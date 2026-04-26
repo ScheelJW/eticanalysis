@@ -4,6 +4,7 @@
  * R2 keys: abuse-tracker/<caseId>/<uuid>-<safeName>
  */
 
+import { owningUnitForAssetId } from "./msxUnit";
 import { recordCheck } from "./yardSession";
 
 type Env = { ETIC_SNAPSHOTS: D1Database; ETIC_BUCKET: R2Bucket };
@@ -199,7 +200,7 @@ async function hydrateFromFleetAssetCurrent(env: Env, assetId: string): Promise<
     .first<FleetSnapshot>();
   if (!r) return null;
   return {
-    owning_unit: r.owning_unit ?? "",
+    owning_unit: owningUnitForAssetId(assetId, r.owning_unit ?? ""),
     shop: r.shop ?? "",
     make_model: r.make_model ?? "",
     veh_nomen: r.veh_nomen ?? "",
@@ -224,7 +225,7 @@ async function hydrateFleetFields(env: Env, assetId: string): Promise<FleetSnaps
       mgmt_cd: string;
     }>();
   return {
-    owning_unit: r?.owning_unit ?? "",
+    owning_unit: owningUnitForAssetId(assetId, r?.owning_unit ?? ""),
     shop: r?.shop ?? "",
     make_model: r?.make_model ?? "",
     veh_nomen: r?.veh_nomen ?? "",
@@ -301,7 +302,7 @@ export async function createAbuseCase(env: Env, input: CreateAbuseCaseInput): Pr
   // Snapshot org fields at case creation only — never updated from later ingests.
   const fleet = woRow
     ? {
-        owning_unit: woRow.owning_unit ?? "",
+        owning_unit: owningUnitForAssetId(woRow.asset_id, woRow.owning_unit ?? ""),
         shop: woRow.shop ?? "",
         make_model: woRow.make_model ?? "",
         veh_nomen: woRow.veh_nomen ?? "",

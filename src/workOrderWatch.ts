@@ -11,17 +11,13 @@ import {
 import ExcelJS from "exceljs";
 import { getStalenessThresholds } from "./melWatch";
 import { buildLineCompletions } from "./meeting";
+import { MSX_FORCED_OWNING_UNIT, owningUnitForAssetId } from "./msxUnit";
 
 export type MelTier = "below" | "at" | "above" | "unknown";
 
-/** ELMS extract sometimes omits or mis-assigns unit for MSX-prefixed assets; force owning unit for rollups and UI. */
-const SCHEDULE_MX_MSX_UNIT = "791 MXS";
-
-export function scheduleMxOwningUnitForAssetId(assetId: string, extractUnit: string): string {
-  const aid = (assetId ?? "").trim();
-  if (aid.toUpperCase().startsWith("MSX")) return SCHEDULE_MX_MSX_UNIT;
-  return (extractUnit ?? "").trim();
-}
+export { MSX_FORCED_OWNING_UNIT, owningUnitForAssetId };
+/** @deprecated Use owningUnitForAssetId — kept for existing tests/imports. */
+export const scheduleMxOwningUnitForAssetId = owningUnitForAssetId;
 
 /** Default staleness in days between expected remarks. Mirrored in melWatch.ts
  *  so the Settings tab can override these without touching code. */
@@ -191,7 +187,7 @@ function fleetRowFromFleetRecord(
   raw: Record<string, string> | undefined,
 ): { owning_unit: string; shop: string; make_model: string; veh_nomen: string; mgmt_cd: string; mel_key: string } {
   return {
-    owning_unit: guessOwningUnitFromFleetRaw(raw),
+    owning_unit: owningUnitForAssetId((rec.assetId ?? "").trim(), guessOwningUnitFromFleetRaw(raw)),
     shop: guessShopFromFleetRaw(raw, rec.etiCLocation ?? ""),
     make_model: (rec.makeModel ?? "").trim(),
     veh_nomen: (rec.vehNomen ?? "").trim(),
@@ -215,7 +211,7 @@ export async function ingestWorkOrderSnapshot(
       partsStatus: (wo.partsStatus ?? "").trim(),
       eticRaw: (wo.eticDue ?? "").trim(),
       melTier: classifyMelTier(wo.currentMel ?? ""),
-      owningUnit: (wo.owningUnit ?? "").trim(),
+      owningUnit: owningUnitForAssetId((wo.assetId ?? "").trim(), (wo.owningUnit ?? "").trim()),
       melKey: (wo.melKey ?? "").trim(),
       shop: (wo.shop ?? "").trim(),
       mgmtCd: (wo.mgmtCd ?? "").trim(),
@@ -583,7 +579,7 @@ export async function getFleetPaSnapshotForDate(
   return (r.results ?? []).map((row) => ({
     snapshotDateKey: row.snapshot_date_key,
     assetId: row.asset_id,
-    owningUnit: row.owning_unit,
+    owningUnit: owningUnitForAssetId(row.asset_id, row.owning_unit),
     shop: row.shop,
     makeModel: row.make_model,
     vehNomen: row.veh_nomen,
@@ -921,7 +917,7 @@ function rowToWatchRow(
     firstEticDate: row.first_etic_date,
     lastEticDate: row.last_etic_date,
     lastSnapshotDate: row.last_snapshot_date,
-    owningUnit: row.owning_unit ?? "",
+    owningUnit: owningUnitForAssetId(row.asset_id, row.owning_unit ?? ""),
     melKey: row.mel_key ?? "",
     shop: row.shop ?? "",
     mgmtCd: row.mgmt_cd ?? "",

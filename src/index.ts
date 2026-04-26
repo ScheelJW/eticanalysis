@@ -53,6 +53,7 @@ import {
   type SeedWorkOrder,
   type UpsertNoteInput,
 } from "./meeting";
+import { owningUnitForAssetId } from "./msxUnit";
 import { handleAskApi } from "./ai";
 import {
   addPhoto as addYardPhoto,
@@ -4547,7 +4548,7 @@ async function handleMeetingCreateApi(env: Env, request: Request): Promise<Respo
     .map((w) => ({
       workOrderId: w.workOrderId.trim(),
       assetId: (w.assetId ?? "").toString(),
-      owningUnit: (w.owningUnit ?? "").toString(),
+      owningUnit: owningUnitForAssetId((w.assetId ?? "").toString(), (w.owningUnit ?? "").toString()),
       melKey: (w.melKey ?? "").toString(),
       melTier: (w.melTier ?? "").toString(),
       shop: (w.shop ?? "").toString(),
@@ -14010,31 +14011,62 @@ function renderDashboardHtml(): string {
       display: flex;
       flex-wrap: wrap;
       align-items: center;
-      gap: 8px;
+      gap: 10px;
       justify-content: flex-end;
     }
     .smx-copy-status { font-size: 0.72rem; color: var(--muted); max-width: 220px; line-height: 1.3; }
-    .smx-cmd-mail-btns { display: flex; flex-direction: column; gap: 4px; align-items: stretch; }
-    .smx-btn-outlook {
+    .smx-cmd-copy-btn {
       display: inline-flex;
       align-items: center;
-      gap: 6px;
-      padding: 8px 14px;
-      font-size: 0.78rem;
-      font-weight: 700;
-      border-radius: 10px;
-      border: 1px solid rgba(0, 58, 140, 0.35);
-      background: linear-gradient(180deg, rgba(0, 58, 140, 0.12) 0%, rgba(0, 58, 140, 0.06) 100%);
-      color: var(--accent-strong);
+      gap: 10px;
+      padding: 10px 16px 10px 14px;
+      font: inherit;
+      text-align: left;
+      border-radius: 12px;
+      border: 1px solid rgba(0, 72, 140, 0.45);
+      background: linear-gradient(165deg, rgba(0, 91, 180, 0.22) 0%, rgba(0, 58, 130, 0.14) 40%, var(--card) 100%);
+      box-shadow: 0 1px 0 rgba(255, 255, 255, 0.5) inset, 0 4px 16px rgba(0, 40, 100, 0.12);
+      color: var(--text);
       cursor: pointer;
-      white-space: nowrap;
+      transition: transform 0.1s ease, box-shadow 0.15s ease, border-color 0.12s ease;
     }
-    .smx-btn-outlook:hover { filter: brightness(1.05); }
-    .smx-btn-outlook--sm {
-      padding: 5px 10px;
-      font-size: 0.68rem;
-      border-radius: 8px;
+    .smx-cmd-copy-btn:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 1px 0 rgba(255, 255, 255, 0.55) inset, 0 6px 20px rgba(0, 40, 100, 0.16);
+      border-color: rgba(0, 72, 140, 0.6);
     }
+    .smx-cmd-copy-btn:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    .smx-cmd-copy-glyph {
+      font-size: 1.25rem;
+      line-height: 1;
+      filter: drop-shadow(0 1px 0 rgba(255, 255, 255, 0.4));
+    }
+    .smx-cmd-copy-stack { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+    .smx-cmd-copy-title {
+      font-size: 0.84rem;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      color: var(--text);
+    }
+    .smx-cmd-copy-sub {
+      font-size: 0.7rem;
+      font-weight: 500;
+      color: var(--muted);
+      line-height: 1.3;
+    }
+    .smx-cmd-copy-btn--unit {
+      width: 100%;
+      min-width: 0;
+      padding: 8px 10px;
+      gap: 6px;
+      border-radius: 10px;
+      box-shadow: 0 1px 0 rgba(255, 255, 255, 0.4) inset, 0 2px 8px rgba(0, 40, 100, 0.08);
+    }
+    .smx-cmd-copy-btn--unit .smx-cmd-copy-title { font-size: 0.76rem; }
+    .smx-cmd-copy-btn--unit .smx-cmd-copy-glyph { font-size: 1.05rem; }
     .smx-commander-kpis {
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
@@ -14925,11 +14957,12 @@ function renderDashboardHtml(): string {
                   <span class="smx-commander-summary-line" id="smx-commander-summary-line"></span>
                 </div>
                 <div class="smx-commander-actions smx-commander-actions--mail">
-                  <button type="button" class="btn smx-btn-outlook" id="smx-commander-mail-wing" title="Opens default mail app with a plain-text summary (use Copy HTML table for a real table in Outlook)">
-                    RTS Outlook — wing summary
-                  </button>
-                  <button type="button" class="btn secondary" id="smx-commander-copy-html-wing" title="Copies an HTML table — paste into Outlook message body (Ctrl+V)">
-                    Copy HTML table
+                  <button type="button" class="smx-cmd-copy-btn" id="smx-commander-copy-html-wing" title="Copies a formatted HTML table. Paste into your email (Ctrl+V).">
+                    <span class="smx-cmd-copy-glyph" aria-hidden="true">📋</span>
+                    <span class="smx-cmd-copy-stack">
+                      <span class="smx-cmd-copy-title">Copy HTML table</span>
+                      <span class="smx-cmd-copy-sub">For Outlook or any email — paste with Ctrl+V</span>
+                    </span>
                   </button>
                   <span class="smx-copy-status hidden" id="smx-commander-copy-status" role="status"></span>
                 </div>
@@ -14957,7 +14990,7 @@ function renderDashboardHtml(): string {
                       <th scope="col" class="smx-cmd-num">% OK</th>
                       <th scope="col" class="smx-cmd-num">Overdue</th>
                       <th scope="col" class="smx-cmd-num">NCE od</th>
-                      <th scope="col" class="smx-cmd-mail-col">RTS</th>
+                      <th scope="col" class="smx-cmd-mail-col" title="Copy a formatted table for this row">Table</th>
                     </tr>
                   </thead>
                   <tbody id="smx-commander-tbody"></tbody>
@@ -18060,10 +18093,6 @@ function renderDashboardHtml(): string {
       return "Biweekly Scheduled Maintenance Commander Summary (Including NCE)";
     }
 
-    function smxMailtoUrl(subject, body) {
-      return "mailto:?subject=" + encodeURIComponent(subject) + "&body=" + encodeURIComponent(body);
-    }
-
     function smxCmdEmailNarrativeLines() {
       return [
         "Good afternoon,",
@@ -18435,13 +18464,11 @@ function renderDashboardHtml(): string {
             "<td class='smx-cmd-num'>" +
             esc(String(u.nceOverdue)) +
             "</td>" +
-            "<td class='smx-cmd-mail-col'><div class='smx-cmd-mail-btns'>" +
-            "<button type='button' class='btn smx-btn-outlook smx-btn-outlook--sm smx-cmd-mail-unit' data-smx-mail-unit='" +
+            "<td class='smx-cmd-mail-col'><button type='button' class='smx-cmd-copy-btn smx-cmd-copy-btn--unit smx-cmd-copy-html-unit' data-smx-copy-html-unit='" +
             esc(u.unit) +
-            "' title='Plain-text mailto (use Copy HTML for a table)'>RTS Outlook</button>" +
-            "<button type='button' class='btn secondary smx-cmd-copy-html-unit' data-smx-copy-html-unit='" +
+            "' title='Copy HTML table for " +
             esc(u.unit) +
-            "' title='Copy HTML table for this unit'>Copy HTML</button></div></td>" +
+            " — paste into email (Ctrl+V)'><span class='smx-cmd-copy-glyph' aria-hidden='true'>📋</span><span class='smx-cmd-copy-stack'><span class='smx-cmd-copy-title'>Copy HTML</span><span class='smx-cmd-copy-sub'>Table for this unit</span></span></button></td>" +
             "</tr>"
           );
         })
@@ -18457,9 +18484,10 @@ function renderDashboardHtml(): string {
       }
     }
 
+    var SMX_791_MXS = "791 MXS";
     function smxRowOwningUnitDisplay(row) {
       var aid = row && row.assetId ? String(row.assetId).trim() : "";
-      if (aid.toUpperCase().indexOf("MSX") === 0) return "791 MXS";
+      if (aid.toUpperCase().startsWith("MSX")) return SMX_791_MXS;
       return row && row.owningUnit ? String(row.owningUnit).trim() : "";
     }
 
@@ -21421,20 +21449,6 @@ function renderDashboardHtml(): string {
           if (w) setHashWorkOrder(w);
         });
       }
-      const smxMailWing = document.getElementById("smx-commander-mail-wing");
-      if (smxMailWing && !smxMailWing.dataset.wired) {
-        smxMailWing.dataset.wired = "1";
-        smxMailWing.addEventListener("click", function (ev) {
-          ev.preventDefault();
-          ev.stopPropagation();
-          if (!smxCommander) return;
-          var dk = smxSelectedDateKey || "";
-          var ek = smxEticDateKey || "";
-          var subj = smxCommanderReportTitle();
-          var body = smxCommanderEmailBodyWing(smxCommander, dk, ek);
-          window.location.href = smxMailtoUrl(subj, body);
-        });
-      }
       const smxCopyWingHtml = document.getElementById("smx-commander-copy-html-wing");
       if (smxCopyWingHtml && !smxCopyWingHtml.dataset.wired) {
         smxCopyWingHtml.dataset.wired = "1";
@@ -21448,10 +21462,10 @@ function renderDashboardHtml(): string {
           var plain = smxCommanderEmailBodyWing(smxCommander, dk, ek);
           smxCopyCommanderHtml(html, plain)
             .then(function () {
-              smxFlashCommanderCopyStatus("Copied HTML. In Outlook, click in the message body and paste (Ctrl+V) for a real table.");
+              smxFlashCommanderCopyStatus("Copied. Click in the email body and paste (Ctrl+V) for a formatted table.");
             })
             .catch(function () {
-              smxFlashCommanderCopyStatus("Copy failed — check browser permission or use RTS Outlook for plain text.");
+              smxFlashCommanderCopyStatus("Copy failed — allow clipboard access and try again.");
             });
         });
       }
@@ -21477,28 +21491,6 @@ function renderDashboardHtml(): string {
             renderScheduleMxList();
             return;
           }
-          var mailBtn = ev.target.closest(".smx-cmd-mail-unit");
-          if (mailBtn) {
-            ev.preventDefault();
-            ev.stopPropagation();
-            if (!smxCommander) return;
-            var unit = (mailBtn.getAttribute("data-smx-mail-unit") || "").trim();
-            var rowsU = smxCommander.units || [];
-            var row = null;
-            for (var ri = 0; ri < rowsU.length; ri++) {
-              if (rowsU[ri].unit === unit) {
-                row = rowsU[ri];
-                break;
-              }
-            }
-            if (!row) return;
-            var dk2 = smxSelectedDateKey || "";
-            var ek2 = smxEticDateKey || "";
-            var subj2 = smxCommanderReportTitle() + " — " + unit;
-            var body2 = smxCommanderEmailBodyUnit(row, dk2, ek2);
-            window.location.href = smxMailtoUrl(subj2, body2);
-            return;
-          }
           var copyHtmlBtn = ev.target.closest(".smx-cmd-copy-html-unit");
           if (copyHtmlBtn) {
             ev.preventDefault();
@@ -21520,10 +21512,10 @@ function renderDashboardHtml(): string {
             var plainC = smxCommanderEmailBodyUnit(rowC, dk3, ek3);
             smxCopyCommanderHtml(htmlC, plainC)
               .then(function () {
-                smxFlashCommanderCopyStatus("Copied HTML for " + unitC + ". Paste into Outlook (Ctrl+V).");
+                smxFlashCommanderCopyStatus("Copied table for " + unitC + ". Paste into your email (Ctrl+V).");
               })
               .catch(function () {
-                smxFlashCommanderCopyStatus("Copy failed — try RTS Outlook for this unit.");
+                smxFlashCommanderCopyStatus("Copy failed — allow clipboard and try again.");
               });
           }
         });
