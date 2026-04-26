@@ -231,11 +231,9 @@ describe("parseScheduleMxCsvToRawByAsset (compat)", () => {
 });
 
 describe("analyzeElmsScheduleMxFromRaw", () => {
-  it("marks overdue when next maint date is before as-of", () => {
+  it("marks overdue when next maint date is before as-of (no util interval to contradict)", () => {
     const raw = {
       "fleet.next maint date": "2026-04-01",
-      "fleet.current meter reading": "1000",
-      "fleet.next util qty": "5000",
     };
     const a = analyzeElmsScheduleMxFromRaw(raw, "2026-04-25");
     expect(a.scheduleMxBucket).toBe("overdue");
@@ -251,6 +249,27 @@ describe("analyzeElmsScheduleMxFromRaw", () => {
     const a = analyzeElmsScheduleMxFromRaw(raw, "2026-04-25");
     expect(a.scheduleMxOverdueUtil).toBe(true);
     expect(a.scheduleMxBucket).toBe("overdue");
+  });
+
+  it("does not mark overdue from legacy slicer when ELMS util interval is clearly not due", () => {
+    const raw = {
+      "fleet.schedule mx slicer": "Overdue",
+      "fleet.current meter reading": "1000",
+      "fleet.next util qty": "5000",
+    };
+    const a = analyzeElmsScheduleMxFromRaw(raw, "2026-04-25");
+    expect(a.scheduleMxBucket).toBe("ok");
+  });
+
+  it("trusts meter over a stale parsed next-maint date when still before next util qty", () => {
+    const raw = {
+      "fleet.next maint date": "2026-04-01",
+      "fleet.current meter reading": "1000",
+      "fleet.next util qty": "5000",
+    };
+    const a = analyzeElmsScheduleMxFromRaw(raw, "2026-04-25");
+    expect(a.scheduleMxBucket).toBe("ok");
+    expect(a.scheduleMxOverdueUtil).toBe(false);
   });
 });
 

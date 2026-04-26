@@ -1437,12 +1437,24 @@ export function analyzeElmsScheduleMxFromRaw(
     if (elmsCurrentMeter >= elmsNextUtilQty) scheduleMxOverdueUtil = true;
   }
 
+  /** Meter interval says we are still before the next util target (authoritative vs stale calendar cells). */
+  const utilSaysNotOverdue =
+    elmsNextUtilQty != null && elmsCurrentMeter != null && elmsCurrentMeter < elmsNextUtilQty;
+  if (dateOverdue && utilSaysNotOverdue) {
+    dateOverdue = false;
+    dateOverdueByDays = null;
+    daysUntil = null;
+  }
+
   const legacy = analyzeScheduleMxFromRaw(raw, asOfDateKey);
   const hasElmsSignal =
     !!elmsNextMaintDateIso ||
     (elmsNextUtilQty != null && elmsCurrentMeter != null) ||
     !!lastMaintText ||
-    !!nextMaintText;
+    !!nextUtilText ||
+    !!lastUtilText ||
+    !!nextMaintText ||
+    !!meterText;
 
   let bucket: ScheduleMxBucket;
   let scheduleMxOverdueByDays: number | null = legacy.scheduleMxOverdueByDays;
