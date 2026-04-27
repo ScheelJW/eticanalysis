@@ -1966,6 +1966,9 @@ export async function getAssetDetail(env: Env, assetId: string): Promise<AssetDe
 
    FM&A records yard_finding_action rows; for DISCREPANCY/UNLISTED the action
    anchors to the triggering yard_check id so a newer check can re-open.
+   `in_progress` (follow-up) is stored like other resolutions but does NOT
+   count as acknowledged — the finding stays in the open queue with the note
+   until a terminal resolution is recorded.
    ========================================================================== */
 
 /** How long an asset can go un-confirmed before it counts as Missing. Defaults
@@ -2309,7 +2312,10 @@ export async function listOpenFindings(env: Env): Promise<{
     //                             action — there's nothing to be newer than)
     let acknowledged = false;
     if (lastAction) {
-      if (kind === "unlisted") {
+      if (lastAction.resolution === "in_progress") {
+        // Follow-up: keep in the open queue; notes stay visible for FM&A.
+        acknowledged = false;
+      } else if (kind === "unlisted") {
         const lastCheck = triggerCheck;
         acknowledged = !lastCheck || lastAction.resolvedAtIso >= lastCheck.checkedAtIso;
       } else if (kind === "missing") {

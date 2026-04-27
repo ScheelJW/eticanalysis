@@ -5,6 +5,7 @@ import {
   applyScheduleMxFleetUtilizationTypeFromD1,
   calendarDaysBetween,
   classifyMelTier,
+  cleanUtilUomLabel,
   scheduleMxMeterDueSoonMaxRemaining,
   utilizationTypeFromFleetRawJson,
   computeMelRecallHintForRow,
@@ -283,6 +284,16 @@ describe("utilization type and meter due soon", () => {
     expect(utilizationTypeFromFleetRawJson(j)).toBe("Hours");
   });
 
+  it("never returns a pure number as utilization type from header match", () => {
+    const j = JSON.stringify({ "fleet.vehicle utilization uom": "24858.00" });
+    expect(utilizationTypeFromFleetRawJson(j)).toBe("");
+  });
+
+  it("collapses workbook glossary cells like 'h - hour' to the longer half", () => {
+    const j = JSON.stringify({ "fleet.utilization type": "h - hour" });
+    expect(utilizationTypeFromFleetRawJson(j)).toBe("hour");
+  });
+
   it("hour-meter: 274h remaining to target is not meter due soon (274 > 50)", () => {
     const raw: Record<string, string> = {
       "x.next util": "872",
@@ -379,6 +390,49 @@ describe("utilization type and meter due soon", () => {
     const out = applyScheduleMxFleetUtilizationTypeFromD1([row], m, "2026-04-26");
     expect(out[0]!.elmsUtilType).toBe("hours");
     expect(out[0]!.scheduleMxBucket).toBe("ok");
+  });
+});
+
+describe("cleanUtilUomLabel", () => {
+  it("maps short hour codes and full words to 'hours'", () => {
+    expect(cleanUtilUomLabel("h")).toBe("hours");
+    expect(cleanUtilUomLabel("hr")).toBe("hours");
+    expect(cleanUtilUomLabel("hrs")).toBe("hours");
+    expect(cleanUtilUomLabel("Hour")).toBe("hours");
+    expect(cleanUtilUomLabel("HOURS")).toBe("hours");
+    expect(cleanUtilUomLabel("Engine HOURS")).toBe("hours");
+  });
+
+  it("maps short mile codes and full words to 'miles'", () => {
+    expect(cleanUtilUomLabel("mi")).toBe("miles");
+    expect(cleanUtilUomLabel("Mile")).toBe("miles");
+    expect(cleanUtilUomLabel("Miles")).toBe("miles");
+    expect(cleanUtilUomLabel("ODOMETER")).toBe("miles");
+  });
+
+  it("maps km / kilometers to 'kilometers'", () => {
+    expect(cleanUtilUomLabel("km")).toBe("kilometers");
+    expect(cleanUtilUomLabel("Kilometer")).toBe("kilometers");
+    expect(cleanUtilUomLabel("kilometres")).toBe("kilometers");
+  });
+
+  it("collapses workbook glossary cells like 'h - hour' to a single label", () => {
+    expect(cleanUtilUomLabel("h - hour")).toBe("hours");
+    expect(cleanUtilUomLabel("mi - miles")).toBe("miles");
+    expect(cleanUtilUomLabel("mi / miles")).toBe("miles");
+  });
+
+  it("returns empty for pure-number cells (existing guard stays)", () => {
+    expect(cleanUtilUomLabel("24858.00")).toBe("");
+    expect(cleanUtilUomLabel("1,234")).toBe("");
+    expect(cleanUtilUomLabel("")).toBe("");
+    expect(cleanUtilUomLabel(null)).toBe("");
+    expect(cleanUtilUomLabel(undefined)).toBe("");
+  });
+
+  it("falls through unknown labels with whitespace collapsed", () => {
+    expect(cleanUtilUomLabel("Cycles")).toBe("Cycles");
+    expect(cleanUtilUomLabel("  rounds  fired ")).toBe("rounds fired");
   });
 });
 

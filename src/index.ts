@@ -75,6 +75,7 @@ import {
   deleteCheck as deleteYardCheckRow,
   reopenFinding as reopenYardFinding,
   resolveFinding as resolveYardFinding,
+  listFindingActionsForAsset as listYardFindingActionsForAsset,
   updateYardCheck as updateYardCheckRow,
   type FindingKind,
   type FindingResolution,
@@ -744,6 +745,9 @@ export default {
     }
     if (url.pathname === "/api/yard/work-orders-by-asset") {
       return handleYardWorkOrdersByAssetApi(env, url);
+    }
+    if (url.pathname === "/api/yard/finding-actions") {
+      return handleYardFindingActionsApi(env, url);
     }
     if (url.pathname === "/api/yard/findings/resolve") {
       return handleYardFindingResolveApi(env, request);
@@ -2413,6 +2417,21 @@ async function handleYardFindingsApi(env: Env): Promise<Response> {
   return Response.json(result, { headers: cacheHeaders() });
 }
 
+/** GET ?assetId=&kind= — FM&A actions for a finding (newest first). */
+async function handleYardFindingActionsApi(env: Env, url: URL): Promise<Response> {
+  const assetId = (url.searchParams.get("assetId") ?? "").trim();
+  const kind = (url.searchParams.get("kind") ?? "").trim();
+  if (!assetId) {
+    return Response.json({ error: "assetId is required" }, { status: 400, headers: cacheHeaders() });
+  }
+  if (!kind) {
+    return Response.json({ error: "kind is required" }, { status: 400, headers: cacheHeaders() });
+  }
+  const all = await listYardFindingActionsForAsset(env, assetId);
+  const actions = all.filter((a) => a.kind === kind);
+  return Response.json({ assetId, kind, actions }, { headers: cacheHeaders() });
+}
+
 /** GET ?assetId= — all work_order_snapshot rows for an asset (newest report first). */
 async function handleYardWorkOrdersByAssetApi(env: Env, url: URL): Promise<Response> {
   const assetId = (url.searchParams.get("assetId") ?? "").trim();
@@ -2446,11 +2465,44 @@ async function handleYardFindingResolveApi(env: Env, request: Request): Promise<
     return Response.json({ error: "kind required" }, { status: 400, headers: cacheHeaders() });
   }
   try {
+    const resolution = (body.resolution || "resolved") as FindingResolution;
+    if (resolution === "wo_opened" && !(body.woOpened ?? "").trim()) {
+      return Response.json(
+        { error: "Work order number is required when logging that a WO was opened" },
+        { status: 400, headers: cacheHeaders() },
+      );
+    }
+    if (resolution === "resolved") {
+      if (!(body.resolvedBy ?? "").trim()) {
+        return Response.json(
+          { error: "Name is required to close" },
+          { status: 400, headers: cacheHeaders() },
+        );
+      }
+      if (!(body.note ?? "").trim()) {
+        return Response.json(
+          { error: "Note is required when closing without a new work order" },
+          { status: 400, headers: cacheHeaders() },
+        );
+      }
+    }
+    if (resolution === "wo_opened" && !(body.resolvedBy ?? "").trim()) {
+      return Response.json(
+        { error: "Name is required" },
+        { status: 400, headers: cacheHeaders() },
+      );
+    }
+    if (resolution === "in_progress" && !(body.note ?? "").trim()) {
+      return Response.json(
+        { error: "Follow-up note text is required" },
+        { status: 400, headers: cacheHeaders() },
+      );
+    }
     const action = await resolveYardFinding(env, {
       assetId: body.assetId,
       kind: body.kind as FindingKind,
       checkId: body.checkId ?? null,
-      resolution: (body.resolution || "resolved") as FindingResolution,
+      resolution,
       woOpened: body.woOpened,
       note: body.note,
       resolvedBy: body.resolvedBy,
@@ -3012,12 +3064,12 @@ function renderWaiverAppHtml(): string {
                  spellcheck="false" placeholder="Type part of an asset id…"
                  autocomplete="off" role="combobox" aria-autocomplete="list" aria-controls="asset-suggest" aria-expanded="false" />
           <ul id="asset-suggest" class="asset-suggest" hidden role="listbox" aria-label="Matching asset ids"></ul>
-          <p class="asset-ac-hint">Matches load automatically — tap a row or keep typing until only one match, then Open.</p>
+          <p class="asset-ac-hint">Tap a match, or keep typing then hit Open.</p>
         </div>
         <button type="button" class="btn" id="lookup-btn">Open</button>
       </div>
       <div class="name-prompt">
-        <label for="name-input">Your name (used on every action you take)</label>
+        <label for="name-input">Your name</label>
         <input id="name-input" type="text" autocomplete="name" placeholder="First Last" />
       </div>
       <div class="recent" id="recent-wrap" hidden>
@@ -3038,15 +3090,14 @@ function renderWaiverAppHtml(): string {
   <!-- Submit modal -->
   <div class="modal-back" id="submit-modal">
     <div class="modal">
-      <h2>Request a waiver</h2>
-      <div class="h-sub" id="submit-asset-line"></div>
-      <label for="sub-name">Your name (required)</label>
+      <h2 id="submit-asset-line">Request a waiver</h2>
+      <label for="sub-name">Your name</label>
       <input id="sub-name" type="text" autocomplete="name" placeholder="First Last" />
-      <label for="sub-title">Short title (what is the defect?)</label>
+      <label for="sub-title">Defect (short title)</label>
       <input id="sub-title" type="text" maxlength="120" placeholder="e.g. Driver-side mirror crack < 2&quot;" />
-      <label for="sub-desc">Details (where it is, why it doesn't affect safety, etc.)</label>
-      <textarea id="sub-desc" maxlength="2000"></textarea>
-      <label>Photos/videos of the defect (optional)</label>
+      <label for="sub-desc">Details (optional)</label>
+      <textarea id="sub-desc" maxlength="2000" placeholder="Where it is, why it doesn’t affect safety…"></textarea>
+      <label>Photos / videos</label>
       <div class="file-row">
         <label class="file-btn" for="sub-photo">📎 Add media</label>
         <input id="sub-photo" type="file" accept="image/*,video/*" multiple />
@@ -3064,15 +3115,14 @@ function renderWaiverAppHtml(): string {
   <!-- Verify modal -->
   <div class="modal-back" id="verify-modal">
     <div class="modal">
-      <h2>Verify this waiver</h2>
-      <div class="h-sub" id="verify-line"></div>
-      <label for="verify-name">Your name (required)</label>
+      <h2 id="verify-line">Verify waiver</h2>
+      <label for="verify-name">Your name</label>
       <input id="verify-name" type="text" placeholder="First Last" />
-      <label for="verify-note">Optional note</label>
+      <label for="verify-note">Note (optional)</label>
       <textarea id="verify-note" maxlength="500" placeholder="e.g. Re-checked during PMI, still applies"></textarea>
-      <label>Photo at verification (optional)</label>
+      <label>Photo (optional)</label>
       <div class="file-row">
-        <label class="file-btn" for="verify-photo">📷 Take / choose photo</label>
+        <label class="file-btn" for="verify-photo">📷 Take photo</label>
         <input id="verify-photo" type="file" accept="image/*" capture="environment" />
         <span id="verify-photo-name" style="font-size:0.85rem;color:var(--muted);"></span>
       </div>
@@ -3425,7 +3475,7 @@ function renderWaiverAppHtml(): string {
   // ---- Submit modal ----
   function openSubmitModal() {
     if (!state.assetId) { showToast("Pick an asset first", true); return; }
-    $("submit-asset-line").textContent = "For asset " + state.assetId;
+    $("submit-asset-line").textContent = "Request waiver · " + state.assetId;
     $("sub-name").value = readName();
     $("sub-title").value = "";
     $("sub-desc").value = "";
@@ -3506,7 +3556,7 @@ function renderWaiverAppHtml(): string {
   function openVerifyModal(id) {
     state.pendingActionId = id;
     var w = state.waivers.find(function (x) { return x.id === id; });
-    $("verify-line").textContent = w ? ('"' + w.title + '"') : "";
+    $("verify-line").textContent = w ? ('Verify · ' + w.title) : "Verify waiver";
     $("verify-name").value = readName();
     $("verify-note").value = "";
     $("verify-photo").value = "";
@@ -3934,19 +3984,41 @@ function renderWaiverPrintCardHtml(assetId: string, waivers: Waiver[]): string {
   const n = printRows.length;
   const densityClass =
     n >= 16 ? "wv-print--vheavy" : n >= 10 ? "wv-print--heavy" : n >= 6 ? "wv-print--medium" : "";
+  const fmtIsoToShortDate = (iso: string): string => {
+    const t = (iso ?? "").trim();
+    if (!t) return "";
+    const d = new Date(t);
+    if (isNaN(d.getTime())) return "";
+    return d.toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" });
+  };
+  const verifiedLineForRow = (w: Waiver): string => {
+    if (w.lastVerifiedAtIso) {
+      const when = fmtIsoToShortDate(w.lastVerifiedAtIso);
+      const who = (w.lastVerifiedBy ?? "").trim();
+      const parts = ["Last verified:", when || "—"];
+      if (who) parts.push("by " + who);
+      return parts.join(" ");
+    }
+    if (w.reviewedAtIso) {
+      const when = fmtIsoToShortDate(w.reviewedAtIso);
+      return when ? `Approved ${when} (not re-verified yet)` : "Not re-verified yet";
+    }
+    return "";
+  };
   const rows = printRows
     .map((w, i) => {
       const verifyState =
         w.verifyState === "overdue" ? "overdue" :
         w.verifyState === "dueSoon" ? "due-soon" : "fresh";
       const descPrint = descForPrint(w);
+      const verifiedTxt = verifiedLineForRow(w);
       return `
         <article class="row ${verifyState}">
           <div class="num">${i + 1}</div>
           <div class="body">
             <div class="title">${escHtml(w.title)}</div>
             ${descPrint ? `<div class="desc">${escHtml(descPrint)}</div>` : ""}
-            <div class="last-verified">Last verified: legacy</div>
+            ${verifiedTxt ? `<div class="last-verified">${escHtml(verifiedTxt)}</div>` : ""}
           </div>
         </article>`;
     })
@@ -4068,7 +4140,7 @@ function renderWaiverPrintCardHtml(assetId: string, waivers: Waiver[]): string {
   </div>
   ${rows}
   ${empty}
-  <div class="footer">${SITE_TITLE} · in-cab reference</div>
+  <div class="footer">${SITE_TITLE} · in-cab reference · printed ${new Date().toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" })}</div>
   <script>
     if (!new URLSearchParams(location.search).has("noprint")) {
       setTimeout(function () { window.print(); }, 250);
@@ -6157,32 +6229,26 @@ function renderYardAppHtml(): string {
     /* Asset list */
     .list { flex: 1 1 auto; padding: 4px 10px 120px; }
     .row {
-      display: flex; align-items: center; gap: 12px; padding: 14px 14px;
+      display: flex; align-items: flex-start; gap: 10px; padding: 12px 12px;
       background: var(--bg1); border: 1px solid var(--border);
-      border-radius: 10px; margin-bottom: 8px; cursor: pointer;
-      box-shadow: 0 1px 2px rgba(15,30,60,0.04);
+      border-radius: 10px; margin-bottom: 6px; cursor: pointer;
     }
     .row:active { background: var(--bg2); border-color: var(--accent); }
-    .row .id { font-weight: 700; font-size: 17px; }
-    .row .meta { color: var(--muted); font-size: 13px; margin-top: 2px; }
+    .row .id { font-weight: 700; font-size: 16px; line-height: 1.2; }
+    .row .meta {
+      color: var(--muted); font-size: 12px; margin-top: 2px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
     .row .row-loc {
-      margin-top: 8px; padding: 10px 12px; border-radius: 8px;
-      background: linear-gradient(180deg, #e8f0ff 0%, #dfe8f8 100%);
-      border: 1px solid rgba(0, 58, 140, 0.22);
-      font-size: 15px; font-weight: 700; color: var(--accent-strong);
-      line-height: 1.35; word-break: break-word;
+      margin-top: 4px; font-size: 14px; font-weight: 600; color: var(--accent-strong);
+      line-height: 1.3; word-break: break-word;
+      display: flex; align-items: baseline; gap: 6px;
     }
-    .row .row-loc.muted {
-      background: var(--bg2); border-color: var(--border);
-      color: var(--muted); font-weight: 600; font-size: 14px;
-    }
-    .row .row-loc .row-loc-lbl {
-      display: block; font-size: 10px; font-weight: 700; letter-spacing: 0.06em;
-      text-transform: uppercase; color: var(--muted); margin-bottom: 4px;
-    }
+    .row .row-loc::before { content: "\u{1F4CD}"; font-size: 12px; flex: 0 0 auto; }
+    .row .row-loc.muted { color: var(--muted); font-weight: 500; font-size: 13px; }
+    .row .row-loc .row-loc-lbl { display: none; }
     .row .body { flex: 1 1 auto; min-width: 0; }
-    .row .body .meta { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .row .right { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; flex: 0 0 auto; }
+    .row .right { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex: 0 0 auto; }
     .badges { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
     .badge {
       font-size: 10px; font-weight: 700; letter-spacing: 0.4px;
@@ -6236,23 +6302,49 @@ function renderYardAppHtml(): string {
 
     .sheet-body { flex: 1 1 auto; overflow-y: auto; padding: 12px 14px 140px; }
     .yard-loc-hero {
+      display: flex; align-items: stretch; gap: 12px;
       background: linear-gradient(180deg, #f0f6ff 0%, #e4edfc 100%);
       border: 1px solid rgba(0, 58, 140, 0.28); border-radius: 12px;
-      padding: 16px 14px 14px; margin-bottom: 12px;
-      box-shadow: 0 2px 8px rgba(0, 58, 140, 0.08);
+      padding: 12px; margin-bottom: 10px;
+      box-shadow: 0 1px 3px rgba(0, 58, 140, 0.06);
     }
+    .yard-loc-hero-text { flex: 1 1 auto; min-width: 0; }
     .yard-loc-hero-label {
-      font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
-      color: var(--muted); margin-bottom: 6px;
+      font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+      color: var(--muted); margin-bottom: 4px;
     }
     .yard-loc-hero-value {
-      font-size: 1.45rem; font-weight: 800; color: var(--accent-strong);
-      line-height: 1.25; word-break: break-word;
+      font-size: 1.25rem; font-weight: 800; color: var(--accent-strong);
+      line-height: 1.2; word-break: break-word;
     }
-    .yard-loc-hero-value.unknown { font-size: 1.1rem; font-weight: 700; color: var(--muted); }
-    .yard-loc-hero-sub { margin-top: 6px; font-size: 13px; color: var(--text-dim); }
-    .yard-loc-hero-meta { margin-top: 8px; font-size: 12px; color: var(--muted); line-height: 1.45; }
-    .yard-loc-hero-hint { margin: 10px 0 0; font-size: 12px; color: var(--muted); line-height: 1.4; }
+    .yard-loc-hero-value.unknown { font-size: 1rem; font-weight: 700; color: var(--muted); }
+    .yard-loc-hero-sub { margin-top: 4px; font-size: 12px; color: var(--text-dim); }
+    .yard-loc-hero-meta { margin-top: 4px; font-size: 11px; color: var(--muted); line-height: 1.4; }
+    .yard-loc-hero-photo {
+      flex: 0 0 auto; width: 84px; height: 84px; border-radius: 10px; overflow: hidden;
+      background: var(--bg2); border: 1px solid var(--border); position: relative;
+      align-self: flex-start;
+    }
+    .yard-loc-hero-photo .yard-photo-view {
+      position: absolute; inset: 0; padding: 0; margin: 0; border: 0; background: transparent; cursor: pointer; border-radius: inherit;
+    }
+    .yard-loc-hero-photo img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .yard-loc-hero-photo .yard-loc-hero-photo-count {
+      position: absolute; bottom: 4px; right: 4px;
+      font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 999px;
+      background: rgba(0, 0, 0, 0.65); color: #fff; line-height: 1;
+    }
+    .yard-loc-hero-photo .x { position: absolute; top: 2px; right: 2px; width: 22px; height: 22px; font-size: 13px; }
+    .yard-loc-hero-add {
+      flex: 0 0 auto; display: flex; flex-direction: column; align-items: center; justify-content: center;
+      width: 84px; height: 84px; border-radius: 10px; background: var(--bg1);
+      border: 1.5px dashed rgba(0, 58, 140, 0.35); color: var(--accent);
+      font-size: 11px; font-weight: 700; gap: 2px; cursor: pointer; padding: 4px;
+      align-self: flex-start;
+    }
+    .yard-loc-hero-add svg { width: 22px; height: 22px; }
+    .yard-loc-hero-add:active { background: var(--bg2); }
+    .yard-loc-hero-add input { display: none; }
     .yard-log-section {
       background: transparent; border: none; margin: 0; padding: 0;
     }
@@ -6289,6 +6381,8 @@ function renderYardAppHtml(): string {
     .chip-pick .chip { font-size: 13px; padding: 7px 12px; }
     .chip-pick .chip.on { background: var(--accent); color: #ffffff; border-color: var(--accent); }
 
+    .yard-photo-extras { display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 12px; }
+    .yard-photo-extras .photo { width: 64px; height: 64px; aspect-ratio: 1 / 1; }
     .photos { display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 8px; margin-top: 8px; }
     .photo {
       position: relative; aspect-ratio: 1 / 1; border-radius: 8px; overflow: hidden;
@@ -6297,11 +6391,10 @@ function renderYardAppHtml(): string {
     .photo img { width: 100%; height: 100%; object-fit: cover; display: block; }
     .photo .yard-photo-view {
       display: block; width: 100%; height: 100%; padding: 0; margin: 0; border: 0; background: transparent;
-      cursor: zoom-in; border-radius: inherit;
+      cursor: pointer; border-radius: inherit;
     }
-    .yard-photo-lb-overlay {
-      z-index: 80;
-    }
+    .yard-photo-lb-overlay { z-index: 80; cursor: pointer; }
+    .yard-photo-lb-overlay .yard-photo-lb-inner { cursor: default; }
     .yard-photo-lb-overlay .modal.yard-photo-lb-inner {
       position: relative;
       max-width: min(94vw, 960px);
@@ -6312,8 +6405,8 @@ function renderYardAppHtml(): string {
     }
     .yard-photo-lb-overlay .yard-photo-lb-x {
       position: absolute; top: 8px; right: 8px; z-index: 2;
-      width: 38px; height: 38px; border-radius: 8px; border: 1px solid var(--border);
-      background: var(--bg1); font-size: 20px; cursor: pointer; line-height: 1;
+      width: 48px; height: 48px; border-radius: 10px; border: 1px solid var(--border);
+      background: var(--bg1); font-size: 24px; font-weight: 700; cursor: pointer; line-height: 1;
     }
     .yard-photo-lb-overlay #yard-photo-lb-img-m {
       display: block; max-width: 100%; max-height: 86vh; width: auto; height: auto; margin: 0 auto;
@@ -6436,13 +6529,6 @@ function renderYardAppHtml(): string {
       border-top: 1px solid var(--border);
       box-shadow: 0 -4px 14px rgba(15,30,60,0.08);
       z-index: 65;
-    }
-    .save-bar-hint {
-      margin: 0 0 8px;
-      font-size: 12px;
-      line-height: 1.35;
-      color: var(--muted);
-      text-align: center;
     }
     .save-btn {
       width: 100%; padding: 16px; border-radius: 8px;
@@ -6816,8 +6902,8 @@ function renderYardAppHtml(): string {
         </div>
       </div>
       <div class="search-row">
-        <input id="search" type="search" inputmode="search" placeholder="Search asset, VIN, shop, location…" autocomplete="off" />
-        <button class="find-btn" id="find-btn" aria-label="Found asset with no open work order">+ Find</button>
+        <input id="search" type="search" inputmode="search" placeholder="Search…" autocomplete="off" />
+        <button class="find-btn" id="find-btn" aria-label="Find unlisted">+ Find</button>
       </div>
       <div id="walker" class="walker-row"></div>
     </header>
@@ -6829,7 +6915,7 @@ function renderYardAppHtml(): string {
     </nav>
 
     <main class="list yard-list-mobile" id="list">
-      <div class="empty"><div class="big">⏳</div>Loading fleet…</div>
+      <div class="empty"><div class="big">⏳</div>Loading…</div>
     </main>
     </div>
 
@@ -6837,11 +6923,10 @@ function renderYardAppHtml(): string {
       <div class="yard-desktop-top">
         <div class="yard-desktop-brand">
           <span class="yard-desktop-product">${SITE_TITLE}</span>
-          <span class="yard-desktop-tagline">Yard Check · Fleet lookup</span>
         </div>
         <div class="yard-desktop-search">
-          <input id="search-desk" type="search" inputmode="search" placeholder="Search asset, VIN, shop, location…" autocomplete="off" />
-          <button type="button" class="yard-desktop-find" id="find-btn-desk">Found, no WO…</button>
+          <input id="search-desk" type="search" inputmode="search" placeholder="Search…" autocomplete="off" />
+          <button type="button" class="yard-desktop-find" id="find-btn-desk">+ Find</button>
         </div>
         <div class="yard-desktop-stats" aria-live="polite">
           <b data-stat="t-due">0</b> due · <b data-stat="t-today">0</b> today
@@ -6850,8 +6935,7 @@ function renderYardAppHtml(): string {
         <div id="walker-desk" class="walker-row yard-desktop-walker"></div>
       </div>
       <div class="yard-desktop-filterbar">
-        <span class="yard-desktop-filterbar-label">Show</span>
-        <nav id="filters-desk" class="yard-desk-filters" aria-label="Fleet list filters">
+        <nav id="filters-desk" class="yard-desk-filters" aria-label="List filters">
           <button type="button" class="yard-filter-btn active" data-filter="all">All <span class="yard-ftab-n" data-yc="all">0</span></button>
           <button type="button" class="yard-filter-btn" data-filter="needs_action">Due for check <span class="yard-ftab-n" data-yc="needs_action">0</span></button>
           <button type="button" class="yard-filter-btn" data-filter="done">Done <span class="yard-ftab-n" data-yc="done">0</span></button>
@@ -6860,7 +6944,6 @@ function renderYardAppHtml(): string {
     </div>
 
     <div class="yard-desk" id="yard-desk">
-      <p class="yard-desk-hint"><strong>Last parked at</strong> is the main column — search an asset to see where it was last seen. Expand &ldquo;Log a yard visit&rdquo; only when you are updating the record. <span style="color:var(--muted)">NCE and Below MEL tags are work-order context only. Items marked Found, no open WO need a work-order or records fix.</span></p>
       <div class="yard-desk-split">
         <div class="yard-desk-table-wrap">
           <table class="yard-desk-table" aria-label="Yard vehicle lookup">
@@ -6879,7 +6962,7 @@ function renderYardAppHtml(): string {
           </table>
         </div>
         <aside class="yard-desk-aside" id="yard-desk-aside">
-          <div id="yard-desk-empty" class="yard-desk-empty">Select a vehicle in the table to see its last known location, notes, and location history.</div>
+          <div id="yard-desk-empty" class="yard-desk-empty">Select a row.</div>
           <div id="yard-desk-fill" class="hidden">
             <div class="yard-desk-asset-id" id="yard-d-asset" style="font-family:ui-monospace,monospace;font-weight:700;font-size:1.1rem;margin-bottom:12px;"></div>
             <div class="yard-desk-loc-callout">
@@ -6899,7 +6982,7 @@ function renderYardAppHtml(): string {
             <div class="yard-hist-actions">
               <button type="button" class="yard-desk-edit-check" id="yard-desk-edit-check" disabled>Edit this check…</button>
             </div>
-            <button type="button" class="yard-desk-open-full" id="yard-desk-open-full">Log check / photos / full detail</button>
+            <button type="button" class="yard-desk-open-full" id="yard-desk-open-full">Open in yard app</button>
           </div>
         </aside>
       </div>
@@ -6917,8 +7000,7 @@ function renderYardAppHtml(): string {
       <div class="yard-up-track"><div class="yard-up-fill" id="yard-up-fill"></div></div>
     </div>
     <div class="save-bar">
-      <p class="save-bar-hint">Only when logging a visit: set parking spot, then Save once.</p>
-      <button class="save-btn" id="save-btn">Save check</button>
+      <button class="save-btn" id="save-btn">Save</button>
     </div>
   </div>
 
@@ -6926,14 +7008,13 @@ function renderYardAppHtml(): string {
 
   <div class="modal-overlay" id="edit-check-modal" aria-hidden="true">
     <div class="modal" role="dialog" aria-labelledby="edit-check-title">
-      <h3 id="edit-check-title">Edit yard check</h3>
-      <p class="hint">Correct location, notes, or status. The original walk time and walker stay on record; your name is logged in the changelog.</p>
+      <h3 id="edit-check-title">Edit check</h3>
       <input type="hidden" id="edit-check-id" value="" />
       <label>Location
-        <input id="edit-check-loc" type="text" list="loc-options" placeholder="Where it was parked" />
+        <input id="edit-check-loc" type="text" list="loc-options" placeholder="Location" />
       </label>
       <label>Notes
-        <textarea id="edit-check-disc" rows="3" placeholder="Discrepancies / notes"></textarea>
+        <textarea id="edit-check-disc" rows="3" placeholder="Notes"></textarea>
       </label>
       <label>Status
         <select id="edit-check-status">
@@ -6961,17 +7042,16 @@ function renderYardAppHtml(): string {
   <div class="modal-overlay" id="find-modal" aria-hidden="true">
     <div class="modal" role="dialog" aria-labelledby="find-title">
       <h3 id="find-title">Found, no open WO</h3>
-      <p class="hint">Log a vehicle you found in the yard that does not have an open work order in the latest ETIC. It will show in Needs Fix until a fleet manager opens a WO or corrects the record.</p>
-      <label>Asset / tail / bumper number
-        <input id="find-asset-id" type="text" inputmode="text" autocapitalize="characters" placeholder="e.g. L-3157" />
+      <label>Asset
+        <input id="find-asset-id" type="text" inputmode="text" autocapitalize="characters" placeholder="ID" />
       </label>
       <label>Location
-        <input id="find-location" type="text" list="loc-options" placeholder="Where is it?" />
+        <input id="find-location" type="text" list="loc-options" placeholder="Location" />
       </label>
-      <label>Notes (optional)
-        <textarea id="find-notes" rows="2" placeholder="Anything notable about it?"></textarea>
+      <label>Notes
+        <textarea id="find-notes" rows="2" placeholder="Notes"></textarea>
       </label>
-      <label>Photos (optional)
+      <label>Photos
         <input id="find-photos-input" type="file" accept="image/*" multiple />
       </label>
       <div id="find-upload-bar" class="yard-upload-bar find-upload-bar" aria-live="polite">
@@ -7069,7 +7149,7 @@ function renderYardAppHtml(): string {
 
     function requireWalkerName(){
       if ((state.walker || "").trim()) return true;
-      showToast("Enter your name before saving", true);
+      showToast("Name?", true);
       var inp = document.querySelector(".walker-name-input");
       if (inp) inp.focus();
       return false;
@@ -7077,8 +7157,8 @@ function renderYardAppHtml(): string {
 
     function renderWalker(){
       var htmlNamed = state.walker
-        ? ("Walking as <b>" + escapeHtml(state.walker) + "</b> &middot; <a href='#' class='walker-edit'>change</a>")
-        : ("<input class='walker-name-input' type='text' placeholder='Your name (required)' autocomplete='name' />");
+        ? ("<b>" + escapeHtml(state.walker) + '</b> <a href="#" class="walker-edit">Edit</a>')
+        : ("<input class='walker-name-input' type='text' placeholder='Name' autocomplete='name' />");
       [["walker", "walker-row"], ["walker-desk", "walker-row yard-desktop-walker"]].forEach(function(pair){
         var w = $(pair[0]);
         if (!w) return;
@@ -7173,7 +7253,7 @@ function renderYardAppHtml(): string {
       var list = $("list");
       if (!rows.length) {
         list.innerHTML = '<div class="empty"><div class="big">\u2728</div>' +
-          (state.assets.length ? "No assets match." : "No assets in fleet.") + '</div>';
+          (state.assets.length ? "No matches." : "Empty.") + '</div>';
         return;
       }
       var html = "";
@@ -7183,6 +7263,7 @@ function renderYardAppHtml(): string {
         if (a.shop) sub.push("\uD83D\uDD27 " + escapeHtml(a.shop));
         else if (a.owningUnit) sub.push(escapeHtml(a.owningUnit));
         if (a.makeModel) sub.push(escapeHtml(a.makeModel));
+        if (a.photoCount > 0) sub.push("\uD83D\uDCF7 " + a.photoCount);
         // Badges = orthogonal flags only. The colored age line below already
         // conveys never/due/overdue/done, so we don't repeat it here.
         var badges = "";
@@ -7190,7 +7271,6 @@ function renderYardAppHtml(): string {
         if (a.isNewAsset) badges += '<span class="badge new">NEW</span>';
         if (a.isNce) badges += '<span class="badge nce">NCE</span>';
         if (a.isBelowMel) badges += '<span class="badge below-mel">Below MEL</span>';
-        if (a.photoCount > 0) badges += '<span class="badge photos">\uD83D\uDCF7 ' + a.photoCount + '</span>';
         html += '<div class="row" data-id="' + escapeHtml(a.assetId) + '">' +
           '<div class="body">' +
             '<div class="id">' + escapeHtml(a.assetId) + '</div>' +
@@ -7198,8 +7278,8 @@ function renderYardAppHtml(): string {
             (sub.length ? '<div class="meta">' + sub.join(" \u00B7 ") + '</div>' : '') +
           '</div>' +
           '<div class="right">' +
-            '<div class="badges">' + badges + '</div>' +
             '<div class="' + ageClass(a) + '">' + fmtAge(a.daysSinceLastCheck, a.isNeverChecked) + '</div>' +
+            (badges ? '<div class="badges">' + badges + '</div>' : '') +
           '</div>' +
         '</div>';
       }
@@ -7230,7 +7310,7 @@ function renderYardAppHtml(): string {
       if (!tb) return;
       var rows = applyFilter();
       if (!rows.length) {
-        tb.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:24px">No vehicles match.</td></tr>';
+        tb.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:24px">No matches.</td></tr>';
         return;
       }
       var h = "";
@@ -7630,22 +7710,49 @@ function renderYardAppHtml(): string {
       void STATUS;
 
       var photos = d.photos || [];
-      var photoHtml = "";
-      for (var i = 0; i < photos.length; i++) {
-        var p = photos[i];
-        photoHtml += '<div class="photo" data-photo-id="' + p.id + '">' +
-          '<button type="button" class="yard-photo-view" data-yard-photo-url="' + escapeHtml(p.url) + '" aria-label="View full size">' +
-            '<img src="' + escapeHtml(p.url) + '" alt="" loading="lazy" />' +
-          '</button>' +
-          '<button class="x" data-del-photo="' + p.id + '" aria-label="Delete">\u00D7</button>' +
-          '<div class="meta">' + (p.uploadedBy ? escapeHtml(p.uploadedBy) + " \u00B7 " : "") + fmtRel(p.uploadedAtIso) + '</div>' +
-        '</div>';
+      var heroPhotoBlock = "";
+      if (photos.length) {
+        var p0 = photos[0];
+        var countBadge = photos.length > 1
+          ? ('<div class="yard-loc-hero-photo-count">+' + (photos.length - 1) + '</div>')
+          : "";
+        heroPhotoBlock =
+          '<div class="yard-loc-hero-photo" data-photo-id="' + p0.id + '">' +
+            '<button type="button" class="yard-photo-view" data-yard-photo-url="' + escapeHtml(p0.url) + '" aria-label="Photo">' +
+              '<img src="' + escapeHtml(p0.url) + '" alt="" loading="eager" decoding="async" />' +
+            '</button>' +
+            '<button type="button" class="x" data-del-photo="' + p0.id + '" aria-label="Delete">\u00D7</button>' +
+            countBadge +
+          '</div>';
+      } else {
+        heroPhotoBlock =
+          '<label class="yard-loc-hero-add" id="photo-add" aria-label="Add photo">' +
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg>' +
+            '<span>Photo</span>' +
+            '<input type="file" id="photo-input" accept="image/*" capture="environment" />' +
+          '</label>';
       }
-      photoHtml += '<label class="photo-add" id="photo-add">' +
-        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg>' +
-        '<span>Take photo</span>' +
-        '<input type="file" id="photo-input" accept="image/*" capture="environment" />' +
-      '</label>';
+      var extraPhotosHtml = "";
+      if (photos.length) {
+        extraPhotosHtml = '<div class="yard-photo-extras">';
+        for (var pi = 1; pi < photos.length; pi++) {
+          var p = photos[pi];
+          extraPhotosHtml +=
+            '<div class="photo" data-photo-id="' + p.id + '">' +
+              '<button type="button" class="yard-photo-view" data-yard-photo-url="' + escapeHtml(p.url) + '" aria-label="Photo">' +
+                '<img src="' + escapeHtml(p.url) + '" alt="" loading="lazy" />' +
+              '</button>' +
+              '<button type="button" class="x" data-del-photo="' + p.id + '" aria-label="Delete">\u00D7</button>' +
+            '</div>';
+        }
+        extraPhotosHtml +=
+          '<label class="yard-loc-hero-add" id="photo-add" style="width:64px;height:64px;" aria-label="Add photo">' +
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg>' +
+            '<span style="font-size:10px;">Add</span>' +
+            '<input type="file" id="photo-input" accept="image/*" capture="environment" />' +
+          '</label>';
+        extraPhotosHtml += '</div>';
+      }
 
       var checks = d.checks || [];
       var allEdits = d.checkEdits || [];
@@ -7682,7 +7789,7 @@ function renderYardAppHtml(): string {
         }
         historyHtml += '</ul>';
       } else {
-        historyHtml = '<div style="color:var(--muted);font-size:13px;">No previous checks.</div>';
+        historyHtml = '<div style="color:var(--muted);font-size:13px;">None.</div>';
       }
 
       var lastSeen = a.isNeverChecked ? "Never checked" :
@@ -7703,12 +7810,15 @@ function renderYardAppHtml(): string {
         : "";
       var locHeroBlock =
         '<div class="yard-loc-hero">' +
-          '<div class="yard-loc-hero-label">Last known parking spot</div>' +
-          '<div class="' + locHeroValClass + '">' + locHeroValInner + '</div>' +
-          locHeroSubBlock +
-          locHeroMetaBlock +
-          '<p class="yard-loc-hero-hint">Open <strong>Log a yard visit</strong> below only when you are saving a new check, photo, or note.</p>' +
-        '</div>';
+          '<div class="yard-loc-hero-text">' +
+            '<div class="yard-loc-hero-label">Last known parking spot</div>' +
+            '<div class="' + locHeroValClass + '">' + locHeroValInner + '</div>' +
+            locHeroSubBlock +
+            locHeroMetaBlock +
+          '</div>' +
+          heroPhotoBlock +
+        '</div>' +
+        extraPhotosHtml;
 
       // Open work orders for this asset — the remarks fleet managers actually
       // care about. Shows the most recently changed remark first.
@@ -7739,13 +7849,7 @@ function renderYardAppHtml(): string {
         }
       }
 
-      var unlistedBanner = a.isUnlisted
-        ? '<div class="unlisted-banner">' +
-            '<b>Found, no open WO</b>' +
-            'A walker logged this asset, but it does not have an open work order in the latest ETIC. ' +
-            'Have a fleet manager open a WO or correct the record.' +
-          '</div>'
-        : '';
+      var unlistedBanner = a.isUnlisted ? '<div class="unlisted-banner"><b>Found, no open WO</b></div>' : "";
 
       // FM&A action banner — surface the most recent follow-up action so the
       // walker knows whether someone is on it, and what they should do (e.g.
@@ -7765,12 +7869,10 @@ function renderYardAppHtml(): string {
         var noteTxt = act.note ? '<div style="margin-top:4px;font-style:italic;">\u201C' + escapeHtml(act.note) + '\u201D</div>' : "";
         fmaBanner =
           '<div class="unlisted-banner" style="background:#e6f4ec;border-color:#9bd6b1;color:#0a3318;">' +
-            '<b>FM&amp;A acknowledged</b>' +
-            kindLbl + ' \u2192 ' + escapeHtml(label) + woTxt +
-            ' \u00B7 by ' + escapeHtml(act.resolvedBy || "(unknown)") +
-            ' \u00B7 ' + fmtRel(act.resolvedAtIso) +
+            "<b>" + escapeHtml(label) + "</b> \u00B7 " + escapeHtml(kindLbl) + woTxt +
+            " \u00B7 " + fmtRel(act.resolvedAtIso) +
             noteTxt +
-          '</div>';
+          "</div>";
       }
 
       var logVisitInner =
@@ -7780,18 +7882,14 @@ function renderYardAppHtml(): string {
         // (Save) implicitly: opening this sheet and tapping Save is the act of
         // confirming presence.
         '<div class="card">' +
-          '<h4>Parking spot (new check)</h4>' +
+          '<h4>Parking</h4>' +
           '<div class="chip-pick" id="loc-pick">' + locChipHtml + '</div>' +
-          '<input id="loc-input-other" list="loc-options" placeholder="Other location (optional)" value="' + escapeHtml(customLoc) + '" style="margin-top:8px;" />' +
+          '<input id="loc-input-other" list="loc-options" placeholder="Other" value="' + escapeHtml(customLoc) + '" style="margin-top:8px;" />' +
         '</div>' +
         '<div class="card">' +
           '<h4>Discrepancies</h4>' +
           '<div class="chip-pick" id="chip-pick">' + chipHtml + '</div>' +
-          '<textarea id="disc-input" placeholder="Tap chips above or type custom notes (use ; or new line to separate)\u2026" style="margin-top:8px;">' + escapeHtml(state.draft.discrepancies) + '</textarea>' +
-        '</div>' +
-        '<div class="card">' +
-          '<h4>Photos <span style="color:var(--muted2);font-weight:normal;">(' + photos.length + ')</span></h4>' +
-          '<div class="photos">' + photoHtml + '</div>' +
+          '<textarea id="disc-input" placeholder="Notes" style="margin-top:8px;">' + escapeHtml(state.draft.discrepancies) + '</textarea>' +
         '</div>';
 
       $("sheet-body").innerHTML =
@@ -7799,7 +7897,7 @@ function renderYardAppHtml(): string {
         unlistedBanner +
         locHeroBlock +
         '<div class="card">' +
-          '<h4>Vehicle details</h4>' +
+          '<h4>Details</h4>' +
           '<dl class="kv">' +
             '<dt>Asset ID</dt><dd>' + escapeHtml(a.assetId) + '</dd>' +
             (a.shop ? '<dt>Shop</dt><dd>' + escapeHtml(a.shop) + '</dd>' : '') +
@@ -7813,16 +7911,16 @@ function renderYardAppHtml(): string {
         '</div>' +
         (wos.length
           ? ('<div class="card">' +
-              '<h4>Open work orders <span style="color:var(--muted2);font-weight:normal;">(' + wos.length + ')</span></h4>' +
+              '<h4>Open WOs <span style="color:var(--muted2);font-weight:normal;">(' + wos.length + ')</span></h4>' +
               wosHtml +
              '</div>')
           : '') +
         '<details class="yard-log-section">' +
-          '<summary>Log a yard visit (location, notes, photos)</summary>' +
+          "<summary>New check</summary>" +
           logVisitInner +
-        '</details>' +
+        "</details>" +
         '<div class="card">' +
-          '<h4>Check history</h4>' +
+          '<h4>History</h4>' +
           historyHtml +
         '</div>';
 
@@ -7889,7 +7987,7 @@ function renderYardAppHtml(): string {
       var st = $("edit-check-status").value;
       var locEdit = ($("edit-check-loc").value || "").trim();
       if (st === "present" && !locEdit) {
-        showToast("Enter location when status is Present / found.", true);
+        showToast("Location?", true);
         return;
       }
       var btn = $("edit-check-save");
@@ -8121,7 +8219,7 @@ function renderYardAppHtml(): string {
       if (!requireWalkerName()) return;
       var loc = (state.draft.location || "").trim();
       if (!loc) {
-        showToast("Enter where the vehicle is parked, then save once.", true);
+        showToast("Parking spot?", true);
         return;
       }
       state.saving = true;
@@ -8144,7 +8242,7 @@ function renderYardAppHtml(): string {
           return r.json();
         })
         .then(function(){
-          showToast("Check saved");
+          showToast("Saved");
           // Optimistic local update
           var a = state.assets.find(function(x){ return x.assetId === state.openId; });
           if (a) {
@@ -8172,7 +8270,7 @@ function renderYardAppHtml(): string {
         .finally(function(){
           state.saving = false;
           btn.classList.remove("saving");
-          btn.textContent = "Save check";
+          btn.textContent = "Save";
         });
     }
 
@@ -8216,12 +8314,12 @@ function renderYardAppHtml(): string {
     function saveFind(){
       hideYardUploadProgress("find");
       var id = ($("find-asset-id").value || "").trim();
-      if (!id) { showToast("Asset ID required", true); return; }
+      if (!id) { showToast("Asset?", true); return; }
       if (!requireWalkerName()) return;
       var loc = ($("find-location").value || "").trim();
       var notes = ($("find-notes").value || "").trim();
       if (!loc) {
-        showToast("Enter where the vehicle is parked before logging.", true);
+        showToast("Location?", true);
         return;
       }
       var btn = $("find-save");
@@ -9038,7 +9136,9 @@ function renderDashboardHtml(): string {
       white-space: nowrap;
       text-align: right;
     }
-    .compare-table .snap-actions .snap-del { font-size: 0.78rem; padding: 2px 8px; }
+    .compare-table .snap-actions .snap-del,
+    .compare-table .snap-actions .snap-dl { font-size: 0.78rem; padding: 2px 8px; margin-left: 4px; }
+    .compare-table .snap-actions .snap-dl:first-child { margin-left: 0; }
     .compare-table tr[data-in-range="true"] td,
     .compare-table tr[data-in-range="true"] td:first-child {
       background: rgba(0,58,140,0.06);
@@ -10042,14 +10142,6 @@ function renderDashboardHtml(): string {
     .compare-table .delta.neg-down { color: var(--success); }
     .compare-table .delta.flat { color: var(--subtle); }
 
-    /* --- Downloads compact ------------------------------------------------ */
-    .downloads-row .dl-row {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 10px;
-    }
-    @media (max-width: 560px) { .downloads-row .dl-row { grid-template-columns: 1fr; } }
-
     /* --- Ingest footer ---------------------------------------------------- */
     .ingest-footer {
       margin: 24px 0 0;
@@ -10779,6 +10871,16 @@ function renderDashboardHtml(): string {
     .wo-tl-event.field-parts_status .ev-label { background: rgba(94,227,151,0.1); color: var(--success); }
     .wo-tl-event.field-shop .ev-label { background: rgba(255,196,61,0.12); color: var(--warn); }
     .wo-tl-event.field-initial .ev-label { background: rgba(138,143,155,0.1); color: var(--muted); }
+    .wo-tl-event.field-sub_wo_added .ev-label { background: rgba(94,227,151,0.12); color: var(--success); }
+    .wo-tl-event.field-sub_wo_removed .ev-label { background: rgba(138,143,155,0.14); color: var(--muted); }
+    .wo-tl-event.field-sub_wo_state .ev-label { background: rgba(106,63,184,0.12); color: #5a3488; }
+    .wo-tl-event .sub-wo-head { font-size: 0.84rem; color: var(--text-dim); margin-bottom: 4px; }
+    .wo-tl-event .sub-wo-id { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-weight: 700; color: var(--text); }
+    .wo-tl-event .sub-wo-plan { color: var(--muted); }
+    .wo-tl-event .sub-wo-state {
+      display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 0.78rem; font-weight: 700;
+      background: var(--bg2); border: 1px solid var(--border); color: var(--text);
+    }
     .wo-tl-event.meeting-entry .ev-label { background: rgba(106,63,184,0.12); color: #5a3488; }
     .wo-tl-event.yard-walk .ev-label { background: rgba(21,127,58,0.12); color: var(--ok); }
     .ev-meet-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; margin-bottom: 8px; }
@@ -11235,6 +11337,23 @@ function renderDashboardHtml(): string {
       color: var(--muted); margin-bottom: 4px;
     }
     .yard-finding-fma .txt { white-space: pre-wrap; word-break: break-word; color: var(--text); }
+    .yard-finding-asset-dl { margin-top: 8px; max-width: 100%; }
+    .yard-finding-asset-dl-h {
+      display: block; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;
+      color: var(--muted); margin-bottom: 6px;
+    }
+    .yard-finding-asset-dl-grid { margin: 0; }
+    .yard-finding-asset-dl-pair {
+      display: grid; grid-template-columns: 9.2rem minmax(0, 1fr); gap: 2px 10px;
+      font-size: 12px; line-height: 1.35; padding: 3px 0; border-bottom: 1px solid var(--border);
+    }
+    .yard-finding-asset-dl-pair:last-child { border-bottom: none; }
+    .yard-finding-asset-dl-pair dt { margin: 0; color: var(--muted); font-weight: 500; }
+    .yard-finding-asset-dl-pair dd { margin: 0; color: var(--text); word-break: break-word; }
+    #yard-resolve-sub .yard-finding-asset-dl { margin-top: 0; }
+    #yard-resolve-sub .yard-finding-asset-dl-pair { font-size: 11px; }
+    #yard-resolve-sub .yard-resolve-fma-in-modal, #yard-resolve-sub .yard-resolve-disc-in-modal { margin-top: 10px; }
+    #yard-resolve-sub .yard-resolve-disc-in-modal { font-size: 12px; color: var(--text); white-space: pre-wrap; word-break: break-word; }
     #yard-photo-lightbox-desk .yard-photo-lb-card {
       position: relative; max-width: min(94vw, 960px); max-height: 92vh; padding: 12px;
       border-radius: 12px; background: var(--bg1); border: 1px solid var(--border);
@@ -11309,6 +11428,55 @@ function renderDashboardHtml(): string {
       font-size: 12px; color: var(--muted);
     }
     .yard-finding-action b { color: var(--text); }
+
+    .yard-resolve-backdrop { align-items: flex-start; padding: 32px 16px; }
+    .yard-resolve-card {
+      width: 100%;
+      max-width: min(96vw, 640px);
+      border-radius: 16px;
+      box-shadow: 0 20px 50px rgba(0,0,0,0.12);
+      padding: 20px 22px 18px;
+      max-height: calc(100vh - 48px);
+      overflow-y: auto;
+    }
+    .yard-resolve-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
+    .yard-resolve-h3 { margin: 0; font-size: 1.15rem; font-weight: 700; letter-spacing: -0.02em; line-height: 1.3; }
+    .yard-resolve-asset-block { margin: 0 0 4px; }
+    .yard-resolve-sec { margin: 10px 0 0; padding: 10px 12px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg1); }
+    .yard-resolve-sec--close { border-color: rgba(0, 58, 140, 0.18); }
+    .yard-resolve-sec-t { margin: 0 0 8px; font-size: 0.7rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); }
+    .yard-resolve-sec-d { margin: 0 0 8px; font-size: 0.75rem; color: var(--subtle); line-height: 1.4; }
+    .yard-resolve-compact-row { display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: flex-end; margin-bottom: 10px; }
+    .yard-resolve-compact-row .field { margin: 0; flex: 1 1 10rem; min-width: 0; }
+    .yard-resolve-compact-row .field:first-child { flex: 0 1 9rem; max-width: 12rem; }
+    .yard-resolve-fu-list { display: flex; flex-direction: column; gap: 8px; max-height: 180px; overflow-y: auto; }
+    .yard-resolve-fu-empty { margin: 0; font-size: 0.82rem; color: var(--muted); }
+    .yard-resolve-fu-item {
+      padding: 8px 10px; border-radius: 8px; background: var(--bg2); border: 1px solid var(--border);
+      font-size: 0.84rem; line-height: 1.4;
+    }
+    .yard-resolve-fu-item-meta { font-size: 0.72rem; color: var(--muted); margin-bottom: 4px; }
+    .yard-resolve-fu-item-txt { color: var(--text); white-space: pre-wrap; word-break: break-word; }
+    .yard-resolve-fu-details { margin: 8px 0 0; }
+    .yard-resolve-fu-details > summary { cursor: pointer; font-size: 0.75rem; font-weight: 700; color: var(--accent-strong); padding: 4px 0; user-select: none; }
+    .yard-resolve-fu-details .yard-resolve-fu-inner { margin-top: 8px; }
+    .yard-resolve-modes { display: flex; flex-direction: column; gap: 6px; margin: 0 0 8px; }
+    .yard-resolve-mode {
+      display: flex; align-items: flex-start; gap: 8px; margin: 0; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border);
+      background: var(--bg2); font-size: 0.86rem; line-height: 1.3; cursor: pointer; user-select: none;
+    }
+    .yard-resolve-mode:has(input:checked) { border-color: var(--accent); background: rgba(0, 58, 140, 0.07); }
+    .yard-resolve-mode input { margin-top: 2px; flex-shrink: 0; }
+    .yard-resolve-wo-wrap { margin: 0 0 8px; }
+    .yard-resolve-wo-wrap .field { margin: 0; }
+    .yard-resolve-one-primary { width: 100%; min-height: 44px; font-weight: 700; font-size: 0.9rem; margin-top: 4px; }
+    .yard-resolve-modal-foot { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; justify-content: space-between; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); }
+    .yard-resolve-name-foot { flex: 1 1 200px; min-width: 0; margin: 0 !important; }
+    .yard-resolve-name-foot input { max-width: 100%; }
+    .yard-resolve-wo-inp {
+      width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg1);
+      font-size: 0.9rem; font-weight: 600; font-family: ui-monospace, monospace;
+    }
 
     /* Activity feed */
     .yard-activity-row {
@@ -11722,6 +11890,26 @@ function renderDashboardHtml(): string {
     .waivers-sub .wv-count:empty { display: none; }
     .waivers-actions { display: flex; align-items: center; gap: 8px; padding: 8px 0; }
 
+    .wv-reviewer-strip {
+      display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+      padding: 10px 14px; background: var(--surface);
+      border: 1px solid var(--border); border-radius: 12px;
+      margin-bottom: 10px;
+    }
+    .wv-reviewer-strip[hidden] { display: none !important; }
+    .wv-reviewer-strip label {
+      font-size: 0.72rem; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.06em; color: var(--muted); margin: 0;
+    }
+    .wv-reviewer-strip input {
+      flex: 0 1 220px; min-width: 160px;
+      background: var(--bg0, var(--bg)); color: var(--text);
+      border: 1px solid var(--border); border-radius: 8px;
+      padding: 7px 10px; font-size: 0.92rem;
+    }
+    .wv-reviewer-strip input.invalid { border-color: var(--danger); }
+    .wv-reviewer-hint { color: var(--muted); font-size: 0.78rem; }
+
     /* Do not set display on .wv-view — it overrides the [hidden] attribute and
        stacks both sub-views (pending + by vehicle), breaking layout and focus. */
     #panel-waivers .wv-view[hidden] {
@@ -11759,6 +11947,18 @@ function renderDashboardHtml(): string {
     }
     .wv-pcard .title { font-weight: 600; margin-top: 2px; }
     .wv-pcard .submitted { color: var(--muted); font-size: 0.78rem; margin-top: 4px; }
+    .wv-pcard.is-stale { border-color: rgba(245,199,84,0.45); }
+    .wv-pcard.is-very-stale { border-color: rgba(255,138,138,0.5); }
+    .wv-pcard .age-pill {
+      display: inline-block; flex: 0 0 auto;
+      font-size: 0.7rem; font-weight: 600;
+      padding: 2px 8px; border-radius: 999px;
+      background: rgba(15,30,60,0.06); color: var(--muted);
+      border: 1px solid var(--border); white-space: nowrap;
+      letter-spacing: 0.02em;
+    }
+    .wv-pcard.is-stale .age-pill { background: rgba(245,199,84,0.15); color: var(--warn); border-color: rgba(245,199,84,0.45); }
+    .wv-pcard.is-very-stale .age-pill { background: rgba(255,138,138,0.15); color: var(--danger); border-color: rgba(255,138,138,0.45); }
     .wv-pcard .body { padding: 12px 14px; font-size: 0.9rem; color: var(--text-dim); white-space: pre-wrap; min-height: 0; }
     .wv-photo-grid {
       display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 0 0;
@@ -11817,17 +12017,40 @@ function renderDashboardHtml(): string {
       border: 1px solid var(--border); border-radius: 14px;
     }
     .wv-create-card {
-      padding: 14px 16px;
       border-radius: 14px;
       border: 1px solid var(--border);
       background: var(--surface);
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
     }
-    .wv-create-card h4 { margin: 0; font-size: 1rem; }
-    .wv-create-card label { font-size: 0.76rem; color: var(--muted); margin-top: 2px; }
-    .wv-create-card input[type="text"], .wv-create-card textarea, .wv-create-card input[type="file"] {
+    .wv-create-card[open] {
+      box-shadow: 0 1px 3px rgba(15,30,60,0.08);
+    }
+    .wv-create-summary {
+      list-style: none; cursor: pointer; user-select: none;
+      padding: 12px 14px; display: flex; align-items: center; gap: 10px;
+      font-weight: 600; font-size: 0.95rem;
+    }
+    .wv-create-summary::-webkit-details-marker { display: none; }
+    .wv-create-summary:hover { background: rgba(0,58,140,0.04); border-radius: 14px; }
+    .wv-create-card[open] .wv-create-summary { border-bottom: 1px solid var(--border); border-radius: 14px 14px 0 0; }
+    .wv-create-summary-icon {
+      flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+      width: 22px; height: 22px; border-radius: 50%;
+      background: var(--accent); color: var(--bg);
+      font-weight: 700; font-size: 1rem; line-height: 1;
+    }
+    .wv-create-card[open] .wv-create-summary-icon { transform: rotate(45deg); transition: transform 0.15s ease; }
+    .wv-create-summary-text { flex: 1; min-width: 0; }
+    .wv-create-summary-asset {
+      font-family: var(--font-mono); font-size: 0.78rem; color: var(--muted);
+      font-weight: 500; letter-spacing: -0.01em;
+    }
+    .wv-create-summary-asset:empty { display: none; }
+    .wv-create-body {
+      padding: 12px 14px 14px;
+      display: flex; flex-direction: column; gap: 8px;
+    }
+    .wv-create-body label { font-size: 0.76rem; color: var(--muted); margin-top: 2px; }
+    .wv-create-body input[type="text"], .wv-create-body textarea, .wv-create-body input[type="file"] {
       width: 100%;
       background: var(--bg0, var(--bg));
       color: var(--text);
@@ -11837,9 +12060,39 @@ function renderDashboardHtml(): string {
       font-size: 0.9rem;
       font-family: inherit;
     }
-    .wv-create-card textarea { min-height: 76px; resize: vertical; }
+    .wv-create-body textarea { min-height: 76px; resize: vertical; }
     .wv-create-actions { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
     .wv-create-status { font-size: 0.8rem; color: var(--muted); min-height: 1em; }
+
+    .wv-action-card { max-width: 480px; }
+    .wv-action-head {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 12px; margin-bottom: 4px;
+    }
+    .wv-action-head h3 { margin: 0; font-size: 1.1rem; font-weight: 600; }
+    .wv-action-x {
+      width: 32px; height: 32px; padding: 0; display: inline-flex;
+      align-items: center; justify-content: center;
+      border-radius: 8px; font-size: 1.3rem; line-height: 1;
+    }
+    .wv-action-sub {
+      font-size: 0.85rem; color: var(--muted); line-height: 1.4;
+      padding: 4px 0 8px; border-bottom: 1px solid var(--border); margin-bottom: 12px;
+    }
+    .wv-action-lbl {
+      display: block; font-size: 0.72rem; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.06em; margin: 8px 0 4px;
+    }
+    #wv-action-modal input[type="text"], #wv-action-modal textarea {
+      width: 100%; background: var(--bg0, var(--bg)); color: var(--text);
+      border: 1px solid var(--border); border-radius: 8px;
+      padding: 9px 11px; font-size: 0.92rem; font-family: inherit;
+    }
+    #wv-action-modal textarea { resize: vertical; min-height: 70px; }
+    #wv-action-modal input.invalid, #wv-action-modal textarea.invalid { border-color: var(--danger); }
+    .wv-action-err { color: var(--danger); font-size: 0.84rem; margin-top: 8px; }
+    .wv-action-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+    .wv-action-card.danger #wv-action-confirm { background: var(--danger); border-color: var(--danger); color: #fff; }
     .wv-asset-browser-head {
       display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; margin-bottom: 12px;
     }
@@ -14107,110 +14360,72 @@ function renderDashboardHtml(): string {
       position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
       clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
     }
-    /* Commander summary (wing / unit scheduled maintenance compliance) */
-    .smx-commander-wrap {
+    /* Schedule Mx — shared collapsible "tool" rows (add more .smx-tool-block siblings as you add tools) */
+    .smx-tools-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
       margin-bottom: 16px;
-      background: var(--card);
+    }
+    .smx-tool-block { margin: 0; }
+    .smx-tool-details {
+      margin: 0;
       border: 1px solid var(--border);
       border-radius: 12px;
+      background: var(--card);
       overflow: hidden;
       box-shadow: 0 1px 0 rgba(15, 30, 60, 0.04);
     }
-    .smx-cmd-subnav {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      gap: 0;
-      padding: 0 4px;
-      background: var(--bg1);
-      border-bottom: 1px solid var(--border);
-    }
-    .smx-cmd-subnav-item {
-      display: inline-flex;
-      align-items: center;
-      padding: 8px 12px;
-      font-size: 0.68rem;
-      font-weight: 700;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-      color: var(--muted);
-      border-bottom: 2px solid transparent;
-      margin-bottom: -1px;
-    }
-    .smx-cmd-subnav-item.is-active {
-      color: var(--accent);
-      border-bottom-color: var(--accent);
-    }
-    .smx-commander-details {
-      margin: 0;
-      padding: 0;
-      border: none;
-    }
-    .smx-commander-details > summary {
+    .smx-tool-details > summary {
       list-style: none;
-      cursor: pointer;
-      margin: 0;
-      padding: 0;
-    }
-    .smx-commander-details > summary::-webkit-details-marker {
-      display: none;
-    }
-    .smx-cmd-brief {
-      padding: 10px 12px 12px 14px;
-    }
-    .smx-cmd-brief-top {
       display: flex;
-      flex-wrap: wrap;
-      align-items: flex-start;
+      align-items: center;
       justify-content: space-between;
-      gap: 10px 16px;
+      gap: 10px 14px;
+      margin: 0;
+      padding: 10px 14px;
+      cursor: pointer;
+      background: var(--surface);
+      font: inherit;
+      color: inherit;
     }
-    .smx-cmd-brief-left {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: flex-start;
-      gap: 10px 12px;
-      min-width: 0;
-      flex: 1;
-    }
-    .smx-cmd-brief-ctrl {
-      display: flex;
-      align-items: flex-start;
-      gap: 8px;
-      min-width: 0;
-    }
-    .smx-cmd-brief-caret {
-      flex-shrink: 0;
-      width: 0.4em;
-      height: 0.4em;
-      border-right: 2px solid var(--muted);
-      border-bottom: 2px solid var(--muted);
-      transform: rotate(-45deg);
-      margin-top: 0.4em;
-      transition: transform 0.15s ease;
-      opacity: 0.7;
-    }
-    .smx-commander-details[open] .smx-cmd-brief-caret {
-      transform: rotate(45deg);
-      margin-top: 0.35em;
-    }
-    .smx-cmd-brief-titles { min-width: 0; }
-    .smx-cmd-eyebrow {
-      display: block;
-      font-size: 0.58rem;
-      font-weight: 700;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      color: var(--muted);
-      margin-bottom: 2px;
-    }
-    .smx-cmd-brief-name {
-      display: block;
+    .smx-tool-details > summary::-webkit-details-marker { display: none; }
+    .smx-tool-name {
+      margin: 0;
       font-size: 0.9rem;
       font-weight: 800;
       color: var(--text);
       letter-spacing: -0.02em;
       line-height: 1.2;
+    }
+    .smx-tool-chev {
+      flex-shrink: 0;
+      font-size: 0.65rem;
+      color: var(--muted);
+      line-height: 1;
+      transition: transform 0.15s ease;
+    }
+    .smx-tool-details[open] > summary .smx-tool-chev { transform: rotate(-180deg); }
+    .smx-tool-panel {
+      margin: 0;
+      padding: 0 14px 14px;
+      border-top: 1px solid var(--border);
+      background: var(--card);
+    }
+    .smx-commander-rollup-top {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px 14px;
+      margin: 0 0 6px;
+      padding-top: 12px;
+    }
+    .smx-cmd-rollup-hint {
+      margin: 0 0 12px;
+      font-size: 0.72rem;
+      color: var(--muted);
+      line-height: 1.4;
     }
     .smx-cmd-stat-pills {
       display: flex;
@@ -14238,13 +14453,6 @@ function renderDashboardHtml(): string {
     .smx-cmd-pill--crit { border-color: rgba(120, 16, 32, 0.35); background: rgba(120, 16, 32, 0.07); }
     .smx-cmd-pill--crit .smx-cmd-pill-v { color: #7a1020; }
     .smx-cmd-pill--filter { border-style: dashed; border-color: var(--accent); background: rgba(0, 58, 140, 0.04); }
-    .smx-cmd-brief-hint {
-      margin: 8px 0 0;
-      padding-left: calc(0.4em + 8px);
-      font-size: 0.7rem;
-      color: var(--muted);
-      line-height: 1.35;
-    }
     .smx-cmd-brief-tools {
       display: flex;
       flex-wrap: wrap;
@@ -14271,12 +14479,6 @@ function renderDashboardHtml(): string {
     .smx-cmd-toolbar-btn:hover { background: var(--bg1); border-color: rgba(0, 58, 140, 0.35); }
     .smx-cmd-toolbar-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     .smx-cmd-toolbar-ic { font-size: 0.9rem; line-height: 1; opacity: 0.85; }
-    .smx-commander-body {
-      margin: 0;
-      padding: 0 14px 14px;
-      border-top: 1px solid var(--border);
-      background: var(--card);
-    }
     .smx-commander-head {
       display: flex;
       flex-wrap: wrap;
@@ -14284,7 +14486,7 @@ function renderDashboardHtml(): string {
       justify-content: space-between;
       gap: 12px 16px;
       margin: 0 0 12px;
-      padding-top: 12px;
+      padding-top: 0;
     }
     .smx-commander-title {
       margin: 0 0 4px;
@@ -14439,52 +14641,10 @@ function renderDashboardHtml(): string {
     .smx-cmd-pct-bar.bad > i {
       background: linear-gradient(90deg, var(--danger) 0%, #8b1538 100%);
     }
-    .smx-vco-toolkit {
-      margin: 0 0 16px;
+    .smx-vco-toolkit-panel { padding: 0; }
+    .smx-tool-panel .smx-vco-toolkit-hero--panel {
+      padding-top: 12px;
     }
-    .smx-vco-toolkit-expand {
-      border-radius: 12px;
-      border: 1px solid var(--border);
-      background: var(--surface);
-      box-shadow: 0 1px 0 rgba(0, 0, 0, 0.04);
-      overflow: hidden;
-    }
-    .smx-vco-toolkit-sum {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px 12px;
-      list-style: none;
-      margin: 0;
-      padding: 10px 14px;
-      cursor: pointer;
-      background: var(--surface);
-      font: inherit;
-      color: inherit;
-    }
-    .smx-vco-toolkit-sum::-webkit-details-marker { display: none; }
-    .smx-vco-toolkit-expand[open] > .smx-vco-toolkit-sum {
-      border-bottom: 1px solid var(--border);
-    }
-    .smx-vco-toolkit-sum .smx-vco-toolkit-h2 {
-      margin: 0;
-      flex: 1;
-      min-width: 0;
-      font-size: 0.9rem;
-      font-weight: 800;
-      color: var(--text);
-      letter-spacing: -0.02em;
-    }
-    .smx-vco-toolkit-sum-chev {
-      flex-shrink: 0;
-      font-size: 0.65rem;
-      color: var(--muted);
-      line-height: 1;
-      transition: transform 0.15s ease;
-    }
-    .smx-vco-toolkit-expand[open] .smx-vco-toolkit-sum-chev { transform: rotate(-180deg); }
-    .smx-vco-toolkit-panel { padding: 14px 16px 16px; }
     .smx-vco-toolkit-hero--panel {
       display: flex;
       flex-wrap: wrap;
@@ -14563,7 +14723,6 @@ function renderDashboardHtml(): string {
     .smx-vco-mark:hover { border-color: var(--success); color: var(--success); }
     .smx-vco-note { width: 8rem; max-width: 100%; font: inherit; font-size: 0.68rem; padding: 3px 6px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); }
     @media (max-width: 900px) {
-      .smx-vco-toolkit-panel { padding: 12px 12px 14px; }
       .smx-vco-toolkit-hero--panel { flex-direction: column; }
       .smx-vco-mail-tbl { display: block; }
       .smx-vco-mail-tbl tbody, .smx-vco-mail-tbl tr, .smx-vco-mail-tbl td, .smx-vco-mail-tbl th { display: block; width: 100%; }
@@ -14636,9 +14795,10 @@ function renderDashboardHtml(): string {
     }
     .smx-card .top-line {
       display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+      justify-content: flex-start;
+      gap: 8px 10px;
     }
     .smx-card .smx-card-title {
       font-size: 0.88rem;
@@ -14647,7 +14807,15 @@ function renderDashboardHtml(): string {
       line-height: 1.3;
       min-width: 0;
     }
-    .smx-card .badges { display: inline-flex; gap: 6px; align-items: center; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
+    .smx-card .badges {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: flex-start;
+      gap: 6px;
+      min-width: 0;
+      flex: 1 1 auto;
+    }
     .smx-card .badges .smx-chip-btn {
       margin: 0;
       padding: 2px 8px;
@@ -14705,6 +14873,7 @@ function renderDashboardHtml(): string {
     .smx-card .meta .k { color: var(--muted); font-weight: 500; margin-right: 4px; }
     .smx-card .meta .v { font-weight: 500; color: var(--text); }
     .smx-card .meta .v.danger { color: var(--danger); font-weight: 600; }
+    .smx-card .sighting-badge { max-width: 100%; box-sizing: border-box; }
     .smx-plan-stack {
       display: flex;
       flex-direction: column;
@@ -15211,14 +15380,6 @@ function renderDashboardHtml(): string {
             </div>
           </div>
         </details>
-
-        <section class="card downloads-row">
-          <h3>Downloads</h3>
-          <div class="dl-row">
-            <button type="button" class="btn-etic" id="btn-download-etic">Vehicle ETIC (.xlsx)</button>
-          </div>
-          <p class="status" id="etic-dl-status" role="status"></p>
-        </section>
       </div>
 
       <div id="panel-work-orders" class="hidden">
@@ -15375,36 +15536,25 @@ function renderDashboardHtml(): string {
       </div>
 
       <div id="panel-schedule-mx" class="hidden">
-        <div id="smx-commander-wrap" class="smx-commander-wrap hidden" aria-label="Wing maintenance status">
-          <nav class="smx-cmd-subnav" aria-label="Wing report views">
-            <span class="smx-cmd-subnav-item is-active" aria-current="page">Rollup</span>
-          </nav>
-          <details id="smx-commander-details" class="smx-commander-details">
-            <summary class="smx-commander-summary">
-              <div class="smx-cmd-brief">
-                <div class="smx-cmd-brief-top">
-                  <div class="smx-cmd-brief-left">
-                    <div class="smx-cmd-brief-ctrl">
-                      <span class="smx-cmd-brief-caret" aria-hidden="true"></span>
-                      <div class="smx-cmd-brief-titles">
-                        <span class="smx-cmd-eyebrow">Commander</span>
-                        <span class="smx-cmd-brief-name">Wing schedule compliance</span>
-                      </div>
-                    </div>
-                    <div class="smx-cmd-stat-pills" id="smx-commander-stat-pills" aria-label="Wing summary figures"></div>
-                  </div>
-                  <div class="smx-cmd-brief-tools" role="toolbar" aria-label="Wing report actions">
-                    <button type="button" class="smx-cmd-toolbar-btn" id="smx-commander-copy-html-wing" title="Copy a formatted HTML table. Paste into email with Ctrl+V.">
-                      <span class="smx-cmd-toolbar-ic" aria-hidden="true">⧉</span>
-                      <span>Copy for email</span>
-                    </button>
-                    <span class="smx-copy-status hidden" id="smx-commander-copy-status" role="status"></span>
-                  </div>
-                </div>
-                <p class="smx-cmd-brief-hint" id="smx-commander-brief-hint">Open for the unit breakdown table and per-unit copy.</p>
-              </div>
+        <div class="smx-tools-stack hidden" id="smx-tools-stack" aria-label="Schedule Mx email and reporting tools">
+        <div id="smx-commander-wrap" class="smx-tool-block hidden" aria-label="Wing roll-up">
+          <details id="smx-commander-details" class="smx-tool-details">
+            <summary class="smx-tool-sum" id="smx-commander-summary">
+              <span class="smx-tool-name" id="smx-commander-tool-title">Wing roll-up</span>
+              <span class="smx-tool-chev" aria-hidden="true">▾</span>
             </summary>
-            <div class="smx-commander-body">
+            <div class="smx-tool-panel smx-tool-panel--commander">
+              <div class="smx-commander-rollup-top">
+                <div class="smx-cmd-stat-pills" id="smx-commander-stat-pills" aria-label="Wing summary figures"></div>
+                <div class="smx-cmd-brief-tools" role="toolbar" aria-label="Wing report actions">
+                  <button type="button" class="smx-cmd-toolbar-btn" id="smx-commander-copy-html-wing" title="Copy a formatted HTML table. Paste into email with Ctrl+V.">
+                    <span class="smx-cmd-toolbar-ic" aria-hidden="true">⧉</span>
+                    <span>Copy for email</span>
+                  </button>
+                  <span class="smx-copy-status hidden" id="smx-commander-copy-status" role="status"></span>
+                </div>
+              </div>
+              <p class="smx-cmd-rollup-hint" id="smx-commander-brief-hint">Wing schedule compliance — open for the unit table and per-unit copy.</p>
               <div class="smx-commander-head">
                 <div class="smx-commander-titles">
                   <h2 class="smx-commander-title" id="smx-commander-title">Unit breakdown</h2>
@@ -15435,13 +15585,13 @@ function renderDashboardHtml(): string {
             </div>
           </details>
         </div>
-        <section id="smx-vco-toolkit" class="smx-vco-toolkit hidden" aria-labelledby="smx-vco-toolkit-h2">
-          <details class="smx-vco-toolkit-expand" id="smx-vco-toolkit-expand">
-            <summary class="smx-vco-toolkit-sum" id="smx-vco-toolkit-summary">
-              <h2 class="smx-vco-toolkit-h2" id="smx-vco-toolkit-h2">Unit follow-up</h2>
-              <span class="smx-vco-toolkit-sum-chev" aria-hidden="true">▾</span>
+        <section id="smx-vco-toolkit" class="smx-tool-block hidden" aria-labelledby="smx-vco-toolkit-h2">
+          <details class="smx-tool-details" id="smx-vco-toolkit-expand">
+            <summary class="smx-tool-sum" id="smx-vco-toolkit-summary">
+              <span class="smx-tool-name" id="smx-vco-toolkit-h2">Unit follow-up</span>
+              <span class="smx-tool-chev" aria-hidden="true">▾</span>
             </summary>
-            <div class="smx-vco-toolkit-panel">
+            <div class="smx-tool-panel smx-vco-toolkit-panel">
               <div class="smx-vco-toolkit-hero smx-vco-toolkit-hero--panel">
                 <p class="smx-vco-toolkit-tagline" id="smx-vco-toolkit-tagline"></p>
                 <span class="smx-vco-toolkit-status" id="smx-vco-toolkit-status" role="status" aria-live="polite"></span>
@@ -15459,6 +15609,7 @@ function renderDashboardHtml(): string {
             </div>
           </details>
         </section>
+        </div>
         <div class="wo-layout smx-layout">
           <aside class="wo-sidebar">
             <div class="smx-panel-heading">
@@ -15909,6 +16060,22 @@ function renderDashboardHtml(): string {
 
           <div id="yard-sub-findings" class="yard-subpanel hidden" style="padding:16px 20px;">
             <div class="yard-findings-controls" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px;">
+              <input type="search" id="yard-findings-search" class="input" placeholder="Search…" autocomplete="off" style="flex:1 1 160px;max-width:min(100%,300px);min-width:140px;padding:8px 12px;border:1px solid var(--border);border-radius:8px;font-size:14px;" />
+              <label class="field" style="margin:0;flex:0 0 auto;">
+                <span class="label" style="font-size:11px">Sort</span>
+                <select id="yard-findings-sort" style="padding:8px 10px;border-radius:8px;border:1px solid var(--border);font-size:13px;max-width:200px;">
+                  <option value="touched-asc">Last activity \u00B7 oldest</option>
+                  <option value="touched-desc">Last activity \u00B7 newest</option>
+                </select>
+              </label>
+              <label class="field" style="margin:0;flex:0 0 auto;">
+                <span class="label" style="font-size:11px">Follow-up</span>
+                <select id="yard-findings-fu" style="padding:8px 10px;border-radius:8px;border:1px solid var(--border);font-size:13px;">
+                  <option value="all">All</option>
+                  <option value="no">No follow-up</option>
+                  <option value="yes">Has follow-up</option>
+                </select>
+              </label>
               <div class="yard-findings-chips" id="yard-findings-chips" style="display:flex;gap:6px;flex-wrap:wrap;">
                 <button type="button" class="yard-findings-chip active" data-finding-kind="all">All <span class="count" id="ff-all">0</span></button>
                 <button type="button" class="yard-findings-chip" data-finding-kind="unlisted">Found, no open WO <span class="count" id="ff-unlisted">0</span></button>
@@ -15947,41 +16114,53 @@ function renderDashboardHtml(): string {
           </div>
         </section>
 
-        <!-- FM&A "Resolve finding" modal -->
-        <div id="yard-resolve-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-hidden="true">
-          <div class="modal-card" style="max-width:520px;">
-            <header style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;">
-              <h3 style="margin:0;" id="yard-resolve-title">Resolve finding</h3>
+        <!-- FM&A Needs Fix modal: one path — pick how, one primary -->
+        <div id="yard-resolve-modal" class="modal-backdrop hidden yard-resolve-backdrop" role="dialog" aria-modal="true" aria-hidden="true">
+          <div class="modal-card yard-resolve-card">
+            <header class="yard-resolve-head">
+              <h3 class="yard-resolve-h3" id="yard-resolve-title">Update finding</h3>
               <button type="button" class="ghost" id="yard-resolve-close" aria-label="Close" style="font-size:20px;line-height:1;padding:4px 10px;">\u00D7</button>
             </header>
-            <div class="hint" id="yard-resolve-sub" style="margin:0 0 12px;"></div>
-            <div class="settings-grid">
-              <label class="field">
-                <span class="label">What did you do?</span>
-                <select id="yard-resolve-resolution">
-                  <option value="resolved">Resolved (no further action)</option>
-                  <option value="wo_opened">Opened a work order</option>
-                  <option value="in_progress">In progress / following up</option>
-                  <option value="reassigned">Reassigned to a shop</option>
-                  <option value="retired">Retired / removed from fleet</option>
-                  <option value="dismissed">Dismissed (false alarm)</option>
-                </select>
+            <div class="yard-resolve-asset-block" id="yard-resolve-sub" style="margin:0 0 8px"></div>
+            <section class="yard-resolve-sec yard-resolve-sec--close" aria-label="Remove from open queue">
+              <label class="field" style="margin:0 0 10px;">
+                <span class="label" id="yard-resolve-final-note-lbl">Note</span>
+                <textarea id="yard-resolve-final-note" rows="2" style="min-height:64px" placeholder=""></textarea>
               </label>
-              <label class="field" id="yard-resolve-wo-field">
-                <span class="label">WO number (if opened)</span>
-                <input type="text" id="yard-resolve-wo" placeholder="e.g. 12345" />
-              </label>
-              <label class="field">
-                <span class="label">Your name</span>
+              <div class="yard-resolve-modes" role="radiogroup" aria-label="How it was closed">
+                <label class="yard-resolve-mode">
+                  <input type="radio" name="yard-resolve-mode" value="none" id="yard-resolve-mode-none" checked="checked" />
+                  No new maintenance work order
+                </label>
+                <label class="yard-resolve-mode">
+                  <input type="radio" name="yard-resolve-mode" value="wo" id="yard-resolve-mode-wo" aria-controls="yard-resolve-wo-wrap" />
+                  There is a new WO in the system
+                </label>
+              </div>
+              <div id="yard-resolve-wo-wrap" class="yard-resolve-wo-wrap hidden" role="group" aria-label="Work order number">
+                <label class="field">
+                  <span class="label">WO #</span>
+                  <input type="text" class="yard-resolve-wo-inp" id="yard-resolve-wo" placeholder="e.g. 2026021000013" inputmode="numeric" autocomplete="off" />
+                </label>
+              </div>
+              <button type="button" class="primary yard-resolve-one-primary" id="yard-resolve-submit">Remove from list</button>
+            </section>
+            <details class="yard-resolve-sec yard-resolve-fu-details" id="yard-resolve-fu-details">
+              <summary>Follow-ups</summary>
+              <div class="yard-resolve-fu-inner">
+                <div id="yard-resolve-fu-list" class="yard-resolve-fu-list"></div>
+                <label class="field" style="margin:6px 0 0">
+                  <span class="label">Note</span>
+                  <textarea id="yard-resolve-fu-note" rows="2" placeholder="Required to save"></textarea>
+                </label>
+                <button type="button" class="ghost" id="yard-resolve-add-fu" style="margin-top:6px">Add follow-up</button>
+              </div>
+            </details>
+            <div class="yard-resolve-modal-foot">
+              <label class="field yard-resolve-name-foot">
+                <span class="label">Name</span>
                 <input type="text" id="yard-resolve-by" autocomplete="name" />
               </label>
-              <label class="field" style="grid-column: 1 / -1;">
-                <span class="label">Notes</span>
-                <textarea id="yard-resolve-note" rows="3" placeholder="What you found, where the asset went, who you contacted, etc."></textarea>
-              </label>
-            </div>
-            <div class="settings-actions" style="margin-top:14px;">
-              <button type="button" class="primary" id="yard-resolve-save">Record action</button>
               <button type="button" class="ghost" id="yard-resolve-cancel">Cancel</button>
             </div>
           </div>
@@ -16000,10 +16179,6 @@ function renderDashboardHtml(): string {
            swap views). The mobile mechanic UI lives at /waivers. -->
       <div id="panel-waivers" class="hidden">
         <div class="waivers-wrap">
-          <div class="waivers-strap">
-            <h2 class="waivers-strap-title">Waiver desk</h2>
-            <p class="waivers-strap-desc">Pending review is the approval queue. By vehicle is for lookup, history, and printing the in-cab waiver card.</p>
-          </div>
           <header class="waivers-head">
             <nav class="waivers-subnav" id="waivers-subnav" aria-label="Waiver views">
               <button type="button" class="waivers-sub active" data-wv-sub="pending">Pending review <span class="wv-count" id="wv-pending-count"></span></button>
@@ -16021,6 +16196,11 @@ function renderDashboardHtml(): string {
               <strong>All caught up</strong>
               <span class="wv-zero-msg">No waiver requests are waiting for approval.</span>
             </div>
+            <div class="wv-reviewer-strip" id="wv-reviewer-strip" hidden>
+              <label for="wv-reviewer-name">Your name</label>
+              <input type="text" id="wv-reviewer-name" placeholder="First Last" autocomplete="name" />
+              <span class="wv-reviewer-hint">Used on every approve / reject below.</span>
+            </div>
             <div class="wv-pending-list" id="wv-pending-list"></div>
           </section>
 
@@ -16029,42 +16209,45 @@ function renderDashboardHtml(): string {
               <div class="wv-byvehicle-side">
                 <div class="wv-hero-card">
                   <h3 class="wv-hero-title">Look up a vehicle</h3>
-                  <p class="wv-hero-lead">Enter an asset id to load waivers, verification history, and print the driver card.</p>
                   <div class="wv-hero-form">
                     <input type="text" id="wv-bv-input" placeholder="e.g. AF00C00488"
                            autocomplete="off" autocapitalize="characters" spellcheck="false" />
                     <button type="button" class="primary" id="wv-bv-go">Look up</button>
                   </div>
                 </div>
-                <div class="wv-create-card">
-                  <h4>Add waiver request</h4>
-                  <label for="wv-create-asset">Selected asset (from lookup)</label>
-                  <input type="text" id="wv-create-asset" placeholder="Look up or select a vehicle first"
-                         autocomplete="off" spellcheck="false" readonly />
-                  <label for="wv-create-name">Your name (required)</label>
-                  <input type="text" id="wv-create-name" placeholder="First Last" autocomplete="name" />
-                  <label for="wv-create-title">Short title (required)</label>
-                  <input type="text" id="wv-create-title" maxlength="120" placeholder="e.g. Passenger mirror crack" />
-                  <label for="wv-create-desc">Details (optional)</label>
-                  <textarea id="wv-create-desc" maxlength="2000"></textarea>
-                  <label for="wv-create-media">Photos/videos (optional)</label>
-                  <input type="file" id="wv-create-media" accept="image/*,video/*" multiple />
-                  <div class="wv-create-actions">
-                    <button type="button" class="primary" id="wv-create-submit">Submit waiver</button>
-                    <span class="wv-create-status" id="wv-create-status"></span>
+                <details class="wv-create-card" id="wv-create-card">
+                  <summary class="wv-create-summary">
+                    <span class="wv-create-summary-icon" aria-hidden="true">+</span>
+                    <span class="wv-create-summary-text">New waiver request</span>
+                    <span class="wv-create-summary-asset" id="wv-create-summary-asset"></span>
+                  </summary>
+                  <div class="wv-create-body">
+                    <input type="hidden" id="wv-create-asset" />
+                    <label for="wv-create-name">Your name (required)</label>
+                    <input type="text" id="wv-create-name" placeholder="First Last" autocomplete="name" />
+                    <label for="wv-create-title">Short title (required)</label>
+                    <input type="text" id="wv-create-title" maxlength="120" placeholder="e.g. Passenger mirror crack" />
+                    <label for="wv-create-desc">Details (optional)</label>
+                    <textarea id="wv-create-desc" maxlength="2000"></textarea>
+                    <label for="wv-create-media">Photos/videos (optional)</label>
+                    <input type="file" id="wv-create-media" accept="image/*,video/*" multiple />
+                    <div class="wv-create-actions">
+                      <button type="button" class="primary" id="wv-create-submit">Submit request</button>
+                      <span class="wv-create-status" id="wv-create-status"></span>
+                    </div>
                   </div>
-                </div>
+                </details>
                 <div class="wv-asset-browser" id="wv-asset-browser">
                   <div class="wv-asset-browser-head">
                     <div class="wv-ab-titles">
-                      <span class="wv-asset-browser-title">Fleet list</span>
+                      <span class="wv-asset-browser-title">Vehicles with waivers</span>
                       <span class="wv-asset-browser-meta hint" id="wv-asset-browser-count"></span>
                     </div>
                     <input type="search" id="wv-asset-filter" class="wv-asset-filter"
-                           placeholder="Filter by asset id…" autocomplete="off" spellcheck="false" />
+                           placeholder="Filter…" autocomplete="off" spellcheck="false" />
                   </div>
                   <div class="wv-asset-chip-wrap" id="wv-asset-chip-wrap">
-                    <p class="wv-chip-hint hint">Open this tab and hit Refresh to load every asset that has a waiver. Tap an id to load it.</p>
+                    <p class="wv-chip-hint hint">Tap Refresh above to load.</p>
                   </div>
                 </div>
               </div>
@@ -16073,12 +16256,32 @@ function renderDashboardHtml(): string {
                   <div class="wv-bv-placeholder">
                     <span class="wv-bv-placeholder-icon" aria-hidden="true">📋</span>
                     <strong>No vehicle selected</strong>
-                    <span>Type an asset id and choose Look up, or tap a fleet id on the left.</span>
+                    <span>Type an asset id, or pick one from the list on the left.</span>
                   </div>
                 </div>
               </div>
             </div>
           </section>
+        </div>
+
+        <!-- Verify / remove modal (replaces window.prompt). One markup, two modes. -->
+        <div id="wv-action-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-hidden="true">
+          <div class="modal-card wv-action-card">
+            <div class="wv-action-head">
+              <h3 id="wv-action-title">Verify waiver</h3>
+              <button type="button" class="ghost wv-action-x" id="wv-action-x" aria-label="Close">×</button>
+            </div>
+            <div class="wv-action-sub" id="wv-action-sub"></div>
+            <label for="wv-action-name" class="wv-action-lbl">Your name (required)</label>
+            <input type="text" id="wv-action-name" placeholder="First Last" autocomplete="name" />
+            <label for="wv-action-note" class="wv-action-lbl" id="wv-action-note-lbl">Optional note</label>
+            <textarea id="wv-action-note" rows="3"></textarea>
+            <div class="wv-action-err" id="wv-action-err" hidden></div>
+            <div class="wv-action-actions">
+              <button type="button" class="ghost" id="wv-action-cancel">Cancel</button>
+              <button type="button" class="primary" id="wv-action-confirm">Confirm</button>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -17165,11 +17368,20 @@ function renderDashboardHtml(): string {
           "<td class='nmc'>" + esc(nmc) + "</td>" +
           "<td class='surp'>" + esc(sur) + "</td>" +
           "<td class='snap-actions'>" +
+          "<button type='button' class='ghost snap-dl' data-snap-dl='" + esc(r.dateKey) + "' title='Download Vehicle ETIC workbook for this snapshot'>Download</button>" +
           "<button type='button' class='ghost snap-del' data-snap-del='" + esc(r.dateKey) + "' title='Hide this snapshot from lists (soft delete)'>Delete</button>" +
           "</td>" +
           "</tr>"
         );
       }).join("");
+      body.querySelectorAll("button[data-snap-dl]").forEach(function (btn) {
+        btn.addEventListener("click", function (ev) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          const dk = btn.getAttribute("data-snap-dl");
+          if (dk) downloadEticWorkbook(dk, btn);
+        });
+      });
       body.querySelectorAll("tr[data-date]").forEach(function (tr) {
         tr.addEventListener("click", function () {
           const dk = tr.getAttribute("data-date");
@@ -18955,6 +19167,13 @@ function renderDashboardHtml(): string {
       return lines.join("\\n");
     }
 
+    function smxSyncToolsStackVis() {
+      var st = document.getElementById("smx-tools-stack");
+      if (!st) return;
+      var any = st.querySelector(".smx-tool-block:not(.hidden)");
+      st.classList.toggle("hidden", !any);
+    }
+
     function renderSmxVcoMail() {
       var tk = document.getElementById("smx-vco-toolkit");
       var tagline = document.getElementById("smx-vco-toolkit-tagline");
@@ -18964,6 +19183,7 @@ function renderDashboardHtml(): string {
       if (!tk || !inner) return;
       if (!smxRows || !smxRows.length) {
         tk.classList.add("hidden");
+        smxSyncToolsStackVis();
         return;
       }
       tk.classList.remove("hidden");
@@ -18973,7 +19193,7 @@ function renderDashboardHtml(): string {
         "Maintenance import " +
         (dk ? fmtKeyLong(dk) : "—") +
         (ek ? " · Latest fleet book " + fmtKeyLong(ek) : "") +
-        " · This toolkit is separate from the Commander wing rollup.";
+        " · Separate from the Wing roll-up table above.";
       if (tagline) tagline.textContent = taglineStr;
       if (sumLine) sumLine.title = taglineStr;
       if (lead) {
@@ -18998,6 +19218,7 @@ function renderDashboardHtml(): string {
       if (!rows.length) {
         inner.innerHTML =
           "<p class='smx-vco-empty-state' style='margin:0;font-size:0.76rem;color:var(--muted);line-height:1.45'>No units have overdue or due-soon assets on this import under the rules above.</p>";
+        smxSyncToolsStackVis();
         return;
       }
       inner.innerHTML =
@@ -19079,6 +19300,7 @@ function renderDashboardHtml(): string {
           })
           .join("") +
         "</tbody></table>";
+      smxSyncToolsStackVis();
     }
 
     function smxVcoCopyText(uunit, kind, part) {
@@ -19104,6 +19326,7 @@ function renderDashboardHtml(): string {
       if (!wrap || !kpis || !tbody) return;
       if (!smxCommander || !smxRows.length) {
         wrap.classList.add("hidden");
+        smxSyncToolsStackVis();
         return;
       }
       wrap.classList.remove("hidden");
@@ -19230,6 +19453,7 @@ function renderDashboardHtml(): string {
           hintLbl.textContent = "";
         }
       }
+      smxSyncToolsStackVis();
     }
 
     var SMX_791_MXS = "791 MXS";
@@ -19481,12 +19705,10 @@ function renderDashboardHtml(): string {
         "<div class='wo-hero-row'>" +
         "<div class='wo-hero-id'>" + esc(assetId) + "</div>" +
         chips.join("") +
+        renderSightingBadge(assetId) +
         (yp ? "<span class='smx-hero-yphoto'>" + yp + "</span>" : "") +
         "</div>" +
-        smxAssetIdentityStripFromPlans(plans) +
-        "<div class='wo-hero-sub wo-hero-sub-primary'>" +
-        renderSightingBadge(assetId) +
-        "</div>";
+        smxAssetIdentityStripFromPlans(plans);
     }
 
     function smxFactsHtmlForPlan(row) {
@@ -19852,15 +20074,28 @@ function renderDashboardHtml(): string {
       }
     }
 
-    /** Human label for utilization type (avoid generic "units"). */
+    /**
+     * Canonical, deterministic UoM display label. Mirrors cleanUtilUomLabel() in
+     * src/workOrderWatch.ts. Pure numeric cells return empty so the renderer drops the unit.
+     * Glossary cells like 'h - hour' or 'mi / miles' map to a single pluralized label.
+     */
     function smxUtilUomLabel(utRaw) {
-      const s = String(utRaw || "").toLowerCase().replace(/\s+/g, " ").trim();
-      if (!s) return "miles";
-      if (/\bmile|\bmi\b|mph|odometer/.test(s)) return "miles";
-      if (/\bhour|\bhr\b|hrs|operating hour|engine hour|\beng\b/.test(s)) return "hours";
-      if (/\bkm\b|kilometer|kilomet/.test(s)) return "km";
-      if (s.length <= 14) return s;
-      return "miles";
+      const raw = String(utRaw == null ? '' : utRaw).replace(/\s+/g, ' ').trim();
+      if (!raw) return '';
+      const nocomma = raw.replace(/,/g, '');
+      if (/^-?\d+(?:\.\d+)?$/.test(nocomma)) return '';
+      const s = raw.toLowerCase();
+      const tokens = s.split(/\s*[-/|]\s*/).map(function (t) { return t.trim(); }).filter(Boolean);
+      for (let i = 0; i < tokens.length; i++) {
+        const t = tokens[i];
+        if (/^(h|hr|hrs|hour|hours)$/.test(t)) return 'hours';
+        if (/^(mi|mile|miles|odo|odometer)$/.test(t)) return 'miles';
+        if (/^(km|kilometer|kilometers|kilometre|kilometres)$/.test(t)) return 'kilometers';
+      }
+      if (/\b(hour|hours|hr|hrs|operating hour|engine hour|eng)\b/.test(s)) return 'hours';
+      if (/\b(mile|miles|mi|odometer|mph)\b/.test(s)) return 'miles';
+      if (/\b(km|kilometer|kilometre)/.test(s)) return 'kilometers';
+      return raw;
     }
 
     /** True when today is after next calendar maint date (independent of meter / open-WO triage). */
@@ -20048,7 +20283,7 @@ function renderDashboardHtml(): string {
       const uom = smxUtilUomLabel(row.elmsUtilType);
       const cur = row.elmsCurrentMeter;
       const nxt = row.elmsNextUtilQty;
-      const uSuffix = " " + uom;
+      const uSuffix = uom ? " " + uom : "";
       const rem = row.scheduleMxUtilRemaining != null ? row.scheduleMxUtilRemaining : nxt - cur;
       const overUtil = row.scheduleMxOverdueUtil || rem < 0;
       const safeNxt = Math.max(1, nxt);
@@ -20059,7 +20294,7 @@ function renderDashboardHtml(): string {
       const curS = smxFmtNum(cur) + uSuffix;
       const nxtS = smxFmtNum(nxt) + uSuffix;
       const remS =
-        rem >= 0 ? smxFmtNum(rem) + " " + uom + " left" : smxFmtNum(Math.abs(rem)) + " " + uom + " over";
+        rem >= 0 ? smxFmtNum(rem) + uSuffix + " left" : smxFmtNum(Math.abs(rem)) + uSuffix + " over";
       var lead = "";
       var leadCls = "smx-plain-lead";
       if (overUtil) {
@@ -20280,9 +20515,8 @@ function renderDashboardHtml(): string {
           "<div class='smx-card" + (isActive ? " active" : "") + "' data-smx-asset='" + esc(assetId) + "' data-smx-tier='" + esc(tier) + "' tabindex='0' role='button' aria-label='Select asset " + esc(assetId) + "'>" +
           "<div class='top-line'>" +
           "<span class='asset-mono smx-card-select'>" + esc(assetId) + "</span>" +
-          "<span class='badges'>" + nceChip + critChip + planGapChip + aggPill + "</span>" +
+          "<span class='badges'>" + nceChip + critChip + planGapChip + aggPill + renderSightingBadge(assetId) + "</span>" +
           "</div>" +
-          "<div class='wo-meta-line smx-card-select'>" + renderSightingBadge(assetId, { compact: true }) + "</div>" +
           "<div class='meta smx-card-select'>" + metaBits.join("") + "</div>" +
           "</div>"
         );
@@ -20645,7 +20879,28 @@ function renderDashboardHtml(): string {
       if (f === "remarks") return "Remarks";
       if (f === "shop") return "Shop";
       if (f === "initial") return "Tracking start";
+      if (f === "sub_wo_added") return "Sub-WO added";
+      if (f === "sub_wo_removed") return "Sub-WO removed";
+      if (f === "sub_wo_state") return "Sub-WO state";
       return f || "";
+    }
+    function splitSubWoField(raw) {
+      var f = String(raw || "").toLowerCase();
+      if (f.indexOf("sub_wo_") !== 0) return { kind: f, id: "" };
+      var idx = f.indexOf(":");
+      if (idx < 0) return { kind: f, id: "" };
+      return { kind: f.slice(0, idx), id: String(raw).slice(idx + 1) };
+    }
+    function parseSubWoPayload(s) {
+      var t = (s == null ? "" : String(s)).trim();
+      if (!t) return { state: "", plan: "" };
+      try {
+        var o = JSON.parse(t);
+        if (o && typeof o === "object") {
+          return { state: String(o.state || ""), plan: String(o.plan || "") };
+        }
+      } catch (_) {}
+      return { state: t, plan: "" };
     }
 
     const WO_MONTHS = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
@@ -21222,9 +21477,31 @@ function renderDashboardHtml(): string {
             );
           }
           const e = item.ev;
-          const fld = (e.field || "").toLowerCase();
+          const fldRaw = (e.field || "").toLowerCase();
+          const subSplit = splitSubWoField(e.field || "");
+          const fld = fldRaw.indexOf("sub_wo_") === 0 ? subSplit.kind : fldRaw;
           let body = "";
-          if (fld === "initial") {
+          if (fld === "sub_wo_added" || fld === "sub_wo_removed" || fld === "sub_wo_state") {
+            const subId = subSplit.id || "";
+            const payloadOld = parseSubWoPayload(e.old_value);
+            const payloadNew = parseSubWoPayload(e.new_value);
+            const planLbl = payloadNew.plan || payloadOld.plan || "";
+            const headerBits = [];
+            if (subId) headerBits.push("<span class='sub-wo-id'>" + esc(subId) + "</span>");
+            if (planLbl) headerBits.push("<span class='sub-wo-plan'>" + esc(planLbl) + "</span>");
+            const head = headerBits.length ? ("<div class='sub-wo-head'>" + headerBits.join(" \u00B7 ") + "</div>") : "";
+            if (fld === "sub_wo_added") {
+              const stateTxt = payloadNew.state ? "<span class='sub-wo-state'>" + esc(payloadNew.state) + "</span>" : "<span style='color:var(--subtle)'>(no state)</span>";
+              body = head + "<ins>added</ins> " + stateTxt;
+            } else if (fld === "sub_wo_removed") {
+              const stateTxt = payloadOld.state ? "<span class='sub-wo-state'>" + esc(payloadOld.state) + "</span>" : "";
+              body = head + "<del>removed</del>" + (stateTxt ? " " + stateTxt : "");
+            } else {
+              const oldS = payloadOld.state || "—";
+              const newS = payloadNew.state || "—";
+              body = head + "<del>" + esc(oldS) + "</del><span class='arrow'>\u2192</span><ins>" + esc(newS) + "</ins>";
+            }
+          } else if (fld === "initial") {
             body = "<span style='color:var(--muted)'>First snapshot we have for this WO</span>";
           } else if (fld === "remarks") {
             const oldV = (e.old_value || "").trim();
@@ -21456,7 +21733,6 @@ function renderDashboardHtml(): string {
       selectedDate = dateKey;
       if (pushHash && dateKey) setHashSnapshot(dateKey);
       const ys = document.getElementById("yard-status"); if (ys) { ys.textContent = ""; ys.className = "status"; }
-      const es = document.getElementById("etic-dl-status"); if (es) { es.textContent = ""; es.className = "status"; }
       if (!dateKey) return;
       renderDatePicker();
       populateCompareDateSelects();
@@ -21465,8 +21741,7 @@ function renderDashboardHtml(): string {
         const analysis = await loadAnalysis(dateKey);
         renderDetails(analysis);
       } catch (e) {
-        const es = document.getElementById("etic-dl-status");
-        if (es) { es.textContent = "Could not load snapshot: " + (e.message || e); es.className = "status err"; }
+        console.warn("Could not load snapshot:", e);
       }
     }
 
@@ -21538,15 +21813,14 @@ function renderDashboardHtml(): string {
       }
     }
 
-    async function downloadEticWorkbook() {
-      const btn = document.getElementById("btn-download-etic");
-      const st = document.getElementById("etic-dl-status");
-      if (!selectedDate) return;
-      btn.disabled = true;
-      st.className = "status";
-      st.textContent = "Downloading…";
+    async function downloadEticWorkbook(dateKey, srcBtn) {
+      const dk = dateKey || selectedDate;
+      if (!dk) return;
+      const btn = srcBtn || null;
+      const prevLabel = btn ? btn.textContent : "";
+      if (btn) { btn.disabled = true; btn.textContent = "…"; }
       try {
-        const url = "/api/workbook.xlsx?date=" + encodeURIComponent(selectedDate);
+        const url = "/api/workbook.xlsx?date=" + encodeURIComponent(dk);
         const res = await fetch(url);
         if (!res.ok) {
           let msg = "Could not download.";
@@ -21554,8 +21828,7 @@ function renderDashboardHtml(): string {
             const j = await res.json();
             if (j && j.error) msg = j.error;
           } catch (_) {}
-          st.className = "status err";
-          st.textContent = msg;
+          alert(msg);
           return;
         }
         const disp = res.headers.get("Content-Disposition") || "";
@@ -21570,13 +21843,10 @@ function renderDashboardHtml(): string {
         a.click();
         a.remove();
         URL.revokeObjectURL(u);
-        st.className = "status ok";
-        st.textContent = "Saved " + name;
       } catch (e) {
-        st.className = "status err";
-        st.textContent = String(e && e.message ? e.message : e);
+        alert(String(e && e.message ? e.message : e));
       } finally {
-        btn.disabled = false;
+        if (btn) { btn.disabled = false; btn.textContent = prevLabel; }
       }
     }
 
@@ -22459,8 +22729,6 @@ function renderDashboardHtml(): string {
       if (setTabBtn) setTabBtn.addEventListener("click", function () { setMainTab("settings"); syncDashboardQuery("settings"); });
 
       askInit();
-
-      document.getElementById("btn-download-etic").addEventListener("click", downloadEticWorkbook);
 
       const askBd = document.getElementById("ai-ask-bd");
       if (askBd) askBd.addEventListener("click", function (ev) {
@@ -25186,6 +25454,8 @@ function renderDashboardHtml(): string {
       bv: { assetId: "", waivers: [], removed: [], verifications: {} },
       /** Sorted asset ids from last /api/waivers/counts (By vehicle list). */
       bvAssetKeys: [],
+      /** Active waiver-action modal target: { id, mode: "verify" | "delete" } */
+      actionTarget: null,
     };
     let waiversDeepLinkApplied = false;
 
@@ -25259,6 +25529,36 @@ function renderDashboardHtml(): string {
       if (createAsset) createAsset.value = ((waiversState.bv && waiversState.bv.assetId) || "").trim().toUpperCase();
       const createBtn = document.getElementById("wv-create-submit");
       if (createBtn) createBtn.addEventListener("click", submitDesktopWaiver);
+
+      const reviewerName = document.getElementById("wv-reviewer-name");
+      if (reviewerName) {
+        reviewerName.value = localStorage.getItem("waiver.reviewerName") || "";
+        reviewerName.addEventListener("change", function () {
+          var v = (reviewerName.value || "").trim();
+          if (v) localStorage.setItem("waiver.reviewerName", v);
+          reviewerName.classList.remove("invalid");
+        });
+        reviewerName.addEventListener("input", function () {
+          reviewerName.classList.remove("invalid");
+        });
+      }
+
+      // Wire the verify/remove action modal once.
+      const am = document.getElementById("wv-action-modal");
+      if (am) {
+        const cancel = document.getElementById("wv-action-cancel");
+        const xBtn = document.getElementById("wv-action-x");
+        const confirmBtn = document.getElementById("wv-action-confirm");
+        if (cancel) cancel.addEventListener("click", closeWvActionModal);
+        if (xBtn) xBtn.addEventListener("click", closeWvActionModal);
+        am.addEventListener("click", function (e) {
+          if (e.target === am) closeWvActionModal();
+        });
+        if (confirmBtn) confirmBtn.addEventListener("click", confirmWvActionModal);
+        document.addEventListener("keydown", function (e) {
+          if (e.key === "Escape" && !am.classList.contains("hidden")) closeWvActionModal();
+        });
+      }
     }
 
     async function submitDesktopWaiver() {
@@ -25310,6 +25610,9 @@ function renderDashboardHtml(): string {
         if (descEl) descEl.value = "";
         if (mediaEl) mediaEl.value = "";
         setStatus("Submitted. Now pending review.", false);
+        // Collapse the create form on success so the layout settles back.
+        const createCardEl = document.getElementById("wv-create-card");
+        if (createCardEl) createCardEl.removeAttribute("open");
         await loadWaiverByVehicle(assetId);
         await loadWaiverPending();
         await loadWaiverCounts(true);
@@ -25324,7 +25627,7 @@ function renderDashboardHtml(): string {
       const wrap = document.getElementById("wv-asset-chip-wrap");
       const meta = document.getElementById("wv-asset-browser-count");
       if (!wrap) return;
-      wrap.innerHTML = "<div class='hint' style='color:var(--muted);padding:6px 0'>Loading asset list…</div>";
+      wrap.innerHTML = "<div class='hint' style='color:var(--muted);padding:6px 0'>Loading…</div>";
       try {
         const m = await loadWaiverCounts(true);
         const keys = [];
@@ -25338,8 +25641,8 @@ function renderDashboardHtml(): string {
         waiversState.bvAssetKeys = keys;
         if (meta) {
           meta.textContent = keys.length
-            ? keys.length + " vehicle" + (keys.length === 1 ? "" : "s") + " with waivers"
-            : "No vehicles in list yet";
+            ? keys.length + " " + (keys.length === 1 ? "vehicle" : "vehicles")
+            : "";
         }
         renderWaiverAssetChipList();
       } catch (e) {
@@ -25361,7 +25664,7 @@ function renderDashboardHtml(): string {
           "<p class='hint' style='margin:8px 0;color:var(--muted)'>" +
           ((waiversState.bvAssetKeys && waiversState.bvAssetKeys.length)
             ? "No asset ids match this filter."
-            : "No waivers on file yet — nothing to list.") +
+            : "No waivers on file yet.") +
           "</p>";
         return;
       }
@@ -25416,27 +25719,48 @@ function renderDashboardHtml(): string {
     async function loadWaiverPending() {
       const list = document.getElementById("wv-pending-list");
       const empty = document.getElementById("wv-pending-empty");
+      const strip = document.getElementById("wv-reviewer-strip");
       const countEl = document.getElementById("wv-pending-count");
       if (empty) empty.hidden = true;
       list.innerHTML = "<div class='hint' style='color:var(--muted);padding:14px'>Loading…</div>";
       try {
         const r = await fetch("/api/waivers/pending", { cache: "no-store" });
         const j = await r.json();
-        const ws = (j && j.waivers) || [];
+        const ws = ((j && j.waivers) || []).slice();
+        // Approval queue UX: oldest waiting first so chronic stragglers surface.
+        ws.sort(function (a, b) {
+          const ta = Date.parse(a.submittedAtIso || "") || 0;
+          const tb = Date.parse(b.submittedAtIso || "") || 0;
+          return ta - tb;
+        });
         waiversState.pending = ws;
         countEl.textContent = ws.length ? String(ws.length) : "";
         if (!ws.length) {
           list.innerHTML = "";
+          if (strip) strip.hidden = true;
           if (empty) empty.hidden = false;
           return;
         }
         if (empty) empty.hidden = true;
+        if (strip) strip.hidden = false;
         list.innerHTML = ws.map(renderPendingCard).join("");
         wirePendingCardActions();
       } catch (e) {
         if (empty) empty.hidden = true;
+        if (strip) strip.hidden = true;
         list.innerHTML = "<div class='wv-empty'>Could not load pending waivers.</div>";
       }
+    }
+
+    /** "X days waiting" / "today" / "1 day waiting" — short urgency cue. */
+    function fmtDaysWaiting(iso) {
+      if (!iso) return "";
+      const t = Date.parse(iso);
+      if (!isFinite(t)) return "";
+      const days = Math.max(0, Math.floor((Date.now() - t) / 86400000));
+      if (days <= 0) return "today";
+      if (days === 1) return "1 day waiting";
+      return days + " days waiting";
     }
 
     function waiverDefectPhotosHtml(w) {
@@ -25463,23 +25787,29 @@ function renderDashboardHtml(): string {
       const desc = w.description
         ? "<div class='body'>" + esc(w.description) + "</div>"
         : "";
+      const days = (function () {
+        const t = Date.parse(w.submittedAtIso || "");
+        if (!isFinite(t)) return 0;
+        return Math.max(0, Math.floor((Date.now() - t) / 86400000));
+      })();
+      const staleCls = days >= 14 ? " is-very-stale" : days >= 4 ? " is-stale" : "";
+      const ageTxt = fmtDaysWaiting(w.submittedAtIso);
       return (
-        "<article class='wv-pcard' data-wid='" + w.id + "'>" +
+        "<article class='wv-pcard" + staleCls + "' data-wid='" + w.id + "'>" +
           "<div class='head'>" +
             "<div style='flex:1;min-width:0'>" +
               "<div class='asset'>" + esc(w.assetId) + "</div>" +
               "<div class='title'>" + esc(w.title) + "</div>" +
-              "<div class='submitted'>Submitted by " + esc(w.submittedBy) + " · " +
+              "<div class='submitted'>" + esc(w.submittedBy) + " · " +
                 fmtKeyShort(w.submittedAtIso.slice(0,10)) + "</div>" +
             "</div>" +
+            (ageTxt ? "<span class='age-pill' title='Time since submission'>" + esc(ageTxt) + "</span>" : "") +
           "</div>" +
           desc +
           photo +
           "<div class='review-block'>" +
-            "<label>Your name (required)</label>" +
-            "<input class='review-name' data-role='name' placeholder='First Last' />" +
-            "<label>Note (optional for approve, required for reject)</label>" +
-            "<textarea data-role='note' placeholder='e.g. doesn't affect serviceability per shop chief'></textarea>" +
+            "<label>Note <span style='font-weight:400;text-transform:none;letter-spacing:0'>(required to reject)</span></label>" +
+            "<textarea data-role='note' placeholder='e.g. doesn’t affect serviceability per shop chief'></textarea>" +
           "</div>" +
           "<div class='actions'>" +
             "<button type='button' class='btn-approve' data-act='approve'>Approve</button>" +
@@ -25489,24 +25819,37 @@ function renderDashboardHtml(): string {
       );
     }
 
+    /** Read the single sticky reviewer-name strip; flash invalid + focus if blank. */
+    function readWvReviewerName(opts) {
+      const inp = document.getElementById("wv-reviewer-name");
+      if (!inp) return "";
+      const v = (inp.value || "").trim();
+      if (!v && (!opts || opts.required !== false)) {
+        inp.classList.add("invalid");
+        inp.focus();
+        return "";
+      }
+      if (v) localStorage.setItem("waiver.reviewerName", v);
+      return v;
+    }
+
     function wirePendingCardActions() {
       const cards = document.querySelectorAll("#wv-pending-list .wv-pcard");
       cards.forEach(function (card) {
         const id = Number(card.getAttribute("data-wid"));
-        const nameInput = card.querySelector("[data-role='name']");
         const noteInput = card.querySelector("[data-role='note']");
-        // Pre-fill from a tiny localStorage cache so the manager doesn't
-        // type their name on every approval click.
-        const cachedName = localStorage.getItem("waiver.reviewerName") || "";
-        if (cachedName) nameInput.value = cachedName;
         card.querySelectorAll("[data-act]").forEach(function (b) {
           b.addEventListener("click", async function () {
             const act = b.getAttribute("data-act");
-            const by = (nameInput.value || "").trim();
+            const by = readWvReviewerName({ required: true });
             const note = (noteInput.value || "").trim();
-            if (!by) { nameInput.focus(); nameInput.style.borderColor = "var(--danger)"; return; }
-            if (act === "reject" && !note) { noteInput.focus(); noteInput.style.borderColor = "var(--danger)"; return; }
-            localStorage.setItem("waiver.reviewerName", by);
+            if (!by) return;
+            if (act === "reject" && !note) {
+              noteInput.focus();
+              noteInput.classList.add("invalid");
+              noteInput.style.borderColor = "var(--danger)";
+              return;
+            }
             b.disabled = true;
             try {
               const body = act === "reject" ? { by: by, reason: note } : { by: by, note: note };
@@ -25532,6 +25875,8 @@ function renderDashboardHtml(): string {
       waiversState.bv.assetId = assetId;
       const createAsset = document.getElementById("wv-create-asset");
       if (createAsset) createAsset.value = (assetId || "").toUpperCase();
+      const summaryAsset = document.getElementById("wv-create-summary-asset");
+      if (summaryAsset) summaryAsset.textContent = assetId ? ("for " + (assetId || "").toUpperCase()) : "";
       const wrap = document.getElementById("wv-bv-result");
       if (!wrap) return;
       wrap.innerHTML = "<div class='hint' style='color:var(--muted);padding:8px 0'>Loading waivers for " + esc(assetId) + "…</div>";
@@ -25707,54 +26052,125 @@ function renderDashboardHtml(): string {
       );
     }
 
-    async function promptVerify(id) {
-      const w = waiversState.bv.waivers.find(function (x) { return x.id === id; });
+    function promptVerify(id) {
+      const list = (waiversState.bv.waivers || []).concat(waiversState.bv.removed || []);
+      const w = list.find(function (x) { return x.id === id; });
       if (!w) return;
-      const cachedName = localStorage.getItem("waiver.reviewerName") || "";
-      const by = window.prompt('Verify "' + w.title + '" — your name (required):', cachedName);
-      if (!by || !by.trim()) return;
-      localStorage.setItem("waiver.reviewerName", by.trim());
-      const note = window.prompt("Optional note:", "") || "";
-      try {
-        const r = await fetch("/api/waivers/" + id + "/verify", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ by: by.trim(), note: note.trim(), kind: "annual" }),
-        });
-        const j = await r.json();
-        if (!r.ok) throw new Error((j && j.error) || ("HTTP " + r.status));
-        loadWaiverByVehicle(waiversState.bv.assetId);
-        loadWaiverCounts(true);
-      } catch (e) {
-        alert("Verify failed: " + (e.message || e));
-      }
+      openWvActionModal({
+        mode: "verify",
+        id: id,
+        title: "Verify waiver",
+        sub: '"' + w.title + '" on ' + (waiversState.bv.assetId || w.assetId) +
+             ". Logs an annual verification entry with your name.",
+        noteLabel: "Optional note",
+        notePlaceholder: "e.g. Re-checked at PMI, still applies",
+        confirmLabel: "Verify",
+        danger: false,
+      });
     }
 
-    async function promptDelete(id) {
-      const w = waiversState.bv.waivers.find(function (x) { return x.id === id; });
+    function promptDelete(id) {
+      const list = (waiversState.bv.waivers || []).concat(waiversState.bv.removed || []);
+      const w = list.find(function (x) { return x.id === id; });
       if (!w) return;
-      const cachedName = localStorage.getItem("waiver.reviewerName") || "";
-      const deletedBy = window.prompt(
-        'Remove "' + w.title + '" from the printed waiver card. Your name (required, stored in audit):',
-        cachedName,
-      );
-      if (!deletedBy || !deletedBy.trim()) return;
-      localStorage.setItem("waiver.reviewerName", deletedBy.trim());
-      if (!window.confirm(
-        "Remove this waiver from the card? It will not appear on print. Expand 'Removed from card' below to view the audit record.",
-      )) return;
+      openWvActionModal({
+        mode: "delete",
+        id: id,
+        title: "Remove from card",
+        sub: 'Remove "' + w.title + '" from the printed driver card. The record is kept for audit and shown under "Removed from card".',
+        noteLabel: "Reason (optional)",
+        notePlaceholder: "Why was this removed?",
+        confirmLabel: "Remove",
+        danger: true,
+      });
+    }
+
+    function openWvActionModal(opts) {
+      const m = document.getElementById("wv-action-modal");
+      if (!m) return;
+      const card = m.querySelector(".wv-action-card");
+      const titleEl = document.getElementById("wv-action-title");
+      const subEl = document.getElementById("wv-action-sub");
+      const nameEl = document.getElementById("wv-action-name");
+      const noteEl = document.getElementById("wv-action-note");
+      const noteLbl = document.getElementById("wv-action-note-lbl");
+      const confirmBtn = document.getElementById("wv-action-confirm");
+      const errEl = document.getElementById("wv-action-err");
+      waiversState.actionTarget = { id: opts.id, mode: opts.mode };
+      if (titleEl) titleEl.textContent = opts.title || "";
+      if (subEl) subEl.textContent = opts.sub || "";
+      if (noteLbl) noteLbl.textContent = opts.noteLabel || "Optional note";
+      if (noteEl) {
+        noteEl.value = "";
+        noteEl.placeholder = opts.notePlaceholder || "";
+        noteEl.classList.remove("invalid");
+      }
+      if (nameEl) {
+        nameEl.value = localStorage.getItem("waiver.reviewerName") || "";
+        nameEl.classList.remove("invalid");
+      }
+      if (errEl) { errEl.textContent = ""; errEl.hidden = true; }
+      if (confirmBtn) {
+        confirmBtn.textContent = opts.confirmLabel || "Confirm";
+        confirmBtn.disabled = false;
+      }
+      if (card) card.classList.toggle("danger", !!opts.danger);
+      m.classList.remove("hidden");
+      m.setAttribute("aria-hidden", "false");
+      setTimeout(function () { if (nameEl) nameEl.focus(); }, 30);
+    }
+
+    function closeWvActionModal() {
+      const m = document.getElementById("wv-action-modal");
+      if (!m) return;
+      m.classList.add("hidden");
+      m.setAttribute("aria-hidden", "true");
+      waiversState.actionTarget = null;
+    }
+
+    async function confirmWvActionModal() {
+      const target = waiversState.actionTarget;
+      if (!target) { closeWvActionModal(); return; }
+      const nameEl = document.getElementById("wv-action-name");
+      const noteEl = document.getElementById("wv-action-note");
+      const errEl = document.getElementById("wv-action-err");
+      const confirmBtn = document.getElementById("wv-action-confirm");
+      const by = ((nameEl && nameEl.value) || "").trim();
+      const note = ((noteEl && noteEl.value) || "").trim();
+      if (!by) {
+        if (nameEl) { nameEl.classList.add("invalid"); nameEl.focus(); }
+        return;
+      }
+      localStorage.setItem("waiver.reviewerName", by);
+      if (confirmBtn) confirmBtn.disabled = true;
+      if (errEl) { errEl.textContent = ""; errEl.hidden = true; }
       try {
-        const r = await fetch("/api/waivers/" + id, {
-          method: "DELETE",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ deletedBy: deletedBy.trim() }),
-        });
-        const j = await r.json().catch(function () { return {}; });
-        if (!r.ok) throw new Error((j && j.error) || ("HTTP " + r.status));
-        loadWaiverByVehicle(waiversState.bv.assetId);
+        if (target.mode === "verify") {
+          const r = await fetch("/api/waivers/" + target.id + "/verify", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ by: by, note: note, kind: "annual" }),
+          });
+          const j = await r.json();
+          if (!r.ok) throw new Error((j && j.error) || ("HTTP " + r.status));
+        } else if (target.mode === "delete") {
+          const r = await fetch("/api/waivers/" + target.id, {
+            method: "DELETE",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ deletedBy: by, reason: note || undefined }),
+          });
+          const j = await r.json().catch(function () { return {}; });
+          if (!r.ok) throw new Error((j && j.error) || ("HTTP " + r.status));
+        }
+        closeWvActionModal();
+        if (waiversState.bv.assetId) loadWaiverByVehicle(waiversState.bv.assetId);
         loadWaiverCounts(true);
       } catch (e) {
-        alert("Remove failed: " + (e.message || e));
+        if (errEl) {
+          errEl.textContent = (e && e.message) ? e.message : String(e);
+          errEl.hidden = false;
+        }
+        if (confirmBtn) confirmBtn.disabled = false;
       }
     }
 
@@ -25771,6 +26187,9 @@ function renderDashboardHtml(): string {
       findings: [],
       totals: { total: 0, missing: 0, unlisted: 0, discrepancy: 0, unknown: 0, acknowledged: 0 },
       kindFilter: "all",
+      findingsSearch: "",
+      findingsSort: "touched-asc",
+      findingsFu: "all",
       showAck: false,
       activity: [],
       resolveTarget: null, // { assetId, kind, checkId, asset }
@@ -25792,10 +26211,10 @@ function renderDashboardHtml(): string {
       unknown: "\u00B7",
     };
     const RESOLUTION_LABELS = {
-      resolved: "Resolved",
-      in_progress: "In progress",
+      resolved: "No work order needed",
+      in_progress: "Follow-up note",
       dismissed: "Dismissed",
-      wo_opened: "WO opened",
+      wo_opened: "Work order opened",
       retired: "Retired",
       reassigned: "Reassigned",
     };
@@ -25850,6 +26269,27 @@ function renderDashboardHtml(): string {
         yardRenderFindingsCounts();
         yardRenderFindings();
       });
+      const fSearch = document.getElementById("yard-findings-search");
+      if (fSearch) {
+        fSearch.addEventListener("input", function () {
+          yardFmState.findingsSearch = (fSearch.value || "").trim();
+          yardRenderFindings();
+        });
+      }
+      const fSort = document.getElementById("yard-findings-sort");
+      if (fSort) {
+        fSort.addEventListener("change", function () {
+          yardFmState.findingsSort = fSort.value || "touched-asc";
+          yardRenderFindings();
+        });
+      }
+      const fFu = document.getElementById("yard-findings-fu");
+      if (fFu) {
+        fFu.addEventListener("change", function () {
+          yardFmState.findingsFu = fFu.value || "all";
+          yardRenderFindings();
+        });
+      }
       const refresh = document.getElementById("yard-findings-refresh");
       if (refresh) refresh.addEventListener("click", function () { yardLoadFindings(); });
 
@@ -25905,13 +26345,31 @@ function renderDashboardHtml(): string {
 
       const close = document.getElementById("yard-resolve-close");
       const cancel = document.getElementById("yard-resolve-cancel");
-      const save = document.getElementById("yard-resolve-save");
+      const addFu = document.getElementById("yard-resolve-add-fu");
+      const closeSubmit = document.getElementById("yard-resolve-submit");
+      const modeNone = document.getElementById("yard-resolve-mode-none");
+      const modeWo = document.getElementById("yard-resolve-mode-wo");
       const back = document.getElementById("yard-resolve-modal");
-      function closeModal(){ back.classList.add("hidden"); back.setAttribute("aria-hidden","true"); yardFmState.resolveTarget = null; }
+      function closeModal() {
+        if (back) {
+          back.classList.add("hidden");
+          back.setAttribute("aria-hidden", "true");
+        }
+        yardFmState.resolveTarget = null;
+      }
       if (close) close.addEventListener("click", closeModal);
       if (cancel) cancel.addEventListener("click", closeModal);
-      if (back) back.addEventListener("click", function(e){ if (e.target === back) closeModal(); });
-      if (save) save.addEventListener("click", function(){ yardSubmitResolve().then(function(ok){ if (ok) closeModal(); }); });
+      if (back) back.addEventListener("click", function (e) { if (e.target === back) closeModal(); });
+      if (addFu) addFu.addEventListener("click", function () { yardAddFollowup(); });
+      if (closeSubmit) {
+        closeSubmit.addEventListener("click", function () {
+          yardCloseFindingSubmit().then(function (ok) {
+            if (ok) closeModal();
+          });
+        });
+      }
+      if (modeNone) modeNone.addEventListener("change", yardSyncResolveModeUi);
+      if (modeWo) modeWo.addEventListener("change", yardSyncResolveModeUi);
       var plb = document.getElementById("yard-photo-lightbox-desk");
       var plbX = document.getElementById("yard-photo-lb-close-desk");
       if (plb && plb.dataset.wiredLb !== "1") {
@@ -26013,42 +26471,110 @@ function renderDashboardHtml(): string {
       set("yard-sub-findings-count", open);
     }
 
+    function yardFindingLastTouchedMs(f) {
+      var t = 0;
+      if (f.triggerCheck && f.triggerCheck.checkedAtIso) {
+        var a = new Date(f.triggerCheck.checkedAtIso).getTime();
+        if (Number.isFinite(a) && a > t) t = a;
+      }
+      if (f.lastAction && f.lastAction.resolvedAtIso) {
+        var b = new Date(f.lastAction.resolvedAtIso).getTime();
+        if (Number.isFinite(b) && b > t) t = b;
+      }
+      return t;
+    }
+    function yardFindingHasFollowup(f) {
+      return !!(f.lastAction && f.lastAction.resolution === "in_progress");
+    }
+    function yardFindingMatchesSearch(f, q) {
+      if (!q) return true;
+      var low = q.toLowerCase();
+      if (String(f.assetId || "")
+        .toLowerCase()
+        .indexOf(low) !== -1) {
+        return true;
+      }
+      if (f.triggerCheck) {
+        if (String(f.triggerCheck.location || "")
+          .toLowerCase()
+          .indexOf(low) !== -1) {
+          return true;
+        }
+        if (String(f.triggerCheck.discrepancies || "")
+          .toLowerCase()
+          .indexOf(low) !== -1) {
+          return true;
+        }
+        if (String(f.triggerCheck.checkedBy || "")
+          .toLowerCase()
+          .indexOf(low) !== -1) {
+          return true;
+        }
+      }
+      if (String(f.fleetFmaNotes || "")
+        .toLowerCase()
+        .indexOf(low) !== -1) {
+        return true;
+      }
+      if (f.lastAction && f.lastAction.note && String(f.lastAction.note).toLowerCase().indexOf(low) !== -1) return true;
+      return false;
+    }
+
     function yardRenderFindings() {
       const list = document.getElementById("yard-findings-list");
       if (!list) return;
       const kind = yardFmState.kindFilter;
       const showAck = yardFmState.showAck;
-      const rows = (yardFmState.findings || []).filter(function (f) {
+      const q = (yardFmState.findingsSearch || "").trim();
+      const sort = yardFmState.findingsSort || "touched-asc";
+      const fu = yardFmState.findingsFu || "all";
+      const base = (yardFmState.findings || []).filter(function (f) {
         if (kind !== "all" && f.kind !== kind) return false;
         if (!showAck && f.isAcknowledged) return false;
         return true;
       });
+      const filtered = base.filter(function (f) {
+        if (!yardFindingMatchesSearch(f, q)) return false;
+        if (fu === "yes" && !yardFindingHasFollowup(f)) return false;
+        if (fu === "no" && yardFindingHasFollowup(f)) return false;
+        return true;
+      });
+      const rows = filtered.slice();
+      rows.sort(function (a, b) {
+        const ta = yardFindingLastTouchedMs(a);
+        const tb = yardFindingLastTouchedMs(b);
+        if (ta !== tb) return sort === "touched-desc" ? (ta < tb ? 1 : -1) : ta < tb ? -1 : 1;
+        return String(a.assetId || "").localeCompare(String(b.assetId || ""), undefined, { numeric: true });
+      });
       if (!rows.length) {
         const totals = yardFmState.totals || {};
         if ((totals.total || 0) === 0) {
-          // Nothing has been tagged yet at all — show explanatory copy so
-          // it's clear the page works, just has no data.
           list.innerHTML =
             '<div class="hint" style="padding:32px 16px;text-align:center;max-width:640px;margin:0 auto;">' +
-              '<div style="font-size:18px;color:var(--text);font-weight:600;margin-bottom:8px;">No yard checks yet</div>' +
-              '<p style="margin:0 0 12px;">Walkers tag what they actually see. Needs Fix items appear here automatically. Each one is:</p>' +
-              '<ul style="text-align:left;display:inline-block;line-height:1.7;">' +
-                '<li><b>Found, no open WO</b> \u2014 walker logged an asset that has no open WO in the latest ingest.</li>' +
-                '<li><b>Discrepancy</b> \u2014 walker noted something (flat tire, windows down, etc.).</li>' +
-              '</ul>' +
-              '<p style="margin:12px 0 0;font-size:13px;color:var(--muted);">Vehicles waiting for a yard walk (due / never checked) appear on the <b>Fleet list</b> tab, not here.</p>' +
-              '<p style="margin:16px 0 0;"><a href="/yard?desktop=1" target="_blank" rel="noopener">Open the walker app \u2197</a> ' +
-              'to start tagging, or scan the QR on a phone.</p>' +
-            '</div>';
+            '<div style="font-size:18px;color:var(--text);font-weight:600;margin-bottom:8px;">No yard checks yet</div>' +
+            '<p style="margin:0 0 12px;">Walkers tag what they actually see. Needs Fix items appear here automatically. Each one is:</p>' +
+            '<ul style="text-align:left;display:inline-block;line-height:1.7;">' +
+            '<li><b>Found, no open WO</b> \u2014 walker logged an asset that has no open WO in the latest ingest.</li>' +
+            '<li><b>Discrepancy</b> \u2014 walker noted something (flat tire, windows down, etc.).</li>' +
+            "</ul>" +
+            '<p style="margin:12px 0 0;font-size:13px;color:var(--muted);">Vehicles waiting for a yard walk (due / never checked) appear on the <b>Fleet list</b> tab, not here.</p>' +
+            '<p style="margin:16px 0 0;"><a href="/yard?desktop=1" target="_blank" rel="noopener">Open the walker app \u2197</a> ' +
+            "to start tagging, or scan the QR on a phone.</p>" +
+            "</div>";
+        } else if (base.length) {
+          list.innerHTML =
+            '<div class="hint" style="padding:24px;text-align:center;">No matches for search or filters.</div>';
         } else {
-          list.innerHTML = '<div class="hint" style="padding:24px;text-align:center;">' +
-            (showAck ? "Nothing matches that filter." : "All Needs Fix items cleared. \uD83C\uDF89 (Toggle \u201CShow resolved\u201D to see history.)") +
-            '</div>';
+          list.innerHTML =
+            '<div class="hint" style="padding:24px;text-align:center;">' +
+            (showAck
+              ? "Nothing matches that filter."
+              : "All Needs Fix items cleared. \uD83C\uDF89 (Toggle \u201CShow resolved\u201D to see history.)") +
+            "</div>";
         }
         return;
       }
-      const html = rows.map(yardRenderFindingCard).join("");
-      list.innerHTML = html;
+      list.innerHTML = rows.map(yardRenderFindingCard).join("");
     }
 
     function yardFormatWoHistoryTable(rows) {
@@ -26130,32 +26656,74 @@ function renderDashboardHtml(): string {
       });
     }
 
+    /** Book + check context for Needs Fix cards and the resolve modal (full snapshot fields). */
+    function yardFindingAssetDetailsHtml(a, tc) {
+      const rows = [];
+      function add(label, val) {
+        const s = val != null && val !== undefined ? String(val).trim() : "";
+        if (s) rows.push({ label: label, v: s });
+      }
+      if (a) {
+        add("Owning unit", a.owningUnit);
+        add("Shop", a.shop);
+        add("Mgmt code", a.mgmtCd);
+        add("Make / model", a.makeModel);
+        add("Nomenclature", a.vehNomen);
+        add("MEL key", a.melKey);
+        add("MEL tier", a.melTier);
+        add("VIN / serial", a.vinSerial);
+        if (Number.isFinite(Number(a.openWoCount)) && Math.floor(Number(a.openWoCount)) > 0) {
+          add("Open work orders", String(Math.floor(Number(a.openWoCount))));
+        }
+        if ((a.lastLocation || "").trim()) add("Last known location (book)", a.lastLocation);
+      }
+      if (tc && (tc.location || "").trim()) add("Location (this check)", (tc.location || "").trim());
+      if (!rows.length) return "";
+      return (
+        '<div class="yard-finding-asset-dl" aria-label="Asset details">' +
+        '<strong class="yard-finding-asset-dl-h">Asset details (book)</strong>' +
+        '<dl class="yard-finding-asset-dl-grid">' +
+        rows
+          .map(function (r) {
+            return (
+              '<div class="yard-finding-asset-dl-pair">' +
+              "<dt>" + escapeHtml(r.label) + "</dt>" +
+              "<dd>" + escapeHtml(r.v) + "</dd>" +
+              "</div>"
+            );
+          })
+          .join("") +
+        "</dl></div>"
+      );
+    }
+
     function yardRenderFindingCard(f) {
       const a = f.asset || {};
       const tc = f.triggerCheck;
       const meta = [];
-      if (a.shop) meta.push("\uD83D\uDD27 " + escapeHtml(a.shop));
-      else if (a.owningUnit) meta.push(escapeHtml(a.owningUnit));
-      if (a.makeModel) meta.push(escapeHtml(a.makeModel));
-      if (a.lastLocation) meta.push("\uD83D\uDCCD " + escapeHtml(a.lastLocation));
       // For Missing (absence-derived), "last seen" reads more naturally than
       // "seen" — the asset is on the ETIC but nobody's confirmed it in a
       // while. For other kinds (unlisted/discrepancy), the trigger check IS
       // the most recent walker touch, so "seen" is right.
       const seenVerb = f.kind === "missing" ? "last seen" : "seen";
       const neverLbl = f.kind === "missing" ? "never seen by a walker" : "never checked";
-      if (tc) meta.push(seenVerb + " " + fmtRelTs(tc.checkedAtIso) + (tc.checkedBy ? " by " + escapeHtml(tc.checkedBy) : ""));
-      else meta.push(neverLbl);
+      if (tc) {
+        meta.push(seenVerb + " " + fmtRelTs(tc.checkedAtIso) + (tc.checkedBy ? " by " + escapeHtml(tc.checkedBy) : ""));
+        if (tc.sourceDateKey) meta.push("Book " + escapeHtml(tc.sourceDateKey));
+      } else meta.push(neverLbl);
+      var tms = yardFindingLastTouchedMs(f);
+      if (tms) meta.push("Last touch " + fmtRelTs(new Date(tms).toISOString()) + (yardFindingHasFollowup(f) ? " \u00B7 follow-up" : ""));
       const badges = [];
       if (a.isNce) badges.push('<span class="badge nce">NCE</span>');
       if (a.isBelowMel) badges.push('<span class="badge below-mel">Below MEL</span>');
       if (f.photoCount > 0) badges.push('<span class="badge photos">\uD83D\uDCF7 ' + f.photoCount + '</span>');
-      const disc = tc && tc.discrepancies ? '<div class="yard-finding-disc">\u201C' + escapeHtml(tc.discrepancies) + '\u201D</div>' : '';
+      const bookDl = yardFindingAssetDetailsHtml(a, tc);
+      const disc = tc && tc.discrepancies ? '<div class="yard-finding-disc"><strong>Walker</strong> \u2014 ' + escapeHtml(tc.discrepancies) + "</div>" : "";
       var fmaNotesRaw = (f.fleetFmaNotes || "").trim();
       var fmaHtml = "";
       if (fmaNotesRaw) {
         fmaHtml =
-          '<div class="yard-finding-fma"><span class="lbl">FM&amp;A / fleet (P&amp;A) notes</span><div class="txt">' +
+          '<div class="yard-finding-fma"><span class="lbl">FM&amp;A / fleet (P&amp;A) notes (book)</span><div class="txt">' +
           escapeHtml(fmaNotesRaw) +
           "</div></div>";
       }
@@ -26170,7 +26738,7 @@ function renderDashboardHtml(): string {
       const thumb = f.previewPhotoUrl
         ? '<button type="button" class="yard-finding-thumb" data-yard-finding-photo="' + escapeHtml(f.previewPhotoUrl) + '" title="View photo"><img src="' + escapeHtml(f.previewPhotoUrl) + '" alt="" loading="lazy" decoding="async" /></button>'
         : '<div class="yard-finding-thumb placeholder" aria-hidden="true">No\u00A0photo</div>';
-      const lastActionBlock = f.lastAction ? yardRenderLastAction(f.lastAction, f.isAcknowledged) : '';
+      const lastActionBlock = f.lastAction ? yardRenderLastAction(f) : "";
       const ackedClass = f.isAcknowledged ? ' acked' : '';
       const buttons = f.isAcknowledged
         ? '<button data-fa="reopen">Re-open</button>'
@@ -26184,6 +26752,7 @@ function renderDashboardHtml(): string {
             badges.join(" ") +
           '</div>' +
           '<div class="yard-finding-meta">' + meta.join(" \u00B7 ") + '</div>' +
+          bookDl +
           disc +
           fmaHtml +
           woHistHtml +
@@ -26193,17 +26762,20 @@ function renderDashboardHtml(): string {
       '</article>';
     }
 
-    function yardRenderLastAction(action, isAck) {
+    function yardRenderLastAction(f) {
+      const action = f.lastAction;
+      if (!action) return "";
       const label = RESOLUTION_LABELS[action.resolution] || action.resolution;
-      const tag = isAck ? "Acknowledged" : "Last action (re-opened by newer check)";
-      const wo = action.woOpened ? ' \u00B7 WO #' + escapeHtml(action.woOpened) : '';
-      const note = action.note ? ' \u00B7 \u201C' + escapeHtml(action.note) + '\u201D' : '';
-      return '<div class="yard-finding-action"><b>' + tag + ':</b> ' +
-        escapeHtml(label) + wo +
-        ' \u00B7 ' + escapeHtml(action.resolvedBy || "(unknown)") +
-        ' \u00B7 ' + fmtRelTs(action.resolvedAtIso) +
-        note +
-      '</div>';
+      var tag;
+      if (f.isAcknowledged) tag = "Acknowledged";
+      else if (action.resolution === "in_progress") tag = "Follow-up (still on open list)";
+      else tag = "Last action (superseded by newer check)";
+      const wo = action.woOpened ? " \u00B7 WO #" + escapeHtml(action.woOpened) : "";
+      const note = action.note ? " \u00B7 \u201C" + escapeHtml(action.note) + "\u201D" : "";
+      return (
+        '<div class="yard-finding-action"><b>' + tag + ":</b> " +
+        escapeHtml(label) + wo + " \u00B7 " + escapeHtml(action.resolvedBy || "(unknown)") + " \u00B7 " + fmtRelTs(action.resolvedAtIso) + note + "</div>"
+      );
     }
 
     function fmtRelTs(iso) {
@@ -26219,6 +26791,87 @@ function renderDashboardHtml(): string {
       return d.toLocaleDateString(undefined, { day: "2-digit", month: "short", year: "2-digit" });
     }
 
+    function fmtYardActionFullDate(iso) {
+      if (!iso) return "";
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return iso;
+      return d.toLocaleString();
+    }
+
+    function yardFormatFollowupListHtml(fups) {
+      if (!fups.length) {
+        return '<p class="yard-resolve-fu-empty">None yet.</p>';
+      }
+      return fups
+        .map(function (a) {
+          const meta = escapeHtml(fmtRelTs(a.resolvedAtIso)) + " \u00B7 " + escapeHtml(a.resolvedBy || "—");
+          const tAttr = ' title="' + esc(fmtYardActionFullDate(a.resolvedAtIso)) + '"';
+          return (
+            '<div class="yard-resolve-fu-item"' + tAttr + '>' +
+            '<div class="yard-resolve-fu-item-meta">' + meta + "</div>" +
+            '<div class="yard-resolve-fu-item-txt">' + escapeHtml(a.note || "") + "</div></div>"
+          );
+        })
+        .join("");
+    }
+
+    function yardLoadFindingActionsIntoModal() {
+      const t = yardFmState.resolveTarget;
+      const el = document.getElementById("yard-resolve-fu-list");
+      if (!t || !el) return;
+      el.textContent = "Loading\u2026";
+      fetch(
+        "/api/yard/finding-actions?assetId=" + encodeURIComponent(t.assetId) + "&kind=" + encodeURIComponent(t.kind),
+        { cache: "no-store" },
+      )
+        .then(function (r) {
+          return r.json().then(function (j) {
+            return { r: r, j: j };
+          });
+        })
+        .then(function (o) {
+          if (!o.r.ok) throw new Error(o.j.error || "load failed");
+          const all = o.j.actions || [];
+          const fups = all.filter(function (a) {
+            return a.resolution === "in_progress";
+          });
+          fups.sort(function (a, b) {
+            return a.resolvedAtIso < b.resolvedAtIso ? -1 : 1;
+          });
+          el.innerHTML = yardFormatFollowupListHtml(fups);
+        })
+        .catch(function (e) {
+          el.innerHTML = '<p class="yard-resolve-fu-empty" style="color:var(--danger)">' + escapeHtml(String(e)) + "</p>";
+        });
+    }
+
+    async function yardPostFindingAction(payload) {
+      const t = yardFmState.resolveTarget;
+      if (!t) return { ok: false, err: "no target" };
+      const by = (document.getElementById("yard-resolve-by") || {}).value || "";
+      try {
+        window.localStorage.setItem("yardFm.resolvedBy", by);
+      } catch (e) {
+        void e;
+      }
+      const r = await fetch("/api/yard/findings/resolve", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          assetId: t.assetId,
+          kind: t.kind,
+          checkId: t.triggerCheck ? t.triggerCheck.id : null,
+          resolution: payload.resolution,
+          woOpened: (payload.woOpened || "").trim(),
+          note: (payload.note || "").trim(),
+          resolvedBy: by,
+        }),
+      });
+      const j = await r.json();
+      if (!r.ok) return { ok: false, err: j.error || "save failed" };
+      return { ok: true, action: j.action };
+    }
+
     function yardOpenResolveModal(assetId, kind) {
       const finding = (yardFmState.findings || []).find(function (f) {
         return f.assetId === assetId && f.kind === kind;
@@ -26228,80 +26881,143 @@ function renderDashboardHtml(): string {
       const back = document.getElementById("yard-resolve-modal");
       const title = document.getElementById("yard-resolve-title");
       const sub = document.getElementById("yard-resolve-sub");
+      if (!back || !title || !sub) return;
       title.textContent = FINDING_LABELS[kind] + " \u2014 " + assetId;
       const a = finding.asset || {};
-      const ctx = [];
-      [
-        a.owningUnit ? "Unit " + a.owningUnit : "",
-        a.makeModel || "",
-        a.shop ? "Shop " + a.shop : "",
-        a.lastLocation ? "Parked " + a.lastLocation : "",
-        Number.isFinite(Number(a.openWoCount)) ? (Number(a.openWoCount) || 0) + " open WO" : "",
-      ].forEach(function (x) { if (String(x || "").trim()) ctx.push(x); });
-      if (finding.triggerCheck) {
-        ctx.push("Seen " + fmtRelTs(finding.triggerCheck.checkedAtIso) + (finding.triggerCheck.checkedBy ? " by " + finding.triggerCheck.checkedBy : ""));
-        if (finding.triggerCheck.sourceDateKey) ctx.push("Book " + finding.triggerCheck.sourceDateKey);
-        if (finding.triggerCheck.discrepancies) ctx.push('"' + finding.triggerCheck.discrepancies + '"');
-      }
-      if (finding.fleetFmaNotes) {
-        ctx.push("Fleet notes: " + finding.fleetFmaNotes);
-      }
-      sub.textContent = ctx.join(" \u00B7 ");
-      // Pre-fill last-known values
+      const tc2 = finding.triggerCheck;
+      const built =
+        yardFindingAssetDetailsHtml(a, tc2) +
+        (tc2 && (tc2.discrepancies || "").trim()
+          ? '<div class="yard-finding-disc yard-resolve-disc-in-modal"><strong>Walker</strong> \u2014 ' + escapeHtml(tc2.discrepancies) + "</div>"
+          : "") +
+        ((finding.fleetFmaNotes || "").trim()
+          ? '<div class="yard-finding-fma yard-resolve-fma-in-modal"><span class="lbl">FM&amp;A / fleet (P&amp;A) notes (book)</span><div class="txt">' +
+            escapeHtml((finding.fleetFmaNotes || "").trim()) +
+            "</div></div>"
+          : "");
+      sub.innerHTML = built
+        ? built
+        : '<span class="hint">No book fields for this asset.</span>';
       const by = document.getElementById("yard-resolve-by");
       if (by && !by.value) {
         try {
           const stored = window.localStorage.getItem("yardFm.resolvedBy");
           if (stored) by.value = stored;
-        } catch {}
+        } catch (e) {
+          void e;
+        }
       }
-      const noteEl = document.getElementById("yard-resolve-note"); if (noteEl) noteEl.value = "";
-      const woEl = document.getElementById("yard-resolve-wo"); if (woEl) woEl.value = "";
-      const resEl = document.getElementById("yard-resolve-resolution");
-      if (resEl) resEl.value = kind === "missing" ? "in_progress" : kind === "unlisted" ? "wo_opened" : "resolved";
+      const fuEl = document.getElementById("yard-resolve-fu-note");
+      if (fuEl) fuEl.value = "";
+      const finEl = document.getElementById("yard-resolve-final-note");
+      if (finEl) finEl.value = "";
+      const woEl = document.getElementById("yard-resolve-wo");
+      if (woEl) woEl.value = "";
+      const mNone = document.getElementById("yard-resolve-mode-none");
+      const mWo2 = document.getElementById("yard-resolve-mode-wo");
+      if (mNone) mNone.checked = true;
+      if (mWo2) mWo2.checked = false;
+      yardSyncResolveModeUi();
       back.classList.remove("hidden");
       back.setAttribute("aria-hidden", "false");
+      yardLoadFindingActionsIntoModal();
     }
 
-    async function yardSubmitResolve() {
-      const t = yardFmState.resolveTarget;
-      if (!t) return false;
-      const by = (document.getElementById("yard-resolve-by") || {}).value || "";
-      const wo = (document.getElementById("yard-resolve-wo") || {}).value || "";
-      const note = (document.getElementById("yard-resolve-note") || {}).value || "";
-      const res = (document.getElementById("yard-resolve-resolution") || {}).value || "resolved";
-      try { window.localStorage.setItem("yardFm.resolvedBy", by); } catch {}
-      try {
-        const r = await fetch("/api/yard/findings/resolve", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            assetId: t.assetId,
-            kind: t.kind,
-            checkId: t.triggerCheck ? t.triggerCheck.id : null,
-            resolution: res,
-            woOpened: wo,
-            note: note,
-            resolvedBy: by,
-          }),
-        });
-        const j = await r.json();
-        if (!r.ok) throw new Error(j.error || "save failed");
-        const key = t.assetId + "|" + t.kind;
-        yardFmState.findings = (yardFmState.findings || []).map(function (f) {
-          if ((f.assetId + "|" + f.kind) !== key) return f;
-          f.isAcknowledged = true;
-          f.lastAction = j.action || f.lastAction;
-          return f;
-        });
-        yardRenderFindingsCounts();
-        yardRenderFindings();
-        yardLoadFindings();
-        return true;
-      } catch (e) {
-        alert("Failed: " + (e && e.message ? e.message : String(e)));
+    async function yardAddFollowup() {
+      const note = ((document.getElementById("yard-resolve-fu-note") || {}).value || "").trim();
+      if (!note) {
+        alert("Enter text for the follow-up note.");
+        return;
+      }
+      const res = await yardPostFindingAction({ resolution: "in_progress", note: note });
+      if (!res.ok) {
+        alert("Failed: " + res.err);
+        return;
+      }
+      (document.getElementById("yard-resolve-fu-note") || {}).value = "";
+      yardLoadFindingActionsIntoModal();
+      await yardLoadFindings();
+    }
+
+    function yardSyncResolveModeUi() {
+      const woR = document.getElementById("yard-resolve-wo");
+      const wrap = document.getElementById("yard-resolve-wo-wrap");
+      const mWo = document.getElementById("yard-resolve-mode-wo");
+      const fin = document.getElementById("yard-resolve-final-note");
+      const lbl = document.getElementById("yard-resolve-final-note-lbl");
+      if (wrap) {
+        if (mWo && mWo.checked) {
+          wrap.classList.remove("hidden");
+          if (woR) {
+            try {
+              woR.focus();
+            } catch (e) {
+              void e;
+            }
+          }
+        } else {
+          wrap.classList.add("hidden");
+          if (woR) woR.value = "";
+        }
+      }
+      if (fin && lbl) {
+        if (mWo && mWo.checked) {
+          fin.placeholder = "Optional";
+          lbl.textContent = "Note (optional)";
+        } else {
+          fin.placeholder = "Required";
+          lbl.textContent = "Note";
+        }
+      }
+    }
+
+    async function yardCloseFindingSubmit() {
+      const mWo = document.getElementById("yard-resolve-mode-wo");
+      if (mWo && mWo.checked) {
+        return yardCloseFindingWo();
+      }
+      return yardCloseFindingOk();
+    }
+
+    async function yardCloseFindingOk() {
+      const by = ((document.getElementById("yard-resolve-by") || {}).value || "").trim();
+      const fin = ((document.getElementById("yard-resolve-final-note") || {}).value || "").trim();
+      if (!by) {
+        alert("Name?");
         return false;
       }
+      if (!fin) {
+        alert("Note?");
+        return false;
+      }
+      const res = await yardPostFindingAction({ resolution: "resolved", note: fin });
+      if (!res.ok) {
+        alert("Failed: " + res.err);
+        return false;
+      }
+      await yardLoadFindings();
+      return true;
+    }
+
+    async function yardCloseFindingWo() {
+      const by = ((document.getElementById("yard-resolve-by") || {}).value || "").trim();
+      if (!by) {
+        alert("Name?");
+        return false;
+      }
+      const wo = ((document.getElementById("yard-resolve-wo") || {}).value || "").trim();
+      if (!wo) {
+        alert("WO #?");
+        return false;
+      }
+      const fin = ((document.getElementById("yard-resolve-final-note") || {}).value || "").trim();
+      const res = await yardPostFindingAction({ resolution: "wo_opened", woOpened: wo, note: fin });
+      if (!res.ok) {
+        alert("Failed: " + res.err);
+        return false;
+      }
+      await yardLoadFindings();
+      return true;
     }
 
     async function yardReopenFinding(assetId, kind) {

@@ -1033,7 +1033,7 @@ export type ScheduleMxFleetRow = {
 } & ReturnType<typeof analyzeElmsScheduleMxFromRaw>;
 
 /** Overlap several D1 round-trips without unbounded fan-out (D1 limits / latency). */
-const SCHEDULE_MX_D1_BATCH_CONCURRENCY = 8;
+const SCHEDULE_MX_D1_BATCH_CONCURRENCY = 12;
 
 async function runAssetIdBatchesInParallel<T>(
   ids: string[],
@@ -1149,13 +1149,19 @@ function collectDistinctOpenWorkOrderIdsForOswo(byAsset: Map<string, ScheduleMxE
  * make-model / type / mgmt / NCE, plus **Work Order Inquiry** rows for open WO ids and
  * in-shop parts status. Used to enrich Schedule Mx (ELMS plans) without trusting ELMS
  * item lines for fleet identity.
+ * @param preloadedEticDateKey If passed (including `null`), skip {@link getLatestEticSnapshotDateKey};
+ *   otherwise fetch it. Lets Schedule Mx pipeline overlap this query with other work.
  */
 export async function loadScheduleMxEticContextByAsset(
   env: { ETIC_SNAPSHOTS: D1Database },
   assetIds: string[],
+  preloadedEticDateKey?: string | null,
 ): Promise<{ eticDateKey: string | null; byAsset: Map<string, ScheduleMxEticAssetContext> }> {
   const byAsset = new Map<string, ScheduleMxEticAssetContext>();
-  const eticDateKey = await getLatestEticSnapshotDateKey(env);
+  const eticDateKey =
+    preloadedEticDateKey !== undefined
+      ? preloadedEticDateKey
+      : await getLatestEticSnapshotDateKey(env);
   if (!eticDateKey || assetIds.length === 0) {
     return { eticDateKey, byAsset };
   }
@@ -1183,7 +1189,8 @@ export async function loadScheduleMxEticContextByAsset(
     raw_row_json: string | null;
   };
   type WoAgg = {
-    workOrderIds: string[];
+    /** Dedup with Set — WOs can appear many per asset; .includes on an array is O(n²) for large books. */
+    workOrderIdSet: Set<string>;
     inMaintenance: boolean;
     nmcOnOpenWorkOrder: boolean;
     owningUnit: string;
@@ -1196,19 +1203,19 @@ export async function loadScheduleMxEticContextByAsset(
     utilizationType: string;
   };
   const woByAsset = new Map<string, WoAgg>();
+  const idSet = new Set(ids);
 
-  const [fleetRowsFlat, woRowsFlat] = await Promise.all([
-    runAssetIdBatchesInParallel(ids, batchSize, async (chunk) => {
-      const ph = chunk.map(() => "?").join(",");
+  const [fleetR, woRowsFlat] = await Promise.all([
+    (async () => {
       const r = await env.ETIC_SNAPSHOTS.prepare(
         `SELECT asset_id, owning_unit, make_model, veh_nomen, mgmt_cd, raw_row_json
          FROM fleet_p_a_snapshot
-         WHERE snapshot_date_key = ? AND asset_id IN (${ph})`,
+         WHERE snapshot_date_key = ?`,
       )
-        .bind(eticDateKey, ...chunk)
+        .bind(eticDateKey)
         .all<FleetPaRow>();
       return r.results ?? [];
-    }),
+    })(),
     runAssetIdBatchesInParallel(ids, batchSize, async (chunk) => {
       const ph = chunk.map(() => "?").join(",");
       const r = await env.ETIC_SNAPSHOTS.prepare(
@@ -1223,9 +1230,9 @@ export async function loadScheduleMxEticContextByAsset(
     }),
   ]);
 
-  for (const row of fleetRowsFlat) {
+  for (const row of fleetR) {
     const aid = (row.asset_id ?? "").trim();
-    if (aid) fleetByAsset.set(aid, row);
+    if (aid && idSet.has(aid)) fleetByAsset.set(aid, row);
   }
   for (const row of woRowsFlat) {
     const aid = (row.asset_id ?? "").trim();
@@ -1233,7 +1240,7 @@ export async function loadScheduleMxEticContextByAsset(
     let ctx = woByAsset.get(aid);
     if (!ctx) {
       ctx = {
-        workOrderIds: [],
+        workOrderIdSet: new Set(),
         inMaintenance: false,
         nmcOnOpenWorkOrder: false,
         owningUnit: "",
@@ -1247,7 +1254,7 @@ export async function loadScheduleMxEticContextByAsset(
       woByAsset.set(aid, ctx);
     }
     const wid = (row.work_order_id ?? "").trim();
-    if (wid && !ctx.workOrderIds.includes(wid)) ctx.workOrderIds.push(wid);
+    if (wid) ctx.workOrderIdSet.add(wid);
     const ps = (row.parts_status ?? "").trim();
     if (partsStatusLooksInMaintenance(ps)) ctx.inMaintenance = true;
     if (workOrderRowLooksNmc(ps, row.raw_row_json)) ctx.nmcOnOpenWorkOrder = true;
@@ -1273,12 +1280,12 @@ export async function loadScheduleMxEticContextByAsset(
   for (const aid of ids) {
     const f = fleetByAsset.get(aid);
     const w = woByAsset.get(aid);
-    if (!f && (!w || w.workOrderIds.length === 0)) continue;
+    if (!f && (!w || w.workOrderIdSet.size === 0)) continue;
     const fpNce = f ? nceInfoFromSnapshotRawJson(f.raw_row_json) : { nce: false, nceStatus: "" };
     const nce = fpNce.nce || !!w?.nce;
     const nceStatus = (fpNce.nceStatus || w?.nceStatus || "").trim();
     byAsset.set(aid, {
-      workOrderIds: w?.workOrderIds ?? [],
+      workOrderIds: w ? Array.from(w.workOrderIdSet) : [],
       owningUnit: (f?.owning_unit ?? "").trim() || (w?.owningUnit ?? ""),
       makeModel: (f?.make_model ?? "").trim() || (w?.makeModel ?? ""),
       vehNomen: (f?.veh_nomen ?? "").trim() || (w?.vehNomen ?? ""),
@@ -1595,6 +1602,57 @@ function looksLikePureNumberToken(s: string): boolean {
   return /^-?\d+(?:\.\d+)?$/.test(t);
 }
 
+/**
+ * When a UoM cell looks like a glossary entry such as `"h - hour"` or `"mi / miles"`,
+ * pick the longest human-readable half so downstream code does not show both halves.
+ * Returns the input trimmed (with collapsed whitespace) when there is no separator.
+ */
+function preferLongerUtilLabelHalf(raw: string): string {
+  const t = raw.replace(/\s+/g, " ").trim();
+  if (!t) return "";
+  if (!/[-/|]/.test(t)) return t;
+  const halves = t
+    .split(/\s*[-/|]\s*/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+  if (halves.length < 2) return t;
+  let best = halves[0]!;
+  for (const h of halves) {
+    if (h.length > best.length) best = h;
+  }
+  return best;
+}
+
+/**
+ * Canonical, deterministic display label for a workbook utilization-type cell.
+ * - Pure numbers (e.g. `"24858.00"`) → `""` so the renderer drops the unit entirely.
+ * - Short codes, full words, and glossary cells (`"h - hour"`, `"mi - miles"`) all map to
+ *   pluralized labels: `"hours"`, `"miles"`, `"kilometers"`.
+ * - Anything else is returned trimmed with whitespace collapsed (no synthetic dashes).
+ *
+ * Mirrored verbatim by the dashboard `smxUtilUomLabel()` JS helper in {@link src/index.ts}.
+ */
+export function cleanUtilUomLabel(utRaw: string | null | undefined): string {
+  const raw = String(utRaw ?? "").replace(/\s+/g, " ").trim();
+  if (!raw) return "";
+  const nocomma = raw.replace(/,/g, "");
+  if (/^-?\d+(?:\.\d+)?$/.test(nocomma)) return "";
+  const s = raw.toLowerCase();
+  const tokens = s
+    .split(/\s*[-/|]\s*/)
+    .map((t) => t.trim())
+    .filter(Boolean);
+  for (const t of tokens) {
+    if (/^(h|hr|hrs|hour|hours)$/.test(t)) return "hours";
+    if (/^(mi|mile|miles|odo|odometer)$/.test(t)) return "miles";
+    if (/^(km|kilometer|kilometers|kilometre|kilometres)$/.test(t)) return "kilometers";
+  }
+  if (/\b(hour|hours|hr|hrs|operating hour|engine hour|eng)\b/.test(s)) return "hours";
+  if (/\b(mile|miles|mi|odometer|mph)\b/.test(s)) return "miles";
+  if (/\b(km|kilometer|kilometre)/.test(s)) return "kilometers";
+  return raw;
+}
+
 function parseUtilNumber(s: string): number | null {
   const t = String(s ?? "").replace(/,/g, "");
   const m = t.match(/-?\d+(?:\.\d+)?/);
@@ -1728,7 +1786,7 @@ export function utilizationTypeFromFleetRawJson(rawRowJson: string | null | unde
     "service meter uom",
     "vehicle utilization",
   ]);
-  if (t0.trim() && !looksLikePureNumberToken(t0)) return t0.replace(/\s+/g, " ").trim();
+  if (t0.trim() && !looksLikePureNumberToken(t0)) return preferLongerUtilLabelHalf(t0);
 
   let bestScore = 0;
   let bestVal = "";
@@ -1745,7 +1803,7 @@ export function utilizationTypeFromFleetRawJson(rawRowJson: string | null | unde
       bestVal = vv;
     }
   }
-  if (bestVal) return bestVal.replace(/\s+/g, " ").trim();
+  if (bestVal && !looksLikePureNumberToken(bestVal)) return preferLongerUtilLabelHalf(bestVal);
 
   for (const [k, v] of Object.entries(raw)) {
     const vv = (v ?? "").trim();
@@ -1759,7 +1817,7 @@ export function utilizationTypeFromFleetRawJson(rawRowJson: string | null | unde
       /^(hrs?|hours?|h|eng(\s+hours?)?|engine(\s+hours?)?|mi|miles?|m|odo(meter)?|km)$/i.test(vv) ||
       /\b(hour|hr|eng|engine|mi|mile|odo|miles|odometer)\b/i.test(vv)
     ) {
-      return vv;
+      return preferLongerUtilLabelHalf(vv);
     }
   }
   return "";
@@ -2666,6 +2724,29 @@ export async function ingestOswoExtractFromAttachment(
     );
   }
   const parentSet = new Set(rows.map((r) => r.parentWorkOrderId));
+
+  // Going-forward sub-WO change timeline: diff against the previous OSWO snapshot
+  // (no historical seeding). Writes rows into `work_order_changelog` keyed to the
+  // parent WO so the WO change timeline can surface "sub-WO added / removed /
+  // state changed" events alongside ETIC field changes.
+  let subWoChangelogEntries = 0;
+  try {
+    subWoChangelogEntries = await writeOswoSubWorkOrderChangelogDiffs(
+      env,
+      opts.dateKey,
+      opts.receivedAtIso,
+    );
+  } catch (e) {
+    console.error(
+      JSON.stringify({
+        level: "warn",
+        message: "oswo_sub_wo_changelog_diff_failed",
+        dateKey: opts.dateKey,
+        error: e instanceof Error ? e.message : String(e),
+      }),
+    );
+  }
+
   console.log(
     JSON.stringify({
       level: "info",
@@ -2673,12 +2754,158 @@ export async function ingestOswoExtractFromAttachment(
       dateKey: opts.dateKey,
       rows: rows.length,
       distinctParentWos: parentSet.size,
+      changelogEntries: subWoChangelogEntries,
       fileName: opts.fileName,
       from: opts.from,
       to: opts.to,
     }),
   );
   return { rowCount: rows.length, dateKey: opts.dateKey };
+}
+
+/**
+ * Diff the current OSWO snapshot against the previous one and append change rows
+ * to `work_order_changelog`, scoped to the parent work order. Idempotent: any
+ * existing `sub_wo_*` rows for the same `snapshot_date_key` are wiped first so
+ * repeated ingest of the same OSWO date doesn't duplicate.
+ *
+ * Field naming honors the `(work_order_id, snapshot_date_key, field)` UNIQUE
+ * constraint by suffixing the field with the sub-WO's stable identity:
+ *   - `sub_wo_added:<id>`
+ *   - `sub_wo_removed:<id>`
+ *   - `sub_wo_state:<id>`
+ *
+ * `<id>` is the Sub Work Order Id when present, otherwise the work-plan label,
+ * otherwise the per-snapshot `row_key`. Old/new values carry a small JSON
+ * payload `{state, plan}` so the renderer can show both pieces. Returns the
+ * number of changelog rows written.
+ */
+async function writeOswoSubWorkOrderChangelogDiffs(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  currentDateKey: string,
+  receivedAtIso: string,
+): Promise<number> {
+  const prev = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT MAX(snapshot_date_key) AS k FROM oswo_sub_work_order_snapshot WHERE snapshot_date_key < ?`,
+  )
+    .bind(currentDateKey)
+    .first<{ k: string | null }>();
+  const prevKey = (prev?.k ?? "").trim();
+
+  // Always clear any prior sub_wo_* entries for this date so re-ingest is a
+  // clean replace. If there's no previous snapshot we still wipe (in case a
+  // user deleted the prev one) and exit — there's no baseline to diff against.
+  await env.ETIC_SNAPSHOTS.prepare(
+    `DELETE FROM work_order_changelog WHERE snapshot_date_key = ? AND field LIKE 'sub_wo_%'`,
+  )
+    .bind(currentDateKey)
+    .run();
+  if (!prevKey) return 0;
+
+  const [curR, prvR] = await Promise.all([
+    env.ETIC_SNAPSHOTS.prepare(
+      `SELECT row_key, parent_work_order_id, sub_work_order_id, raw_row_json
+       FROM oswo_sub_work_order_snapshot WHERE snapshot_date_key = ?`,
+    )
+      .bind(currentDateKey)
+      .all<{ row_key: string; parent_work_order_id: string; sub_work_order_id: string; raw_row_json: string }>(),
+    env.ETIC_SNAPSHOTS.prepare(
+      `SELECT row_key, parent_work_order_id, sub_work_order_id, raw_row_json
+       FROM oswo_sub_work_order_snapshot WHERE snapshot_date_key = ?`,
+    )
+      .bind(prevKey)
+      .all<{ row_key: string; parent_work_order_id: string; sub_work_order_id: string; raw_row_json: string }>(),
+  ]);
+
+  type SubInfo = { state: string; plan: string };
+  type ParentMap = Map<string, Map<string, SubInfo>>;
+  const parentCasing = new Map<string, string>();
+  function group(
+    rows: { row_key: string; parent_work_order_id: string; sub_work_order_id: string; raw_row_json: string }[],
+  ): ParentMap {
+    const m: ParentMap = new Map();
+    for (const r of rows) {
+      const parent = (r.parent_work_order_id ?? "").trim();
+      if (!parent) continue;
+      const lower = parent.toLowerCase();
+      if (!parentCasing.has(lower)) parentCasing.set(lower, parent);
+      let raw: Record<string, string> = {};
+      try {
+        raw = JSON.parse(r.raw_row_json || "{}") as Record<string, string>;
+      } catch {
+        raw = {};
+      }
+      const state = pickOswoSubWorkOrderState(raw);
+      const plan = pickOswoWorkPlanLabel(raw);
+      const subId = (r.sub_work_order_id ?? "").trim();
+      const idKey = subId || plan || ("row:" + r.row_key);
+      if (!m.has(lower)) m.set(lower, new Map());
+      const inner = m.get(lower)!;
+      if (!inner.has(idKey)) inner.set(idKey, { state, plan });
+    }
+    return m;
+  }
+  const cur = group(curR.results ?? []);
+  const prv = group(prvR.results ?? []);
+
+  const insert = env.ETIC_SNAPSHOTS.prepare(
+    `INSERT OR REPLACE INTO work_order_changelog
+       (work_order_id, snapshot_date_key, changed_at_iso, field, old_value, new_value)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  );
+  const stmts: D1PreparedStatement[] = [];
+  const allParents = new Set<string>([...cur.keys(), ...prv.keys()]);
+  for (const lower of allParents) {
+    const parent = parentCasing.get(lower) || lower;
+    const cmap = cur.get(lower) ?? new Map<string, SubInfo>();
+    const pmap = prv.get(lower) ?? new Map<string, SubInfo>();
+    const allSubs = new Set<string>([...cmap.keys(), ...pmap.keys()]);
+    for (const subKey of allSubs) {
+      const c = cmap.get(subKey);
+      const p = pmap.get(subKey);
+      const safeKey = subKey.slice(0, 120);
+      if (c && !p) {
+        stmts.push(
+          insert.bind(
+            parent,
+            currentDateKey,
+            receivedAtIso,
+            "sub_wo_added:" + safeKey,
+            "",
+            JSON.stringify({ state: c.state, plan: c.plan }),
+          ),
+        );
+      } else if (!c && p) {
+        stmts.push(
+          insert.bind(
+            parent,
+            currentDateKey,
+            receivedAtIso,
+            "sub_wo_removed:" + safeKey,
+            JSON.stringify({ state: p.state, plan: p.plan }),
+            "",
+          ),
+        );
+      } else if (c && p && c.state !== p.state) {
+        stmts.push(
+          insert.bind(
+            parent,
+            currentDateKey,
+            receivedAtIso,
+            "sub_wo_state:" + safeKey,
+            JSON.stringify({ state: p.state, plan: p.plan }),
+            JSON.stringify({ state: c.state, plan: c.plan }),
+          ),
+        );
+      }
+    }
+  }
+  if (!stmts.length) return 0;
+  const BATCH = 50;
+  for (let i = 0; i < stmts.length; i += BATCH) {
+    await env.ETIC_SNAPSHOTS.batch(stmts.slice(i, i + BATCH));
+  }
+  return stmts.length;
 }
 
 async function resolveOswoSnapshotDateKeyForAsOf(
@@ -2795,7 +3022,9 @@ function accumulateOswoSnapshotRowIntoParentAgg(
 
 /**
  * Same aggregates as {@link loadOswoParentAggregatesForSnapshot} but only for the given
- * parent work order ids (Schedule Mx needs open WOs only — avoids a full-table scan).
+ * parent work order ids. One D1 read for the import date then filter in memory — many batched
+ * `IN (…90)` round-trips were dominating wall time when hundreds of open parents appear on
+ * the latest ETIC book.
  */
 export async function loadOswoParentAggregatesForParentIds(
   env: { ETIC_SNAPSHOTS: D1Database },
@@ -2803,20 +3032,18 @@ export async function loadOswoParentAggregatesForParentIds(
   parentIds: string[],
 ): Promise<Map<string, OswoParentAgg>> {
   const byLower = new Map<string, OswoParentAgg>();
-  const uniqLower = [...new Set(parentIds.map((p) => (p ?? "").trim().toLowerCase()).filter(Boolean))];
-  if (!uniqLower.length) return byLower;
-  const batchSize = 90;
-  const flat = await runAssetIdBatchesInParallel(uniqLower, batchSize, async (chunk) => {
-    const ph = chunk.map(() => "?").join(",");
-    const r = await env.ETIC_SNAPSHOTS.prepare(
-      `SELECT parent_work_order_id, raw_row_json FROM oswo_sub_work_order_snapshot
-       WHERE snapshot_date_key = ? AND lower(trim(parent_work_order_id)) IN (${ph})`,
-    )
-      .bind(snapshotKey, ...chunk)
-      .all<{ parent_work_order_id: string; raw_row_json: string }>();
-    return r.results ?? [];
-  });
-  for (const row of flat) {
+  const parentSet = new Set(parentIds.map((p) => (p ?? "").trim().toLowerCase()).filter(Boolean));
+  if (!parentSet.size) return byLower;
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT parent_work_order_id, raw_row_json FROM oswo_sub_work_order_snapshot
+     WHERE snapshot_date_key = ?`,
+  )
+    .bind(snapshotKey)
+    .all<{ parent_work_order_id: string; raw_row_json: string }>();
+  for (const row of r.results ?? []) {
+    const p = (row.parent_work_order_id ?? "").trim();
+    if (!p) continue;
+    if (!parentSet.has(p.toLowerCase())) continue;
     accumulateOswoSnapshotRowIntoParentAgg(byLower, row);
   }
   return byLower;
@@ -2931,14 +3158,15 @@ export async function getScheduleMxFleetForDate(
   opts?: { includeOswoGaps?: boolean },
 ): Promise<ScheduleMxFleetRow[]> {
   const includeOswoGaps = opts?.includeOswoGaps !== false;
-  const [planRows, woCounts] = await Promise.all([
+  const [planRows, woCounts, eticKeyForContext] = await Promise.all([
     loadScheduleMxPlanRowsForDate(env, dateKey),
     loadWoCountsPerAsset(env, dateKey),
+    getLatestEticSnapshotDateKey(env),
   ]);
   if (planRows.length === 0) return [];
   const rows = buildScheduleMxRowsFromPlanRows(planRows, woCounts, dateKey);
   const assetIds = [...new Set(rows.map((r) => (r.assetId ?? "").trim()).filter(Boolean))];
-  const { eticDateKey, byAsset } = await loadScheduleMxEticContextByAsset(env, assetIds);
+  const { eticDateKey, byAsset } = await loadScheduleMxEticContextByAsset(env, assetIds, eticKeyForContext);
 
   let oswoAggPromise: Promise<Map<string, OswoParentAgg>> = Promise.resolve(new Map<string, OswoParentAgg>());
   if (includeOswoGaps && eticDateKey) {
@@ -3431,9 +3659,12 @@ export async function getChangelogFromSnapshots(
 }
 
 /**
- * Work-order change timeline for display. Derive from consecutive snapshot rows
- * first so stale persisted changelog rows cannot invent a later tracking start.
- * Fall back to work_order_changelog only when snapshot history is unavailable.
+ * Work-order change timeline for display. Derive ETIC field changes from
+ * consecutive snapshot rows so stale persisted changelog rows cannot invent a
+ * later tracking start. Sub-WO events (`sub_wo_added` / `sub_wo_removed` /
+ * `sub_wo_state`) are not derivable from snapshots, so they are always merged
+ * in from the persisted changelog. Falls back to the persisted log entirely
+ * when snapshot history is unavailable.
  */
 export async function getChangelogForDisplay(
   env: { ETIC_SNAPSHOTS: D1Database },
@@ -3441,7 +3672,25 @@ export async function getChangelogForDisplay(
   limit = 500,
 ): Promise<WorkOrderChangelogEntry[]> {
   const fromSnapshots = await getChangelogFromSnapshots(env, workOrderId, limit);
-  if (fromSnapshots.length > 0) return fromSnapshots;
+  const subWoR = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT id, snapshot_date_key, changed_at_iso, field, old_value, new_value
+     FROM work_order_changelog
+     WHERE work_order_id = ? AND field LIKE 'sub_wo_%'
+     ORDER BY id DESC LIMIT ?`,
+  )
+    .bind(workOrderId, limit)
+    .all<{
+      id: number;
+      snapshot_date_key: string;
+      changed_at_iso: string;
+      field: string;
+      old_value: string | null;
+      new_value: string | null;
+    }>();
+  const subWoEntries = subWoR.results ?? [];
+  if (fromSnapshots.length > 0 || subWoEntries.length > 0) {
+    return [...fromSnapshots, ...subWoEntries];
+  }
   return getChangelog(env, workOrderId, limit);
 }
 
