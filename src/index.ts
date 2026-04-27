@@ -18665,7 +18665,7 @@ function renderDashboardHtml(): string {
         if (asOf) {
           const cached = watchCacheByDate.get(asOf);
           if (cached && cached.length) {
-            renderWoList(cached);
+            renderWoList(cached, { preserveScroll: true });
             loadSightings(false);
             loadWaiverCounts(false);
             loadYardPhotoLatest(false);
@@ -20746,15 +20746,59 @@ function renderDashboardHtml(): string {
       rebuild(mgmtSel, "All Mgmt Cd", mgmtItems, woMgmtCd);
     }
 
-    function renderWoList(rows) {
+    function captureWoListScroll(list) {
+      if (!list) return null;
+      const listTop = list.getBoundingClientRect().top;
+      const cards = list.querySelectorAll(".wo-card");
+      for (var i = 0; i < cards.length; i++) {
+        const card = cards[i];
+        const rect = card.getBoundingClientRect();
+        if (rect.bottom >= listTop) {
+          return {
+            woId: card.getAttribute("data-wo") || "",
+            offsetTop: rect.top - listTop,
+            scrollTop: list.scrollTop,
+          };
+        }
+      }
+      return { woId: "", offsetTop: 0, scrollTop: list.scrollTop };
+    }
+
+    function restoreWoListScroll(list, anchor) {
+      if (!list || !anchor) return;
+      requestAnimationFrame(function () {
+        if (!list.isConnected) return;
+        var restored = false;
+        if (anchor.woId) {
+          const cards = list.querySelectorAll(".wo-card");
+          for (var i = 0; i < cards.length; i++) {
+            const card = cards[i];
+            if ((card.getAttribute("data-wo") || "") !== anchor.woId) continue;
+            const listTop = list.getBoundingClientRect().top;
+            const rect = card.getBoundingClientRect();
+            list.scrollTop += rect.top - listTop - anchor.offsetTop;
+            restored = true;
+            break;
+          }
+        }
+        if (!restored) {
+          const max = Math.max(0, list.scrollHeight - list.clientHeight);
+          list.scrollTop = Math.min(anchor.scrollTop || 0, max);
+        }
+      });
+    }
+
+    function renderWoList(rows, opts) {
       const list = document.getElementById("wo-list");
       const meta = document.getElementById("wo-list-meta");
+      const scrollAnchor = opts && opts.preserveScroll ? captureWoListScroll(list) : null;
       refreshRefineOptions(rows);
       const visible = filterAndSortWoList(rows);
       renderWoListCounts(rows);
       meta.textContent = visible.length + " of " + rows.length + " work orders";
       if (!visible.length) {
         list.innerHTML = "<div class='problem-empty' style='padding:18px 4px'>No work orders match this filter.</div>";
+        restoreWoListScroll(list, scrollAnchor);
         return;
       }
       list.innerHTML = visible.map(function (r) {
@@ -20840,6 +20884,7 @@ function renderDashboardHtml(): string {
           if (wo) selectWo(wo, true);
         });
       });
+      restoreWoListScroll(list, scrollAnchor);
     }
 
     async function loadAndRenderWoList(dateKey, opts) {
@@ -20855,7 +20900,7 @@ function renderDashboardHtml(): string {
           loadYardPhotoLatest(force),
         ]).then(function () {
           if (woAsOfDate() !== dateKey) return;
-          renderWoList(rows);
+          renderWoList(rows, { preserveScroll: true });
         });
       } catch (e) {
         meta.textContent = "Could not load work orders.";
