@@ -14608,9 +14608,12 @@ function renderDashboardHtml(): string {
       font-variant-numeric: tabular-nums;
     }
     .smx-commander-table .smx-cmd-mail-col { width: 1%; white-space: nowrap; }
-    .smx-commander-table tbody tr.smx-cmd-row--ok { background: rgba(34, 160, 90, 0.06); }
-    .smx-commander-table tbody tr.smx-cmd-row--warn { background: rgba(245, 199, 84, 0.12); }
-    .smx-commander-table tbody tr.smx-cmd-row--bad { background: rgba(176, 0, 32, 0.07); }
+    .smx-commander-table tbody tr.smx-cmd-row--ok { background: rgba(34, 160, 90, 0.055); }
+    .smx-commander-table tbody tr.smx-cmd-row--warn { background: rgba(245, 199, 84, 0.13); }
+    .smx-commander-table tbody tr.smx-cmd-row--bad {
+      background: linear-gradient(90deg, rgba(176, 0, 32, 0.11), rgba(176, 0, 32, 0.045));
+      box-shadow: inset 3px 0 0 var(--danger);
+    }
     .smx-commander-table tbody tr.smx-cmd-row--active {
       outline: 2px solid var(--accent);
       outline-offset: -2px;
@@ -14657,6 +14660,22 @@ function renderDashboardHtml(): string {
     }
     .smx-cmd-pct-bar.bad > i {
       background: linear-gradient(90deg, var(--danger) 0%, #8b1538 100%);
+    }
+    .smx-cmd-overdue-pill {
+      display: inline-flex;
+      align-items: center;
+      justify-content: flex-end;
+      min-width: 2.2rem;
+      padding: 3px 8px;
+      border-radius: 999px;
+      font-weight: 800;
+      color: var(--danger);
+      background: rgba(176, 0, 32, 0.09);
+    }
+    .smx-cmd-overdue-pill--crit {
+      color: #7a1020;
+      background: rgba(120, 16, 32, 0.13);
+      box-shadow: inset 0 0 0 1px rgba(120, 16, 32, 0.18);
     }
     .smx-vco-toolkit-panel { padding: 0; }
     .smx-tool-panel .smx-vco-toolkit-hero--panel {
@@ -14960,6 +14979,9 @@ function renderDashboardHtml(): string {
       margin: 0 0 6px;
       font-size: 0.58rem;
       letter-spacing: 0.07em;
+      display: flex;
+      align-items: center;
+      gap: 6px;
     }
     .smx-plan-facts .wo-facts-dl {
       gap: 8px 14px;
@@ -15032,6 +15054,21 @@ function renderDashboardHtml(): string {
       font-variant-numeric: tabular-nums;
       color: var(--text);
       line-height: 1.25;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .smx-uom-chip {
+      display: inline-flex;
+      align-items: center;
+      padding: 1px 6px;
+      border-radius: 999px;
+      background: rgba(0, 58, 140, 0.08);
+      color: var(--accent);
+      font-size: 0.56rem;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
     }
     .smx-plain-callout .smx-util-progress-wrap {
       margin-top: 8px;
@@ -16950,6 +16987,15 @@ function renderDashboardHtml(): string {
       );
     }
 
+    function refreshRenderedAssetBadges(scopeSelector) {
+      var root = scopeSelector ? document.querySelector(scopeSelector) : document;
+      if (!root) return;
+      root.querySelectorAll("[data-asset-badges]").forEach(function (el) {
+        var aid = el.getAttribute("data-asset-badges") || "";
+        el.innerHTML = renderSightingBadge(aid) + renderYardPhotoThumb(aid);
+      });
+    }
+
     var yardPhotoLightboxWired = false;
     function wireYardPhotoLightboxOnce() {
       if (yardPhotoLightboxWired) return;
@@ -18754,6 +18800,13 @@ function renderDashboardHtml(): string {
 
     function smxSetFilter(mode) {
       smxFilter = mode || "all";
+      if (smxFilter === "plan_gap" && !smxOswoGapsIncluded && !smxLoadingGaps) {
+        loadScheduleMxOswoGaps();
+      }
+      if (smxFilter === "plan_gap" && smxLoadingGaps) {
+        const meta = document.getElementById("smx-list-meta");
+        if (meta) meta.textContent = "Loading OSWO gap check…";
+      }
       var smxFilt = document.getElementById("smx-filters");
       if (smxFilt) {
         smxFilt.querySelectorAll(".wo-filter-btn").forEach(function (x) {
@@ -18771,6 +18824,10 @@ function renderDashboardHtml(): string {
     /** Wing commander summary from API + optional unit filter for asset list. */
     var smxCommander = null;
     var smxCommanderFilterUnit = "";
+    var smxOswoGapsIncluded = false;
+    var smxLoadingGaps = false;
+    var smxLoadSeq = 0;
+    var smxCache = new Map();
 
     function smxFmtPct2(n) {
       var x = Number(n);
@@ -19431,7 +19488,7 @@ function renderDashboardHtml(): string {
             "<td><button type='button' class='smx-cmd-unit-btn' data-smx-cmd-unit='" +
             esc(u.unit) +
             "' title='Filter asset list to this unit'>" +
-            esc(u.unit) +
+            esc(smxDisplayUnitName(u.unit)) +
             "</button></td>" +
             "<td class='smx-cmd-num'>" +
             esc(String(u.totalVehicles)) +
@@ -19447,10 +19504,10 @@ function renderDashboardHtml(): string {
             esc(smxFmtPct2(pct)) +
             "%</span></td>" +
             "<td class='smx-cmd-num'>" +
-            esc(String(u.overdue)) +
+            (u.overdue > 0 ? "<span class='smx-cmd-overdue-pill'>" + esc(String(u.overdue)) + "</span>" : "0") +
             "</td>" +
             "<td class='smx-cmd-num'>" +
-            esc(String(u.nceOverdue)) +
+            (u.nceOverdue > 0 ? "<span class='smx-cmd-overdue-pill smx-cmd-overdue-pill--crit'>" + esc(String(u.nceOverdue)) + "</span>" : "0") +
             "</td>" +
             "<td class='smx-cmd-mail-col'><button type='button' class='smx-cmd-mini-copy smx-cmd-copy-html-unit' data-smx-copy-html-unit='" +
             esc(u.unit) +
@@ -19478,6 +19535,18 @@ function renderDashboardHtml(): string {
       var aid = row && row.assetId ? String(row.assetId).trim() : "";
       if (aid.toUpperCase().startsWith("MSX")) return SMX_791_MXS;
       return row && row.owningUnit ? String(row.owningUnit).trim() : "";
+    }
+
+    function smxDisplayUnitName(unit) {
+      var u = String(unit || "").trim();
+      if (!u) return "(Unknown unit)";
+      if (/^\\d+$/.test(u)) return "Unit " + u;
+      return u;
+    }
+
+    function updateScheduleMxListBadges() {
+      refreshRenderedAssetBadges("#smx-list");
+      refreshRenderedAssetBadges("#smx-hero");
     }
 
     function smxNormUnitFromRow(row) {
@@ -19722,8 +19791,10 @@ function renderDashboardHtml(): string {
         "<div class='wo-hero-row'>" +
         "<div class='wo-hero-id'>" + esc(assetId) + "</div>" +
         chips.join("") +
+        "<span data-asset-badges='" + esc(assetId) + "'>" +
         renderSightingBadge(assetId) +
-        (yp ? "<span class='smx-hero-yphoto'>" + yp + "</span>" : "") +
+        (yp ? yp : "") +
+        "</span>" +
         "</div>" +
         smxAssetIdentityStripFromPlans(plans);
     }
@@ -19854,7 +19925,7 @@ function renderDashboardHtml(): string {
           renderSmxVcoMail();
           return;
         }
-        const r = await fetch("/api/schedule-mx?date=" + encodeURIComponent(dk));
+        const r = await fetch("/api/schedule-mx?date=" + encodeURIComponent(dk) + "&gaps=0");
         const j = await r.json();
         if (!r.ok) {
           if (statsEl) statsEl.textContent = j.error || "Could not load schedule maintenance.";
@@ -19874,6 +19945,9 @@ function renderDashboardHtml(): string {
         smxStats = j.stats || null;
         smxCommander = j.commander || null;
         smxCommanderFilterUnit = "";
+        smxOswoGapsIncluded = !!j.oswoGapsIncluded;
+        smxLoadingGaps = false;
+        smxCache.set(dk + "|gaps=0", j);
         smxEticDateKey = j.eticDateKey || null;
         if (pill && dk && smxEticDateKey) {
           pill.setAttribute("title", "Import " + fmtKeyLong(dk) + " · Fleet book " + fmtKeyLong(smxEticDateKey));
@@ -19889,7 +19963,7 @@ function renderDashboardHtml(): string {
         Promise.all([loadSightings(false), loadYardPhotoLatest(false)]).then(function () {
           const p = document.getElementById("panel-schedule-mx");
           if (!p || p.classList.contains("hidden")) return;
-          renderScheduleMxList();
+          updateScheduleMxListBadges();
         });
       } catch (e) {
         if (statsEl) statsEl.textContent = "Could not load schedule maintenance.";
@@ -19901,6 +19975,46 @@ function renderDashboardHtml(): string {
         smxCommanderFilterUnit = "";
         renderSmxCommander();
         renderSmxVcoMail();
+      }
+    }
+
+    async function loadScheduleMxOswoGaps() {
+      var dk = smxSelectedDateKey || "";
+      if (!dk || smxOswoGapsIncluded || smxLoadingGaps) return;
+      var cached = smxCache.get(dk + "|gaps=1");
+      if (cached) {
+        smxRows = Array.isArray(cached.rows) ? cached.rows : [];
+        smxStats = cached.stats || smxStats;
+        smxCommander = cached.commander || smxCommander;
+        smxOswoGapsIncluded = !!cached.oswoGapsIncluded;
+        renderSmxCommander();
+        renderSmxVcoMail();
+        renderScheduleMxStats();
+        renderScheduleMxList();
+        return;
+      }
+      smxLoadingGaps = true;
+      var seq = ++smxLoadSeq;
+      var meta = document.getElementById("smx-list-meta");
+      if (meta) meta.textContent = "Loading OSWO gap check…";
+      try {
+        var r = await fetch("/api/schedule-mx?date=" + encodeURIComponent(dk));
+        var j = await r.json();
+        if (seq !== smxLoadSeq || dk !== (smxSelectedDateKey || "")) return;
+        if (!r.ok) throw new Error(j && j.error ? j.error : "OSWO gap check failed");
+        smxRows = Array.isArray(j.rows) ? j.rows : [];
+        smxStats = j.stats || smxStats;
+        smxCommander = j.commander || smxCommander;
+        smxOswoGapsIncluded = !!j.oswoGapsIncluded;
+        smxCache.set(dk + "|gaps=1", j);
+        renderSmxCommander();
+        renderSmxVcoMail();
+        renderScheduleMxStats();
+        renderScheduleMxList();
+      } catch (e) {
+        if (meta) meta.textContent = "Could not load OSWO gap check.";
+      } finally {
+        smxLoadingGaps = false;
       }
     }
 
@@ -20329,9 +20443,12 @@ function renderDashboardHtml(): string {
       }
       const calloutCls =
         "smx-plain-callout smx-plain-callout--compact" + (overUtil ? " smx-plain-callout--warn" : "");
+      const leadSafe = esc(lead);
       return (
         "<section class='wo-facts-group smx-util-section' aria-label='Service meter'>" +
-        "<h4 class='wo-facts-group-h'>Service meter</h4>" +
+        "<h4 class='wo-facts-group-h'>Service meter" +
+        (uom ? "<span class='smx-uom-chip'>" + esc(uom) + "</span>" : "") +
+        "</h4>" +
         "<div class='" +
         esc(calloutCls) +
         "' role='status'>" +
@@ -20358,7 +20475,7 @@ function renderDashboardHtml(): string {
         "<p class='" +
         esc(leadCls) +
         "'>" +
-        lead +
+        leadSafe +
         "</p>" +
         "</div></section>"
       );
@@ -20535,7 +20652,8 @@ function renderDashboardHtml(): string {
           "<div class='smx-card" + (isActive ? " active" : "") + "' data-smx-asset='" + esc(assetId) + "' data-smx-tier='" + esc(tier) + "' tabindex='0' role='button' aria-label='Select asset " + esc(assetId) + "'>" +
           "<div class='top-line'>" +
           "<span class='asset-mono smx-card-select'>" + esc(assetId) + "</span>" +
-          "<span class='badges'>" + nceChip + critChip + planGapChip + aggPill + renderSightingBadge(assetId) + "</span>" +
+          "<span class='badges'>" + nceChip + critChip + planGapChip + aggPill +
+          "<span data-asset-badges='" + esc(assetId) + "'>" + renderSightingBadge(assetId) + renderYardPhotoThumb(assetId) + "</span></span>" +
           "</div>" +
           "<div class='meta smx-card-select'>" + metaBits.join("") + "</div>" +
           "</div>"
