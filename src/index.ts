@@ -14767,6 +14767,12 @@ function renderDashboardHtml(): string {
     }
 
     /* Schedule Mx tab — same split-pane rhythm as Work Orders */
+    body.smx-tab-active {
+      overflow: hidden;
+    }
+    body.smx-tab-active .app {
+      padding-bottom: 0;
+    }
     #panel-schedule-mx {
       height: calc(100vh - 150px);
       min-height: 620px;
@@ -14794,6 +14800,12 @@ function renderDashboardHtml(): string {
       overscroll-behavior: contain;
     }
     @media (max-width: 760px) {
+      body.smx-tab-active {
+        overflow: auto;
+      }
+      body.smx-tab-active .app {
+        padding-bottom: 88px;
+      }
       #panel-schedule-mx {
         height: auto;
         min-height: 0;
@@ -18726,6 +18738,7 @@ function renderDashboardHtml(): string {
       const isAsk = which === "ask";
       const isSet = which === "settings";
       const isSnap = !isWo && !isSmx && !isAuthz && !isMel && !isMeet && !isYard && !isWv && !isAbuse && !isAsk && !isSet;
+      document.body.classList.toggle("schedule-mx-mode", isSmx);
       snapBtn.classList.toggle("active", isSnap);
       woBtn.classList.toggle("active", isWo);
       if (smxBtn) smxBtn.classList.toggle("active", isSmx);
