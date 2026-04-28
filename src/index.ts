@@ -648,7 +648,7 @@ export default {
     }
 
     if (url.pathname === "/api/schedule-mx") {
-      return handleScheduleMxApi(env, request);
+      return handleScheduleMxApi(env, request, ctx);
     }
 
     if (url.pathname === "/api/authz-manager") {
@@ -1117,6 +1117,12 @@ async function buildYardCheckMeta(env: Env, request: Request): Promise<YardCheck
 function cacheHeaders(): HeadersInit {
   return {
     "Cache-Control": "no-store",
+  };
+}
+
+function scheduleMxCacheHeaders(): HeadersInit {
+  return {
+    "Cache-Control": "public, max-age=60, s-maxage=300",
   };
 }
 
@@ -4998,7 +5004,7 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
   );
 }
 
-async function handleScheduleMxApi(env: Env, request: Request): Promise<Response> {
+async function handleScheduleMxApi(env: Env, request: Request, ctx: ExecutionContext): Promise<Response> {
   if (request.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
   const url = new URL(request.url);
   if (url.searchParams.get("dates") === "1") {
@@ -5007,6 +5013,7 @@ async function handleScheduleMxApi(env: Env, request: Request): Promise<Response
     return Response.json({ dates, latest }, { headers: cacheHeaders() });
   }
 
+  const explicitDate = url.searchParams.has("date");
   let dateKey = url.searchParams.get("date")?.trim() ?? "";
   if (!dateKey) {
     dateKey = (await getLatestScheduleMxExtractDateKey(env)) ?? "";
@@ -5025,6 +5032,12 @@ async function handleScheduleMxApi(env: Env, request: Request): Promise<Response
   }
   /** When "0", skip OSWO aggregation (Plan not on WO badge cleared); default full gap detection. */
   const includeOswoGaps = url.searchParams.get("gaps") !== "0";
+  const cacheKey = explicitDate ? new Request(url.toString(), request) : null;
+  const edgeCache = (caches as unknown as { default?: Cache }).default;
+  if (cacheKey && edgeCache) {
+    const cached = await edgeCache.match(cacheKey);
+    if (cached) return cached;
+  }
   const rows = await getScheduleMxFleetForDate(env, dateKey, { includeOswoGaps });
   if (rows.length === 0) {
     return Response.json(
@@ -5041,7 +5054,7 @@ async function handleScheduleMxApi(env: Env, request: Request): Promise<Response
   const stats = computeScheduleMxAssetStats(rows);
   const commander = computeScheduleMxCommanderSummary(rows);
   const eticDateKey = rows.length ? rows[0].eticSnapshotDateKey ?? null : null;
-  return Response.json(
+  const response = Response.json(
     {
       dateKey,
       eticDateKey,
@@ -5051,8 +5064,12 @@ async function handleScheduleMxApi(env: Env, request: Request): Promise<Response
       source: "prevmx_extract",
       oswoGapsIncluded: includeOswoGaps,
     },
-    { headers: cacheHeaders() },
+    { headers: explicitDate ? scheduleMxCacheHeaders() : cacheHeaders() },
   );
+  if (cacheKey && edgeCache) {
+    ctx.waitUntil(edgeCache.put(cacheKey, response.clone()));
+  }
+  return response;
 }
 
 async function handleAuthzManagerApi(env: Env, request: Request): Promise<Response> {
@@ -19837,7 +19854,7 @@ function renderDashboardHtml(): string {
           renderSmxVcoMail();
           return;
         }
-        const r = await fetch("/api/schedule-mx?date=" + encodeURIComponent(dk), { cache: "no-store" });
+        const r = await fetch("/api/schedule-mx?date=" + encodeURIComponent(dk));
         const j = await r.json();
         if (!r.ok) {
           if (statsEl) statsEl.textContent = j.error || "Could not load schedule maintenance.";
