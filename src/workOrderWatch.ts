@@ -970,7 +970,10 @@ function rowToWatchRow(
     firstEticDate: row.first_etic_date,
     lastEticDate: row.last_etic_date,
     lastSnapshotDate: row.last_snapshot_date,
-    owningUnit: owningUnitForAssetId(row.asset_id, row.owning_unit ?? ""),
+    owningUnit: owningUnitForAssetId(
+      row.asset_id,
+      cleanOwningUnitCandidate(row.owning_unit) || watchOwningUnitFromRawJson(row.raw_row_json),
+    ),
     melKey: row.mel_key ?? "",
     shop: row.shop ?? "",
     mgmtCd: row.mgmt_cd ?? "",
