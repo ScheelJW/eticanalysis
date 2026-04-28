@@ -14768,6 +14768,7 @@ function renderDashboardHtml(): string {
 
     /* Schedule Mx tab — same split-pane rhythm as Work Orders */
     .smx-layout {
+      grid-template-columns: minmax(280px, 390px) minmax(0, 1fr);
       height: calc(100vh - 190px);
       min-height: 560px;
       overflow: hidden;
@@ -14781,8 +14782,9 @@ function renderDashboardHtml(): string {
       overflow-y: auto;
       overscroll-behavior: contain;
     }
-    @media (max-width: 960px) {
+    @media (max-width: 760px) {
       .smx-layout {
+        grid-template-columns: 1fr;
         height: auto;
         min-height: 0;
         overflow: visible;
