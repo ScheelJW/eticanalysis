@@ -163,8 +163,9 @@ function cleanFullOwningUnitLabel(raw: string | null | undefined): string {
 }
 
 function cleanHistoricalOwningUnitLabel(raw: string | null | undefined): string {
-  const t = cleanFullOwningUnitLabel(raw);
+  const t = cleanOwningUnitCandidate(raw);
   if (!t) return "";
+  if (!/[A-Za-z]/.test(t)) return "";
   return t;
 }
 
