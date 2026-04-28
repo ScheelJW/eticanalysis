@@ -14767,6 +14767,7 @@ function renderDashboardHtml(): string {
     }
 
     /* Schedule Mx tab — same split-pane rhythm as Work Orders */
+    html.schedule-mx-mode,
     body.schedule-mx-mode {
       overflow: hidden;
       height: 100vh;
@@ -14801,6 +14802,7 @@ function renderDashboardHtml(): string {
       overscroll-behavior: contain;
     }
     @media (max-width: 760px) {
+      html.schedule-mx-mode,
       body.schedule-mx-mode {
         overflow: auto;
         height: auto;
@@ -18740,7 +18742,8 @@ function renderDashboardHtml(): string {
       const isAsk = which === "ask";
       const isSet = which === "settings";
       const isSnap = !isWo && !isSmx && !isAuthz && !isMel && !isMeet && !isYard && !isWv && !isAbuse && !isAsk && !isSet;
-      document.body.classList.toggle("smx-tab-active", isSmx);
+      document.documentElement.classList.toggle("schedule-mx-mode", isSmx);
+      document.body.classList.toggle("schedule-mx-mode", isSmx);
       if (isSmx) {
         try { window.scrollTo(0, 0); } catch (_e) {}
       }
