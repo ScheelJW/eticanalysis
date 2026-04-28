@@ -165,7 +165,7 @@ function cleanFullOwningUnitLabel(raw: string | null | undefined): string {
 function cleanHistoricalOwningUnitLabel(raw: string | null | undefined): string {
   const t = cleanFullOwningUnitLabel(raw);
   if (!t) return "";
-  return looksLikeFullOwningUnit(t) ? t : "";
+  return t;
 }
 
 const USER_CD_TO_OWNING_UNIT: Record<string, string> = {
