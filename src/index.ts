@@ -20080,24 +20080,24 @@ function renderDashboardHtml(): string {
      * Glossary cells like 'h - hour' or 'mi / miles' map to a single pluralized label.
      */
     function smxUtilUomLabel(utRaw) {
-      const raw = String(utRaw == null ? '' : utRaw).replace(/\s+/g, ' ').trim();
+      const raw = String(utRaw == null ? '' : utRaw).replace(/\\s+/g, ' ').trim();
       if (!raw) return '';
       const nocomma = raw.replace(/,/g, '');
-      if (/^-?\d+(?:\.\d+)?$/.test(nocomma)) return '';
-      if (/^[A-Z]?\d{6,}[A-Z]?$/i.test(raw) || /^[A-Z]\d{2,}[A-Z]{2,}\d+$/i.test(raw)) return '';
-      if (/\boverdue\b/i.test(raw) && /(?:\b\d{2}[A-Z]{2}\b|\(|\d+\s*(?:mi|mile|miles|hr|hrs|hour|hours)\b)/i.test(raw)) return '';
+      if (/^-?\\d+(?:\\.\\d+)?$/.test(nocomma)) return '';
+      if (/^[A-Z]?\\d{6,}[A-Z]?$/i.test(raw) || /^[A-Z]\\d{2,}[A-Z]{2,}\\d+$/i.test(raw)) return '';
+      if (/\\boverdue\\b/i.test(raw) && /(?:\\b\\d{2}[A-Z]{2}\\b|\\(|\\d+\\s*(?:mi|mile|miles|hr|hrs|hour|hours)\\b)/i.test(raw)) return '';
       if (raw.length > 40 && /[,()]/.test(raw)) return '';
       const s = raw.toLowerCase();
-      const tokens = s.split(/\s*[-/|]\s*/).map(function (t) { return t.trim(); }).filter(Boolean);
+      const tokens = s.split(/\\s*[-/|]\\s*/).map(function (t) { return t.trim(); }).filter(Boolean);
       for (let i = 0; i < tokens.length; i++) {
         const t = tokens[i];
         if (/^(h|hr|hrs|hour|hours)$/.test(t)) return 'hours';
         if (/^(mi|mile|miles|odo|odometer)$/.test(t)) return 'miles';
         if (/^(km|kilometer|kilometers|kilometre|kilometres)$/.test(t)) return 'kilometers';
       }
-      if (/\b(hour|hours|hr|hrs|operating hour|engine hour|eng)\b/.test(s)) return 'hours';
-      if (/\b(mile|miles|mi|odometer|mph)\b/.test(s)) return 'miles';
-      if (/\b(km|kilometer|kilometre)/.test(s)) return 'kilometers';
+      if (/\\b(hour|hours|hr|hrs|operating hour|engine hour|eng)\\b/.test(s)) return 'hours';
+      if (/\\b(mile|miles|mi|odometer|mph)\\b/.test(s)) return 'miles';
+      if (/\\b(km|kilometer|kilometre)/.test(s)) return 'kilometers';
       return raw;
     }
 
