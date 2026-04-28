@@ -302,6 +302,14 @@ describe("utilization type and meter due soon", () => {
     expect(utilizationTypeFromFleetRawJson(j)).toBe("");
   });
 
+  it("ignores ELMS overdue meter-summary text as a utilization type", () => {
+    const j = JSON.stringify({
+      "fleet.vehicle utilization uom": "overdue 34aa (313 miles overdue), 35bd (313 miles overdue)",
+      "fleet.smr": "AF10B01142",
+    });
+    expect(utilizationTypeFromFleetRawJson(j)).toBe("");
+  });
+
   it("hour-meter: 274h remaining to target is not meter due soon (274 > 50)", () => {
     const raw: Record<string, string> = {
       "x.next util": "872",
@@ -441,6 +449,7 @@ describe("cleanUtilUomLabel", () => {
   it("returns empty for asset ids and overdue schedule-summary text", () => {
     expect(cleanUtilUomLabel("E441VV00000170")).toBe("");
     expect(cleanUtilUomLabel("Overdue 34AA (12 Nov 25 or 1941 miles)")).toBe("");
+    expect(cleanUtilUomLabel("overdue 34aa (313 miles overdue), 35bd (313 miles overdue)")).toBe("");
   });
 
   it("falls through unknown labels with whitespace collapsed", () => {

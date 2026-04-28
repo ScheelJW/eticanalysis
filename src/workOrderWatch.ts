@@ -1658,6 +1658,8 @@ function looksLikeScheduleSummaryText(s: string): boolean {
   if (!t) return false;
   if (/\b(overdue|due\s+soon|current)\b/.test(t) && /\b\d{1,2}\s+[a-z]{3}\s+\d{2,4}\b/.test(t)) return true;
   if (/\b\d+[a-z]{2}\b/.test(t) && /\bor\s+\d[\d,]*(?:\.\d+)?\s*(mile|miles|hour|hours|hr|hrs|km)\b/.test(t)) return true;
+  if (/\boverdue\b/.test(t) && /\b\d+[a-z]{2}\b/.test(t) && /\b(mile|miles|hour|hours|hr|hrs|km)\s+overdue\b/.test(t)) return true;
+  if (/^overdue\b/.test(t) && /\b\d+[a-z]{2}\b/.test(t) && /[,()]/.test(t)) return true;
   return false;
 }
 
