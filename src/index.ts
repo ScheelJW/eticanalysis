@@ -14767,14 +14767,31 @@ function renderDashboardHtml(): string {
     }
 
     /* Schedule Mx tab — same split-pane rhythm as Work Orders */
+    .smx-layout {
+      height: calc(100vh - 190px);
+      min-height: 560px;
+      overflow: hidden;
+      align-items: stretch;
+    }
+    .smx-layout .wo-sidebar,
     .smx-layout .wo-detail-pane {
-      position: sticky;
-      top: 20px;
-      max-height: calc(100vh - 40px);
+      position: static;
+      height: 100%;
+      max-height: none;
       overflow-y: auto;
+      overscroll-behavior: contain;
     }
     @media (max-width: 960px) {
-      .smx-layout .wo-detail-pane { position: static; max-height: none; overflow: visible; }
+      .smx-layout {
+        height: auto;
+        min-height: 0;
+        overflow: visible;
+      }
+      .smx-layout .wo-sidebar,
+      .smx-layout .wo-detail-pane {
+        height: auto;
+        overflow: visible;
+      }
     }
     .smx-layout .smx-panel-heading { margin-bottom: 10px; }
     .smx-panel-title { margin: 0 0 4px; font-size: 1.05rem; font-weight: 700; color: var(--text); }
