@@ -20084,6 +20084,9 @@ function renderDashboardHtml(): string {
       if (!raw) return '';
       const nocomma = raw.replace(/,/g, '');
       if (/^-?\d+(?:\.\d+)?$/.test(nocomma)) return '';
+      if (/^[A-Z]?\d{6,}[A-Z]?$/i.test(raw) || /^[A-Z]\d{2,}[A-Z]{2,}\d+$/i.test(raw)) return '';
+      if (/\boverdue\b/i.test(raw) && /(?:\b\d{2}[A-Z]{2}\b|\(|\d+\s*(?:mi|mile|miles|hr|hrs|hour|hours)\b)/i.test(raw)) return '';
+      if (raw.length > 40 && /[,()]/.test(raw)) return '';
       const s = raw.toLowerCase();
       const tokens = s.split(/\s*[-/|]\s*/).map(function (t) { return t.trim(); }).filter(Boolean);
       for (let i = 0; i < tokens.length; i++) {

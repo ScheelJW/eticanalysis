@@ -147,15 +147,55 @@ type WoStateRow = {
   updated_at_iso: string;
 };
 
-function guessOwningUnitFromFleetRaw(raw: Record<string, string> | undefined): string {
+function cleanOwningUnitCandidate(raw: string | null | undefined): string {
+  const t = String(raw ?? "").replace(/\s+/g, " ").trim();
+  if (!t) return "";
+  if (/^\d+$/.test(t)) return "";
+  return t;
+}
+
+function pickOwningUnitFromRaw(raw: Record<string, string> | undefined): string {
   if (!raw) return "";
+  const exactKeys = [
+    "fleet.owning unit",
+    "fleet.owning org",
+    "fleet.owning organization",
+    "fleet.user/unit",
+    "fleet.user unit",
+    "fleet.assigned unit",
+    "fleet.organization",
+    "fleet.squadron",
+    "fleet.customer unit",
+  ];
+  for (const key of exactKeys) {
+    const t = cleanOwningUnitCandidate(raw[key]);
+    if (t) return t;
+  }
   for (const [k, v] of Object.entries(raw)) {
     const kk = k.toLowerCase();
-    const t = (v ?? "").trim();
+    const t = cleanOwningUnitCandidate(v);
     if (!t) continue;
-    if (/\bunit\b|owning|organization|org\b|squadron|flight|assigned/.test(kk)) return t;
+    if (/owning|organization|org\b|squadron|flight|assigned|customer/.test(kk)) return t;
+    if (/\bunit\b/.test(kk) && /[a-z]/i.test(t)) return t;
   }
   return "";
+}
+
+function guessOwningUnitFromFleetRaw(raw: Record<string, string> | undefined): string {
+  return pickOwningUnitFromRaw(raw);
+}
+
+function parseRawJsonRecord(rawRowJson: string | null | undefined): Record<string, string> | undefined {
+  if (!rawRowJson || !rawRowJson.trim()) return undefined;
+  try {
+    return JSON.parse(rawRowJson) as Record<string, string>;
+  } catch {
+    return undefined;
+  }
+}
+
+function pickOwningUnitFromRawJson(rawRowJson: string | null | undefined): string {
+  return pickOwningUnitFromRaw(parseRawJsonRecord(rawRowJson));
 }
 
 function guessShopFromFleetRaw(raw: Record<string, string> | undefined, eticLocation: string): string {
@@ -187,7 +227,10 @@ function fleetRowFromFleetRecord(
   raw: Record<string, string> | undefined,
 ): { owning_unit: string; shop: string; make_model: string; veh_nomen: string; mgmt_cd: string; mel_key: string } {
   return {
-    owning_unit: owningUnitForAssetId((rec.assetId ?? "").trim(), guessOwningUnitFromFleetRaw(raw)),
+    owning_unit: owningUnitForAssetId(
+      (rec.assetId ?? "").trim(),
+      cleanOwningUnitCandidate((rec as FleetRecord & { owningUnit?: string }).owningUnit) || guessOwningUnitFromFleetRaw(raw),
+    ),
     shop: guessShopFromFleetRaw(raw, rec.etiCLocation ?? ""),
     make_model: (rec.makeModel ?? "").trim(),
     veh_nomen: (rec.vehNomen ?? "").trim(),
@@ -1258,7 +1301,7 @@ export async function loadScheduleMxEticContextByAsset(
     const ps = (row.parts_status ?? "").trim();
     if (partsStatusLooksInMaintenance(ps)) ctx.inMaintenance = true;
     if (workOrderRowLooksNmc(ps, row.raw_row_json)) ctx.nmcOnOpenWorkOrder = true;
-    const ou = (row.owning_unit ?? "").trim();
+    const ou = cleanOwningUnitCandidate(row.owning_unit) || pickOwningUnitFromRawJson(row.raw_row_json);
     if (ou && !ctx.owningUnit) ctx.owningUnit = ou;
     const mm = (row.make_model ?? "").trim();
     if (mm && !ctx.makeModel) ctx.makeModel = mm;
@@ -1286,7 +1329,9 @@ export async function loadScheduleMxEticContextByAsset(
     const nceStatus = (fpNce.nceStatus || w?.nceStatus || "").trim();
     byAsset.set(aid, {
       workOrderIds: w ? Array.from(w.workOrderIdSet) : [],
-      owningUnit: (f?.owning_unit ?? "").trim() || (w?.owningUnit ?? ""),
+      owningUnit:
+        (f ? cleanOwningUnitCandidate(f.owning_unit) || pickOwningUnitFromRawJson(f.raw_row_json) : "") ||
+        (w?.owningUnit ?? ""),
       makeModel: (f?.make_model ?? "").trim() || (w?.makeModel ?? ""),
       vehNomen: (f?.veh_nomen ?? "").trim() || (w?.vehNomen ?? ""),
       mgmtCd: (f?.mgmt_cd ?? "").trim() || (w?.mgmtCd ?? ""),
@@ -1602,6 +1647,33 @@ function looksLikePureNumberToken(s: string): boolean {
   return /^-?\d+(?:\.\d+)?$/.test(t);
 }
 
+function looksLikeAssetIdentifierToken(s: string): boolean {
+  const t = s.trim().toUpperCase();
+  if (!t) return false;
+  return /^AF\d{2}[A-Z]\d{5,9}$/.test(t) || /^[A-Z]\d{3,}[A-Z]{2}\d{4,}$/.test(t) || /^[A-Z]?\d{6,}[A-Z]?$/.test(t);
+}
+
+function looksLikeScheduleSummaryText(s: string): boolean {
+  const t = s.trim().toLowerCase();
+  if (!t) return false;
+  if (/\b(overdue|due\s+soon|current)\b/.test(t) && /\b\d{1,2}\s+[a-z]{3}\s+\d{2,4}\b/.test(t)) return true;
+  if (/\b\d+[a-z]{2}\b/.test(t) && /\bor\s+\d[\d,]*(?:\.\d+)?\s*(mile|miles|hour|hours|hr|hrs|km)\b/.test(t)) return true;
+  return false;
+}
+
+function plausibleUtilTypeLabel(raw: string): string {
+  const t = preferLongerUtilLabelHalf(raw);
+  if (!t || looksLikePureNumberToken(t) || looksLikeAssetIdentifierToken(t) || looksLikeScheduleSummaryText(t)) return "";
+  const s = t.toLowerCase();
+  if (
+    /^(hrs?|hours?|h|eng(\s+hours?)?|engine(\s+hours?)?|mi|miles?|m|odo(meter)?|km|kilometers?|kilometres?)$/i.test(t) ||
+    /\b(hour|hours|hr|hrs|eng|engine|mi|mile|miles|odo|odometer|km|kilometer|kilometre)\b/.test(s)
+  ) {
+    return t;
+  }
+  return "";
+}
+
 /**
  * When a UoM cell looks like a glossary entry such as `"h - hour"` or `"mi / miles"`,
  * pick the longest human-readable half so downstream code does not show both halves.
@@ -1637,6 +1709,7 @@ export function cleanUtilUomLabel(utRaw: string | null | undefined): string {
   if (!raw) return "";
   const nocomma = raw.replace(/,/g, "");
   if (/^-?\d+(?:\.\d+)?$/.test(nocomma)) return "";
+  if (looksLikeAssetIdentifierToken(raw) || looksLikeScheduleSummaryText(raw)) return "";
   const s = raw.toLowerCase();
   const tokens = s
     .split(/\s*[-/|]\s*/)
@@ -1786,7 +1859,8 @@ export function utilizationTypeFromFleetRawJson(rawRowJson: string | null | unde
     "service meter uom",
     "vehicle utilization",
   ]);
-  if (t0.trim() && !looksLikePureNumberToken(t0)) return preferLongerUtilLabelHalf(t0);
+  const direct = plausibleUtilTypeLabel(t0);
+  if (direct) return direct;
 
   let bestScore = 0;
   let bestVal = "";
@@ -1803,7 +1877,8 @@ export function utilizationTypeFromFleetRawJson(rawRowJson: string | null | unde
       bestVal = vv;
     }
   }
-  if (bestVal && !looksLikePureNumberToken(bestVal)) return preferLongerUtilLabelHalf(bestVal);
+  const best = plausibleUtilTypeLabel(bestVal);
+  if (best) return best;
 
   for (const [k, v] of Object.entries(raw)) {
     const vv = (v ?? "").trim();
@@ -1817,7 +1892,8 @@ export function utilizationTypeFromFleetRawJson(rawRowJson: string | null | unde
       /^(hrs?|hours?|h|eng(\s+hours?)?|engine(\s+hours?)?|mi|miles?|m|odo(meter)?|km)$/i.test(vv) ||
       /\b(hour|hr|eng|engine|mi|mile|odo|miles|odometer)\b/i.test(vv)
     ) {
-      return preferLongerUtilLabelHalf(vv);
+      const label = plausibleUtilTypeLabel(vv);
+      if (label) return label;
     }
   }
   return "";

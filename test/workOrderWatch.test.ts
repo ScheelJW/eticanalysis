@@ -294,6 +294,14 @@ describe("utilization type and meter due soon", () => {
     expect(utilizationTypeFromFleetRawJson(j)).toBe("hour");
   });
 
+  it("ignores Fleet P&A overdue summary text as a utilization type", () => {
+    const j = JSON.stringify({
+      "fleet.schedule maintenance": "Overdue 43AA (19 Aug 25), 34AA (13 Feb 25 or 4992 miles)",
+      "fleet.smr": "E441VV00000170",
+    });
+    expect(utilizationTypeFromFleetRawJson(j)).toBe("");
+  });
+
   it("hour-meter: 274h remaining to target is not meter due soon (274 > 50)", () => {
     const raw: Record<string, string> = {
       "x.next util": "872",
@@ -428,6 +436,11 @@ describe("cleanUtilUomLabel", () => {
     expect(cleanUtilUomLabel("")).toBe("");
     expect(cleanUtilUomLabel(null)).toBe("");
     expect(cleanUtilUomLabel(undefined)).toBe("");
+  });
+
+  it("returns empty for asset ids and overdue schedule-summary text", () => {
+    expect(cleanUtilUomLabel("E441VV00000170")).toBe("");
+    expect(cleanUtilUomLabel("Overdue 34AA (12 Nov 25 or 1941 miles)")).toBe("");
   });
 
   it("falls through unknown labels with whitespace collapsed", () => {
