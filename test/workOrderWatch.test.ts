@@ -22,6 +22,7 @@ import {
   parseScheduleMxCsvToPlanRows,
   parseScheduleMxCsvToRawByAsset,
   parseOswoCsvToRows,
+  watchOwningUnitFromRawJson,
 } from "../src/workOrderWatch";
 import type { ScheduleMxFleetRow, WatchRow } from "../src/workOrderWatch";
 
@@ -47,6 +48,16 @@ describe("parseEticDate", () => {
   it("parses ISO prefix and US dates", () => {
     expect(parseEticDate("2026-04-20")).toBe("2026-04-20");
     expect(parseEticDate("4/20/2026")).toBe("2026-04-20");
+  });
+});
+
+describe("watchOwningUnitFromRawJson", () => {
+  it("uses Fleet P&A user cd for Work Orders unit display", () => {
+    expect(watchOwningUnitFromRawJson(JSON.stringify({ "fleet.user cd": "EP" }))).toBe("EP");
+  });
+
+  it("rejects numeric-only Fleet P&A unit candidates", () => {
+    expect(watchOwningUnitFromRawJson(JSON.stringify({ "fleet.user cd": "7" }))).toBe("");
   });
 });
 

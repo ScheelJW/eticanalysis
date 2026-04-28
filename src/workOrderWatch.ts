@@ -154,18 +154,24 @@ function cleanOwningUnitCandidate(raw: string | null | undefined): string {
   return t;
 }
 
-function pickOwningUnitFromRaw(raw: Record<string, string> | undefined): string {
+export function pickOwningUnitFromRaw(raw: Record<string, string> | undefined): string {
   if (!raw) return "";
   const exactKeys = [
     "fleet.owning unit",
     "fleet.owning org",
     "fleet.owning organization",
+    "fleet.user cd",
+    "fleet.user code",
     "fleet.user/unit",
     "fleet.user unit",
     "fleet.assigned unit",
     "fleet.organization",
     "fleet.squadron",
     "fleet.customer unit",
+    "user cd",
+    "user code",
+    "user/unit",
+    "user unit",
   ];
   for (const key of exactKeys) {
     const t = cleanOwningUnitCandidate(raw[key]);
@@ -185,6 +191,10 @@ function guessOwningUnitFromFleetRaw(raw: Record<string, string> | undefined): s
   return pickOwningUnitFromRaw(raw);
 }
 
+export function __testPickOwningUnitFromRaw(raw: Record<string, string> | undefined): string {
+  return pickOwningUnitFromRaw(raw);
+}
+
 function parseRawJsonRecord(rawRowJson: string | null | undefined): Record<string, string> | undefined {
   if (!rawRowJson || !rawRowJson.trim()) return undefined;
   try {
@@ -194,7 +204,7 @@ function parseRawJsonRecord(rawRowJson: string | null | undefined): Record<strin
   }
 }
 
-function pickOwningUnitFromRawJson(rawRowJson: string | null | undefined): string {
+export function watchOwningUnitFromRawJson(rawRowJson: string | null | undefined): string {
   return pickOwningUnitFromRaw(parseRawJsonRecord(rawRowJson));
 }
 
@@ -1301,7 +1311,7 @@ export async function loadScheduleMxEticContextByAsset(
     const ps = (row.parts_status ?? "").trim();
     if (partsStatusLooksInMaintenance(ps)) ctx.inMaintenance = true;
     if (workOrderRowLooksNmc(ps, row.raw_row_json)) ctx.nmcOnOpenWorkOrder = true;
-    const ou = cleanOwningUnitCandidate(row.owning_unit) || pickOwningUnitFromRawJson(row.raw_row_json);
+    const ou = cleanOwningUnitCandidate(row.owning_unit) || watchOwningUnitFromRawJson(row.raw_row_json);
     if (ou && !ctx.owningUnit) ctx.owningUnit = ou;
     const mm = (row.make_model ?? "").trim();
     if (mm && !ctx.makeModel) ctx.makeModel = mm;
@@ -1330,7 +1340,7 @@ export async function loadScheduleMxEticContextByAsset(
     byAsset.set(aid, {
       workOrderIds: w ? Array.from(w.workOrderIdSet) : [],
       owningUnit:
-        (f ? cleanOwningUnitCandidate(f.owning_unit) || pickOwningUnitFromRawJson(f.raw_row_json) : "") ||
+        (f ? cleanOwningUnitCandidate(f.owning_unit) || watchOwningUnitFromRawJson(f.raw_row_json) : "") ||
         (w?.owningUnit ?? ""),
       makeModel: (f?.make_model ?? "").trim() || (w?.makeModel ?? ""),
       vehNomen: (f?.veh_nomen ?? "").trim() || (w?.vehNomen ?? ""),
