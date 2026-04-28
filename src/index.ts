@@ -14767,6 +14767,15 @@ function renderDashboardHtml(): string {
     }
 
     /* Schedule Mx tab — same split-pane rhythm as Work Orders */
+    .smx-layout .wo-detail-pane {
+      position: sticky;
+      top: 20px;
+      max-height: calc(100vh - 40px);
+      overflow-y: auto;
+    }
+    @media (max-width: 960px) {
+      .smx-layout .wo-detail-pane { position: static; max-height: none; overflow: visible; }
+    }
     .smx-layout .smx-panel-heading { margin-bottom: 10px; }
     .smx-panel-title { margin: 0 0 4px; font-size: 1.05rem; font-weight: 700; color: var(--text); }
     .smx-date-field { display: block; margin-bottom: 12px; }
@@ -15143,6 +15152,13 @@ function renderDashboardHtml(): string {
     .smx-pill.ok { background: rgba(34,160,90,0.12); color: var(--success); }
     .smx-pill.no_due { background: rgba(15,30,60,0.06); color: var(--muted); }
     .smx-pill.plan_gap { background: rgba(109,40,217,0.16); color: #5b21b6; }
+    @media (max-width: 960px) {
+      .smx-layout .wo-detail-pane {
+        position: static;
+        max-height: none;
+        overflow: visible;
+      }
+    }
 
     .authz-header {
       display: flex; justify-content: space-between; align-items: flex-start; gap: 16px;
