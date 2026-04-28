@@ -52,6 +52,14 @@ describe("parseEticDate", () => {
 });
 
 describe("watchOwningUnitFromRawJson", () => {
+  it("prefers the ETIC Fleet P&A Unit column over Fleet user cd", () => {
+    expect(watchOwningUnitFromRawJson(JSON.stringify({ "fleet.unit": "5", "fleet.user cd": "EP" }))).toBe("5");
+  });
+
+  it("uses the normalized leading-space ETIC Fleet P&A Unit column", () => {
+    expect(watchOwningUnitFromRawJson(JSON.stringify({ " unit": "7", "fleet.user cd": "KL" }))).toBe("7");
+  });
+
   it("uses Fleet P&A user cd for Work Orders unit display", () => {
     expect(watchOwningUnitFromRawJson(JSON.stringify({ "fleet.user cd": "EP" }))).toBe("EP");
   });

@@ -147,15 +147,20 @@ type WoStateRow = {
   updated_at_iso: string;
 };
 
-function cleanOwningUnitCandidate(raw: string | null | undefined): string {
+function cleanOwningUnitCandidate(raw: string | null | undefined, opts?: { allowNumeric?: boolean }): string {
   const t = String(raw ?? "").replace(/\s+/g, " ").trim();
   if (!t) return "";
-  if (/^\d+$/.test(t)) return "";
+  if (!opts?.allowNumeric && /^\d+$/.test(t)) return "";
   return t;
 }
 
-export function pickOwningUnitFromRaw(raw: Record<string, string> | undefined): string {
+function pickOwningUnitFromRawInternal(raw: Record<string, string> | undefined, opts?: { allowNumericUnitColumn?: boolean }): string {
   if (!raw) return "";
+  const unitKeys = ["fleet.unit", "fleet. unit", " unit", "unit"];
+  for (const key of unitKeys) {
+    const t = cleanOwningUnitCandidate(raw[key], { allowNumeric: !!opts?.allowNumericUnitColumn });
+    if (t) return t;
+  }
   const exactKeys = [
     "fleet.owning unit",
     "fleet.owning org",
@@ -187,11 +192,11 @@ export function pickOwningUnitFromRaw(raw: Record<string, string> | undefined): 
   return "";
 }
 
-function guessOwningUnitFromFleetRaw(raw: Record<string, string> | undefined): string {
-  return pickOwningUnitFromRaw(raw);
+export function pickOwningUnitFromRaw(raw: Record<string, string> | undefined): string {
+  return pickOwningUnitFromRawInternal(raw, { allowNumericUnitColumn: true });
 }
 
-export function __testPickOwningUnitFromRaw(raw: Record<string, string> | undefined): string {
+function guessOwningUnitFromFleetRaw(raw: Record<string, string> | undefined): string {
   return pickOwningUnitFromRaw(raw);
 }
 
@@ -206,6 +211,10 @@ function parseRawJsonRecord(rawRowJson: string | null | undefined): Record<strin
 
 export function watchOwningUnitFromRawJson(rawRowJson: string | null | undefined): string {
   return pickOwningUnitFromRaw(parseRawJsonRecord(rawRowJson));
+}
+
+function scheduleMxOwningUnitFromRawJson(rawRowJson: string | null | undefined): string {
+  return pickOwningUnitFromRawInternal(parseRawJsonRecord(rawRowJson), { allowNumericUnitColumn: false });
 }
 
 function guessShopFromFleetRaw(raw: Record<string, string> | undefined, eticLocation: string): string {
@@ -1370,7 +1379,7 @@ function applyEticContextToScheduleMxRow(
   const woCount = eticDateKey != null ? (ctx?.workOrderIds.length ?? 0) : row.workOrderCount;
   const owningUnit = scheduleMxOwningUnitForAssetId(
     row.assetId,
-    ctx && ctx.owningUnit ? ctx.owningUnit : row.owningUnit,
+    cleanOwningUnitCandidate(ctx && ctx.owningUnit ? ctx.owningUnit : row.owningUnit),
   );
   const makeModel = ctx && ctx.makeModel ? ctx.makeModel : row.makeModel;
   const vehNomen = ctx && ctx.vehNomen ? ctx.vehNomen : row.vehNomen;
