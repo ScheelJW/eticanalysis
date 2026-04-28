@@ -1361,7 +1361,7 @@ export async function loadScheduleMxEticContextByAsset(
   const woByAsset = new Map<string, WoAgg>();
   const idSet = new Set(ids);
 
-  const [fleetR, woRowsFlat] = await Promise.all([
+  const [fleetR, woRowsFlat, historicalUnits] = await Promise.all([
     (async () => {
       const r = await env.ETIC_SNAPSHOTS.prepare(
         `SELECT asset_id, owning_unit, make_model, veh_nomen, mgmt_cd, raw_row_json
@@ -1384,6 +1384,7 @@ export async function loadScheduleMxEticContextByAsset(
         .all<WoSnapRow>();
       return r.results ?? [];
     }),
+    getHistoricalOwningUnitByAsset(env, ids),
   ]);
 
   for (const row of fleetR) {
@@ -1414,7 +1415,7 @@ export async function loadScheduleMxEticContextByAsset(
     const ps = (row.parts_status ?? "").trim();
     if (partsStatusLooksInMaintenance(ps)) ctx.inMaintenance = true;
     if (workOrderRowLooksNmc(ps, row.raw_row_json)) ctx.nmcOnOpenWorkOrder = true;
-    const ou = cleanOwningUnitCandidate(row.owning_unit) || watchOwningUnitFromRawJson(row.raw_row_json);
+    const ou = cleanFullOwningUnitLabel(row.owning_unit) || watchOwningUnitFromRawJson(row.raw_row_json);
     if (ou && !ctx.owningUnit) ctx.owningUnit = ou;
     const mm = (row.make_model ?? "").trim();
     if (mm && !ctx.makeModel) ctx.makeModel = mm;
@@ -1443,7 +1444,8 @@ export async function loadScheduleMxEticContextByAsset(
     byAsset.set(aid, {
       workOrderIds: w ? Array.from(w.workOrderIdSet) : [],
       owningUnit:
-        (f ? cleanOwningUnitCandidate(f.owning_unit) || watchOwningUnitFromRawJson(f.raw_row_json) : "") ||
+        (f ? cleanFullOwningUnitLabel(f.owning_unit) || scheduleMxOwningUnitFromRawJson(f.raw_row_json) : "") ||
+        historicalUnits.get(aid) ||
         (w?.owningUnit ?? ""),
       makeModel: (f?.make_model ?? "").trim() || (w?.makeModel ?? ""),
       vehNomen: (f?.veh_nomen ?? "").trim() || (w?.vehNomen ?? ""),
