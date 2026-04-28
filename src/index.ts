@@ -14832,23 +14832,43 @@ function renderDashboardHtml(): string {
     .smx-panel-title { margin: 0 0 4px; font-size: 1.05rem; font-weight: 700; color: var(--text); }
     .smx-date-field { display: block; margin-bottom: 12px; }
     .smx-date-field .wo-refine-sel { width: 100%; }
+    .smx-layout .wo-sidebar {
+      padding: 14px 16px 8px;
+    }
+    .smx-layout .wo-searchbar {
+      margin-bottom: 8px;
+    }
+    .smx-layout .wo-searchbar input {
+      padding: 10px 12px;
+    }
+    .smx-layout .wo-filters {
+      gap: 6px;
+      margin-bottom: 8px;
+    }
+    .smx-layout .wo-filter-btn {
+      padding: 6px 10px;
+      font-size: 0.68rem;
+    }
     .smx-refine-one {
       display: grid;
       grid-template-columns: 1fr;
-      gap: 8px;
-      padding: 4px 0 10px;
+      gap: 6px;
+      padding: 2px 0 8px;
     }
     .nce-inline { font-weight: 800; color: var(--accent); }
     .smx-stats {
-      display: flex; flex-wrap: wrap; gap: 8px 10px;
-      margin-bottom: 12px;
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 6px;
+      margin-bottom: 8px;
     }
     .smx-stat {
       background: var(--card); border: 1px solid var(--border); border-radius: 10px;
-      padding: 8px 12px; min-width: 96px;
+      padding: 7px 9px;
+      min-width: 0;
     }
-    .smx-stat .lbl { display: block; font-size: 0.58rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
-    .smx-stat .v { font-size: 1.05rem; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.2; }
+    .smx-stat .lbl { display: block; font-size: 0.52rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .smx-stat .v { font-size: 0.92rem; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.15; }
     .smx-stat.bad .v { color: var(--danger); }
     .smx-stat.warn .v { color: var(--warn); }
     .smx-stat.crit .v { color: #7a1020; }
