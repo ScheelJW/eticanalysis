@@ -53,15 +53,15 @@ describe("parseEticDate", () => {
 
 describe("watchOwningUnitFromRawJson", () => {
   it("prefers the ETIC Fleet P&A Unit column over Fleet user cd", () => {
-    expect(watchOwningUnitFromRawJson(JSON.stringify({ "fleet.unit": "5", "fleet.user cd": "EP" }))).toBe("5");
+    expect(watchOwningUnitFromRawJson(JSON.stringify({ "fleet.unit": "5 LRS", "fleet.user cd": "EP" }))).toBe("5 LRS");
   });
 
   it("uses the normalized leading-space ETIC Fleet P&A Unit column", () => {
-    expect(watchOwningUnitFromRawJson(JSON.stringify({ " unit": "7", "fleet.user cd": "KL" }))).toBe("7");
+    expect(watchOwningUnitFromRawJson(JSON.stringify({ " unit": "5 SFS", "fleet.user cd": "KL" }))).toBe("5 SFS");
   });
 
-  it("uses Fleet P&A user cd for Work Orders unit display", () => {
-    expect(watchOwningUnitFromRawJson(JSON.stringify({ "fleet.user cd": "EP" }))).toBe("EP");
+  it("maps Fleet P&A user cd to full unit name for already-ingested rows", () => {
+    expect(watchOwningUnitFromRawJson(JSON.stringify({ "fleet.user cd": "EP" }))).toBe("5 LRS");
   });
 
   it("rejects numeric-only Fleet P&A unit candidates", () => {
@@ -983,6 +983,9 @@ class MockD1Database {
         return String(b.last_snapshot_date).localeCompare(String(a.last_snapshot_date));
       });
       return rows as T[];
+    }
+    if (sql.includes("FROM fleet_p_a_snapshot") && sql.includes("ROW_NUMBER() OVER")) {
+      return [] as T[];
     }
     return [];
   }

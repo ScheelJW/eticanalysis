@@ -154,41 +154,95 @@ function cleanOwningUnitCandidate(raw: string | null | undefined, opts?: { allow
   return t;
 }
 
+function cleanFullOwningUnitLabel(raw: string | null | undefined): string {
+  const t = cleanOwningUnitCandidate(raw);
+  if (!t) return "";
+  if (/^[A-Z0-9]{1,3}$/i.test(t)) return "";
+  if (!/[A-Za-z]/.test(t)) return "";
+  return t;
+}
+
+function cleanHistoricalOwningUnitLabel(raw: string | null | undefined): string {
+  const t = cleanFullOwningUnitLabel(raw);
+  if (!t) return "";
+  return looksLikeFullOwningUnit(t) ? t : "";
+}
+
+const USER_CD_TO_OWNING_UNIT: Record<string, string> = {
+  CQ: "5 MXS",
+  CU: "5 MXS",
+  CM: "5 MXS",
+  CO: "5 MXS",
+  DP: "23 BGS",
+  DS: "5 MUNS",
+  DT: "5 MUNS",
+  DV: "5 MUNS",
+  EG: "5 LRS",
+  EM: "5 LRS",
+  EP: "5 LRS",
+  ES: "5 LRS",
+  FB: "91 OSS",
+  FD: "91 OSS",
+  FG: "91 OSS",
+  HH: "5 MDG",
+  HK: "5 MDG",
+  JP: "5 CES",
+  KL: "5 SFS",
+  KM: "5 SFS",
+  KN: "5 SFS",
+  KO: "5 SFS",
+  KE: "5 SFS",
+  MU: "705 MUNS",
+  NW: "91 MW",
+};
+
+function userCodeToOwningUnit(raw: string | null | undefined): string {
+  const code = String(raw ?? "").replace(/\s+/g, " ").trim().toUpperCase();
+  if (!code || /^\d+$/.test(code)) return "";
+  return USER_CD_TO_OWNING_UNIT[code] ?? "";
+}
+
+function looksLikeFullOwningUnit(raw: string | null | undefined): boolean {
+  const t = String(raw ?? "").replace(/\s+/g, " ").trim();
+  if (!t || /^\d+$/.test(t)) return false;
+  return /\b(?:LRS|MXS|BGS|MUNS|MDG|SFS|BW|MW|OSS|CES|MSOS|MMXS|MSFS|CS|FSS|MXG|SSPTS|CACS|TRS|OG)\b/i.test(t);
+}
+
 function pickOwningUnitFromRawInternal(raw: Record<string, string> | undefined, opts?: { allowNumericUnitColumn?: boolean }): string {
   if (!raw) return "";
   const unitKeys = ["fleet.unit", "fleet. unit", " unit", "unit"];
   for (const key of unitKeys) {
-    const t = cleanOwningUnitCandidate(raw[key], { allowNumeric: !!opts?.allowNumericUnitColumn });
+    const t = opts?.allowNumericUnitColumn
+      ? cleanOwningUnitCandidate(raw[key], { allowNumeric: true })
+      : cleanFullOwningUnitLabel(raw[key]);
     if (t) return t;
   }
   const exactKeys = [
     "fleet.owning unit",
     "fleet.owning org",
     "fleet.owning organization",
-    "fleet.user cd",
-    "fleet.user code",
     "fleet.user/unit",
     "fleet.user unit",
     "fleet.assigned unit",
     "fleet.organization",
     "fleet.squadron",
     "fleet.customer unit",
-    "user cd",
-    "user code",
     "user/unit",
     "user unit",
   ];
   for (const key of exactKeys) {
-    const t = cleanOwningUnitCandidate(raw[key]);
+    const t = cleanFullOwningUnitLabel(raw[key]);
     if (t) return t;
   }
   for (const [k, v] of Object.entries(raw)) {
     const kk = k.toLowerCase();
-    const t = cleanOwningUnitCandidate(v);
+    const t = cleanFullOwningUnitLabel(v);
     if (!t) continue;
     if (/owning|organization|org\b|squadron|flight|assigned|customer/.test(kk)) return t;
     if (/\bunit\b/.test(kk) && /[a-z]/i.test(t)) return t;
   }
+  const fromUserCd = userCodeToOwningUnit(raw["fleet.user cd"]) || userCodeToOwningUnit(raw["fleet.user code"]) || userCodeToOwningUnit(raw["user cd"]) || userCodeToOwningUnit(raw["user code"]);
+  if (fromUserCd) return fromUserCd;
   return "";
 }
 
@@ -946,6 +1000,7 @@ function rowToWatchRow(
     firstSeenDate?: string | null;
     earliestSnapshot?: string | null;
     intervals?: Record<MelTier, number | null>;
+    owningUnitFallback?: string;
   },
 ): WatchRow {
   const tier = (row.mel_tier as MelTier) || "unknown";
@@ -981,7 +1036,9 @@ function rowToWatchRow(
     lastSnapshotDate: row.last_snapshot_date,
     owningUnit: owningUnitForAssetId(
       row.asset_id,
-      cleanOwningUnitCandidate(row.owning_unit) || watchOwningUnitFromRawJson(row.raw_row_json),
+      cleanFullOwningUnitLabel(row.owning_unit) ||
+        watchOwningUnitFromRawJson(row.raw_row_json) ||
+        cleanFullOwningUnitLabel(ctx?.owningUnitFallback),
     ),
     melKey: row.mel_key ?? "",
     shop: row.shop ?? "",
@@ -1116,6 +1173,40 @@ async function runAssetIdBatchesInParallel<T>(
     for (const p of parts) flat.push(...p);
   }
   return flat;
+}
+
+async function getHistoricalOwningUnitByAsset(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  assetIds: string[],
+): Promise<Map<string, string>> {
+  const ids = [...new Set(assetIds.map((x) => (x ?? "").trim()).filter(Boolean))];
+  const out = new Map<string, string>();
+  if (!ids.length) return out;
+  const rows = await runAssetIdBatchesInParallel(ids, 80, async (chunk) => {
+    const ph = chunk.map(() => "?").join(",");
+    const r = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT asset_id, owning_unit
+       FROM (
+         SELECT asset_id, owning_unit, snapshot_date_key,
+                ROW_NUMBER() OVER (PARTITION BY asset_id ORDER BY snapshot_date_key DESC) AS rn
+         FROM fleet_p_a_snapshot
+         WHERE asset_id IN (${ph})
+           AND owning_unit IS NOT NULL
+           AND TRIM(owning_unit) <> ''
+           AND owning_unit GLOB '*[A-Za-z]*'
+       )
+       WHERE rn = 1`,
+    )
+      .bind(...chunk)
+      .all<{ asset_id: string; owning_unit: string }>();
+    return r.results ?? [];
+  });
+  for (const row of rows) {
+    const aid = (row.asset_id ?? "").trim();
+    const unit = cleanHistoricalOwningUnitLabel(row.owning_unit);
+    if (aid && unit && !out.has(aid)) out.set(aid, unit);
+  }
+  return out;
 }
 
 async function loadWoCountsPerAsset(
@@ -3534,19 +3625,23 @@ export async function getWatchRowsForDate(
     .bind(dateKey)
     .all<WatchReadRow>();
 
-  const ids = (r.results ?? []).map((row) => row.work_order_id);
-  const [firstSeenMap, earliest, intervals] = await Promise.all([
+  const resultRows = r.results ?? [];
+  const ids = resultRows.map((row) => row.work_order_id);
+  const assetIds = [...new Set(resultRows.map((row) => (row.asset_id ?? "").trim()).filter(Boolean))];
+  const [firstSeenMap, earliest, intervals, unitFallbacks] = await Promise.all([
     getFirstSeenDates(env, ids),
     getEarliestSnapshotDate(env),
     getStalenessThresholds(env).then(resolveStaleness),
+    getHistoricalOwningUnitByAsset(env, assetIds),
   ]);
   const out: WatchRow[] = [];
-  for (const row of r.results ?? []) {
+  for (const row of resultRows) {
     out.push(
       rowToWatchRow(row, dateKey, {
         firstSeenDate: firstSeenMap.get(row.work_order_id) ?? "",
         earliestSnapshot: earliest,
         intervals,
+        owningUnitFallback: unitFallbacks.get((row.asset_id ?? "").trim()) ?? "",
       }),
     );
   }
