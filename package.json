@@ -34,6 +34,7 @@
   },
   "homepage": "https://github.com/ScheelJW/eticanalysis#readme",
   "dependencies": {
+    "@cursor/sdk": "^1.0.10",
     "exceljs": "^4.4.0",
     "postal-mime": "^2.7.4"
   },
