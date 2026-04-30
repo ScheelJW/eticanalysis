@@ -10230,6 +10230,9 @@ function renderDashboardHtml(): string {
       border-radius: var(--radius-sm);
       transition: border-color 0.15s ease, box-shadow 0.15s ease;
     }
+    .wo-searchbar:focus-within {
+      filter: drop-shadow(0 4px 12px rgba(0, 58, 140, 0.08));
+    }
     .wo-searchbar input::placeholder { color: var(--subtle); }
     .wo-searchbar input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
     .wo-searchbar select { padding: 10px 38px 10px 12px; font-size: 0.86rem; background-color: var(--bg1); }
@@ -10251,12 +10254,14 @@ function renderDashboardHtml(): string {
       color: var(--muted);
       cursor: pointer;
       transition: color 0.12s ease, border-color 0.12s ease, background 0.12s ease;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.65);
     }
-    .wo-filter-btn:hover { color: var(--text); border-color: rgba(15,30,60,0.30); }
+    .wo-filter-btn:hover { color: var(--text); border-color: rgba(15,30,60,0.30); background: rgba(15,30,60,0.035); }
     .wo-filter-btn.active {
       background: var(--accent-soft);
       border-color: rgba(0,58,140,0.4);
       color: var(--accent-strong);
+      box-shadow: 0 1px 4px rgba(0,58,140,0.10), inset 0 1px 0 rgba(255,255,255,0.70);
     }
     .wo-filter-btn .count {
       margin-left: 6px;
@@ -10266,6 +10271,11 @@ function renderDashboardHtml(): string {
       font-variant-numeric: tabular-nums;
     }
     .wo-filter-btn.active .count { color: var(--accent-strong); }
+    .wo-filter-btn:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+      box-shadow: 0 0 0 3px var(--accent-soft);
+    }
 
     .wo-refine {
       display: grid;
@@ -10412,6 +10422,7 @@ function renderDashboardHtml(): string {
       gap: 6px;
       flex: 1 1 auto;
       min-height: 0;
+      scroll-padding-top: 8px;
     }
     .wo-list::-webkit-scrollbar { width: 6px; }
     .wo-list::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 999px; }
