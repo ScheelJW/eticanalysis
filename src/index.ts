@@ -8331,18 +8331,19 @@ function renderYardAppHtml(): string {
           if (!r.ok) return r.json().then(function(j){ throw new Error(j.error || "save failed"); });
           return r.json();
         })
-        .then(function(){
+        .then(function(j){
           showToast("Saved");
+          var savedCheck = j && j.check ? j.check : null;
           // Optimistic local update
           var a = state.assets.find(function(x){ return x.assetId === state.openId; });
           if (a) {
-            a.lastCheckedAtIso = new Date().toISOString();
-            a.lastCheckedBy = (state.walker || "").trim() || a.lastCheckedBy;
+            a.lastCheckedAtIso = (savedCheck && savedCheck.checkedAtIso) || new Date().toISOString();
+            a.lastCheckedBy = (savedCheck && savedCheck.checkedBy) || (state.walker || "").trim() || a.lastCheckedBy;
             a.daysSinceLastCheck = 0;
             a.rollingState = isMissing ? "due" : "fresh";
             a.isNeverChecked = false;
-            if (!isMissing && state.draft.location) a.lastLocation = state.draft.location;
-            a.lastNotes = state.draft.discrepancies || "";
+            if (!isMissing && savedCheck && savedCheck.location) a.lastLocation = savedCheck.location;
+            a.lastNotes = (savedCheck && savedCheck.discrepancies) || state.draft.discrepancies || "";
           }
           // Update totals quickly
           if (state.roster && state.roster.totals) {
