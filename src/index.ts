@@ -5039,7 +5039,8 @@ async function handleScheduleMxApi(env: Env, request: Request, ctx: ExecutionCon
     const cached = await edgeCache.match(cacheKey);
     if (cached) return cached;
   }
-  const rows = await getScheduleMxFleetForDate(env, dateKey, { includeOswoGaps });
+  const assetId = url.searchParams.get("assetId")?.trim() ?? "";
+  const rows = await getScheduleMxFleetForDate(env, dateKey, { includeOswoGaps, assetId: assetId || undefined });
   if (rows.length === 0) {
     return Response.json(
       {
@@ -5055,7 +5056,6 @@ async function handleScheduleMxApi(env: Env, request: Request, ctx: ExecutionCon
   const stats = computeScheduleMxAssetStats(rows);
   const commander = computeScheduleMxCommanderSummary(rows);
   const eticDateKey = rows.length ? rows[0].eticSnapshotDateKey ?? null : null;
-  const assetId = (url.searchParams.get("assetId") ?? "").trim();
   const summaryOnly = url.searchParams.get("summary") === "1";
   const responseRows = assetId
     ? rows.filter((row) => (row.assetId ?? "").trim().toUpperCase() === assetId.toUpperCase())

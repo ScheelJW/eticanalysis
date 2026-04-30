@@ -3371,11 +3371,23 @@ export async function applyScheduleMxOswoPlanGaps(
 async function loadScheduleMxPlanRowsForDate(
   env: { ETIC_SNAPSHOTS: D1Database },
   dateKey: string,
+  assetId?: string,
 ): Promise<ScheduleMxPlanParseRow[]> {
-  const r = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT plan_row_key, asset_id, raw_row_json FROM schedule_mx_plan_snapshot WHERE snapshot_date_key = ? ORDER BY asset_id ASC, plan_row_key ASC`,
-  )
-    .bind(dateKey)
+  const aidFilter = (assetId ?? "").trim();
+  const stmt = aidFilter
+    ? env.ETIC_SNAPSHOTS.prepare(
+        `SELECT plan_row_key, asset_id, raw_row_json
+         FROM schedule_mx_plan_snapshot
+         WHERE snapshot_date_key = ? AND UPPER(TRIM(asset_id)) = UPPER(TRIM(?))
+         ORDER BY plan_row_key ASC`,
+      ).bind(dateKey, aidFilter)
+    : env.ETIC_SNAPSHOTS.prepare(
+        `SELECT plan_row_key, asset_id, raw_row_json
+         FROM schedule_mx_plan_snapshot
+         WHERE snapshot_date_key = ?
+         ORDER BY asset_id ASC, plan_row_key ASC`,
+      ).bind(dateKey);
+  const r = await stmt
     .all<{ plan_row_key: string; asset_id: string; raw_row_json: string }>();
   const out: ScheduleMxPlanParseRow[] = [];
   for (const row of r.results ?? []) {
@@ -3420,11 +3432,12 @@ export async function listScheduleMxExtractDateKeysDesc(env: { ETIC_SNAPSHOTS: D
 export async function getScheduleMxFleetForDate(
   env: { ETIC_SNAPSHOTS: D1Database },
   dateKey: string,
-  opts?: { includeOswoGaps?: boolean },
+  opts?: { includeOswoGaps?: boolean; assetId?: string },
 ): Promise<ScheduleMxFleetRow[]> {
   const includeOswoGaps = opts?.includeOswoGaps !== false;
+  const assetFilter = (opts?.assetId ?? "").trim();
   const [planRows, woCounts, eticKeyForContext] = await Promise.all([
-    loadScheduleMxPlanRowsForDate(env, dateKey),
+    loadScheduleMxPlanRowsForDate(env, dateKey, assetFilter),
     loadWoCountsPerAsset(env, dateKey),
     getLatestEticSnapshotDateKey(env),
   ]);
