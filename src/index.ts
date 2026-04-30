@@ -18956,7 +18956,10 @@ function renderDashboardHtml(): string {
     var smxRows = [];
     var smxAssetSummaries = [];
     var smxDetailCache = new Map();
+    var smxDetailInflight = new Map();
     var smxDetailLoadingAssetId = "";
+    var smxAssetDetailSeq = 0;
+    var smxUsingFullRows = true;
     var smxStats = null;
     /** Latest ETIC workbook date used for unit / NCE / open WO enrichment (YYYY-MM-DD). */
     var smxEticDateKey = null;
@@ -19720,7 +19723,7 @@ function renderDashboardHtml(): string {
     }
 
     function smxAssetRows() {
-      return smxAssetSummaryRows.length ? smxAssetSummaryRows : smxRows;
+      return smxAssetSummaries.length ? smxAssetSummaries : smxRows;
     }
 
     function smxEffBucket(row) {
@@ -19730,11 +19733,11 @@ function renderDashboardHtml(): string {
     function smxPlansForAsset(assetId) {
       var aid = String(assetId || "").trim();
       if (!aid) return [];
-      var cached = smxPlanCache.get(aid);
+      var cached = smxDetailCache.get(aid);
       if (cached) return cached;
-      if (smxRowsArePlanRows) {
+      if (smxUsingFullRows) {
         var rows = smxRows.filter(function (r) { return String(r.assetId || "").trim() === aid; });
-        if (rows.length) smxPlanCache.set(aid, rows);
+        if (rows.length) smxDetailCache.set(aid, rows);
         return rows;
       }
       return [];
@@ -19743,8 +19746,8 @@ function renderDashboardHtml(): string {
     function smxSummaryForAsset(assetId) {
       var aid = String(assetId || "").trim();
       if (!aid) return null;
-      for (var i = 0; i < smxAssetSummaryRows.length; i++) {
-        if (String(smxAssetSummaryRows[i].assetId || "").trim() === aid) return smxAssetSummaryRows[i];
+      for (var i = 0; i < smxAssetSummaries.length; i++) {
+        if (String(smxAssetSummaries[i].assetId || "").trim() === aid) return smxAssetSummaries[i];
       }
       return null;
     }
@@ -19767,7 +19770,7 @@ function renderDashboardHtml(): string {
       var aid = String(assetId || "").trim();
       var dk = smxSelectedDateKey || "";
       if (!aid || !dk) return;
-      if (smxAssetDetailInflight.has(aid)) return smxAssetDetailInflight.get(aid);
+      if (smxDetailInflight.has(aid)) return smxDetailInflight.get(aid);
       var seq = ++smxAssetDetailSeq;
       smxRenderAssetLoading(aid);
       var p = fetch("/api/schedule-mx?date=" + encodeURIComponent(dk) + "&assetId=" + encodeURIComponent(aid) + "&gaps=" + (smxOswoGapsIncluded ? "1" : "0"))
@@ -19779,7 +19782,7 @@ function renderDashboardHtml(): string {
         })
         .then(function (j) {
           var rows = Array.isArray(j.rows) ? j.rows : [];
-          smxPlanCache.set(aid, rows);
+          smxDetailCache.set(aid, rows);
           if (seq === smxAssetDetailSeq && smxSelectedAssetId === aid) {
             selectSmxAsset(aid, false);
           }
@@ -19793,10 +19796,10 @@ function renderDashboardHtml(): string {
           return [];
         })
         .then(function (rows) {
-          smxAssetDetailInflight.delete(aid);
+          smxDetailInflight.delete(aid);
           return rows;
         });
-      smxAssetDetailInflight.set(aid, p);
+      smxDetailInflight.set(aid, p);
       return p;
     }
 
@@ -19960,7 +19963,7 @@ function renderDashboardHtml(): string {
       if (!plans.length) {
         empty.classList.add("hidden");
         wrap.classList.remove("hidden");
-        renderSmxHeroAsset(smxSelectedAssetId, smxAssetSummaryRows.filter(function (r) { return String(r.assetId || "").trim() === smxSelectedAssetId; }));
+        renderSmxHeroAsset(smxSelectedAssetId, smxAssetSummaries.filter(function (r) { return String(r.assetId || "").trim() === smxSelectedAssetId; }));
         const plansWrap = document.getElementById("smx-plans-wrap");
         if (plansWrap) plansWrap.innerHTML = "<div class='problem-empty'>Loading maintenance plans…</div>";
         loadScheduleMxAssetDetails(smxSelectedAssetId);
@@ -20184,8 +20187,8 @@ function renderDashboardHtml(): string {
           return;
         }
         smxRows = Array.isArray(j.assets) ? j.assets : [];
-        smxRowsArePlanRows = false;
-        smxPlanCache.clear();
+        smxUsingFullRows = false;
+        smxDetailCache.clear();
         smxStats = j.stats || null;
         smxCommander = j.commander || null;
         smxCommanderFilterUnit = "";
