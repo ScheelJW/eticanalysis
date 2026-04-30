@@ -7931,7 +7931,7 @@ function renderYardAppHtml(): string {
         walkerNameHtml +
         '<div class="card">' +
           '<h4>Check result</h4>' +
-          '<div class="status-row">' + statusHtml + '</div>' +
+          '<div class="status-row" id="yard-status-pick">' + statusHtml + '</div>' +
           (state.draft.status === "missing"
             ? '<p class="missing-help">Use this when you looked for the vehicle but could not find it. Location is optional; notes are required.</p>'
             : '') +
