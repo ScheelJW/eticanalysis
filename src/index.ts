@@ -10235,6 +10235,7 @@ function renderDashboardHtml(): string {
       padding: 18px 18px 10px;
       box-shadow: var(--shadow-md);
       max-height: calc(100vh - 40px);
+      overflow: hidden;
       display: flex;
       flex-direction: column;
       min-height: 0;
@@ -10464,6 +10465,7 @@ function renderDashboardHtml(): string {
       flex: 1 1 auto;
       min-height: 0;
       scroll-padding-top: 8px;
+      isolation: isolate;
     }
     .wo-list::-webkit-scrollbar { width: 6px; }
     .wo-list::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 999px; }
