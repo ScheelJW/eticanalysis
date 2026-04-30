@@ -8223,7 +8223,6 @@ function renderYardAppHtml(): string {
         state.draft.status = st;
         if (st === "missing") {
           state.draft.location = "";
-          if (!state.draft.discrepancies.trim()) state.draft.discrepancies = "Cannot find vehicle";
         }
         renderSheet();
       });
