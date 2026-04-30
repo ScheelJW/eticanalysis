@@ -8601,6 +8601,9 @@ function renderDashboardHtml(): string {
        Spans the full viewport width but keeps inner content aligned with the
        .app column. Sits flush under the 4px accent strap. */
     .top {
+      position: sticky;
+      top: 0;
+      z-index: 80;
       display: flex;
       flex-direction: column;
       align-items: stretch;
@@ -8613,19 +8616,20 @@ function renderDashboardHtml(): string {
       background: var(--accent);
       color: #ffffff;
       border-bottom: 3px solid var(--accent-strong);
+      box-shadow: 0 8px 24px rgba(0, 32, 84, 0.16);
     }
     .top-shell {
-      padding: 14px max(32px, calc(50vw - 528px)) 14px;
+      padding: 12px max(32px, calc(50vw - 560px)) 12px;
       display: flex;
       flex-direction: column;
-      gap: 14px;
+      gap: 10px;
       box-sizing: border-box;
     }
     @media (max-width: 640px) {
       .top { margin-bottom: 16px; }
       .top-shell { padding: 12px 20px 14px; }
     }
-    .brand { display: flex; align-items: center; gap: 14px; min-width: 0; }
+    .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
     .brand-mark {
       width: 40px; height: 40px; flex: 0 0 auto;
       border-radius: 4px;
@@ -8713,8 +8717,8 @@ function renderDashboardHtml(): string {
       display: flex;
       flex-wrap: nowrap;
       align-items: stretch;
-      gap: 4px;
-      padding: 6px;
+      gap: 3px;
+      padding: 5px;
       margin: 0;
       width: 100%;
       max-width: 100%;
@@ -8739,8 +8743,8 @@ function renderDashboardHtml(): string {
       font-size: 0.78rem;
       font-weight: 600;
       line-height: 1.2;
-      padding: 9px 14px;
-      min-height: 38px;
+      padding: 8px 12px;
+      min-height: 36px;
       border-radius: 8px;
       border: 1px solid transparent;
       background: transparent;
@@ -8764,6 +8768,17 @@ function renderDashboardHtml(): string {
     .main-nav button.active:hover {
       color: var(--accent);
       background: #ffffff;
+    }
+    @media (min-width: 1100px) {
+      .top-shell {
+        flex-direction: row;
+        align-items: center;
+        justify-content: space-between;
+      }
+      .main-nav {
+        width: auto;
+        max-width: min(72vw, 820px);
+      }
     }
 
     .construction-banner {
@@ -15310,6 +15325,7 @@ function renderDashboardHtml(): string {
         <div class="brand">
           <div class="brand-mark" aria-hidden="true">USAF</div>
           <div class="brand-text">
+            <div class="brand-eyebrow">Vehicle Management Operations</div>
             <h1><a href="/" class="brand-title-link">${escapedTitle}</a></h1>
             <p id="brand-sub">Fleet readiness at a glance.</p>
           </div>
