@@ -10228,13 +10228,13 @@ function renderDashboardHtml(): string {
 
     .wo-sidebar {
       position: sticky;
-      top: 20px;
+      top: 118px;
       border-radius: var(--radius-lg);
       background: var(--surface);
       border: 1px solid var(--border);
       padding: 18px 18px 10px;
       box-shadow: var(--shadow-md);
-      max-height: calc(100vh - 40px);
+      max-height: calc(100vh - 138px);
       overflow: hidden;
       display: flex;
       flex-direction: column;
