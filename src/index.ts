@@ -6409,6 +6409,21 @@ function renderYardAppHtml(): string {
     .chip-pick { display: flex; flex-wrap: wrap; gap: 6px; }
     .chip-pick .chip { font-size: 13px; padding: 7px 12px; }
     .chip-pick .chip.on { background: var(--accent); color: #ffffff; border-color: var(--accent); }
+    .missing-toggle {
+      display: flex; align-items: flex-start; gap: 10px;
+      width: 100%; margin-top: 10px; padding: 11px 12px;
+      border-radius: 9px; border: 1px solid rgba(176,0,32,0.28);
+      background: #fff8f8; color: var(--text); text-align: left;
+      font: inherit; cursor: pointer;
+    }
+    .missing-toggle .mt-main { display: block; font-weight: 800; color: var(--danger); line-height: 1.15; }
+    .missing-toggle .mt-sub { display: block; margin-top: 3px; font-size: 12px; color: var(--muted); line-height: 1.3; }
+    .missing-toggle.on { background: #fde8eb; border-color: rgba(176,0,32,0.55); box-shadow: inset 0 0 0 1px rgba(176,0,32,0.12); }
+    .yard-missing-note {
+      margin: 10px 0 0; padding: 9px 11px; border-radius: 8px;
+      background: #fff4d6; border: 1px solid #e7c779; color: var(--warn);
+      font-size: 12px; line-height: 1.35;
+    }
 
     .yard-photo-extras { display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 12px; }
     .yard-photo-extras .photo { width: 64px; height: 64px; aspect-ratio: 1 / 1; }
@@ -7125,12 +7140,10 @@ function renderYardAppHtml(): string {
       "SP OUTSIDE",
       "TIRE SHOP"
     ];
-    // Walker only ever logs what they actually see. "Not here" used to be a
-    // button, but the walker has no way of knowing what *should* be parked in
-    // any given lot, so asking them to declare absence was busy-work and
-    // produced bad findings. Absence is now derived on the FM&A side from
-    // "asset is on the ETIC roster but no walker has confirmed it in N days."
-    // If the walker isn't sure about an asset, they leave it untagged.
+    // Walker normally logs what they actually see. Cannot find is a deliberate
+    // exception for cases where the asset is expected/assigned to be checked but
+    // the walker needs to create an FM&A discrepancy without inventing a parking
+    // location. These rows do not count as sightings.
     var STATUS = [
       { id: "present", label: "Found it", icon: "\u2713" }
     ];
@@ -7731,12 +7744,11 @@ function renderYardAppHtml(): string {
       }).join("");
       var customLoc = hasBasicLoc ? "" : (state.draft.location || "");
 
-      // STATUS is single-button now ("Found it") and isn't rendered as its
-      // own row anymore — the act of saving the sheet implies presence. We
-      // still send status:"present" on save so the API + downstream readers
-      // see a normal value. STATUS is kept around in case we ever need to
-      // reintroduce a per-asset state picker.
-      void STATUS;
+      var statusHtml = STATUS.map(function(s){
+        var on = state.draft.status === s.id;
+        return '<button class="status-btn ' + (on ? ("active " + s.id) : "") + '" data-status="' + s.id + '"><span class="icon">' + s.icon + '</span>' + escapeHtml(s.label) + '</button>';
+      }).join("");
+      var isMissingDraft = state.draft.status === "missing";
 
       var photos = d.photos || [];
       var heroPhotoBlock = "";
@@ -7911,9 +7923,16 @@ function renderYardAppHtml(): string {
         // (Save) implicitly: opening this sheet and tapping Save is the act of
         // confirming presence.
         '<div class="card">' +
+          '<h4>Check result</h4>' +
+          '<div class="status-row">' + statusHtml + '</div>' +
+          (state.draft.status === "missing"
+            ? '<p class="missing-help">Use this when you looked for the vehicle but could not find it. Location is optional; notes are required.</p>'
+            : '') +
+        '</div>' +
+        '<div class="card ' + (state.draft.status === "missing" ? "muted-card" : "") + '">' +
           '<h4>Parking</h4>' +
           '<div class="chip-pick" id="loc-pick">' + locChipHtml + '</div>' +
-          '<input id="loc-input-other" list="loc-options" placeholder="Other" value="' + escapeHtml(customLoc) + '" style="margin-top:8px;" />' +
+          '<input id="loc-input-other" list="loc-options" placeholder="' + (state.draft.status === "missing" ? "Optional if found later" : "Other") + '" value="' + escapeHtml(customLoc) + '" style="margin-top:8px;" ' + (state.draft.status === "missing" ? "aria-label='Optional location'" : "") + ' />' +
         '</div>' +
         '<div class="card">' +
           '<h4>Discrepancies</h4>' +
@@ -8163,10 +8182,23 @@ function renderYardAppHtml(): string {
         var btn = e.target.closest("[data-loc-chip]");
         if (!btn) return;
         state.draft.location = btn.getAttribute("data-loc-chip") || "";
+        state.draft.status = "present";
+        renderSheet();
+      });
+      var sp = $("yard-status-pick");
+      if (sp) sp.addEventListener("click", function(e){
+        var btn = e.target.closest("[data-status]");
+        if (!btn) return;
+        var st = btn.getAttribute("data-status") || "present";
+        state.draft.status = st;
+        if (st === "missing") {
+          state.draft.location = "";
+          if (!state.draft.discrepancies.trim()) state.draft.discrepancies = "Cannot find vehicle";
+        }
         renderSheet();
       });
       var locOther = $("loc-input-other");
-      if (locOther) locOther.addEventListener("input", function(){ state.draft.location = locOther.value; });
+      if (locOther) locOther.addEventListener("input", function(){ state.draft.location = locOther.value; state.draft.status = "present"; });
       var disc = $("disc-input");
       if (disc) disc.addEventListener("input", function(){ state.draft.discrepancies = disc.value; });
       var pi = $("photo-input");
