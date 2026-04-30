@@ -20,6 +20,7 @@ import {
   getScheduleMxFleetForDate,
   computeScheduleMxAssetStats,
   computeScheduleMxCommanderSummary,
+  summarizeScheduleMxAssets,
   getLatestScheduleMxExtractDateKey,
   listScheduleMxExtractDateKeysDesc,
   getWatchRowsLatest,
@@ -5054,15 +5055,24 @@ async function handleScheduleMxApi(env: Env, request: Request, ctx: ExecutionCon
   const stats = computeScheduleMxAssetStats(rows);
   const commander = computeScheduleMxCommanderSummary(rows);
   const eticDateKey = rows.length ? rows[0].eticSnapshotDateKey ?? null : null;
+  const assetId = (url.searchParams.get("assetId") ?? "").trim();
+  const summaryOnly = url.searchParams.get("summary") === "1";
+  const responseRows = assetId
+    ? rows.filter((row) => (row.assetId ?? "").trim().toUpperCase() === assetId.toUpperCase())
+    : summaryOnly
+      ? summarizeScheduleMxAssets(rows)
+      : rows;
   const response = Response.json(
     {
       dateKey,
       eticDateKey,
       stats,
       commander,
-      rows,
+      rows: responseRows,
       source: "prevmx_extract",
       oswoGapsIncluded: includeOswoGaps,
+      summaryOnly,
+      assetId: assetId || null,
     },
     { headers: explicitDate ? scheduleMxCacheHeaders() : cacheHeaders() },
   );
@@ -15030,9 +15040,11 @@ function renderDashboardHtml(): string {
     }
     .smx-card .asset-mono {
       font-family: var(--font-mono);
-      font-size: 0.92rem;
-      font-weight: 600;
+      font-size: clamp(1.02rem, 1.8vw, 1.22rem);
+      font-weight: 800;
       color: var(--text);
+      letter-spacing: -0.035em;
+      line-height: 1.05;
     }
     .smx-card .meta {
       display: flex;
@@ -18942,6 +18954,9 @@ function renderDashboardHtml(): string {
     }
 
     var smxRows = [];
+    var smxAssetSummaries = [];
+    var smxDetailCache = new Map();
+    var smxDetailLoadingAssetId = "";
     var smxStats = null;
     /** Latest ETIC workbook date used for unit / NCE / open WO enrichment (YYYY-MM-DD). */
     var smxEticDateKey = null;
@@ -19283,8 +19298,9 @@ function renderDashboardHtml(): string {
     }
     function smxVcoAssetsByUnit() {
       var m = new Map();
-      for (var i = 0; i < smxRows.length; i++) {
-        var row = smxRows[i];
+      var rows = smxAssetRows();
+      for (var i = 0; i < rows.length; i++) {
+        var row = rows[i];
         var u = smxNormUnitFromRow(row);
         var aid = String(row.assetId || "").trim();
         if (!aid) continue;
@@ -19404,7 +19420,7 @@ function renderDashboardHtml(): string {
       var lead = document.getElementById("smx-vco-mail-lead");
       var inner = document.getElementById("smx-vco-mail-inner");
       if (!tk || !inner) return;
-      if (!smxRows || !smxRows.length) {
+      if (!smxAssetRows().length) {
         tk.classList.add("hidden");
         smxSyncToolsStackVis();
         return;
@@ -19703,8 +19719,85 @@ function renderDashboardHtml(): string {
       return u || "(Unknown unit)";
     }
 
+    function smxAssetRows() {
+      return smxAssetSummaryRows.length ? smxAssetSummaryRows : smxRows;
+    }
+
     function smxEffBucket(row) {
       return row.scheduleMxPlanEffectiveBucket || row.scheduleMxBucket || "ok";
+    }
+
+    function smxPlansForAsset(assetId) {
+      var aid = String(assetId || "").trim();
+      if (!aid) return [];
+      var cached = smxPlanCache.get(aid);
+      if (cached) return cached;
+      if (smxRowsArePlanRows) {
+        var rows = smxRows.filter(function (r) { return String(r.assetId || "").trim() === aid; });
+        if (rows.length) smxPlanCache.set(aid, rows);
+        return rows;
+      }
+      return [];
+    }
+
+    function smxSummaryForAsset(assetId) {
+      var aid = String(assetId || "").trim();
+      if (!aid) return null;
+      for (var i = 0; i < smxAssetSummaryRows.length; i++) {
+        if (String(smxAssetSummaryRows[i].assetId || "").trim() === aid) return smxAssetSummaryRows[i];
+      }
+      return null;
+    }
+
+    function smxRenderAssetLoading(assetId) {
+      const empty = document.getElementById("smx-detail-empty");
+      const wrap = document.getElementById("smx-detail");
+      const hero = document.getElementById("smx-hero");
+      const plansWrap = document.getElementById("smx-plans-wrap");
+      if (!empty || !wrap) return;
+      empty.classList.add("hidden");
+      wrap.classList.remove("hidden");
+      var summary = smxSummaryForAsset(assetId);
+      if (summary) renderSmxHeroAsset(assetId, [summary]);
+      else if (hero) hero.innerHTML = "<div class='wo-hero-row'><div class='wo-hero-id'>" + esc(assetId) + "</div></div>";
+      if (plansWrap) plansWrap.innerHTML = "<div class='problem-empty'>Loading maintenance plans for " + esc(assetId) + "…</div>";
+    }
+
+    async function loadScheduleMxAssetDetails(assetId) {
+      var aid = String(assetId || "").trim();
+      var dk = smxSelectedDateKey || "";
+      if (!aid || !dk) return;
+      if (smxAssetDetailInflight.has(aid)) return smxAssetDetailInflight.get(aid);
+      var seq = ++smxAssetDetailSeq;
+      smxRenderAssetLoading(aid);
+      var p = fetch("/api/schedule-mx?date=" + encodeURIComponent(dk) + "&assetId=" + encodeURIComponent(aid) + "&gaps=" + (smxOswoGapsIncluded ? "1" : "0"))
+        .then(function (r) {
+          return r.json().then(function (j) {
+            if (!r.ok) throw new Error(j && j.error ? j.error : "Could not load asset plans.");
+            return j;
+          });
+        })
+        .then(function (j) {
+          var rows = Array.isArray(j.rows) ? j.rows : [];
+          smxPlanCache.set(aid, rows);
+          if (seq === smxAssetDetailSeq && smxSelectedAssetId === aid) {
+            selectSmxAsset(aid, false);
+          }
+          return rows;
+        })
+        .catch(function () {
+          if (seq === smxAssetDetailSeq && smxSelectedAssetId === aid) {
+            var plansWrap = document.getElementById("smx-plans-wrap");
+            if (plansWrap) plansWrap.innerHTML = "<div class='problem-empty'>Could not load maintenance plans for " + esc(aid) + ".</div>";
+          }
+          return [];
+        })
+        .then(function (rows) {
+          smxAssetDetailInflight.delete(aid);
+          return rows;
+        });
+      smxAssetDetailInflight.set(aid, p);
+      return p;
     }
 
     function smxPlanRank(row) {
@@ -19746,7 +19839,7 @@ function renderDashboardHtml(): string {
     function smxFilteredPlanRows() {
       const qel = document.getElementById("smx-query");
       const q = (qel && qel.value) ? qel.value.trim() : "";
-      return smxRows.filter(function (row) {
+      return smxAssetRows().filter(function (row) {
         if (smxCommanderFilterUnit && smxNormUnitFromRow(row) !== smxCommanderFilterUnit) return false;
         return smxMatchesFilter(row, smxFilter) && smxMatchesQuery(row, q);
       });
@@ -19863,14 +19956,14 @@ function renderDashboardHtml(): string {
         wrap.classList.add("hidden");
         return;
       }
-      const byAsset = smxPlansByAsset();
-      var plans = byAsset.get(smxSelectedAssetId) || [];
+      var plans = smxPlansForAsset(smxSelectedAssetId);
       if (!plans.length) {
-        plans = smxRows.filter(function (r) { return String(r.assetId || "").trim() === smxSelectedAssetId; });
-      }
-      if (!plans.length) {
-        empty.classList.remove("hidden");
-        wrap.classList.add("hidden");
+        empty.classList.add("hidden");
+        wrap.classList.remove("hidden");
+        renderSmxHeroAsset(smxSelectedAssetId, smxAssetSummaryRows.filter(function (r) { return String(r.assetId || "").trim() === smxSelectedAssetId; }));
+        const plansWrap = document.getElementById("smx-plans-wrap");
+        if (plansWrap) plansWrap.innerHTML = "<div class='problem-empty'>Loading maintenance plans…</div>";
+        loadScheduleMxAssetDetails(smxSelectedAssetId);
         return;
       }
       plans = smxSortPlansForAsset(plans);
@@ -20074,7 +20167,7 @@ function renderDashboardHtml(): string {
           renderSmxVcoMail();
           return;
         }
-        const r = await fetch("/api/schedule-mx?date=" + encodeURIComponent(dk) + "&gaps=0");
+        const r = await fetch("/api/schedule-mx?date=" + encodeURIComponent(dk) + "&gaps=0&summary=1");
         const j = await r.json();
         if (!r.ok) {
           if (statsEl) statsEl.textContent = j.error || "Could not load schedule maintenance.";
@@ -20090,13 +20183,15 @@ function renderDashboardHtml(): string {
           renderSmxVcoMail();
           return;
         }
-        smxRows = Array.isArray(j.rows) ? j.rows : [];
+        smxRows = Array.isArray(j.assets) ? j.assets : [];
+        smxRowsArePlanRows = false;
+        smxPlanCache.clear();
         smxStats = j.stats || null;
         smxCommander = j.commander || null;
         smxCommanderFilterUnit = "";
         smxOswoGapsIncluded = !!j.oswoGapsIncluded;
         smxLoadingGaps = false;
-        smxCache.set(dk + "|gaps=0", j);
+        smxCache.set(dk + "|summary", j);
         smxEticDateKey = j.eticDateKey || null;
         if (pill && dk && smxEticDateKey) {
           pill.setAttribute("title", "Import " + fmtKeyLong(dk) + " · Fleet book " + fmtKeyLong(smxEticDateKey));
@@ -20782,19 +20877,12 @@ function renderDashboardHtml(): string {
           : "";
         var aggPill =
           "<span class='smx-pill " + esc(worstBucket) + "'>" + esc(smxPillLabel(worstBucket)) + "</span>";
-        var nextD = null;
-        var minK = "9999-99-99";
-        for (var qi = 0; qi < plans.length; qi++) {
-          var nk = smxNextKey(plans[qi]);
-          if (nk < minK) {
-            minK = nk;
-            nextD = plans[qi].elmsNextMaintDateIso || plans[qi].scheduleMxDueIso;
-          }
-        }
+        var nextD = plans[0] && (plans[0].earliestNextMaintDateIso || plans[0].earliestDueIso || plans[0].elmsNextMaintDateIso || plans[0].scheduleMxDueIso);
         var nextTxt = nextD ? fmtKeyShort(nextD) : "—";
         var wo = plans[0] && plans[0].workOrderCount != null ? plans[0].workOrderCount : 0;
         var metaBits = [];
-        metaBits.push("<span><span class='k'>Plans</span><span class='v'>" + plans.length + "</span></span>");
+        var planN = plans[0] && plans[0].planCount != null ? plans[0].planCount : plans.length;
+        metaBits.push("<span><span class='k'>Plans</span><span class='v'>" + planN + "</span></span>");
         metaBits.push("<span><span class='k'>Next</span><span class='v'>" + esc(nextTxt) + "</span></span>");
         if (wo) metaBits.push("<span><span class='k'>WOs</span><span class='v'>" + wo + "</span></span>");
         return (

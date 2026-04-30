@@ -1155,6 +1155,31 @@ export type ScheduleMxFleetRow = {
   scheduleMxPlanMissingFromOpenWo: boolean;
 } & ReturnType<typeof analyzeElmsScheduleMxFromRaw>;
 
+export type ScheduleMxAssetSummaryRow = Pick<
+  ScheduleMxFleetRow,
+  | "assetId"
+  | "makeModel"
+  | "mgmtCd"
+  | "workOrderCount"
+  | "nce"
+  | "nceStatus"
+  | "owningUnit"
+  | "vehNomen"
+  | "eticSnapshotDateKey"
+  | "eticOpenWorkOrderIds"
+  | "eticOpenInMaintenance"
+  | "eticOpenNmc"
+  | "scheduleMxPlanEffectiveBucket"
+  | "scheduleMxPlanEffectiveNceCritical"
+  | "scheduleMxSuppressedByOpenWo"
+  | "scheduleMxPlanMissingFromOpenWo"
+> & {
+  planCount: number;
+  earliestNextMaintDateIso: string | null;
+  earliestDueIso: string | null;
+  firstPlanName: string;
+};
+
 /** Overlap several D1 round-trips without unbounded fan-out (D1 limits / latency). */
 const SCHEDULE_MX_D1_BATCH_CONCURRENCY = 12;
 
@@ -1543,6 +1568,52 @@ function sortScheduleMxRows(out: ScheduleMxFleetRow[]): ScheduleMxFleetRow[] {
     return a.planRowKey.localeCompare(b.planRowKey);
   });
   return out;
+}
+
+export function summarizeScheduleMxAssets(rows: ScheduleMxFleetRow[]): ScheduleMxAssetSummaryRow[] {
+  const byAsset = new Map<string, ScheduleMxFleetRow[]>();
+  for (const row of rows) {
+    const aid = (row.assetId ?? "").trim() || "—";
+    if (!byAsset.has(aid)) byAsset.set(aid, []);
+    byAsset.get(aid)!.push(row);
+  }
+  const out: ScheduleMxAssetSummaryRow[] = [];
+  for (const [assetId, plans] of byAsset) {
+    const sorted = sortScheduleMxRows(plans.slice());
+    const first = sorted[0];
+    if (!first) continue;
+    let earliestNext: string | null = null;
+    let earliestDue: string | null = null;
+    for (const p of sorted) {
+      const n = p.elmsNextMaintDateIso;
+      if (n && (!earliestNext || n < earliestNext)) earliestNext = n;
+      const d = p.scheduleMxDueIso;
+      if (d && (!earliestDue || d < earliestDue)) earliestDue = d;
+    }
+    out.push({
+      assetId,
+      makeModel: first.makeModel,
+      mgmtCd: first.mgmtCd,
+      workOrderCount: first.workOrderCount,
+      nce: sorted.some((p) => p.nce),
+      nceStatus: sorted.find((p) => p.nceStatus)?.nceStatus ?? first.nceStatus,
+      owningUnit: first.owningUnit,
+      vehNomen: first.vehNomen,
+      eticSnapshotDateKey: first.eticSnapshotDateKey,
+      eticOpenWorkOrderIds: first.eticOpenWorkOrderIds,
+      eticOpenInMaintenance: first.eticOpenInMaintenance,
+      eticOpenNmc: first.eticOpenNmc,
+      scheduleMxPlanEffectiveBucket: first.scheduleMxPlanEffectiveBucket,
+      scheduleMxPlanEffectiveNceCritical: sorted.some((p) => p.scheduleMxPlanEffectiveNceCritical),
+      scheduleMxSuppressedByOpenWo: sorted.some((p) => p.scheduleMxSuppressedByOpenWo),
+      scheduleMxPlanMissingFromOpenWo: sorted.some((p) => p.scheduleMxPlanMissingFromOpenWo),
+      planCount: sorted.length,
+      earliestNextMaintDateIso: earliestNext,
+      earliestDueIso: earliestDue,
+      firstPlanName: first.planName || "",
+    });
+  }
+  return sortScheduleMxRows(out as unknown as ScheduleMxFleetRow[]) as unknown as ScheduleMxAssetSummaryRow[];
 }
 
 /**
