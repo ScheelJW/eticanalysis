@@ -7145,7 +7145,8 @@ function renderYardAppHtml(): string {
     // the walker needs to create an FM&A discrepancy without inventing a parking
     // location. These rows do not count as sightings.
     var STATUS = [
-      { id: "present", label: "Found it", icon: "\u2713" }
+      { id: "present", label: "Found it", icon: "\u2713" },
+      { id: "missing", label: "Cannot find vehicle", icon: "!" }
     ];
 
     var state = {
