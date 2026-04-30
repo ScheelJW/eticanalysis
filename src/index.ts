@@ -20186,7 +20186,7 @@ function renderDashboardHtml(): string {
           renderSmxVcoMail();
           return;
         }
-        smxRows = Array.isArray(j.assets) ? j.assets : [];
+        smxRows = Array.isArray(j.assets) ? j.assets : (Array.isArray(j.rows) ? j.rows : []);
         smxUsingFullRows = false;
         smxDetailCache.clear();
         smxStats = j.stats || null;
