@@ -8293,10 +8293,23 @@ function renderYardAppHtml(): string {
 
     function saveCheck(){
       if (state.saving || !state.openId) return;
+      var sheetName = $("sheet-walker-name");
+      if (sheetName && sheetName.value && sheetName.value.trim()) {
+        state.walker = sheetName.value.trim();
+        localStorage.setItem("yard.walker", state.walker);
+      }
       if (!requireWalkerName()) return;
       var loc = (state.draft.location || "").trim();
-      if (!loc) {
+      var isMissing = state.draft.status === "missing";
+      var notes = (state.draft.discrepancies || "").trim();
+      if (!isMissing && !loc) {
         showToast("Parking spot?", true);
+        return;
+      }
+      if (isMissing && !notes) {
+        showToast("Notes required", true);
+        var noteEl = $("disc-input");
+        if (noteEl) noteEl.focus();
         return;
       }
       state.saving = true;
@@ -8308,9 +8321,9 @@ function renderYardAppHtml(): string {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           assetId: state.openId,
-          location: state.draft.location,
+          location: isMissing ? "" : state.draft.location,
           discrepancies: state.draft.discrepancies,
-          status: "present",
+          status: isMissing ? "missing" : "present",
           checkedBy: (state.walker || "").trim()
         })
       })
@@ -8326,9 +8339,9 @@ function renderYardAppHtml(): string {
             a.lastCheckedAtIso = new Date().toISOString();
             a.lastCheckedBy = (state.walker || "").trim() || a.lastCheckedBy;
             a.daysSinceLastCheck = 0;
-            a.rollingState = "fresh";
+            a.rollingState = isMissing ? "due" : "fresh";
             a.isNeverChecked = false;
-            if (state.draft.location) a.lastLocation = state.draft.location;
+            if (!isMissing && state.draft.location) a.lastLocation = state.draft.location;
             a.lastNotes = state.draft.discrepancies || "";
           }
           // Update totals quickly
