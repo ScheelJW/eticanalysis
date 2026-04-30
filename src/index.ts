@@ -8626,8 +8626,14 @@ function renderDashboardHtml(): string {
       box-sizing: border-box;
     }
     @media (max-width: 640px) {
-      .top { margin-bottom: 16px; }
-      .top-shell { padding: 12px 20px 14px; }
+      .app { padding-left: 14px; padding-right: 14px; }
+      .top { margin-bottom: 14px; }
+      .top-shell { padding: 10px 14px 12px; }
+      .brand-mark { width: 34px; height: 34px; font-size: 0.76rem; }
+      .brand p { font-size: 0.76rem; }
+      .brand-eyebrow { font-size: 0.58rem; }
+      .main-nav { gap: 3px; padding: 4px; border-radius: 8px; }
+      .main-nav button { min-height: 34px; padding: 7px 10px; font-size: 0.73rem; }
     }
     .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
     .brand-mark {
@@ -10206,7 +10212,7 @@ function renderDashboardHtml(): string {
       gap: 20px;
       align-items: start;
     }
-    @media (max-width: 960px) { .wo-layout { grid-template-columns: 1fr; } }
+    @media (max-width: 960px) { .wo-layout { grid-template-columns: 1fr; gap: 14px; } }
 
     .wo-sidebar {
       position: sticky;
@@ -10221,7 +10227,17 @@ function renderDashboardHtml(): string {
       flex-direction: column;
       min-height: 0;
     }
-    @media (max-width: 960px) { .wo-sidebar { position: static; max-height: none; } }
+    @media (max-width: 960px) { .wo-sidebar { position: static; max-height: none; padding: 14px; } }
+    @media (max-width: 560px) {
+      .wo-sidebar { border-radius: 10px; }
+      .wo-searchbar { gap: 6px; margin-bottom: 8px; }
+      .wo-searchbar input { flex-basis: 100%; padding: 10px 12px; }
+      .wo-filters { flex-wrap: nowrap; overflow-x: auto; padding-bottom: 4px; margin-bottom: 8px; }
+      .wo-filter-btn { flex: 0 0 auto; padding: 6px 10px; }
+      .wo-refine { grid-template-columns: 1fr; gap: 6px; }
+      .wo-list { margin: 0 -6px; padding-left: 6px; padding-right: 6px; }
+      .wo-card { padding: 11px 12px 11px 16px; }
+    }
 
     .wo-searchbar {
       display: flex;
@@ -10603,7 +10619,7 @@ function renderDashboardHtml(): string {
       box-shadow: var(--shadow-md);
       min-height: 300px;
     }
-    @media (max-width: 640px) { .wo-detail-pane { padding: 22px 20px; } }
+    @media (max-width: 640px) { .wo-detail-pane { padding: 18px 16px; border-radius: 10px; } }
 
     .wo-empty {
       display: flex;
