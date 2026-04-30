@@ -7428,6 +7428,27 @@ function renderYardAppHtml(): string {
       if (!sel) return;
       var checks = (d && d.checks) ? d.checks.slice() : [];
       checks.sort(function(a, b){ return (b.checkedAtIso || "").localeCompare(a.checkedAtIso || ""); });
+      if (checks.length && d && d.asset && d.asset.assetId) {
+        var latest = checks[0];
+        var a = state.assets.find(function(x){ return x.assetId === d.asset.assetId; });
+        if (a) {
+          a.lastNotes = latest.discrepancies || "";
+          a.lastLocation = latest.location || "";
+          a.lastCheckedAtIso = latest.checkedAtIso || a.lastCheckedAtIso;
+          a.lastCheckedBy = latest.checkedBy || a.lastCheckedBy;
+          if (state.deskSelectedId === a.assetId) {
+            var elNotes = document.getElementById("yard-d-notes");
+            var elLoc = document.getElementById("yard-d-loc");
+            var elLocMeta = document.getElementById("yard-d-loc-meta");
+            if (elNotes) elNotes.textContent = (a.lastNotes || "").trim() || "(no notes on last check)";
+            if (elLoc) {
+              elLoc.textContent = a.lastLocation || "No location logged yet";
+              elLoc.classList.toggle("muted", !((a.lastLocation || "").trim()));
+            }
+            if (elLocMeta) elLocMeta.textContent = formatLastParkedMeta(a);
+          }
+        }
+      }
       state.deskHistChecks = checks;
       state.deskHistEdits = (d && d.checkEdits) ? d.checkEdits.slice() : [];
       if (!checks.length) {
@@ -8348,6 +8369,16 @@ function renderYardAppHtml(): string {
           // Update totals quickly
           if (state.roster && state.roster.totals) {
             state.roster.totals.checkedToday = (state.roster.totals.checkedToday || 0) + 1;
+          }
+          if (state.deskSelectedId === state.openId) {
+            fetch("/api/yard/asset/" + encodeURIComponent(state.openId), { cache: "no-store" })
+              .then(function(r){ return r.json(); })
+              .then(function(d){
+                state.deskDetailById = state.deskDetailById || {};
+                state.deskDetailById[state.openId] = d;
+                fillDeskHistory(d);
+              })
+              .catch(function(){});
           }
           refreshCounts();
           renderList();
