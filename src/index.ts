@@ -18736,9 +18736,9 @@ function renderDashboardHtml(): string {
       const cells = [
         { lbl: "MC Rate", sub: "", val: fmtMc(am.mcRatePercent), cls: "kpi-val-mc em", miss: am.mcRatePercent == null, delta: makeDelta(am.mcRatePercent, prev && prev.mcRatePercent, "pct") },
         { lbl: "Fleet Total", sub: "", val: fmtKpi(am.fleetTotal), cls: "kpi-val-fleet", miss: am.fleetTotal == null, delta: makeDelta(am.fleetTotal, prev && prev.fleetTotal, "flat") },
-        { lbl: "No. Vehs", sub: "FMC", val: fmtKpi(am.fmc), cls: "kpi-val-fmc", miss: am.fmc == null, delta: makeDelta(am.fmc, prev && prev.fmc, "good-up") },
-        { lbl: "No. Vehs", sub: "NMC", val: fmtKpi(am.nmc), cls: "kpi-val-nmc", miss: am.nmc == null, delta: makeDelta(am.nmc, prev && prev.nmc, "bad-up") },
-        { lbl: "No. Vehs", sub: "Surplus", val: fmtKpi(am.surplus), cls: "kpi-val-surplus", miss: am.surplus == null, delta: makeDelta(am.surplus, prev && prev.surplus, "flat") },
+        { lbl: "No. Vehicles", sub: "FMC", val: fmtKpi(am.fmc), cls: "kpi-val-fmc", miss: am.fmc == null, delta: makeDelta(am.fmc, prev && prev.fmc, "good-up") },
+        { lbl: "No. Vehicles", sub: "NMC", val: fmtKpi(am.nmc), cls: "kpi-val-nmc", miss: am.nmc == null, delta: makeDelta(am.nmc, prev && prev.nmc, "bad-up") },
+        { lbl: "No. Vehicles", sub: "Surplus", val: fmtKpi(am.surplus), cls: "kpi-val-surplus", miss: am.surplus == null, delta: makeDelta(am.surplus, prev && prev.surplus, "flat") },
       ];
       row.innerHTML = cells.map(function (c) {
         const miss = c.miss ? " kpi-missing" : "";
