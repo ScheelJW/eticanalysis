@@ -7924,7 +7924,7 @@ function renderYardAppHtml(): string {
       var walkerNameHtml = state.walker ? "" : (
         '<div class="card">' +
           '<h4>Your name</h4>' +
-          '<input class="walker-name-input" type="text" placeholder="First Last" autocomplete="name" />' +
+          '<input id="sheet-walker-name" class="walker-name-input" type="text" placeholder="First Last" autocomplete="name" />' +
         '</div>'
       );
       var logVisitInner =
