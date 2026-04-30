@@ -7193,9 +7193,20 @@ function renderYardAppHtml(): string {
     function requireWalkerName(){
       if ((state.walker || "").trim()) return true;
       showToast("Name?", true);
-      var inp = document.querySelector(".walker-name-input");
+      var inp = document.querySelector("#sheet-walker-name") || document.querySelector(".walker-name-input");
       if (inp) inp.focus();
       return false;
+    }
+
+    function syncWalkerNameFromInput(input) {
+      if (!input) return false;
+      var v = (input.value || "").trim();
+      if (!v) return false;
+      state.walker = v;
+      localStorage.setItem("yard.walker", v);
+      renderWalker();
+      if (typeof syncChiprowOffset === "function") syncChiprowOffset();
+      return true;
     }
 
     function renderWalker(){
@@ -7214,14 +7225,7 @@ function renderYardAppHtml(): string {
           inp.removeEventListener("change", inp._yardSave);
           inp.removeEventListener("blur", inp._yardSave);
         }
-        inp._yardSave = function(){
-          var v = inp.value.trim();
-          if (!v) return;
-          state.walker = v;
-          localStorage.setItem("yard.walker", v);
-          renderWalker();
-          if (typeof syncChiprowOffset === "function") syncChiprowOffset();
-        };
+        inp._yardSave = function(){ syncWalkerNameFromInput(inp); };
         inp.addEventListener("change", inp._yardSave);
         inp.addEventListener("blur", inp._yardSave);
       });
@@ -7917,12 +7921,14 @@ function renderYardAppHtml(): string {
           "</div>";
       }
 
+      var walkerNameHtml = state.walker ? "" : (
+        '<div class="card">' +
+          '<h4>Your name</h4>' +
+          '<input class="walker-name-input" type="text" placeholder="First Last" autocomplete="name" />' +
+        '</div>'
+      );
       var logVisitInner =
-        // Walker only logs assets they actually see. The "Status" row used to
-        // include a "Not here" button — see the comment above STATUS for why
-        // it was removed. The single "Found it" button now lives at the bottom
-        // (Save) implicitly: opening this sheet and tapping Save is the act of
-        // confirming presence.
+        walkerNameHtml +
         '<div class="card">' +
           '<h4>Check result</h4>' +
           '<div class="status-row">' + statusHtml + '</div>' +
@@ -7930,11 +7936,13 @@ function renderYardAppHtml(): string {
             ? '<p class="missing-help">Use this when you looked for the vehicle but could not find it. Location is optional; notes are required.</p>'
             : '') +
         '</div>' +
-        '<div class="card ' + (state.draft.status === "missing" ? "muted-card" : "") + '">' +
-          '<h4>Parking</h4>' +
-          '<div class="chip-pick" id="loc-pick">' + locChipHtml + '</div>' +
-          '<input id="loc-input-other" list="loc-options" placeholder="' + (state.draft.status === "missing" ? "Optional if found later" : "Other") + '" value="' + escapeHtml(customLoc) + '" style="margin-top:8px;" ' + (state.draft.status === "missing" ? "aria-label='Optional location'" : "") + ' />' +
-        '</div>' +
+        (state.draft.status !== "missing"
+          ? '<div class="card">' +
+            '<h4>Parking</h4>' +
+            '<div class="chip-pick" id="loc-pick">' + locChipHtml + '</div>' +
+            '<input id="loc-input-other" list="loc-options" placeholder="Other" value="' + escapeHtml(customLoc) + '" style="margin-top:8px;" />' +
+          '</div>'
+          : '') +
         '<div class="card">' +
           '<h4>Discrepancies</h4>' +
           '<div class="chip-pick" id="chip-pick">' + chipHtml + '</div>' +
@@ -8199,7 +8207,14 @@ function renderYardAppHtml(): string {
         renderSheet();
       });
       var locOther = $("loc-input-other");
-      if (locOther) locOther.addEventListener("input", function(){ state.draft.location = locOther.value; state.draft.status = "present"; });
+      if (locOther) locOther.addEventListener("input", function(){ state.draft.location = locOther.value; if ((locOther.value || "").trim()) state.draft.status = "present"; });
+      var sheetWalker = $("sheet-walker-name");
+      if (sheetWalker) sheetWalker.addEventListener("input", function(){
+        var v = sheetWalker.value.trim();
+        state.walker = v;
+        if (v) localStorage.setItem("yard.walker", v);
+        renderWalker();
+      });
       var disc = $("disc-input");
       if (disc) disc.addEventListener("input", function(){ state.draft.discrepancies = disc.value; });
       var pi = $("photo-input");
