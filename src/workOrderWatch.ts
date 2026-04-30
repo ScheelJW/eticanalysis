@@ -760,6 +760,91 @@ export type WatchRow = {
   melRecallHint?: MelRecallHint | null;
 };
 
+export type WatchListSummaryRow = Pick<
+  WatchRow,
+  | "workOrderId"
+  | "assetId"
+  | "melTier"
+  | "partsStatus"
+  | "eticRaw"
+  | "eticDate"
+  | "lastRemarkChangeDate"
+  | "daysSinceRemarkChange"
+  | "requiredIntervalDays"
+  | "remarkStale"
+  | "eticPushCount"
+  | "cumulativeEticSlipDays"
+  | "firstEticDate"
+  | "lastEticDate"
+  | "lastSnapshotDate"
+  | "owningUnit"
+  | "melKey"
+  | "shop"
+  | "mgmtCd"
+  | "makeModel"
+  | "vehNomen"
+  | "firstSeenDate"
+  | "historyBounded"
+  | "establishedDate"
+  | "establishedDateIso"
+  | "woReason"
+  | "nce"
+  | "nceStatus"
+  | "scheduleMxStatus"
+  | "scheduleMxDueIso"
+  | "scheduleMxDaysUntil"
+  | "scheduleMxOverdueByDays"
+  | "scheduleMxBucket"
+  | "scheduleMxNeedsEntry"
+  | "daysDown"
+  | "melRecallHint"
+> & { remarkPreview: string };
+
+export function summarizeWatchRowsForList(rows: WatchRow[]): WatchListSummaryRow[] {
+  return rows.map((row) => {
+    const preview = (row.remarks || "").replace(/\s+/g, " ").trim().slice(0, 180);
+    return {
+      workOrderId: row.workOrderId,
+      assetId: row.assetId,
+      melTier: row.melTier,
+      partsStatus: row.partsStatus,
+      eticRaw: row.eticRaw,
+      eticDate: row.eticDate,
+      lastRemarkChangeDate: row.lastRemarkChangeDate,
+      daysSinceRemarkChange: row.daysSinceRemarkChange,
+      requiredIntervalDays: row.requiredIntervalDays,
+      remarkStale: row.remarkStale,
+      eticPushCount: row.eticPushCount,
+      cumulativeEticSlipDays: row.cumulativeEticSlipDays,
+      firstEticDate: row.firstEticDate,
+      lastEticDate: row.lastEticDate,
+      lastSnapshotDate: row.lastSnapshotDate,
+      owningUnit: row.owningUnit,
+      melKey: row.melKey,
+      shop: row.shop,
+      mgmtCd: row.mgmtCd,
+      makeModel: row.makeModel,
+      vehNomen: row.vehNomen,
+      firstSeenDate: row.firstSeenDate,
+      historyBounded: row.historyBounded,
+      establishedDate: row.establishedDate,
+      establishedDateIso: row.establishedDateIso,
+      woReason: row.woReason,
+      nce: row.nce,
+      nceStatus: row.nceStatus,
+      scheduleMxStatus: row.scheduleMxStatus,
+      scheduleMxDueIso: row.scheduleMxDueIso,
+      scheduleMxDaysUntil: row.scheduleMxDaysUntil,
+      scheduleMxOverdueByDays: row.scheduleMxOverdueByDays,
+      scheduleMxBucket: row.scheduleMxBucket,
+      scheduleMxNeedsEntry: row.scheduleMxNeedsEntry,
+      daysDown: row.daysDown,
+      melRecallHint: row.melRecallHint,
+      remarkPreview: preview,
+    };
+  });
+}
+
 /** Computed MEL recall opportunity (see attachMelRecallHints). */
 export type MelRecallHint = {
   donorMelKey: string;

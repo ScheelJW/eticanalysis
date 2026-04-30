@@ -17,6 +17,7 @@ import {
   getWatchRowById,
   getWatchRowByIdForDate,
   getWatchRowsForDate,
+  summarizeWatchRowsForList,
   getScheduleMxFleetForDate,
   computeScheduleMxAssetStats,
   computeScheduleMxCommanderSummary,
@@ -4999,8 +5000,9 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
   const staleOnly = url.searchParams.get("stale") === "1";
   const filtered = staleOnly ? rows.filter((r) => r.remarkStale) : rows;
   const staleCount = rows.filter((r) => r.remarkStale).length;
+  const responseRows = url.searchParams.get("summary") === "1" ? summarizeWatchRowsForList(filtered) : filtered;
   return Response.json(
-    { asOfDateKey: asOf, scope, staleCount, total: rows.length, rows: filtered, healed },
+    { asOfDateKey: asOf, scope, staleCount, total: rows.length, rows: responseRows, healed },
     { headers: cacheHeaders() },
   );
 }
@@ -17450,7 +17452,7 @@ function renderDashboardHtml(): string {
       // that were actually present in the .xlsx for this date. scope=all would
       // return every WO we've ever ingested (work_order_state), which inflates
       // the count well beyond what's in the latest workbook.
-      const url = "/api/watch?date=" + encodeURIComponent(dateKey) +
+      const url = "/api/watch?date=" + encodeURIComponent(dateKey) + "&summary=1" +
         (force ? "&_=" + Date.now() : "");
       const res = await fetch(url, force ? { cache: "no-store" } : undefined);
       if (!res.ok) { watchCacheByDate.set(dateKey, []); return []; }
