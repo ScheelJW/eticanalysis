@@ -22,6 +22,7 @@ import {
   parseScheduleMxCsvToPlanRows,
   parseScheduleMxCsvToRawByAsset,
   parseOswoCsvToRows,
+  watchOwningUnitFromRawJson,
 } from "../src/workOrderWatch";
 import type { ScheduleMxFleetRow, WatchRow } from "../src/workOrderWatch";
 
@@ -47,6 +48,24 @@ describe("parseEticDate", () => {
   it("parses ISO prefix and US dates", () => {
     expect(parseEticDate("2026-04-20")).toBe("2026-04-20");
     expect(parseEticDate("4/20/2026")).toBe("2026-04-20");
+  });
+});
+
+describe("watchOwningUnitFromRawJson", () => {
+  it("prefers the ETIC Fleet P&A Unit column over Fleet user cd", () => {
+    expect(watchOwningUnitFromRawJson(JSON.stringify({ "fleet.unit": "5 LRS", "fleet.user cd": "EP" }))).toBe("5 LRS");
+  });
+
+  it("uses the normalized leading-space ETIC Fleet P&A Unit column", () => {
+    expect(watchOwningUnitFromRawJson(JSON.stringify({ " unit": "5 SFS", "fleet.user cd": "KL" }))).toBe("5 SFS");
+  });
+
+  it("maps Fleet P&A user cd to full unit name for already-ingested rows", () => {
+    expect(watchOwningUnitFromRawJson(JSON.stringify({ "fleet.user cd": "EP" }))).toBe("5 LRS");
+  });
+
+  it("rejects numeric-only Fleet P&A unit candidates", () => {
+    expect(watchOwningUnitFromRawJson(JSON.stringify({ "fleet.user cd": "7" }))).toBe("");
   });
 });
 
@@ -294,6 +313,22 @@ describe("utilization type and meter due soon", () => {
     expect(utilizationTypeFromFleetRawJson(j)).toBe("hour");
   });
 
+  it("ignores Fleet P&A overdue summary text as a utilization type", () => {
+    const j = JSON.stringify({
+      "fleet.schedule maintenance": "Overdue 43AA (19 Aug 25), 34AA (13 Feb 25 or 4992 miles)",
+      "fleet.smr": "E441VV00000170",
+    });
+    expect(utilizationTypeFromFleetRawJson(j)).toBe("");
+  });
+
+  it("ignores ELMS overdue meter-summary text as a utilization type", () => {
+    const j = JSON.stringify({
+      "fleet.vehicle utilization uom": "overdue 34aa (313 miles overdue), 35bd (313 miles overdue)",
+      "fleet.smr": "AF10B01142",
+    });
+    expect(utilizationTypeFromFleetRawJson(j)).toBe("");
+  });
+
   it("hour-meter: 274h remaining to target is not meter due soon (274 > 50)", () => {
     const raw: Record<string, string> = {
       "x.next util": "872",
@@ -428,6 +463,12 @@ describe("cleanUtilUomLabel", () => {
     expect(cleanUtilUomLabel("")).toBe("");
     expect(cleanUtilUomLabel(null)).toBe("");
     expect(cleanUtilUomLabel(undefined)).toBe("");
+  });
+
+  it("returns empty for asset ids and overdue schedule-summary text", () => {
+    expect(cleanUtilUomLabel("E441VV00000170")).toBe("");
+    expect(cleanUtilUomLabel("Overdue 34AA (12 Nov 25 or 1941 miles)")).toBe("");
+    expect(cleanUtilUomLabel("overdue 34aa (313 miles overdue), 35bd (313 miles overdue)")).toBe("");
   });
 
   it("falls through unknown labels with whitespace collapsed", () => {
@@ -942,6 +983,9 @@ class MockD1Database {
         return String(b.last_snapshot_date).localeCompare(String(a.last_snapshot_date));
       });
       return rows as T[];
+    }
+    if (sql.includes("FROM fleet_p_a_snapshot") && sql.includes("ROW_NUMBER() OVER")) {
+      return [] as T[];
     }
     return [];
   }

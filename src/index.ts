@@ -17,9 +17,11 @@ import {
   getWatchRowById,
   getWatchRowByIdForDate,
   getWatchRowsForDate,
+  summarizeWatchRowsForList,
   getScheduleMxFleetForDate,
   computeScheduleMxAssetStats,
   computeScheduleMxCommanderSummary,
+  summarizeScheduleMxAssets,
   getLatestScheduleMxExtractDateKey,
   listScheduleMxExtractDateKeysDesc,
   getWatchRowsLatest,
@@ -648,7 +650,7 @@ export default {
     }
 
     if (url.pathname === "/api/schedule-mx") {
-      return handleScheduleMxApi(env, request);
+      return handleScheduleMxApi(env, request, ctx);
     }
 
     if (url.pathname === "/api/authz-manager") {
@@ -1117,6 +1119,12 @@ async function buildYardCheckMeta(env: Env, request: Request): Promise<YardCheck
 function cacheHeaders(): HeadersInit {
   return {
     "Cache-Control": "no-store",
+  };
+}
+
+function scheduleMxCacheHeaders(): HeadersInit {
+  return {
+    "Cache-Control": "public, max-age=60, s-maxage=300",
   };
 }
 
@@ -4992,13 +5000,14 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
   const staleOnly = url.searchParams.get("stale") === "1";
   const filtered = staleOnly ? rows.filter((r) => r.remarkStale) : rows;
   const staleCount = rows.filter((r) => r.remarkStale).length;
+  const responseRows = url.searchParams.get("summary") === "1" ? summarizeWatchRowsForList(filtered) : filtered;
   return Response.json(
-    { asOfDateKey: asOf, scope, staleCount, total: rows.length, rows: filtered, healed },
+    { asOfDateKey: asOf, scope, staleCount, total: rows.length, rows: responseRows, healed },
     { headers: cacheHeaders() },
   );
 }
 
-async function handleScheduleMxApi(env: Env, request: Request): Promise<Response> {
+async function handleScheduleMxApi(env: Env, request: Request, ctx: ExecutionContext): Promise<Response> {
   if (request.method !== "GET") return new Response("Method Not Allowed", { status: 405 });
   const url = new URL(request.url);
   if (url.searchParams.get("dates") === "1") {
@@ -5007,6 +5016,7 @@ async function handleScheduleMxApi(env: Env, request: Request): Promise<Response
     return Response.json({ dates, latest }, { headers: cacheHeaders() });
   }
 
+  const explicitDate = url.searchParams.has("date");
   let dateKey = url.searchParams.get("date")?.trim() ?? "";
   if (!dateKey) {
     dateKey = (await getLatestScheduleMxExtractDateKey(env)) ?? "";
@@ -5025,7 +5035,14 @@ async function handleScheduleMxApi(env: Env, request: Request): Promise<Response
   }
   /** When "0", skip OSWO aggregation (Plan not on WO badge cleared); default full gap detection. */
   const includeOswoGaps = url.searchParams.get("gaps") !== "0";
-  const rows = await getScheduleMxFleetForDate(env, dateKey, { includeOswoGaps });
+  const cacheKey = explicitDate ? new Request(url.toString(), request) : null;
+  const edgeCache = (caches as unknown as { default?: Cache }).default;
+  if (cacheKey && edgeCache) {
+    const cached = await edgeCache.match(cacheKey);
+    if (cached) return cached;
+  }
+  const assetId = url.searchParams.get("assetId")?.trim() ?? "";
+  const rows = await getScheduleMxFleetForDate(env, dateKey, { includeOswoGaps, assetId: assetId || undefined });
   if (rows.length === 0) {
     return Response.json(
       {
@@ -5041,18 +5058,30 @@ async function handleScheduleMxApi(env: Env, request: Request): Promise<Response
   const stats = computeScheduleMxAssetStats(rows);
   const commander = computeScheduleMxCommanderSummary(rows);
   const eticDateKey = rows.length ? rows[0].eticSnapshotDateKey ?? null : null;
-  return Response.json(
+  const summaryOnly = url.searchParams.get("summary") === "1";
+  const responseRows = assetId
+    ? rows.filter((row) => (row.assetId ?? "").trim().toUpperCase() === assetId.toUpperCase())
+    : summaryOnly
+      ? summarizeScheduleMxAssets(rows)
+      : rows;
+  const response = Response.json(
     {
       dateKey,
       eticDateKey,
       stats,
       commander,
-      rows,
+      rows: responseRows,
       source: "prevmx_extract",
       oswoGapsIncluded: includeOswoGaps,
+      summaryOnly,
+      assetId: assetId || null,
     },
-    { headers: cacheHeaders() },
+    { headers: explicitDate ? scheduleMxCacheHeaders() : cacheHeaders() },
   );
+  if (cacheKey && edgeCache) {
+    ctx.waitUntil(edgeCache.put(cacheKey, response.clone()));
+  }
+  return response;
 }
 
 async function handleAuthzManagerApi(env: Env, request: Request): Promise<Response> {
@@ -6380,6 +6409,21 @@ function renderYardAppHtml(): string {
     .chip-pick { display: flex; flex-wrap: wrap; gap: 6px; }
     .chip-pick .chip { font-size: 13px; padding: 7px 12px; }
     .chip-pick .chip.on { background: var(--accent); color: #ffffff; border-color: var(--accent); }
+    .missing-toggle {
+      display: flex; align-items: flex-start; gap: 10px;
+      width: 100%; margin-top: 10px; padding: 11px 12px;
+      border-radius: 9px; border: 1px solid rgba(176,0,32,0.28);
+      background: #fff8f8; color: var(--text); text-align: left;
+      font: inherit; cursor: pointer;
+    }
+    .missing-toggle .mt-main { display: block; font-weight: 800; color: var(--danger); line-height: 1.15; }
+    .missing-toggle .mt-sub { display: block; margin-top: 3px; font-size: 12px; color: var(--muted); line-height: 1.3; }
+    .missing-toggle.on { background: #fde8eb; border-color: rgba(176,0,32,0.55); box-shadow: inset 0 0 0 1px rgba(176,0,32,0.12); }
+    .yard-missing-note {
+      margin: 10px 0 0; padding: 9px 11px; border-radius: 8px;
+      background: #fff4d6; border: 1px solid #e7c779; color: var(--warn);
+      font-size: 12px; line-height: 1.35;
+    }
 
     .yard-photo-extras { display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 12px; }
     .yard-photo-extras .photo { width: 64px; height: 64px; aspect-ratio: 1 / 1; }
@@ -7096,14 +7140,13 @@ function renderYardAppHtml(): string {
       "SP OUTSIDE",
       "TIRE SHOP"
     ];
-    // Walker only ever logs what they actually see. "Not here" used to be a
-    // button, but the walker has no way of knowing what *should* be parked in
-    // any given lot, so asking them to declare absence was busy-work and
-    // produced bad findings. Absence is now derived on the FM&A side from
-    // "asset is on the ETIC roster but no walker has confirmed it in N days."
-    // If the walker isn't sure about an asset, they leave it untagged.
+    // Walker normally logs what they actually see. Cannot find is a deliberate
+    // exception for cases where the asset is expected/assigned to be checked but
+    // the walker needs to create an FM&A discrepancy without inventing a parking
+    // location. These rows do not count as sightings.
     var STATUS = [
-      { id: "present", label: "Found it", icon: "\u2713" }
+      { id: "present", label: "Found it", icon: "\u2713" },
+      { id: "missing", label: "Cannot find vehicle", icon: "!" }
     ];
 
     var state = {
@@ -7150,9 +7193,20 @@ function renderYardAppHtml(): string {
     function requireWalkerName(){
       if ((state.walker || "").trim()) return true;
       showToast("Name?", true);
-      var inp = document.querySelector(".walker-name-input");
+      var inp = document.querySelector("#sheet-walker-name") || document.querySelector(".walker-name-input");
       if (inp) inp.focus();
       return false;
+    }
+
+    function syncWalkerNameFromInput(input) {
+      if (!input) return false;
+      var v = (input.value || "").trim();
+      if (!v) return false;
+      state.walker = v;
+      localStorage.setItem("yard.walker", v);
+      renderWalker();
+      if (typeof syncChiprowOffset === "function") syncChiprowOffset();
+      return true;
     }
 
     function renderWalker(){
@@ -7171,14 +7225,7 @@ function renderYardAppHtml(): string {
           inp.removeEventListener("change", inp._yardSave);
           inp.removeEventListener("blur", inp._yardSave);
         }
-        inp._yardSave = function(){
-          var v = inp.value.trim();
-          if (!v) return;
-          state.walker = v;
-          localStorage.setItem("yard.walker", v);
-          renderWalker();
-          if (typeof syncChiprowOffset === "function") syncChiprowOffset();
-        };
+        inp._yardSave = function(){ syncWalkerNameFromInput(inp); };
         inp.addEventListener("change", inp._yardSave);
         inp.addEventListener("blur", inp._yardSave);
       });
@@ -7381,6 +7428,27 @@ function renderYardAppHtml(): string {
       if (!sel) return;
       var checks = (d && d.checks) ? d.checks.slice() : [];
       checks.sort(function(a, b){ return (b.checkedAtIso || "").localeCompare(a.checkedAtIso || ""); });
+      if (checks.length && d && d.asset && d.asset.assetId) {
+        var latest = checks[0];
+        var a = state.assets.find(function(x){ return x.assetId === d.asset.assetId; });
+        if (a) {
+          a.lastNotes = latest.discrepancies || "";
+          a.lastLocation = latest.location || "";
+          a.lastCheckedAtIso = latest.checkedAtIso || a.lastCheckedAtIso;
+          a.lastCheckedBy = latest.checkedBy || a.lastCheckedBy;
+          if (state.deskSelectedId === a.assetId) {
+            var elNotes = document.getElementById("yard-d-notes");
+            var elLoc = document.getElementById("yard-d-loc");
+            var elLocMeta = document.getElementById("yard-d-loc-meta");
+            if (elNotes) elNotes.textContent = (a.lastNotes || "").trim() || "(no notes on last check)";
+            if (elLoc) {
+              elLoc.textContent = a.lastLocation || "No location logged yet";
+              elLoc.classList.toggle("muted", !((a.lastLocation || "").trim()));
+            }
+            if (elLocMeta) elLocMeta.textContent = formatLastParkedMeta(a);
+          }
+        }
+      }
       state.deskHistChecks = checks;
       state.deskHistEdits = (d && d.checkEdits) ? d.checkEdits.slice() : [];
       if (!checks.length) {
@@ -7702,12 +7770,11 @@ function renderYardAppHtml(): string {
       }).join("");
       var customLoc = hasBasicLoc ? "" : (state.draft.location || "");
 
-      // STATUS is single-button now ("Found it") and isn't rendered as its
-      // own row anymore — the act of saving the sheet implies presence. We
-      // still send status:"present" on save so the API + downstream readers
-      // see a normal value. STATUS is kept around in case we ever need to
-      // reintroduce a per-asset state picker.
-      void STATUS;
+      var statusHtml = STATUS.map(function(s){
+        var on = state.draft.status === s.id;
+        return '<button class="status-btn ' + (on ? ("active " + s.id) : "") + '" data-status="' + s.id + '"><span class="icon">' + s.icon + '</span>' + escapeHtml(s.label) + '</button>';
+      }).join("");
+      var isMissingDraft = state.draft.status === "missing";
 
       var photos = d.photos || [];
       var heroPhotoBlock = "";
@@ -7875,17 +7942,28 @@ function renderYardAppHtml(): string {
           "</div>";
       }
 
-      var logVisitInner =
-        // Walker only logs assets they actually see. The "Status" row used to
-        // include a "Not here" button — see the comment above STATUS for why
-        // it was removed. The single "Found it" button now lives at the bottom
-        // (Save) implicitly: opening this sheet and tapping Save is the act of
-        // confirming presence.
+      var walkerNameHtml = state.walker ? "" : (
         '<div class="card">' +
-          '<h4>Parking</h4>' +
-          '<div class="chip-pick" id="loc-pick">' + locChipHtml + '</div>' +
-          '<input id="loc-input-other" list="loc-options" placeholder="Other" value="' + escapeHtml(customLoc) + '" style="margin-top:8px;" />' +
+          '<h4>Your name</h4>' +
+          '<input id="sheet-walker-name" class="walker-name-input" type="text" placeholder="First Last" autocomplete="name" />' +
+        '</div>'
+      );
+      var logVisitInner =
+        walkerNameHtml +
+        '<div class="card">' +
+          '<h4>Check result</h4>' +
+          '<div class="status-row" id="yard-status-pick">' + statusHtml + '</div>' +
+          (state.draft.status === "missing"
+            ? '<p class="missing-help">Use this when you looked for the vehicle but could not find it. Location is optional; notes are required.</p>'
+            : '') +
         '</div>' +
+        (state.draft.status !== "missing"
+          ? '<div class="card">' +
+            '<h4>Parking</h4>' +
+            '<div class="chip-pick" id="loc-pick">' + locChipHtml + '</div>' +
+            '<input id="loc-input-other" list="loc-options" placeholder="Other" value="' + escapeHtml(customLoc) + '" style="margin-top:8px;" />' +
+          '</div>'
+          : '') +
         '<div class="card">' +
           '<h4>Discrepancies</h4>' +
           '<div class="chip-pick" id="chip-pick">' + chipHtml + '</div>' +
@@ -8134,10 +8212,29 @@ function renderYardAppHtml(): string {
         var btn = e.target.closest("[data-loc-chip]");
         if (!btn) return;
         state.draft.location = btn.getAttribute("data-loc-chip") || "";
+        state.draft.status = "present";
+        renderSheet();
+      });
+      var sp = $("yard-status-pick");
+      if (sp) sp.addEventListener("click", function(e){
+        var btn = e.target.closest("[data-status]");
+        if (!btn) return;
+        var st = btn.getAttribute("data-status") || "present";
+        state.draft.status = st;
+        if (st === "missing") {
+          state.draft.location = "";
+        }
         renderSheet();
       });
       var locOther = $("loc-input-other");
-      if (locOther) locOther.addEventListener("input", function(){ state.draft.location = locOther.value; });
+      if (locOther) locOther.addEventListener("input", function(){ state.draft.location = locOther.value; if ((locOther.value || "").trim()) state.draft.status = "present"; });
+      var sheetWalker = $("sheet-walker-name");
+      if (sheetWalker) sheetWalker.addEventListener("input", function(){
+        var v = sheetWalker.value.trim();
+        state.walker = v;
+        if (v) localStorage.setItem("yard.walker", v);
+        renderWalker();
+      });
       var disc = $("disc-input");
       if (disc) disc.addEventListener("input", function(){ state.draft.discrepancies = disc.value; });
       var pi = $("photo-input");
@@ -8216,10 +8313,23 @@ function renderYardAppHtml(): string {
 
     function saveCheck(){
       if (state.saving || !state.openId) return;
+      var sheetName = $("sheet-walker-name");
+      if (sheetName && sheetName.value && sheetName.value.trim()) {
+        state.walker = sheetName.value.trim();
+        localStorage.setItem("yard.walker", state.walker);
+      }
       if (!requireWalkerName()) return;
       var loc = (state.draft.location || "").trim();
-      if (!loc) {
+      var isMissing = state.draft.status === "missing";
+      var notes = (state.draft.discrepancies || "").trim();
+      if (!isMissing && !loc) {
         showToast("Parking spot?", true);
+        return;
+      }
+      if (isMissing && !notes) {
+        showToast("Notes required", true);
+        var noteEl = $("disc-input");
+        if (noteEl) noteEl.focus();
         return;
       }
       state.saving = true;
@@ -8231,9 +8341,9 @@ function renderYardAppHtml(): string {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           assetId: state.openId,
-          location: state.draft.location,
+          location: isMissing ? "" : state.draft.location,
           discrepancies: state.draft.discrepancies,
-          status: "present",
+          status: isMissing ? "missing" : "present",
           checkedBy: (state.walker || "").trim()
         })
       })
@@ -8241,22 +8351,33 @@ function renderYardAppHtml(): string {
           if (!r.ok) return r.json().then(function(j){ throw new Error(j.error || "save failed"); });
           return r.json();
         })
-        .then(function(){
+        .then(function(j){
           showToast("Saved");
+          var savedCheck = j && j.check ? j.check : null;
           // Optimistic local update
           var a = state.assets.find(function(x){ return x.assetId === state.openId; });
           if (a) {
-            a.lastCheckedAtIso = new Date().toISOString();
-            a.lastCheckedBy = (state.walker || "").trim() || a.lastCheckedBy;
+            a.lastCheckedAtIso = (savedCheck && savedCheck.checkedAtIso) || new Date().toISOString();
+            a.lastCheckedBy = (savedCheck && savedCheck.checkedBy) || (state.walker || "").trim() || a.lastCheckedBy;
             a.daysSinceLastCheck = 0;
-            a.rollingState = "fresh";
+            a.rollingState = isMissing ? "due" : "fresh";
             a.isNeverChecked = false;
-            if (state.draft.location) a.lastLocation = state.draft.location;
-            a.lastNotes = state.draft.discrepancies || "";
+            if (!isMissing && savedCheck && savedCheck.location) a.lastLocation = savedCheck.location;
+            a.lastNotes = (savedCheck && savedCheck.discrepancies) || state.draft.discrepancies || "";
           }
           // Update totals quickly
           if (state.roster && state.roster.totals) {
             state.roster.totals.checkedToday = (state.roster.totals.checkedToday || 0) + 1;
+          }
+          if (state.deskSelectedId === state.openId) {
+            fetch("/api/yard/asset/" + encodeURIComponent(state.openId), { cache: "no-store" })
+              .then(function(r){ return r.json(); })
+              .then(function(d){
+                state.deskDetailById = state.deskDetailById || {};
+                state.deskDetailById[state.openId] = d;
+                fillDeskHistory(d);
+              })
+              .catch(function(){});
           }
           refreshCounts();
           renderList();
@@ -8584,6 +8705,9 @@ function renderDashboardHtml(): string {
        Spans the full viewport width but keeps inner content aligned with the
        .app column. Sits flush under the 4px accent strap. */
     .top {
+      position: sticky;
+      top: 0;
+      z-index: 80;
       display: flex;
       flex-direction: column;
       align-items: stretch;
@@ -8596,19 +8720,26 @@ function renderDashboardHtml(): string {
       background: var(--accent);
       color: #ffffff;
       border-bottom: 3px solid var(--accent-strong);
+      box-shadow: 0 8px 24px rgba(0, 32, 84, 0.16);
     }
     .top-shell {
-      padding: 14px max(32px, calc(50vw - 528px)) 14px;
+      padding: 12px max(32px, calc(50vw - 560px)) 12px;
       display: flex;
       flex-direction: column;
-      gap: 14px;
+      gap: 10px;
       box-sizing: border-box;
     }
     @media (max-width: 640px) {
-      .top { margin-bottom: 16px; }
-      .top-shell { padding: 12px 20px 14px; }
+      .app { padding-left: 14px; padding-right: 14px; }
+      .top { margin-bottom: 14px; }
+      .top-shell { padding: 10px 14px 12px; }
+      .brand-mark { width: 34px; height: 34px; font-size: 0.76rem; }
+      .brand p { font-size: 0.76rem; }
+      .brand-eyebrow { font-size: 0.58rem; }
+      .main-nav { gap: 3px; padding: 4px; border-radius: 8px; }
+      .main-nav button { min-height: 34px; padding: 7px 10px; font-size: 0.73rem; }
     }
-    .brand { display: flex; align-items: center; gap: 14px; min-width: 0; }
+    .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
     .brand-mark {
       width: 40px; height: 40px; flex: 0 0 auto;
       border-radius: 4px;
@@ -8696,8 +8827,8 @@ function renderDashboardHtml(): string {
       display: flex;
       flex-wrap: nowrap;
       align-items: stretch;
-      gap: 4px;
-      padding: 6px;
+      gap: 3px;
+      padding: 5px;
       margin: 0;
       width: 100%;
       max-width: 100%;
@@ -8722,8 +8853,8 @@ function renderDashboardHtml(): string {
       font-size: 0.78rem;
       font-weight: 600;
       line-height: 1.2;
-      padding: 9px 14px;
-      min-height: 38px;
+      padding: 8px 12px;
+      min-height: 36px;
       border-radius: 8px;
       border: 1px solid transparent;
       background: transparent;
@@ -8747,6 +8878,17 @@ function renderDashboardHtml(): string {
     .main-nav button.active:hover {
       color: var(--accent);
       background: #ffffff;
+    }
+    @media (min-width: 1100px) {
+      .top-shell {
+        flex-direction: row;
+        align-items: center;
+        justify-content: space-between;
+      }
+      .main-nav {
+        width: auto;
+        max-width: min(72vw, 820px);
+      }
     }
 
     .construction-banner {
@@ -8844,13 +8986,15 @@ function renderDashboardHtml(): string {
     @media (max-width: 520px) { .kpi-row { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 14px; } }
     .kpi-cell {
       text-align: left;
-      padding: 0;
+      padding: 14px 16px;
       border-left: 1px solid var(--border);
-      padding-left: 18px;
+      border-radius: 12px;
+      background: rgba(255,255,255,0.72);
+      box-shadow: inset 0 0 0 1px rgba(15,30,60,0.04);
     }
-    .kpi-cell:first-child { border-left: 0; padding-left: 0; }
+    .kpi-cell:first-child { border-left-color: transparent; }
     @media (max-width: 900px) {
-      .kpi-cell { border-left: 0; padding-left: 0; }
+      .kpi-cell { border-left: 0; }
     }
     .kpi-cell .lbl {
       font-size: 0.7rem;
@@ -9559,17 +9703,28 @@ function renderDashboardHtml(): string {
       color: var(--muted);
       min-height: 22px;
       margin: 0;
+      line-height: 1.45;
     }
-    .status.err { color: var(--danger); }
-    .status.ok { color: var(--success); }
+    .status.err,
+    .status.ok {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 8px;
+      border-radius: 999px;
+      min-height: 0;
+      font-weight: 600;
+    }
+    .status.err { color: var(--danger); background: rgba(176,0,32,0.08); }
+    .status.ok { color: var(--success); background: rgba(21,127,58,0.08); }
     .empty-state {
       text-align: center;
       padding: 72px 24px;
       color: var(--muted);
       font-size: 0.98rem;
       line-height: 1.6;
-      background: var(--surface);
-      border: 1px solid var(--border);
+      background: linear-gradient(180deg, var(--surface) 0%, rgba(255,255,255,0.82) 100%);
+      border: 1px dashed var(--border-strong);
       border-radius: var(--radius-lg);
       box-shadow: var(--shadow-sm);
     }
@@ -10161,22 +10316,33 @@ function renderDashboardHtml(): string {
       gap: 20px;
       align-items: start;
     }
-    @media (max-width: 960px) { .wo-layout { grid-template-columns: 1fr; } }
+    @media (max-width: 960px) { .wo-layout { grid-template-columns: 1fr; gap: 14px; } }
 
     .wo-sidebar {
       position: sticky;
-      top: 20px;
+      top: 118px;
       border-radius: var(--radius-lg);
       background: var(--surface);
       border: 1px solid var(--border);
       padding: 18px 18px 10px;
       box-shadow: var(--shadow-md);
-      max-height: calc(100vh - 40px);
+      max-height: calc(100vh - 138px);
+      overflow: hidden;
       display: flex;
       flex-direction: column;
       min-height: 0;
     }
-    @media (max-width: 960px) { .wo-sidebar { position: static; max-height: none; } }
+    @media (max-width: 960px) { .wo-sidebar { position: static; max-height: none; padding: 14px; } }
+    @media (max-width: 560px) {
+      .wo-sidebar { border-radius: 10px; }
+      .wo-searchbar { gap: 6px; margin-bottom: 8px; }
+      .wo-searchbar input { flex-basis: 100%; padding: 10px 12px; }
+      .wo-filters { flex-wrap: nowrap; overflow-x: auto; padding-bottom: 4px; margin-bottom: 8px; }
+      .wo-filter-btn { flex: 0 0 auto; padding: 6px 10px; }
+      .wo-refine { grid-template-columns: 1fr; gap: 6px; }
+      .wo-list { margin: 0 -6px; padding-left: 6px; padding-right: 6px; }
+      .wo-card { padding: 11px 12px 11px 16px; }
+    }
 
     .wo-searchbar {
       display: flex;
@@ -10197,6 +10363,9 @@ function renderDashboardHtml(): string {
       border: 1px solid var(--border-strong);
       border-radius: var(--radius-sm);
       transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+    .wo-searchbar:focus-within {
+      filter: drop-shadow(0 4px 12px rgba(0, 58, 140, 0.08));
     }
     .wo-searchbar input::placeholder { color: var(--subtle); }
     .wo-searchbar input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
@@ -10219,12 +10388,14 @@ function renderDashboardHtml(): string {
       color: var(--muted);
       cursor: pointer;
       transition: color 0.12s ease, border-color 0.12s ease, background 0.12s ease;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.65);
     }
-    .wo-filter-btn:hover { color: var(--text); border-color: rgba(15,30,60,0.30); }
+    .wo-filter-btn:hover { color: var(--text); border-color: rgba(15,30,60,0.30); background: rgba(15,30,60,0.035); }
     .wo-filter-btn.active {
       background: var(--accent-soft);
       border-color: rgba(0,58,140,0.4);
       color: var(--accent-strong);
+      box-shadow: 0 1px 4px rgba(0,58,140,0.10), inset 0 1px 0 rgba(255,255,255,0.70);
     }
     .wo-filter-btn .count {
       margin-left: 6px;
@@ -10234,6 +10405,11 @@ function renderDashboardHtml(): string {
       font-variant-numeric: tabular-nums;
     }
     .wo-filter-btn.active .count { color: var(--accent-strong); }
+    .wo-filter-btn:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+      box-shadow: 0 0 0 3px var(--accent-soft);
+    }
 
     .wo-refine {
       display: grid;
@@ -10380,6 +10556,8 @@ function renderDashboardHtml(): string {
       gap: 6px;
       flex: 1 1 auto;
       min-height: 0;
+      scroll-padding-top: 8px;
+      isolation: isolate;
     }
     .wo-list::-webkit-scrollbar { width: 6px; }
     .wo-list::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 999px; }
@@ -10547,7 +10725,7 @@ function renderDashboardHtml(): string {
       box-shadow: var(--shadow-md);
       min-height: 300px;
     }
-    @media (max-width: 640px) { .wo-detail-pane { padding: 22px 20px; } }
+    @media (max-width: 640px) { .wo-detail-pane { padding: 18px 16px; border-radius: 10px; } }
 
     .wo-empty {
       display: flex;
@@ -14591,9 +14769,12 @@ function renderDashboardHtml(): string {
       font-variant-numeric: tabular-nums;
     }
     .smx-commander-table .smx-cmd-mail-col { width: 1%; white-space: nowrap; }
-    .smx-commander-table tbody tr.smx-cmd-row--ok { background: rgba(34, 160, 90, 0.06); }
-    .smx-commander-table tbody tr.smx-cmd-row--warn { background: rgba(245, 199, 84, 0.12); }
-    .smx-commander-table tbody tr.smx-cmd-row--bad { background: rgba(176, 0, 32, 0.07); }
+    .smx-commander-table tbody tr.smx-cmd-row--ok { background: rgba(34, 160, 90, 0.055); }
+    .smx-commander-table tbody tr.smx-cmd-row--warn { background: rgba(245, 199, 84, 0.13); }
+    .smx-commander-table tbody tr.smx-cmd-row--bad {
+      background: linear-gradient(90deg, rgba(176, 0, 32, 0.11), rgba(176, 0, 32, 0.045));
+      box-shadow: inset 3px 0 0 var(--danger);
+    }
     .smx-commander-table tbody tr.smx-cmd-row--active {
       outline: 2px solid var(--accent);
       outline-offset: -2px;
@@ -14640,6 +14821,22 @@ function renderDashboardHtml(): string {
     }
     .smx-cmd-pct-bar.bad > i {
       background: linear-gradient(90deg, var(--danger) 0%, #8b1538 100%);
+    }
+    .smx-cmd-overdue-pill {
+      display: inline-flex;
+      align-items: center;
+      justify-content: flex-end;
+      min-width: 2.2rem;
+      padding: 3px 8px;
+      border-radius: 999px;
+      font-weight: 800;
+      color: var(--danger);
+      background: rgba(176, 0, 32, 0.09);
+    }
+    .smx-cmd-overdue-pill--crit {
+      color: #7a1020;
+      background: rgba(120, 16, 32, 0.13);
+      box-shadow: inset 0 0 0 1px rgba(120, 16, 32, 0.18);
     }
     .smx-vco-toolkit-panel { padding: 0; }
     .smx-tool-panel .smx-vco-toolkit-hero--panel {
@@ -14731,27 +14928,108 @@ function renderDashboardHtml(): string {
     }
 
     /* Schedule Mx tab — same split-pane rhythm as Work Orders */
+    html.schedule-mx-mode,
+    body.schedule-mx-mode {
+      overflow: hidden;
+      height: 100vh;
+    }
+    body.schedule-mx-mode .app {
+      padding-bottom: 0;
+    }
+    #panel-schedule-mx {
+      height: calc(100vh - 150px);
+      min-height: 620px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    #panel-schedule-mx .smx-tools-stack {
+      flex: 0 0 auto;
+    }
+    .smx-layout {
+      grid-template-columns: minmax(280px, 390px) minmax(0, 1fr);
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow: hidden;
+      align-items: stretch;
+    }
+    .smx-layout .wo-sidebar,
+    .smx-layout .wo-detail-pane {
+      position: static;
+      height: auto;
+      min-height: 0;
+      max-height: none;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+    }
+    @media (max-width: 760px) {
+      html.schedule-mx-mode,
+      body.schedule-mx-mode {
+        overflow: auto;
+        height: auto;
+      }
+      body.schedule-mx-mode .app {
+        padding-bottom: 88px;
+      }
+      #panel-schedule-mx {
+        height: auto;
+        min-height: 0;
+        overflow: visible;
+      }
+      .smx-layout {
+        grid-template-columns: 1fr;
+        flex: 0 0 auto;
+        height: auto;
+        min-height: 0;
+        overflow: visible;
+      }
+      .smx-layout .wo-sidebar,
+      .smx-layout .wo-detail-pane {
+        height: auto;
+        overflow: visible;
+      }
+    }
     .smx-layout .smx-panel-heading { margin-bottom: 10px; }
     .smx-panel-title { margin: 0 0 4px; font-size: 1.05rem; font-weight: 700; color: var(--text); }
     .smx-date-field { display: block; margin-bottom: 12px; }
     .smx-date-field .wo-refine-sel { width: 100%; }
+    .smx-layout .wo-sidebar {
+      padding: 14px 16px 8px;
+    }
+    .smx-layout .wo-searchbar {
+      margin-bottom: 8px;
+    }
+    .smx-layout .wo-searchbar input {
+      padding: 10px 12px;
+    }
+    .smx-layout .wo-filters {
+      gap: 6px;
+      margin-bottom: 8px;
+    }
+    .smx-layout .wo-filter-btn {
+      padding: 6px 10px;
+      font-size: 0.68rem;
+    }
     .smx-refine-one {
       display: grid;
       grid-template-columns: 1fr;
-      gap: 8px;
-      padding: 4px 0 10px;
+      gap: 6px;
+      padding: 2px 0 8px;
     }
     .nce-inline { font-weight: 800; color: var(--accent); }
     .smx-stats {
-      display: flex; flex-wrap: wrap; gap: 8px 10px;
-      margin-bottom: 12px;
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 6px;
+      margin-bottom: 8px;
     }
     .smx-stat {
       background: var(--card); border: 1px solid var(--border); border-radius: 10px;
-      padding: 8px 12px; min-width: 96px;
+      padding: 7px 9px;
+      min-width: 0;
     }
-    .smx-stat .lbl { display: block; font-size: 0.58rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
-    .smx-stat .v { font-size: 1.05rem; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.2; }
+    .smx-stat .lbl { display: block; font-size: 0.52rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .smx-stat .v { font-size: 0.92rem; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.15; }
     .smx-stat.bad .v { color: var(--danger); }
     .smx-stat.warn .v { color: var(--warn); }
     .smx-stat.crit .v { color: #7a1020; }
@@ -14858,9 +15136,11 @@ function renderDashboardHtml(): string {
     }
     .smx-card .asset-mono {
       font-family: var(--font-mono);
-      font-size: 0.92rem;
-      font-weight: 600;
+      font-size: clamp(1.02rem, 1.8vw, 1.22rem);
+      font-weight: 800;
       color: var(--text);
+      letter-spacing: -0.035em;
+      line-height: 1.05;
     }
     .smx-card .meta {
       display: flex;
@@ -14943,6 +15223,9 @@ function renderDashboardHtml(): string {
       margin: 0 0 6px;
       font-size: 0.58rem;
       letter-spacing: 0.07em;
+      display: flex;
+      align-items: center;
+      gap: 6px;
     }
     .smx-plan-facts .wo-facts-dl {
       gap: 8px 14px;
@@ -15015,6 +15298,21 @@ function renderDashboardHtml(): string {
       font-variant-numeric: tabular-nums;
       color: var(--text);
       line-height: 1.25;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .smx-uom-chip {
+      display: inline-flex;
+      align-items: center;
+      padding: 1px 6px;
+      border-radius: 999px;
+      background: rgba(0, 58, 140, 0.08);
+      color: var(--accent);
+      font-size: 0.56rem;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
     }
     .smx-plain-callout .smx-util-progress-wrap {
       margin-top: 8px;
@@ -15089,6 +15387,13 @@ function renderDashboardHtml(): string {
     .smx-pill.ok { background: rgba(34,160,90,0.12); color: var(--success); }
     .smx-pill.no_due { background: rgba(15,30,60,0.06); color: var(--muted); }
     .smx-pill.plan_gap { background: rgba(109,40,217,0.16); color: #5b21b6; }
+    @media (max-width: 960px) {
+      .smx-layout .wo-detail-pane {
+        position: static;
+        max-height: none;
+        overflow: visible;
+      }
+    }
 
     .authz-header {
       display: flex; justify-content: space-between; align-items: flex-start; gap: 16px;
@@ -15168,6 +15473,7 @@ function renderDashboardHtml(): string {
         <div class="brand">
           <div class="brand-mark" aria-hidden="true">USAF</div>
           <div class="brand-text">
+            <div class="brand-eyebrow">Vehicle Management Operations</div>
             <h1><a href="/" class="brand-title-link">${escapedTitle}</a></h1>
             <p id="brand-sub">Fleet readiness at a glance.</p>
           </div>
@@ -16933,6 +17239,15 @@ function renderDashboardHtml(): string {
       );
     }
 
+    function refreshRenderedAssetBadges(scopeSelector) {
+      var root = scopeSelector ? document.querySelector(scopeSelector) : document;
+      if (!root) return;
+      root.querySelectorAll("[data-asset-badges]").forEach(function (el) {
+        var aid = el.getAttribute("data-asset-badges") || "";
+        el.innerHTML = renderSightingBadge(aid) + renderYardPhotoThumb(aid);
+      });
+    }
+
     var yardPhotoLightboxWired = false;
     function wireYardPhotoLightboxOnce() {
       if (yardPhotoLightboxWired) return;
@@ -17231,7 +17546,7 @@ function renderDashboardHtml(): string {
       // that were actually present in the .xlsx for this date. scope=all would
       // return every WO we've ever ingested (work_order_state), which inflates
       // the count well beyond what's in the latest workbook.
-      const url = "/api/watch?date=" + encodeURIComponent(dateKey) +
+      const url = "/api/watch?date=" + encodeURIComponent(dateKey) + "&summary=1" +
         (force ? "&_=" + Date.now() : "");
       const res = await fetch(url, force ? { cache: "no-store" } : undefined);
       if (!res.ok) { watchCacheByDate.set(dateKey, []); return []; }
@@ -18529,9 +18844,9 @@ function renderDashboardHtml(): string {
       const cells = [
         { lbl: "MC Rate", sub: "", val: fmtMc(am.mcRatePercent), cls: "kpi-val-mc em", miss: am.mcRatePercent == null, delta: makeDelta(am.mcRatePercent, prev && prev.mcRatePercent, "pct") },
         { lbl: "Fleet Total", sub: "", val: fmtKpi(am.fleetTotal), cls: "kpi-val-fleet", miss: am.fleetTotal == null, delta: makeDelta(am.fleetTotal, prev && prev.fleetTotal, "flat") },
-        { lbl: "No. Vehs", sub: "FMC", val: fmtKpi(am.fmc), cls: "kpi-val-fmc", miss: am.fmc == null, delta: makeDelta(am.fmc, prev && prev.fmc, "good-up") },
-        { lbl: "No. Vehs", sub: "NMC", val: fmtKpi(am.nmc), cls: "kpi-val-nmc", miss: am.nmc == null, delta: makeDelta(am.nmc, prev && prev.nmc, "bad-up") },
-        { lbl: "No. Vehs", sub: "Surplus", val: fmtKpi(am.surplus), cls: "kpi-val-surplus", miss: am.surplus == null, delta: makeDelta(am.surplus, prev && prev.surplus, "flat") },
+        { lbl: "No. Vehicles", sub: "FMC", val: fmtKpi(am.fmc), cls: "kpi-val-fmc", miss: am.fmc == null, delta: makeDelta(am.fmc, prev && prev.fmc, "good-up") },
+        { lbl: "No. Vehicles", sub: "NMC", val: fmtKpi(am.nmc), cls: "kpi-val-nmc", miss: am.nmc == null, delta: makeDelta(am.nmc, prev && prev.nmc, "bad-up") },
+        { lbl: "No. Vehicles", sub: "Surplus", val: fmtKpi(am.surplus), cls: "kpi-val-surplus", miss: am.surplus == null, delta: makeDelta(am.surplus, prev && prev.surplus, "flat") },
       ];
       row.innerHTML = cells.map(function (c) {
         const miss = c.miss ? " kpi-missing" : "";
@@ -18611,6 +18926,11 @@ function renderDashboardHtml(): string {
       const isAsk = which === "ask";
       const isSet = which === "settings";
       const isSnap = !isWo && !isSmx && !isAuthz && !isMel && !isMeet && !isYard && !isWv && !isAbuse && !isAsk && !isSet;
+      document.documentElement.classList.toggle("schedule-mx-mode", isSmx);
+      document.body.classList.toggle("schedule-mx-mode", isSmx);
+      if (isSmx) {
+        try { window.scrollTo(0, 0); } catch (_e) {}
+      }
       snapBtn.classList.toggle("active", isSnap);
       woBtn.classList.toggle("active", isWo);
       if (smxBtn) smxBtn.classList.toggle("active", isSmx);
@@ -18665,7 +18985,7 @@ function renderDashboardHtml(): string {
         if (asOf) {
           const cached = watchCacheByDate.get(asOf);
           if (cached && cached.length) {
-            renderWoList(cached);
+            renderWoList(cached, { preserveScroll: true });
             loadSightings(false);
             loadWaiverCounts(false);
             loadYardPhotoLatest(false);
@@ -18730,6 +19050,12 @@ function renderDashboardHtml(): string {
     }
 
     var smxRows = [];
+    var smxAssetSummaries = [];
+    var smxDetailCache = new Map();
+    var smxDetailInflight = new Map();
+    var smxDetailLoadingAssetId = "";
+    var smxAssetDetailSeq = 0;
+    var smxUsingFullRows = true;
     var smxStats = null;
     /** Latest ETIC workbook date used for unit / NCE / open WO enrichment (YYYY-MM-DD). */
     var smxEticDateKey = null;
@@ -18737,6 +19063,13 @@ function renderDashboardHtml(): string {
 
     function smxSetFilter(mode) {
       smxFilter = mode || "all";
+      if (smxFilter === "plan_gap" && !smxOswoGapsIncluded && !smxLoadingGaps) {
+        loadScheduleMxOswoGaps();
+      }
+      if (smxFilter === "plan_gap" && smxLoadingGaps) {
+        const meta = document.getElementById("smx-list-meta");
+        if (meta) meta.textContent = "Loading OSWO gap check…";
+      }
       var smxFilt = document.getElementById("smx-filters");
       if (smxFilt) {
         smxFilt.querySelectorAll(".wo-filter-btn").forEach(function (x) {
@@ -18754,6 +19087,10 @@ function renderDashboardHtml(): string {
     /** Wing commander summary from API + optional unit filter for asset list. */
     var smxCommander = null;
     var smxCommanderFilterUnit = "";
+    var smxOswoGapsIncluded = false;
+    var smxLoadingGaps = false;
+    var smxLoadSeq = 0;
+    var smxCache = new Map();
 
     function smxFmtPct2(n) {
       var x = Number(n);
@@ -19060,8 +19397,9 @@ function renderDashboardHtml(): string {
     }
     function smxVcoAssetsByUnit() {
       var m = new Map();
-      for (var i = 0; i < smxRows.length; i++) {
-        var row = smxRows[i];
+      var rows = smxAssetRows();
+      for (var i = 0; i < rows.length; i++) {
+        var row = rows[i];
         var u = smxNormUnitFromRow(row);
         var aid = String(row.assetId || "").trim();
         if (!aid) continue;
@@ -19181,7 +19519,7 @@ function renderDashboardHtml(): string {
       var lead = document.getElementById("smx-vco-mail-lead");
       var inner = document.getElementById("smx-vco-mail-inner");
       if (!tk || !inner) return;
-      if (!smxRows || !smxRows.length) {
+      if (!smxAssetRows().length) {
         tk.classList.add("hidden");
         smxSyncToolsStackVis();
         return;
@@ -19414,7 +19752,7 @@ function renderDashboardHtml(): string {
             "<td><button type='button' class='smx-cmd-unit-btn' data-smx-cmd-unit='" +
             esc(u.unit) +
             "' title='Filter asset list to this unit'>" +
-            esc(u.unit) +
+            esc(smxDisplayUnitName(u.unit)) +
             "</button></td>" +
             "<td class='smx-cmd-num'>" +
             esc(String(u.totalVehicles)) +
@@ -19430,10 +19768,10 @@ function renderDashboardHtml(): string {
             esc(smxFmtPct2(pct)) +
             "%</span></td>" +
             "<td class='smx-cmd-num'>" +
-            esc(String(u.overdue)) +
+            (u.overdue > 0 ? "<span class='smx-cmd-overdue-pill'>" + esc(String(u.overdue)) + "</span>" : "0") +
             "</td>" +
             "<td class='smx-cmd-num'>" +
-            esc(String(u.nceOverdue)) +
+            (u.nceOverdue > 0 ? "<span class='smx-cmd-overdue-pill smx-cmd-overdue-pill--crit'>" + esc(String(u.nceOverdue)) + "</span>" : "0") +
             "</td>" +
             "<td class='smx-cmd-mail-col'><button type='button' class='smx-cmd-mini-copy smx-cmd-copy-html-unit' data-smx-copy-html-unit='" +
             esc(u.unit) +
@@ -19463,13 +19801,102 @@ function renderDashboardHtml(): string {
       return row && row.owningUnit ? String(row.owningUnit).trim() : "";
     }
 
+    function smxDisplayUnitName(unit) {
+      var u = String(unit || "").trim();
+      if (!u) return "(Unknown unit)";
+      if (/^\\d+$/.test(u)) return "Unit " + u;
+      return u;
+    }
+
+    function updateScheduleMxListBadges() {
+      refreshRenderedAssetBadges("#smx-list");
+      refreshRenderedAssetBadges("#smx-hero");
+    }
+
     function smxNormUnitFromRow(row) {
       var u = smxRowOwningUnitDisplay(row);
       return u || "(Unknown unit)";
     }
 
+    function smxAssetRows() {
+      return smxAssetSummaries.length ? smxAssetSummaries : smxRows;
+    }
+
     function smxEffBucket(row) {
       return row.scheduleMxPlanEffectiveBucket || row.scheduleMxBucket || "ok";
+    }
+
+    function smxPlansForAsset(assetId) {
+      var aid = String(assetId || "").trim();
+      if (!aid) return [];
+      var cached = smxDetailCache.get(aid);
+      if (cached) return cached;
+      if (smxUsingFullRows) {
+        var rows = smxRows.filter(function (r) { return String(r.assetId || "").trim() === aid; });
+        if (rows.length) smxDetailCache.set(aid, rows);
+        return rows;
+      }
+      return [];
+    }
+
+    function smxSummaryForAsset(assetId) {
+      var aid = String(assetId || "").trim();
+      if (!aid) return null;
+      for (var i = 0; i < smxAssetSummaries.length; i++) {
+        if (String(smxAssetSummaries[i].assetId || "").trim() === aid) return smxAssetSummaries[i];
+      }
+      return null;
+    }
+
+    function smxRenderAssetLoading(assetId) {
+      const empty = document.getElementById("smx-detail-empty");
+      const wrap = document.getElementById("smx-detail");
+      const hero = document.getElementById("smx-hero");
+      const plansWrap = document.getElementById("smx-plans-wrap");
+      if (!empty || !wrap) return;
+      empty.classList.add("hidden");
+      wrap.classList.remove("hidden");
+      var summary = smxSummaryForAsset(assetId);
+      if (summary) renderSmxHeroAsset(assetId, [summary]);
+      else if (hero) hero.innerHTML = "<div class='wo-hero-row'><div class='wo-hero-id'>" + esc(assetId) + "</div></div>";
+      if (plansWrap) plansWrap.innerHTML = "<div class='problem-empty'>Loading maintenance plans for " + esc(assetId) + "…</div>";
+    }
+
+    async function loadScheduleMxAssetDetails(assetId) {
+      var aid = String(assetId || "").trim();
+      var dk = smxSelectedDateKey || "";
+      if (!aid || !dk) return;
+      if (smxDetailInflight.has(aid)) return smxDetailInflight.get(aid);
+      var seq = ++smxAssetDetailSeq;
+      smxRenderAssetLoading(aid);
+      var p = fetch("/api/schedule-mx?date=" + encodeURIComponent(dk) + "&assetId=" + encodeURIComponent(aid) + "&gaps=" + (smxOswoGapsIncluded ? "1" : "0"))
+        .then(function (r) {
+          return r.json().then(function (j) {
+            if (!r.ok) throw new Error(j && j.error ? j.error : "Could not load asset plans.");
+            return j;
+          });
+        })
+        .then(function (j) {
+          var rows = Array.isArray(j.rows) ? j.rows : [];
+          smxDetailCache.set(aid, rows);
+          if (seq === smxAssetDetailSeq && smxSelectedAssetId === aid) {
+            selectSmxAsset(aid, false);
+          }
+          return rows;
+        })
+        .catch(function () {
+          if (seq === smxAssetDetailSeq && smxSelectedAssetId === aid) {
+            var plansWrap = document.getElementById("smx-plans-wrap");
+            if (plansWrap) plansWrap.innerHTML = "<div class='problem-empty'>Could not load maintenance plans for " + esc(aid) + ".</div>";
+          }
+          return [];
+        })
+        .then(function (rows) {
+          smxDetailInflight.delete(aid);
+          return rows;
+        });
+      smxDetailInflight.set(aid, p);
+      return p;
     }
 
     function smxPlanRank(row) {
@@ -19511,7 +19938,7 @@ function renderDashboardHtml(): string {
     function smxFilteredPlanRows() {
       const qel = document.getElementById("smx-query");
       const q = (qel && qel.value) ? qel.value.trim() : "";
-      return smxRows.filter(function (row) {
+      return smxAssetRows().filter(function (row) {
         if (smxCommanderFilterUnit && smxNormUnitFromRow(row) !== smxCommanderFilterUnit) return false;
         return smxMatchesFilter(row, smxFilter) && smxMatchesQuery(row, q);
       });
@@ -19628,14 +20055,14 @@ function renderDashboardHtml(): string {
         wrap.classList.add("hidden");
         return;
       }
-      const byAsset = smxPlansByAsset();
-      var plans = byAsset.get(smxSelectedAssetId) || [];
+      var plans = smxPlansForAsset(smxSelectedAssetId);
       if (!plans.length) {
-        plans = smxRows.filter(function (r) { return String(r.assetId || "").trim() === smxSelectedAssetId; });
-      }
-      if (!plans.length) {
-        empty.classList.remove("hidden");
-        wrap.classList.add("hidden");
+        empty.classList.add("hidden");
+        wrap.classList.remove("hidden");
+        renderSmxHeroAsset(smxSelectedAssetId, smxAssetSummaries.filter(function (r) { return String(r.assetId || "").trim() === smxSelectedAssetId; }));
+        const plansWrap = document.getElementById("smx-plans-wrap");
+        if (plansWrap) plansWrap.innerHTML = "<div class='problem-empty'>Loading maintenance plans…</div>";
+        loadScheduleMxAssetDetails(smxSelectedAssetId);
         return;
       }
       plans = smxSortPlansForAsset(plans);
@@ -19705,8 +20132,10 @@ function renderDashboardHtml(): string {
         "<div class='wo-hero-row'>" +
         "<div class='wo-hero-id'>" + esc(assetId) + "</div>" +
         chips.join("") +
+        "<span data-asset-badges='" + esc(assetId) + "'>" +
         renderSightingBadge(assetId) +
-        (yp ? "<span class='smx-hero-yphoto'>" + yp + "</span>" : "") +
+        (yp ? yp : "") +
+        "</span>" +
         "</div>" +
         smxAssetIdentityStripFromPlans(plans);
     }
@@ -19837,7 +20266,7 @@ function renderDashboardHtml(): string {
           renderSmxVcoMail();
           return;
         }
-        const r = await fetch("/api/schedule-mx?date=" + encodeURIComponent(dk), { cache: "no-store" });
+        const r = await fetch("/api/schedule-mx?date=" + encodeURIComponent(dk) + "&gaps=0&summary=1");
         const j = await r.json();
         if (!r.ok) {
           if (statsEl) statsEl.textContent = j.error || "Could not load schedule maintenance.";
@@ -19853,10 +20282,15 @@ function renderDashboardHtml(): string {
           renderSmxVcoMail();
           return;
         }
-        smxRows = Array.isArray(j.rows) ? j.rows : [];
+        smxRows = Array.isArray(j.assets) ? j.assets : (Array.isArray(j.rows) ? j.rows : []);
+        smxUsingFullRows = false;
+        smxDetailCache.clear();
         smxStats = j.stats || null;
         smxCommander = j.commander || null;
         smxCommanderFilterUnit = "";
+        smxOswoGapsIncluded = !!j.oswoGapsIncluded;
+        smxLoadingGaps = false;
+        smxCache.set(dk + "|summary", j);
         smxEticDateKey = j.eticDateKey || null;
         if (pill && dk && smxEticDateKey) {
           pill.setAttribute("title", "Import " + fmtKeyLong(dk) + " · Fleet book " + fmtKeyLong(smxEticDateKey));
@@ -19872,7 +20306,7 @@ function renderDashboardHtml(): string {
         Promise.all([loadSightings(false), loadYardPhotoLatest(false)]).then(function () {
           const p = document.getElementById("panel-schedule-mx");
           if (!p || p.classList.contains("hidden")) return;
-          renderScheduleMxList();
+          updateScheduleMxListBadges();
         });
       } catch (e) {
         if (statsEl) statsEl.textContent = "Could not load schedule maintenance.";
@@ -19884,6 +20318,46 @@ function renderDashboardHtml(): string {
         smxCommanderFilterUnit = "";
         renderSmxCommander();
         renderSmxVcoMail();
+      }
+    }
+
+    async function loadScheduleMxOswoGaps() {
+      var dk = smxSelectedDateKey || "";
+      if (!dk || smxOswoGapsIncluded || smxLoadingGaps) return;
+      var cached = smxCache.get(dk + "|gaps=1");
+      if (cached) {
+        smxRows = Array.isArray(cached.rows) ? cached.rows : [];
+        smxStats = cached.stats || smxStats;
+        smxCommander = cached.commander || smxCommander;
+        smxOswoGapsIncluded = !!cached.oswoGapsIncluded;
+        renderSmxCommander();
+        renderSmxVcoMail();
+        renderScheduleMxStats();
+        renderScheduleMxList();
+        return;
+      }
+      smxLoadingGaps = true;
+      var seq = ++smxLoadSeq;
+      var meta = document.getElementById("smx-list-meta");
+      if (meta) meta.textContent = "Loading OSWO gap check…";
+      try {
+        var r = await fetch("/api/schedule-mx?date=" + encodeURIComponent(dk));
+        var j = await r.json();
+        if (seq !== smxLoadSeq || dk !== (smxSelectedDateKey || "")) return;
+        if (!r.ok) throw new Error(j && j.error ? j.error : "OSWO gap check failed");
+        smxRows = Array.isArray(j.rows) ? j.rows : [];
+        smxStats = j.stats || smxStats;
+        smxCommander = j.commander || smxCommander;
+        smxOswoGapsIncluded = !!j.oswoGapsIncluded;
+        smxCache.set(dk + "|gaps=1", j);
+        renderSmxCommander();
+        renderSmxVcoMail();
+        renderScheduleMxStats();
+        renderScheduleMxList();
+      } catch (e) {
+        if (meta) meta.textContent = "Could not load OSWO gap check.";
+      } finally {
+        smxLoadingGaps = false;
       }
     }
 
@@ -20080,21 +20554,24 @@ function renderDashboardHtml(): string {
      * Glossary cells like 'h - hour' or 'mi / miles' map to a single pluralized label.
      */
     function smxUtilUomLabel(utRaw) {
-      const raw = String(utRaw == null ? '' : utRaw).replace(/\s+/g, ' ').trim();
+      const raw = String(utRaw == null ? '' : utRaw).replace(/\\s+/g, ' ').trim();
       if (!raw) return '';
       const nocomma = raw.replace(/,/g, '');
-      if (/^-?\d+(?:\.\d+)?$/.test(nocomma)) return '';
+      if (/^-?\\d+(?:\\.\\d+)?$/.test(nocomma)) return '';
+      if (/^[A-Z]?\\d{6,}[A-Z]?$/i.test(raw) || /^[A-Z]\\d{2,}[A-Z]{2,}\\d+$/i.test(raw)) return '';
+      if (/\\boverdue\\b/i.test(raw) && /(?:\\b\\d{2}[A-Z]{2}\\b|\\(|\\d+\\s*(?:mi|mile|miles|hr|hrs|hour|hours)\\b)/i.test(raw)) return '';
+      if (raw.length > 40 && /[,()]/.test(raw)) return '';
       const s = raw.toLowerCase();
-      const tokens = s.split(/\s*[-/|]\s*/).map(function (t) { return t.trim(); }).filter(Boolean);
+      const tokens = s.split(/\\s*[-/|]\\s*/).map(function (t) { return t.trim(); }).filter(Boolean);
       for (let i = 0; i < tokens.length; i++) {
         const t = tokens[i];
         if (/^(h|hr|hrs|hour|hours)$/.test(t)) return 'hours';
         if (/^(mi|mile|miles|odo|odometer)$/.test(t)) return 'miles';
         if (/^(km|kilometer|kilometers|kilometre|kilometres)$/.test(t)) return 'kilometers';
       }
-      if (/\b(hour|hours|hr|hrs|operating hour|engine hour|eng)\b/.test(s)) return 'hours';
-      if (/\b(mile|miles|mi|odometer|mph)\b/.test(s)) return 'miles';
-      if (/\b(km|kilometer|kilometre)/.test(s)) return 'kilometers';
+      if (/\\b(hour|hours|hr|hrs|operating hour|engine hour|eng)\\b/.test(s)) return 'hours';
+      if (/\\b(mile|miles|mi|odometer|mph)\\b/.test(s)) return 'miles';
+      if (/\\b(km|kilometer|kilometre)/.test(s)) return 'kilometers';
       return raw;
     }
 
@@ -20309,9 +20786,12 @@ function renderDashboardHtml(): string {
       }
       const calloutCls =
         "smx-plain-callout smx-plain-callout--compact" + (overUtil ? " smx-plain-callout--warn" : "");
+      const leadSafe = esc(lead);
       return (
         "<section class='wo-facts-group smx-util-section' aria-label='Service meter'>" +
-        "<h4 class='wo-facts-group-h'>Service meter</h4>" +
+        "<h4 class='wo-facts-group-h'>Service meter" +
+        (uom ? "<span class='smx-uom-chip'>" + esc(uom) + "</span>" : "") +
+        "</h4>" +
         "<div class='" +
         esc(calloutCls) +
         "' role='status'>" +
@@ -20338,7 +20818,7 @@ function renderDashboardHtml(): string {
         "<p class='" +
         esc(leadCls) +
         "'>" +
-        lead +
+        leadSafe +
         "</p>" +
         "</div></section>"
       );
@@ -20496,26 +20976,20 @@ function renderDashboardHtml(): string {
           : "";
         var aggPill =
           "<span class='smx-pill " + esc(worstBucket) + "'>" + esc(smxPillLabel(worstBucket)) + "</span>";
-        var nextD = null;
-        var minK = "9999-99-99";
-        for (var qi = 0; qi < plans.length; qi++) {
-          var nk = smxNextKey(plans[qi]);
-          if (nk < minK) {
-            minK = nk;
-            nextD = plans[qi].elmsNextMaintDateIso || plans[qi].scheduleMxDueIso;
-          }
-        }
+        var nextD = plans[0] && (plans[0].earliestNextMaintDateIso || plans[0].earliestDueIso || plans[0].elmsNextMaintDateIso || plans[0].scheduleMxDueIso);
         var nextTxt = nextD ? fmtKeyShort(nextD) : "—";
         var wo = plans[0] && plans[0].workOrderCount != null ? plans[0].workOrderCount : 0;
         var metaBits = [];
-        metaBits.push("<span><span class='k'>Plans</span><span class='v'>" + plans.length + "</span></span>");
+        var planN = plans[0] && plans[0].planCount != null ? plans[0].planCount : plans.length;
+        metaBits.push("<span><span class='k'>Plans</span><span class='v'>" + planN + "</span></span>");
         metaBits.push("<span><span class='k'>Next</span><span class='v'>" + esc(nextTxt) + "</span></span>");
         if (wo) metaBits.push("<span><span class='k'>WOs</span><span class='v'>" + wo + "</span></span>");
         return (
           "<div class='smx-card" + (isActive ? " active" : "") + "' data-smx-asset='" + esc(assetId) + "' data-smx-tier='" + esc(tier) + "' tabindex='0' role='button' aria-label='Select asset " + esc(assetId) + "'>" +
           "<div class='top-line'>" +
           "<span class='asset-mono smx-card-select'>" + esc(assetId) + "</span>" +
-          "<span class='badges'>" + nceChip + critChip + planGapChip + aggPill + renderSightingBadge(assetId) + "</span>" +
+          "<span class='badges'>" + nceChip + critChip + planGapChip + aggPill +
+          "<span data-asset-badges='" + esc(assetId) + "'>" + renderSightingBadge(assetId) + renderYardPhotoThumb(assetId) + "</span></span>" +
           "</div>" +
           "<div class='meta smx-card-select'>" + metaBits.join("") + "</div>" +
           "</div>"
@@ -20746,15 +21220,59 @@ function renderDashboardHtml(): string {
       rebuild(mgmtSel, "All Mgmt Cd", mgmtItems, woMgmtCd);
     }
 
-    function renderWoList(rows) {
+    function captureWoListScroll(list) {
+      if (!list) return null;
+      const listTop = list.getBoundingClientRect().top;
+      const cards = list.querySelectorAll(".wo-card");
+      for (var i = 0; i < cards.length; i++) {
+        const card = cards[i];
+        const rect = card.getBoundingClientRect();
+        if (rect.bottom >= listTop) {
+          return {
+            woId: card.getAttribute("data-wo") || "",
+            offsetTop: rect.top - listTop,
+            scrollTop: list.scrollTop,
+          };
+        }
+      }
+      return { woId: "", offsetTop: 0, scrollTop: list.scrollTop };
+    }
+
+    function restoreWoListScroll(list, anchor) {
+      if (!list || !anchor) return;
+      requestAnimationFrame(function () {
+        if (!list.isConnected) return;
+        var restored = false;
+        if (anchor.woId) {
+          const cards = list.querySelectorAll(".wo-card");
+          for (var i = 0; i < cards.length; i++) {
+            const card = cards[i];
+            if ((card.getAttribute("data-wo") || "") !== anchor.woId) continue;
+            const listTop = list.getBoundingClientRect().top;
+            const rect = card.getBoundingClientRect();
+            list.scrollTop += rect.top - listTop - anchor.offsetTop;
+            restored = true;
+            break;
+          }
+        }
+        if (!restored) {
+          const max = Math.max(0, list.scrollHeight - list.clientHeight);
+          list.scrollTop = Math.min(anchor.scrollTop || 0, max);
+        }
+      });
+    }
+
+    function renderWoList(rows, opts) {
       const list = document.getElementById("wo-list");
       const meta = document.getElementById("wo-list-meta");
+      const scrollAnchor = opts && opts.preserveScroll ? captureWoListScroll(list) : null;
       refreshRefineOptions(rows);
       const visible = filterAndSortWoList(rows);
       renderWoListCounts(rows);
       meta.textContent = visible.length + " of " + rows.length + " work orders";
       if (!visible.length) {
         list.innerHTML = "<div class='problem-empty' style='padding:18px 4px'>No work orders match this filter.</div>";
+        restoreWoListScroll(list, scrollAnchor);
         return;
       }
       list.innerHTML = visible.map(function (r) {
@@ -20840,6 +21358,7 @@ function renderDashboardHtml(): string {
           if (wo) selectWo(wo, true);
         });
       });
+      restoreWoListScroll(list, scrollAnchor);
     }
 
     async function loadAndRenderWoList(dateKey, opts) {
@@ -20855,7 +21374,7 @@ function renderDashboardHtml(): string {
           loadYardPhotoLatest(force),
         ]).then(function () {
           if (woAsOfDate() !== dateKey) return;
-          renderWoList(rows);
+          renderWoList(rows, { preserveScroll: true });
         });
       } catch (e) {
         meta.textContent = "Could not load work orders.";

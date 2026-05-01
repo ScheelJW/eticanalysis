@@ -158,6 +158,25 @@ describe("recordCheck", () => {
     expect(check.assetSnapshotJson).toContain('"assetId":"AF123"');
     expect(check.assetSnapshotJson).toContain('"previousLocation":"Old lot"');
   });
+
+  it("allows cannot-find checks without location and does not count them as sightings", async () => {
+    const db = new MemoryD1();
+    const env = { ETIC_SNAPSHOTS: db, ETIC_BUCKET: {} };
+
+    const check = await recordCheck(env as never, {
+      assetId: "AF123",
+      status: "missing",
+      discrepancies: "Cannot find vehicle; checked GP outside",
+      checkedBy: "Walker",
+    });
+
+    expect(check.status).toBe("missing");
+    expect(check.location).toBe("");
+
+    const roster = await getRollingRoster(env as never);
+    const asset = roster.assets.find((a) => a.assetId === "AF123");
+    expect(asset?.lastLocation).toBe("");
+  });
 });
 
 describe("Yard roster", () => {

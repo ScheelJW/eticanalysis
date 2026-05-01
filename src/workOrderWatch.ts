@@ -147,15 +147,129 @@ type WoStateRow = {
   updated_at_iso: string;
 };
 
-function guessOwningUnitFromFleetRaw(raw: Record<string, string> | undefined): string {
+function cleanOwningUnitCandidate(raw: string | null | undefined, opts?: { allowNumeric?: boolean }): string {
+  const t = String(raw ?? "").replace(/\s+/g, " ").trim();
+  if (!t) return "";
+  if (!opts?.allowNumeric && /^\d+$/.test(t)) return "";
+  return t;
+}
+
+function cleanFullOwningUnitLabel(raw: string | null | undefined): string {
+  const t = cleanOwningUnitCandidate(raw);
+  if (!t) return "";
+  if (/^[A-Z0-9]{1,3}$/i.test(t)) return "";
+  if (!/[A-Za-z]/.test(t)) return "";
+  return t;
+}
+
+function cleanHistoricalOwningUnitLabel(raw: string | null | undefined): string {
+  const t = cleanOwningUnitCandidate(raw);
+  if (!t) return "";
+  if (!/[A-Za-z]/.test(t)) return "";
+  return t;
+}
+
+const USER_CD_TO_OWNING_UNIT: Record<string, string> = {
+  CQ: "5 MXS",
+  CU: "5 MXS",
+  CM: "5 MXS",
+  CO: "5 MXS",
+  DP: "23 BGS",
+  DS: "5 MUNS",
+  DT: "5 MUNS",
+  DV: "5 MUNS",
+  EG: "5 LRS",
+  EM: "5 LRS",
+  EP: "5 LRS",
+  ES: "5 LRS",
+  FB: "91 OSS",
+  FD: "91 OSS",
+  FG: "91 OSS",
+  HH: "5 MDG",
+  HK: "5 MDG",
+  JP: "5 CES",
+  KL: "5 SFS",
+  KM: "5 SFS",
+  KN: "5 SFS",
+  KO: "5 SFS",
+  KE: "5 SFS",
+  MU: "705 MUNS",
+  NW: "91 MW",
+};
+
+function userCodeToOwningUnit(raw: string | null | undefined): string {
+  const code = String(raw ?? "").replace(/\s+/g, " ").trim().toUpperCase();
+  if (!code || /^\d+$/.test(code)) return "";
+  return USER_CD_TO_OWNING_UNIT[code] ?? "";
+}
+
+function looksLikeFullOwningUnit(raw: string | null | undefined): boolean {
+  const t = String(raw ?? "").replace(/\s+/g, " ").trim();
+  if (!t || /^\d+$/.test(t)) return false;
+  return /\b(?:LRS|MXS|BGS|MUNS|MDG|SFS|BW|MW|OSS|CES|MSOS|MMXS|MSFS|CS|FSS|MXG|SSPTS|CACS|TRS|OG)\b/i.test(t);
+}
+
+function pickOwningUnitFromRawInternal(raw: Record<string, string> | undefined, opts?: { allowNumericUnitColumn?: boolean }): string {
   if (!raw) return "";
+  const unitKeys = ["fleet.unit", "fleet. unit", " unit", "unit"];
+  for (const key of unitKeys) {
+    const t = opts?.allowNumericUnitColumn
+      ? cleanOwningUnitCandidate(raw[key], { allowNumeric: true })
+      : cleanFullOwningUnitLabel(raw[key]);
+    if (t) return t;
+  }
+  const exactKeys = [
+    "fleet.owning unit",
+    "fleet.owning org",
+    "fleet.owning organization",
+    "fleet.user/unit",
+    "fleet.user unit",
+    "fleet.assigned unit",
+    "fleet.organization",
+    "fleet.squadron",
+    "fleet.customer unit",
+    "user/unit",
+    "user unit",
+  ];
+  for (const key of exactKeys) {
+    const t = cleanFullOwningUnitLabel(raw[key]);
+    if (t) return t;
+  }
   for (const [k, v] of Object.entries(raw)) {
     const kk = k.toLowerCase();
-    const t = (v ?? "").trim();
+    const t = cleanFullOwningUnitLabel(v);
     if (!t) continue;
-    if (/\bunit\b|owning|organization|org\b|squadron|flight|assigned/.test(kk)) return t;
+    if (/owning|organization|org\b|squadron|flight|assigned|customer/.test(kk)) return t;
+    if (/\bunit\b/.test(kk) && /[a-z]/i.test(t)) return t;
   }
+  const fromUserCd = userCodeToOwningUnit(raw["fleet.user cd"]) || userCodeToOwningUnit(raw["fleet.user code"]) || userCodeToOwningUnit(raw["user cd"]) || userCodeToOwningUnit(raw["user code"]);
+  if (fromUserCd) return fromUserCd;
   return "";
+}
+
+export function pickOwningUnitFromRaw(raw: Record<string, string> | undefined): string {
+  return pickOwningUnitFromRawInternal(raw, { allowNumericUnitColumn: true });
+}
+
+function guessOwningUnitFromFleetRaw(raw: Record<string, string> | undefined): string {
+  return pickOwningUnitFromRaw(raw);
+}
+
+function parseRawJsonRecord(rawRowJson: string | null | undefined): Record<string, string> | undefined {
+  if (!rawRowJson || !rawRowJson.trim()) return undefined;
+  try {
+    return JSON.parse(rawRowJson) as Record<string, string>;
+  } catch {
+    return undefined;
+  }
+}
+
+export function watchOwningUnitFromRawJson(rawRowJson: string | null | undefined): string {
+  return pickOwningUnitFromRaw(parseRawJsonRecord(rawRowJson));
+}
+
+function scheduleMxOwningUnitFromRawJson(rawRowJson: string | null | undefined): string {
+  return pickOwningUnitFromRawInternal(parseRawJsonRecord(rawRowJson), { allowNumericUnitColumn: false });
 }
 
 function guessShopFromFleetRaw(raw: Record<string, string> | undefined, eticLocation: string): string {
@@ -187,7 +301,10 @@ function fleetRowFromFleetRecord(
   raw: Record<string, string> | undefined,
 ): { owning_unit: string; shop: string; make_model: string; veh_nomen: string; mgmt_cd: string; mel_key: string } {
   return {
-    owning_unit: owningUnitForAssetId((rec.assetId ?? "").trim(), guessOwningUnitFromFleetRaw(raw)),
+    owning_unit: owningUnitForAssetId(
+      (rec.assetId ?? "").trim(),
+      cleanOwningUnitCandidate((rec as FleetRecord & { owningUnit?: string }).owningUnit) || guessOwningUnitFromFleetRaw(raw),
+    ),
     shop: guessShopFromFleetRaw(raw, rec.etiCLocation ?? ""),
     make_model: (rec.makeModel ?? "").trim(),
     veh_nomen: (rec.vehNomen ?? "").trim(),
@@ -643,6 +760,69 @@ export type WatchRow = {
   melRecallHint?: MelRecallHint | null;
 };
 
+export type WatchListSummaryRow = Pick<
+  WatchRow,
+  | "workOrderId"
+  | "assetId"
+  | "melTier"
+  | "eticDate"
+  | "daysSinceRemarkChange"
+  | "requiredIntervalDays"
+  | "remarkStale"
+  | "eticPushCount"
+  | "cumulativeEticSlipDays"
+  | "lastSnapshotDate"
+  | "owningUnit"
+  | "melKey"
+  | "shop"
+  | "mgmtCd"
+  | "makeModel"
+  | "firstSeenDate"
+  | "historyBounded"
+  | "establishedDateIso"
+  | "woReason"
+  | "nce"
+  | "nceStatus"
+  | "scheduleMxBucket"
+  | "scheduleMxNeedsEntry"
+  | "daysDown"
+  | "melRecallHint"
+> & { remarkPreview: string };
+
+export function summarizeWatchRowsForList(rows: WatchRow[]): WatchListSummaryRow[] {
+  return rows.map((row) => {
+    const preview = (row.remarks || "").replace(/\s+/g, " ").trim().slice(0, 180);
+    return {
+      workOrderId: row.workOrderId,
+      assetId: row.assetId,
+      melTier: row.melTier,
+      eticDate: row.eticDate,
+      daysSinceRemarkChange: row.daysSinceRemarkChange,
+      requiredIntervalDays: row.requiredIntervalDays,
+      remarkStale: row.remarkStale,
+      eticPushCount: row.eticPushCount,
+      cumulativeEticSlipDays: row.cumulativeEticSlipDays,
+      lastSnapshotDate: row.lastSnapshotDate,
+      owningUnit: row.owningUnit,
+      melKey: row.melKey,
+      shop: row.shop,
+      mgmtCd: row.mgmtCd,
+      makeModel: row.makeModel,
+      firstSeenDate: row.firstSeenDate,
+      historyBounded: row.historyBounded,
+      establishedDateIso: row.establishedDateIso,
+      woReason: row.woReason,
+      nce: row.nce,
+      nceStatus: row.nceStatus,
+      scheduleMxBucket: row.scheduleMxBucket,
+      scheduleMxNeedsEntry: row.scheduleMxNeedsEntry,
+      daysDown: row.daysDown,
+      melRecallHint: row.melRecallHint,
+      remarkPreview: preview,
+    };
+  });
+}
+
 /** Computed MEL recall opportunity (see attachMelRecallHints). */
 export type MelRecallHint = {
   donorMelKey: string;
@@ -884,6 +1064,7 @@ function rowToWatchRow(
     firstSeenDate?: string | null;
     earliestSnapshot?: string | null;
     intervals?: Record<MelTier, number | null>;
+    owningUnitFallback?: string;
   },
 ): WatchRow {
   const tier = (row.mel_tier as MelTier) || "unknown";
@@ -917,7 +1098,12 @@ function rowToWatchRow(
     firstEticDate: row.first_etic_date,
     lastEticDate: row.last_etic_date,
     lastSnapshotDate: row.last_snapshot_date,
-    owningUnit: owningUnitForAssetId(row.asset_id, row.owning_unit ?? ""),
+    owningUnit: owningUnitForAssetId(
+      row.asset_id,
+      cleanFullOwningUnitLabel(row.owning_unit) ||
+        watchOwningUnitFromRawJson(row.raw_row_json) ||
+        cleanFullOwningUnitLabel(ctx?.owningUnitFallback),
+    ),
     melKey: row.mel_key ?? "",
     shop: row.shop ?? "",
     mgmtCd: row.mgmt_cd ?? "",
@@ -1032,6 +1218,31 @@ export type ScheduleMxFleetRow = {
   scheduleMxPlanMissingFromOpenWo: boolean;
 } & ReturnType<typeof analyzeElmsScheduleMxFromRaw>;
 
+export type ScheduleMxAssetSummaryRow = Pick<
+  ScheduleMxFleetRow,
+  | "assetId"
+  | "makeModel"
+  | "mgmtCd"
+  | "workOrderCount"
+  | "nce"
+  | "nceStatus"
+  | "owningUnit"
+  | "vehNomen"
+  | "eticSnapshotDateKey"
+  | "eticOpenWorkOrderIds"
+  | "eticOpenInMaintenance"
+  | "eticOpenNmc"
+  | "scheduleMxPlanEffectiveBucket"
+  | "scheduleMxPlanEffectiveNceCritical"
+  | "scheduleMxSuppressedByOpenWo"
+  | "scheduleMxPlanMissingFromOpenWo"
+> & {
+  planCount: number;
+  earliestNextMaintDateIso: string | null;
+  earliestDueIso: string | null;
+  firstPlanName: string;
+};
+
 /** Overlap several D1 round-trips without unbounded fan-out (D1 limits / latency). */
 const SCHEDULE_MX_D1_BATCH_CONCURRENCY = 12;
 
@@ -1051,6 +1262,40 @@ async function runAssetIdBatchesInParallel<T>(
     for (const p of parts) flat.push(...p);
   }
   return flat;
+}
+
+async function getHistoricalOwningUnitByAsset(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  assetIds: string[],
+): Promise<Map<string, string>> {
+  const ids = [...new Set(assetIds.map((x) => (x ?? "").trim()).filter(Boolean))];
+  const out = new Map<string, string>();
+  if (!ids.length) return out;
+  const rows = await runAssetIdBatchesInParallel(ids, 80, async (chunk) => {
+    const ph = chunk.map(() => "?").join(",");
+    const r = await env.ETIC_SNAPSHOTS.prepare(
+      `SELECT asset_id, owning_unit
+       FROM (
+         SELECT asset_id, owning_unit, snapshot_date_key,
+                ROW_NUMBER() OVER (PARTITION BY asset_id ORDER BY snapshot_date_key DESC) AS rn
+         FROM fleet_p_a_snapshot
+         WHERE asset_id IN (${ph})
+           AND owning_unit IS NOT NULL
+           AND TRIM(owning_unit) <> ''
+           AND owning_unit GLOB '*[A-Za-z]*'
+       )
+       WHERE rn = 1`,
+    )
+      .bind(...chunk)
+      .all<{ asset_id: string; owning_unit: string }>();
+    return r.results ?? [];
+  });
+  for (const row of rows) {
+    const aid = (row.asset_id ?? "").trim();
+    const unit = cleanHistoricalOwningUnitLabel(row.owning_unit);
+    if (aid && unit && !out.has(aid)) out.set(aid, unit);
+  }
+  return out;
 }
 
 async function loadWoCountsPerAsset(
@@ -1205,7 +1450,7 @@ export async function loadScheduleMxEticContextByAsset(
   const woByAsset = new Map<string, WoAgg>();
   const idSet = new Set(ids);
 
-  const [fleetR, woRowsFlat] = await Promise.all([
+  const [fleetR, woRowsFlat, historicalUnits] = await Promise.all([
     (async () => {
       const r = await env.ETIC_SNAPSHOTS.prepare(
         `SELECT asset_id, owning_unit, make_model, veh_nomen, mgmt_cd, raw_row_json
@@ -1228,6 +1473,7 @@ export async function loadScheduleMxEticContextByAsset(
         .all<WoSnapRow>();
       return r.results ?? [];
     }),
+    getHistoricalOwningUnitByAsset(env, ids),
   ]);
 
   for (const row of fleetR) {
@@ -1258,7 +1504,7 @@ export async function loadScheduleMxEticContextByAsset(
     const ps = (row.parts_status ?? "").trim();
     if (partsStatusLooksInMaintenance(ps)) ctx.inMaintenance = true;
     if (workOrderRowLooksNmc(ps, row.raw_row_json)) ctx.nmcOnOpenWorkOrder = true;
-    const ou = (row.owning_unit ?? "").trim();
+    const ou = cleanFullOwningUnitLabel(row.owning_unit) || watchOwningUnitFromRawJson(row.raw_row_json);
     if (ou && !ctx.owningUnit) ctx.owningUnit = ou;
     const mm = (row.make_model ?? "").trim();
     if (mm && !ctx.makeModel) ctx.makeModel = mm;
@@ -1286,7 +1532,10 @@ export async function loadScheduleMxEticContextByAsset(
     const nceStatus = (fpNce.nceStatus || w?.nceStatus || "").trim();
     byAsset.set(aid, {
       workOrderIds: w ? Array.from(w.workOrderIdSet) : [],
-      owningUnit: (f?.owning_unit ?? "").trim() || (w?.owningUnit ?? ""),
+      owningUnit:
+        (f ? cleanFullOwningUnitLabel(f.owning_unit) || scheduleMxOwningUnitFromRawJson(f.raw_row_json) : "") ||
+        historicalUnits.get(aid) ||
+        (w?.owningUnit ?? ""),
       makeModel: (f?.make_model ?? "").trim() || (w?.makeModel ?? ""),
       vehNomen: (f?.veh_nomen ?? "").trim() || (w?.vehNomen ?? ""),
       mgmtCd: (f?.mgmt_cd ?? "").trim() || (w?.mgmtCd ?? ""),
@@ -1312,7 +1561,7 @@ function applyEticContextToScheduleMxRow(
   const woCount = eticDateKey != null ? (ctx?.workOrderIds.length ?? 0) : row.workOrderCount;
   const owningUnit = scheduleMxOwningUnitForAssetId(
     row.assetId,
-    ctx && ctx.owningUnit ? ctx.owningUnit : row.owningUnit,
+    cleanOwningUnitCandidate(ctx && ctx.owningUnit ? ctx.owningUnit : row.owningUnit),
   );
   const makeModel = ctx && ctx.makeModel ? ctx.makeModel : row.makeModel;
   const vehNomen = ctx && ctx.vehNomen ? ctx.vehNomen : row.vehNomen;
@@ -1382,6 +1631,52 @@ function sortScheduleMxRows(out: ScheduleMxFleetRow[]): ScheduleMxFleetRow[] {
     return a.planRowKey.localeCompare(b.planRowKey);
   });
   return out;
+}
+
+export function summarizeScheduleMxAssets(rows: ScheduleMxFleetRow[]): ScheduleMxAssetSummaryRow[] {
+  const byAsset = new Map<string, ScheduleMxFleetRow[]>();
+  for (const row of rows) {
+    const aid = (row.assetId ?? "").trim() || "—";
+    if (!byAsset.has(aid)) byAsset.set(aid, []);
+    byAsset.get(aid)!.push(row);
+  }
+  const out: ScheduleMxAssetSummaryRow[] = [];
+  for (const [assetId, plans] of byAsset) {
+    const sorted = sortScheduleMxRows(plans.slice());
+    const first = sorted[0];
+    if (!first) continue;
+    let earliestNext: string | null = null;
+    let earliestDue: string | null = null;
+    for (const p of sorted) {
+      const n = p.elmsNextMaintDateIso;
+      if (n && (!earliestNext || n < earliestNext)) earliestNext = n;
+      const d = p.scheduleMxDueIso;
+      if (d && (!earliestDue || d < earliestDue)) earliestDue = d;
+    }
+    out.push({
+      assetId,
+      makeModel: first.makeModel,
+      mgmtCd: first.mgmtCd,
+      workOrderCount: first.workOrderCount,
+      nce: sorted.some((p) => p.nce),
+      nceStatus: sorted.find((p) => p.nceStatus)?.nceStatus ?? first.nceStatus,
+      owningUnit: first.owningUnit,
+      vehNomen: first.vehNomen,
+      eticSnapshotDateKey: first.eticSnapshotDateKey,
+      eticOpenWorkOrderIds: first.eticOpenWorkOrderIds,
+      eticOpenInMaintenance: first.eticOpenInMaintenance,
+      eticOpenNmc: first.eticOpenNmc,
+      scheduleMxPlanEffectiveBucket: first.scheduleMxPlanEffectiveBucket,
+      scheduleMxPlanEffectiveNceCritical: sorted.some((p) => p.scheduleMxPlanEffectiveNceCritical),
+      scheduleMxSuppressedByOpenWo: sorted.some((p) => p.scheduleMxSuppressedByOpenWo),
+      scheduleMxPlanMissingFromOpenWo: sorted.some((p) => p.scheduleMxPlanMissingFromOpenWo),
+      planCount: sorted.length,
+      earliestNextMaintDateIso: earliestNext,
+      earliestDueIso: earliestDue,
+      firstPlanName: first.planName || "",
+    });
+  }
+  return sortScheduleMxRows(out as unknown as ScheduleMxFleetRow[]) as unknown as ScheduleMxAssetSummaryRow[];
 }
 
 /**
@@ -1602,6 +1897,35 @@ function looksLikePureNumberToken(s: string): boolean {
   return /^-?\d+(?:\.\d+)?$/.test(t);
 }
 
+function looksLikeAssetIdentifierToken(s: string): boolean {
+  const t = s.trim().toUpperCase();
+  if (!t) return false;
+  return /^AF\d{2}[A-Z]\d{5,9}$/.test(t) || /^[A-Z]\d{3,}[A-Z]{2}\d{4,}$/.test(t) || /^[A-Z]?\d{6,}[A-Z]?$/.test(t);
+}
+
+function looksLikeScheduleSummaryText(s: string): boolean {
+  const t = s.trim().toLowerCase();
+  if (!t) return false;
+  if (/\b(overdue|due\s+soon|current)\b/.test(t) && /\b\d{1,2}\s+[a-z]{3}\s+\d{2,4}\b/.test(t)) return true;
+  if (/\b\d+[a-z]{2}\b/.test(t) && /\bor\s+\d[\d,]*(?:\.\d+)?\s*(mile|miles|hour|hours|hr|hrs|km)\b/.test(t)) return true;
+  if (/\boverdue\b/.test(t) && /\b\d+[a-z]{2}\b/.test(t) && /\b(mile|miles|hour|hours|hr|hrs|km)\s+overdue\b/.test(t)) return true;
+  if (/^overdue\b/.test(t) && /\b\d+[a-z]{2}\b/.test(t) && /[,()]/.test(t)) return true;
+  return false;
+}
+
+function plausibleUtilTypeLabel(raw: string): string {
+  const t = preferLongerUtilLabelHalf(raw);
+  if (!t || looksLikePureNumberToken(t) || looksLikeAssetIdentifierToken(t) || looksLikeScheduleSummaryText(t)) return "";
+  const s = t.toLowerCase();
+  if (
+    /^(hrs?|hours?|h|eng(\s+hours?)?|engine(\s+hours?)?|mi|miles?|m|odo(meter)?|km|kilometers?|kilometres?)$/i.test(t) ||
+    /\b(hour|hours|hr|hrs|eng|engine|mi|mile|miles|odo|odometer|km|kilometer|kilometre)\b/.test(s)
+  ) {
+    return t;
+  }
+  return "";
+}
+
 /**
  * When a UoM cell looks like a glossary entry such as `"h - hour"` or `"mi / miles"`,
  * pick the longest human-readable half so downstream code does not show both halves.
@@ -1637,6 +1961,7 @@ export function cleanUtilUomLabel(utRaw: string | null | undefined): string {
   if (!raw) return "";
   const nocomma = raw.replace(/,/g, "");
   if (/^-?\d+(?:\.\d+)?$/.test(nocomma)) return "";
+  if (looksLikeAssetIdentifierToken(raw) || looksLikeScheduleSummaryText(raw)) return "";
   const s = raw.toLowerCase();
   const tokens = s
     .split(/\s*[-/|]\s*/)
@@ -1786,7 +2111,8 @@ export function utilizationTypeFromFleetRawJson(rawRowJson: string | null | unde
     "service meter uom",
     "vehicle utilization",
   ]);
-  if (t0.trim() && !looksLikePureNumberToken(t0)) return preferLongerUtilLabelHalf(t0);
+  const direct = plausibleUtilTypeLabel(t0);
+  if (direct) return direct;
 
   let bestScore = 0;
   let bestVal = "";
@@ -1803,7 +2129,8 @@ export function utilizationTypeFromFleetRawJson(rawRowJson: string | null | unde
       bestVal = vv;
     }
   }
-  if (bestVal && !looksLikePureNumberToken(bestVal)) return preferLongerUtilLabelHalf(bestVal);
+  const best = plausibleUtilTypeLabel(bestVal);
+  if (best) return best;
 
   for (const [k, v] of Object.entries(raw)) {
     const vv = (v ?? "").trim();
@@ -1817,7 +2144,8 @@ export function utilizationTypeFromFleetRawJson(rawRowJson: string | null | unde
       /^(hrs?|hours?|h|eng(\s+hours?)?|engine(\s+hours?)?|mi|miles?|m|odo(meter)?|km)$/i.test(vv) ||
       /\b(hour|hr|eng|engine|mi|mile|odo|miles|odometer)\b/i.test(vv)
     ) {
-      return preferLongerUtilLabelHalf(vv);
+      const label = plausibleUtilTypeLabel(vv);
+      if (label) return label;
     }
   }
   return "";
@@ -3106,11 +3434,23 @@ export async function applyScheduleMxOswoPlanGaps(
 async function loadScheduleMxPlanRowsForDate(
   env: { ETIC_SNAPSHOTS: D1Database },
   dateKey: string,
+  assetId?: string,
 ): Promise<ScheduleMxPlanParseRow[]> {
-  const r = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT plan_row_key, asset_id, raw_row_json FROM schedule_mx_plan_snapshot WHERE snapshot_date_key = ? ORDER BY asset_id ASC, plan_row_key ASC`,
-  )
-    .bind(dateKey)
+  const aidFilter = (assetId ?? "").trim();
+  const stmt = aidFilter
+    ? env.ETIC_SNAPSHOTS.prepare(
+        `SELECT plan_row_key, asset_id, raw_row_json
+         FROM schedule_mx_plan_snapshot
+         WHERE snapshot_date_key = ? AND UPPER(TRIM(asset_id)) = UPPER(TRIM(?))
+         ORDER BY plan_row_key ASC`,
+      ).bind(dateKey, aidFilter)
+    : env.ETIC_SNAPSHOTS.prepare(
+        `SELECT plan_row_key, asset_id, raw_row_json
+         FROM schedule_mx_plan_snapshot
+         WHERE snapshot_date_key = ?
+         ORDER BY asset_id ASC, plan_row_key ASC`,
+      ).bind(dateKey);
+  const r = await stmt
     .all<{ plan_row_key: string; asset_id: string; raw_row_json: string }>();
   const out: ScheduleMxPlanParseRow[] = [];
   for (const row of r.results ?? []) {
@@ -3155,11 +3495,12 @@ export async function listScheduleMxExtractDateKeysDesc(env: { ETIC_SNAPSHOTS: D
 export async function getScheduleMxFleetForDate(
   env: { ETIC_SNAPSHOTS: D1Database },
   dateKey: string,
-  opts?: { includeOswoGaps?: boolean },
+  opts?: { includeOswoGaps?: boolean; assetId?: string },
 ): Promise<ScheduleMxFleetRow[]> {
   const includeOswoGaps = opts?.includeOswoGaps !== false;
+  const assetFilter = (opts?.assetId ?? "").trim();
   const [planRows, woCounts, eticKeyForContext] = await Promise.all([
-    loadScheduleMxPlanRowsForDate(env, dateKey),
+    loadScheduleMxPlanRowsForDate(env, dateKey, assetFilter),
     loadWoCountsPerAsset(env, dateKey),
     getLatestEticSnapshotDateKey(env),
   ]);
@@ -3434,19 +3775,23 @@ export async function getWatchRowsForDate(
     .bind(dateKey)
     .all<WatchReadRow>();
 
-  const ids = (r.results ?? []).map((row) => row.work_order_id);
-  const [firstSeenMap, earliest, intervals] = await Promise.all([
+  const resultRows = r.results ?? [];
+  const ids = resultRows.map((row) => row.work_order_id);
+  const assetIds = [...new Set(resultRows.map((row) => (row.asset_id ?? "").trim()).filter(Boolean))];
+  const [firstSeenMap, earliest, intervals, unitFallbacks] = await Promise.all([
     getFirstSeenDates(env, ids),
     getEarliestSnapshotDate(env),
     getStalenessThresholds(env).then(resolveStaleness),
+    getHistoricalOwningUnitByAsset(env, assetIds),
   ]);
   const out: WatchRow[] = [];
-  for (const row of r.results ?? []) {
+  for (const row of resultRows) {
     out.push(
       rowToWatchRow(row, dateKey, {
         firstSeenDate: firstSeenMap.get(row.work_order_id) ?? "",
         earliestSnapshot: earliest,
         intervals,
+        owningUnitFallback: unitFallbacks.get((row.asset_id ?? "").trim()) ?? "",
       }),
     );
   }
