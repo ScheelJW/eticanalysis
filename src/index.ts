@@ -25,6 +25,7 @@ import {
   getLatestScheduleMxExtractDateKey,
   listScheduleMxExtractDateKeysDesc,
   getWatchRowsLatest,
+  getWatchRowsFromWorkbookBytes,
   getWorkOrderActions,
   getWorkOrderTimeline,
   getFleetPaSnapshotForDate,
@@ -441,6 +442,8 @@ export default {
     const workbookKey = `workbooks/${dateKey}/${safeName}`;
     const analysisKey = `analyses/${dateKey}.json`;
 
+    await archiveSupersededEticSnapshotIfPresent(env, dateKey);
+
     await env.ETIC_BUCKET.put(workbookKey, workbookBytes, {
       httpMetadata: {
         contentType:
@@ -498,31 +501,50 @@ export default {
         },
       );
 
-      // Keep the email event fast enough to avoid CPU-limit drops by deferring
-      // workbook-heavy WO/MEL extraction to background work.
-      ctx.waitUntil((async () => {
+      // Run in the same invocation as analysis — waitUntil() could be dropped under
+      // load, which left R2/analysis (MC rate) fresh while D1 work_order_* stayed stale.
+      try {
+        const summary = await ingestCurrentWorkbookIntoD1(env, dateKey, workbookBytes, now.toISOString());
+        console.log(
+          JSON.stringify({
+            level: "info",
+            message: "WO/MEL D1 ingest complete",
+            dateKey,
+            processed: summary.processed,
+            total: summary.total,
+          }),
+        );
+      } catch (d1Err) {
+        const messageText = d1Err instanceof Error ? d1Err.message : String(d1Err);
+        const stack = d1Err instanceof Error ? d1Err.stack : undefined;
+        const failedAtIso = new Date().toISOString();
+        const record = {
+          ...ingestContext,
+          failedAtIso,
+          phase: "d1_wo_mel_ingest",
+          error: messageText,
+          stack,
+        };
+        const stamp = failedAtIso.replace(/[:.]/g, "-");
         try {
-          const summary = await ingestCurrentWorkbookIntoD1(env, dateKey, workbookBytes, now.toISOString());
-          console.log(
-            JSON.stringify({
-              level: "info",
-              message: "Background WO/MEL ingest complete",
-              dateKey,
-              processed: summary.processed,
-              total: summary.total,
-            }),
-          );
-        } catch (error) {
-          console.error(
-            JSON.stringify({
-              level: "error",
-              message: "Background WO/MEL D1 ingest failed",
-              dateKey,
-              error: error instanceof Error ? error.message : String(error),
-            }),
-          );
+          await env.ETIC_BUCKET.put(`ingest-errors/${dateKey}_${stamp}.json`, JSON.stringify(record, null, 2), {
+            httpMetadata: { contentType: "application/json; charset=utf-8" },
+          });
+          await env.ETIC_BUCKET.put("ingest-errors/latest.json", JSON.stringify(record, null, 2), {
+            httpMetadata: { contentType: "application/json; charset=utf-8" },
+          });
+        } catch (_persistErr) {
+          /* best-effort */
         }
-      })());
+        console.error(
+          JSON.stringify({
+            level: "error",
+            message: "WO/MEL D1 ingest failed after analysis persisted (see R2 ingest-errors/)",
+            dateKey,
+            error: messageText,
+          }),
+        );
+      }
     } catch (err) {
       const messageText = err instanceof Error ? err.message : String(err);
       const stack = err instanceof Error ? err.stack : undefined;
@@ -567,6 +589,20 @@ export default {
 
     if (url.pathname === "/api/history") {
       return Response.json(await loadMergedHistory(env), { headers: cacheHeaders() });
+    }
+
+    if (url.pathname === "/api/snapshot-prior-ingests") {
+      const dk = url.searchParams.get("dateKey")?.trim() ?? "";
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dk)) {
+        return Response.json({ error: "Query dateKey=YYYY-MM-DD is required" }, { status: 400, headers: cacheHeaders() });
+      }
+      try {
+        const priors = await listPriorIngestSnapshotsForDate(env, dk);
+        return Response.json({ dateKey: dk, priors }, { headers: cacheHeaders() });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return Response.json({ error: msg }, { status: 500, headers: cacheHeaders() });
+      }
     }
 
     if (url.pathname === "/api/snapshot/delete" && request.method === "POST") {
@@ -631,11 +667,15 @@ export default {
     }
 
     if (url.pathname.startsWith("/api/analysis/")) {
-      const dateKey = url.pathname.slice("/api/analysis/".length);
+      const reqUrl = new URL(request.url);
+      const dateKey = reqUrl.pathname.slice("/api/analysis/".length);
       if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) {
         return new Response("Invalid date key", { status: 400 });
       }
-      let analysis = await readAnalysisForDateKey(env, dateKey);
+      const priorAt = reqUrl.searchParams.get("priorReceivedAt")?.trim() ?? "";
+      let analysis = priorAt
+        ? await readPriorIngestAnalysis(env, dateKey, priorAt)
+        : await readAnalysisForDateKey(env, dateKey);
       if (!analysis) return new Response("Not Found", { status: 404 });
       analysis = await enrichAnalysisAssetManagerFromR2(env, analysis);
       return Response.json(analysis, { headers: cacheHeaders() });
@@ -1139,6 +1179,145 @@ function assetManagerFromAnalysis(analysis: AnalysisResult): AssetManagerKpis {
     nmc: null,
     surplus: null,
   };
+}
+
+type EticSnapshotArchiveSourceRow = {
+  workbook_key: string;
+  workbook_file_name: string;
+  received_at_iso: string;
+  mc_rate: number | null;
+  fleet_total: number | null;
+  fmc: number | null;
+  nmc: number | null;
+  surplus: number | null;
+  asset_manager_ok: number | null;
+  total_rows: number | null;
+  mel_total: number | null;
+  visible_sheets: number | null;
+  hidden_sheets: number | null;
+  asset_manager_breakdown: string | null;
+  analysis_json: string | null;
+};
+
+/** Before replacing a report day, copy the existing workbook + analysis to R2 and log D1 so earlier same-day ingests are not lost. */
+async function archiveSupersededEticSnapshotIfPresent(env: Env, reportDateKey: string): Promise<void> {
+  const row = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT workbook_key, workbook_file_name, received_at_iso,
+            mc_rate, fleet_total, fmc, nmc, surplus, asset_manager_ok,
+            total_rows, mel_total, visible_sheets, hidden_sheets,
+            asset_manager_breakdown, analysis_json
+     FROM etic_snapshots WHERE date_key = ? AND deleted_at_iso IS NULL`,
+  )
+    .bind(reportDateKey)
+    .first<EticSnapshotArchiveSourceRow>();
+  if (!row) return;
+
+  const stamp = row.received_at_iso.replace(/[:.]/g, "-");
+  const baseName = row.workbook_file_name || row.workbook_key.split("/").pop() || "Vehicle_ETIC.xlsx";
+  const safeBase = sanitizeFileName(baseName);
+  const archiveWbKey = `workbooks/${reportDateKey}/prior-ingests/${stamp}/${safeBase}`;
+
+  try {
+    const wbObj = await env.ETIC_BUCKET.get(row.workbook_key);
+    if (wbObj) {
+      const buf = await wbObj.arrayBuffer();
+      await env.ETIC_BUCKET.put(archiveWbKey, buf, {
+        httpMetadata: {
+          contentType:
+            wbObj.httpMetadata?.contentType ??
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        },
+      });
+    }
+  } catch (err) {
+    console.error(
+      JSON.stringify({
+        level: "error",
+        message: "prior_ingest_workbook_archive_failed",
+        reportDateKey,
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+  }
+
+  const analysisArchiveKey = `analyses/archive/${reportDateKey}/${stamp}.json`;
+  let analysisBody = (row.analysis_json ?? "").trim();
+  if (!analysisBody) {
+    try {
+      const obj = await env.ETIC_BUCKET.get(`analyses/${reportDateKey}.json`);
+      if (obj) analysisBody = (await obj.text()).trim();
+    } catch {
+      analysisBody = "";
+    }
+  }
+  if (!analysisBody) analysisBody = "{}";
+  try {
+    await env.ETIC_BUCKET.put(analysisArchiveKey, analysisBody, {
+      httpMetadata: { contentType: "application/json; charset=utf-8" },
+    });
+  } catch (err) {
+    console.error(
+      JSON.stringify({
+        level: "error",
+        message: "prior_ingest_analysis_archive_failed",
+        reportDateKey,
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+  }
+
+  const archivedAt = new Date().toISOString();
+  try {
+    await env.ETIC_SNAPSHOTS.prepare(
+      `INSERT OR IGNORE INTO etic_snapshot_prior_ingest (
+        report_date_key, superseded_received_at_iso, archived_at_iso,
+        workbook_key, workbook_file_name, analysis_archive_key,
+        mc_rate, fleet_total, fmc, nmc, surplus, asset_manager_ok,
+        total_rows, mel_total, visible_sheets, hidden_sheets, asset_manager_breakdown
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    )
+      .bind(
+        reportDateKey,
+        row.received_at_iso,
+        archivedAt,
+        archiveWbKey,
+        baseName,
+        analysisArchiveKey,
+        row.mc_rate,
+        row.fleet_total,
+        row.fmc,
+        row.nmc,
+        row.surplus,
+        row.asset_manager_ok ?? 0,
+        row.total_rows,
+        row.mel_total,
+        row.visible_sheets,
+        row.hidden_sheets,
+        row.asset_manager_breakdown ?? "",
+      )
+      .run();
+  } catch (err) {
+    console.error(
+      JSON.stringify({
+        level: "error",
+        message: "prior_ingest_d1_insert_failed",
+        reportDateKey,
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+    return;
+  }
+
+  console.log(
+    JSON.stringify({
+      level: "info",
+      message: "etic_prior_snapshot_archived",
+      reportDateKey,
+      supersededAt: row.received_at_iso,
+      archiveWbKey,
+      analysisArchiveKey,
+    }),
+  );
 }
 
 async function upsertSnapshotRow(env: Env, analysis: AnalysisResult, workbookKey: string): Promise<void> {
@@ -4960,7 +5139,62 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
     );
   }
 
+  const priorReceivedAt = url.searchParams.get("priorReceivedAt")?.trim() ?? "";
+
   if (woLookup) {
+    if (priorReceivedAt) {
+      const pin = await getPriorIngestRow(env, asOf, priorReceivedAt);
+      if (!pin) {
+        return Response.json(
+          {
+            asOfDateKey: asOf,
+            priorReceivedAt,
+            workOrderId: woLookup,
+            found: false,
+            inSnapshot: false,
+            row: null,
+            openSubWorkOrders: [],
+            oswoSnapshotDateKey: null,
+            error: "Unknown prior ingest",
+          },
+          { status: 404, headers: cacheHeaders() },
+        );
+      }
+      const wbObj = await env.ETIC_BUCKET.get(pin.workbook_key);
+      if (!wbObj) {
+        return Response.json(
+          {
+            asOfDateKey: asOf,
+            priorReceivedAt,
+            workOrderId: woLookup,
+            found: false,
+            inSnapshot: false,
+            row: null,
+            openSubWorkOrders: [],
+            oswoSnapshotDateKey: null,
+            error: "Archived workbook missing",
+          },
+          { status: 404, headers: cacheHeaders() },
+        );
+      }
+      const bytes = await wbObj.arrayBuffer();
+      const ephemeral = await getWatchRowsFromWorkbookBytes(env, asOf, bytes);
+      const scopedRow = ephemeral.find((r) => r.workOrderId === woLookup) ?? null;
+      const oswo = await getOpenSubWorkOrdersForWorkOrder(env, woLookup, asOf);
+      return Response.json(
+        {
+          asOfDateKey: asOf,
+          priorReceivedAt,
+          workOrderId: woLookup,
+          found: scopedRow !== null,
+          inSnapshot: scopedRow !== null,
+          row: scopedRow,
+          openSubWorkOrders: oswo.rows,
+          oswoSnapshotDateKey: oswo.snapshotDateKey,
+        },
+        { headers: cacheHeaders() },
+      );
+    }
     const scopedRow = await getWatchRowByIdForDate(env, woLookup, asOf);
     const row = scopedRow ?? (await getWatchRowById(env, woLookup, asOf));
     const oswo = await getOpenSubWorkOrdersForWorkOrder(env, woLookup, asOf);
@@ -4979,14 +5213,30 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
   }
 
   const scope = (url.searchParams.get("scope") ?? "snapshot").toLowerCase();
-  let rows = scope === "all"
-    ? await getWatchRowsLatest(env, asOf)
-    : await getWatchRowsForDate(env, asOf);
+  let rows =
+    priorReceivedAt && scope !== "all"
+      ? await (async () => {
+          const pin = await getPriorIngestRow(env, asOf, priorReceivedAt);
+          if (!pin) return null;
+          const wbObj = await env.ETIC_BUCKET.get(pin.workbook_key);
+          if (!wbObj) return null;
+          return getWatchRowsFromWorkbookBytes(env, asOf, await wbObj.arrayBuffer());
+        })()
+      : scope === "all"
+        ? await getWatchRowsLatest(env, asOf)
+        : await getWatchRowsForDate(env, asOf);
+  if (priorReceivedAt && scope !== "all" && rows === null) {
+    return Response.json(
+      { error: "Unknown prior ingest or archived workbook missing", asOfDateKey: asOf, rows: [] },
+      { status: 404, headers: cacheHeaders() },
+    );
+  }
+  if (rows === null) rows = [];
   // Self-heal: if scope=snapshot returned 0 rows for a date that does have a
   // workbook in R2 (e.g. ingest never wrote per-row history for that date),
   // replay it on the fly and re-query. Cheap one-shot, idempotent.
   let healed = false;
-  if (scope !== "all" && rows.length === 0) {
+  if (!priorReceivedAt && scope !== "all" && rows.length === 0) {
     const history = await mergeHistoryWithActiveSnapshots(env, await loadHistory(env));
     const entry = history.entries.find((e) => e.dateKey === asOf);
     if (entry) {
@@ -5002,7 +5252,15 @@ async function handleWatchApi(env: Env, request: Request, ctx: ExecutionContext)
   const staleCount = rows.filter((r) => r.remarkStale).length;
   const responseRows = url.searchParams.get("summary") === "1" ? summarizeWatchRowsForList(filtered) : filtered;
   return Response.json(
-    { asOfDateKey: asOf, scope, staleCount, total: rows.length, rows: responseRows, healed },
+    {
+      asOfDateKey: asOf,
+      priorReceivedAt: priorReceivedAt || undefined,
+      scope,
+      staleCount,
+      total: rows.length,
+      rows: responseRows,
+      healed,
+    },
     { headers: cacheHeaders() },
   );
 }
@@ -5245,7 +5503,32 @@ async function handleFmaFollowUpReportApi(env: Env, request: Request): Promise<R
 }
 
 async function handleWorkbookDownload(env: Env, request: Request): Promise<Response> {
+  const url = new URL(request.url);
   const paramDate = parseYardCheckDateParam(request);
+  const priorAt = url.searchParams.get("priorReceivedAt")?.trim() ?? "";
+  if (paramDate && priorAt) {
+    const pin = await getPriorIngestRow(env, paramDate, priorAt);
+    if (!pin) {
+      return Response.json({ ok: false, error: "Prior ingest not found for that date" }, { status: 404 });
+    }
+    const object = await env.ETIC_BUCKET.get(pin.workbook_key);
+    if (!object) {
+      return Response.json({ ok: false, error: `Workbook not found in R2: ${pin.workbook_key}` }, { status: 404 });
+    }
+    const body = await object.arrayBuffer();
+    const safe = (pin.workbook_file_name || "Vehicle_ETIC.xlsx").replace(/[^A-Za-z0-9._-]/g, "_");
+    const downloadName = `etic_${paramDate}_prior_${safe}`;
+    return new Response(body, {
+      headers: {
+        "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "Content-Disposition": 'attachment; filename="' + downloadName + '"',
+        "Cache-Control": "no-store",
+        "X-Source-Date": paramDate,
+        "X-Source-Key": pin.workbook_key,
+        "X-Prior-Received-At": pin.superseded_received_at_iso,
+      },
+    });
+  }
   const resolved = await resolveYardCheckWorkbook(env, paramDate);
   if (!resolved.ok) {
     return Response.json({ ok: false, error: resolved.error }, { status: 404 });
@@ -5309,6 +5592,62 @@ async function readAnalysisForDateKey(env: Env, dateKey: string): Promise<Analys
   const fromDb = await tryReadAnalysisFromD1(env, dateKey);
   if (fromDb) return fromDb;
   return readJson<AnalysisResult>(env, `analyses/${dateKey}.json`);
+}
+
+type PriorIngestRow = {
+  workbook_key: string;
+  workbook_file_name: string;
+  analysis_archive_key: string;
+  superseded_received_at_iso: string;
+};
+
+async function getPriorIngestRow(
+  env: Env,
+  reportDateKey: string,
+  supersededReceivedAt: string,
+): Promise<PriorIngestRow | null> {
+  return env.ETIC_SNAPSHOTS.prepare(
+    `SELECT workbook_key, workbook_file_name, analysis_archive_key, superseded_received_at_iso
+     FROM etic_snapshot_prior_ingest WHERE report_date_key = ? AND superseded_received_at_iso = ?`,
+  )
+    .bind(reportDateKey, supersededReceivedAt)
+    .first<PriorIngestRow>();
+}
+
+async function readPriorIngestAnalysis(
+  env: Env,
+  reportDateKey: string,
+  supersededReceivedAt: string,
+): Promise<AnalysisResult | null> {
+  const row = await getPriorIngestRow(env, reportDateKey, supersededReceivedAt);
+  if (!row) return null;
+  return readJson<AnalysisResult>(env, row.analysis_archive_key);
+}
+
+async function listPriorIngestSnapshotsForDate(env: Env, reportDateKey: string) {
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT superseded_received_at_iso, archived_at_iso, workbook_key, workbook_file_name, analysis_archive_key,
+            mc_rate, fleet_total, fmc, nmc, surplus, total_rows, mel_total, visible_sheets, hidden_sheets
+     FROM etic_snapshot_prior_ingest WHERE report_date_key = ? ORDER BY superseded_received_at_iso ASC`,
+  )
+    .bind(reportDateKey)
+    .all<{
+      superseded_received_at_iso: string;
+      archived_at_iso: string;
+      workbook_key: string;
+      workbook_file_name: string;
+      analysis_archive_key: string;
+      mc_rate: number | null;
+      fleet_total: number | null;
+      fmc: number | null;
+      nmc: number | null;
+      surplus: number | null;
+      total_rows: number | null;
+      mel_total: number | null;
+      visible_sheets: number | null;
+      hidden_sheets: number | null;
+    }>();
+  return r.results ?? [];
 }
 
 /** Copy R2 analysis files into D1 for every active snapshot row missing `analysis_json`. */
@@ -5527,22 +5866,64 @@ function isAuthorizedSender(sender: string, env: Env): boolean {
   return allowed.includes(normalizedSender);
 }
 
+/** Byte size for picking among multiple spreadsheet attachments (no full copy). */
+function attachmentByteLength(content: Attachment["content"]): number {
+  if (content instanceof ArrayBuffer) return content.byteLength;
+  if (content instanceof Uint8Array) return content.byteLength;
+  if (typeof content === "string") return new TextEncoder().encode(content).byteLength;
+  return 0;
+}
+
+/**
+ * Prefer the real Vehicle ETIC export when an email has several `.xlsx` files
+ * (e.g. cover sheet + main workbook); exact `EXPECTED_ATTACHMENT_NAME` wins,
+ * then name heuristics, then largest file.
+ */
 function pickWorkbookAttachment(
   attachments: Attachment[],
   expectedAttachmentName?: string,
 ): Attachment | undefined {
+  const xlsxList = attachments.filter((attachment) => {
+    const filename = attachment.filename?.toLowerCase() ?? "";
+    return filename.endsWith(".xlsx");
+  });
+  if (xlsxList.length === 0) return undefined;
+
   const expected = expectedAttachmentName?.trim().toLowerCase();
   if (expected) {
-    const exact = attachments.find(
+    const exact = xlsxList.find(
       (attachment) => (attachment.filename?.trim().toLowerCase() ?? "") === expected,
     );
     if (exact) return exact;
   }
 
-  return attachments.find((attachment) => {
-    const filename = attachment.filename?.toLowerCase() ?? "";
-    return filename.endsWith(".xlsx");
+  if (xlsxList.length === 1) return xlsxList[0];
+
+  const scored = xlsxList.map((att) => {
+    const fn = (att.filename ?? "").toLowerCase();
+    let score = 0;
+    if (fn.includes("vehicle")) score += 2;
+    if (fn.includes("etic")) score += 2;
+    if (fn.includes("mc rate") || fn.includes("mc_rate")) score += 1;
+    if (fn.includes("fleet")) score += 1;
+    const bytes = attachmentByteLength(att.content);
+    return { att, score, bytes };
   });
+  scored.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return b.bytes - a.bytes;
+  });
+  const chosen = scored[0]!.att;
+  console.log(
+    JSON.stringify({
+      level: "info",
+      message: "etic_workbook_attachment_disambiguation",
+      xlsxCount: xlsxList.length,
+      pickedFileName: chosen.filename ?? "",
+      pickedBytes: attachmentByteLength(chosen.content),
+    }),
+  );
+  return chosen;
 }
 
 function normalizeAttachmentBinary(content: Attachment["content"]): ArrayBuffer {
@@ -9791,6 +10172,11 @@ function renderDashboardHtml(): string {
       cursor: pointer;
     }
     .date-picker .date-select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+    .date-picker .date-prior-ingest {
+      flex: 1 1 160px;
+      max-width: min(240px, 100%);
+      font-size: 0.84rem;
+    }
     .date-picker .date-pick-delete {
       color: var(--danger);
       border-color: rgba(176, 0, 32, 0.4);
@@ -11054,7 +11440,8 @@ function renderDashboardHtml(): string {
     .wo-tl-event.field-sub_wo_state .ev-label { background: rgba(106,63,184,0.12); color: #5a3488; }
     .wo-tl-event .sub-wo-head { font-size: 0.84rem; color: var(--text-dim); margin-bottom: 4px; }
     .wo-tl-event .sub-wo-id { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-weight: 700; color: var(--text); }
-    .wo-tl-event .sub-wo-plan { color: var(--muted); }
+    .wo-tl-event .sub-wo-field { font-size: 0.88rem; margin: 4px 0 2px; line-height: 1.35; }
+    .wo-tl-event .sub-wo-field strong { color: var(--text-dim); font-weight: 600; margin-right: 6px; }
     .wo-tl-event .sub-wo-state {
       display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 0.78rem; font-weight: 700;
       background: var(--bg2); border: 1px solid var(--border); color: var(--text);
@@ -13597,8 +13984,8 @@ function renderDashboardHtml(): string {
       inset: 0;
       display: flex;
       flex-direction: column;
-      padding: 16px 28px 14px;
-      gap: 12px;
+      padding: 12px 22px 10px;
+      gap: 8px;
       background: var(--bg0, #f3f5f8);
       color: var(--text, #0a1a3a);
       font-family: var(--font, "Source Sans 3", system-ui, sans-serif);
@@ -13608,9 +13995,9 @@ function renderDashboardHtml(): string {
       display: grid;
       grid-template-columns: 1fr auto auto auto;
       align-items: center;
-      gap: 12px 16px;
+      gap: 8px 14px;
       flex: 0 0 auto;
-      padding-bottom: 12px;
+      padding-bottom: 8px;
       border-bottom: 1px solid var(--border, rgba(15,30,60,0.12));
     }
     @media (max-width: 720px) {
@@ -13650,6 +14037,11 @@ function renderDashboardHtml(): string {
     .presenter:-webkit-full-screen {
       padding: 20px 32px 18px;
     }
+    /* Presenter FS uses the whole document so fixed siblings (yard photo lightbox) stay in the fullscreen subtree. */
+    html:fullscreen body.presenter-mode .presenter,
+    html:-webkit-full-screen body.presenter-mode .presenter {
+      padding: 20px 32px 18px;
+    }
     .presenter-meeting-title {
       font-size: clamp(1.35rem, 2vw, 2rem);
       font-weight: 700;
@@ -13674,7 +14066,7 @@ function renderDashboardHtml(): string {
     .presenter-clock-time {
       font-variant-numeric: tabular-nums;
       font-weight: 700;
-      font-size: clamp(1.85rem, 2.6vw, 2.75rem);
+      font-size: clamp(1.2rem, 1.65vw, 1.85rem);
       letter-spacing: 0.02em;
       line-height: 1;
       color: var(--accent-strong, #00276b);
@@ -13709,8 +14101,8 @@ function renderDashboardHtml(): string {
       display: flex;
       flex-direction: column;
       align-items: flex-end;
-      gap: 3px;
-      padding: 10px 16px;
+      gap: 2px;
+      padding: 7px 12px;
       border-radius: 12px;
       background: linear-gradient(160deg, #ffffff 0%, var(--bg1, #e9edf3) 110%);
       border: 1px solid var(--border, rgba(15,30,60,0.14));
@@ -13726,7 +14118,7 @@ function renderDashboardHtml(): string {
       line-height: 1.2;
     }
     .presenter-pos-chip .p-val {
-      font-size: clamp(1.1rem, 1.5vw, 1.55rem);
+      font-size: clamp(0.95rem, 1.2vw, 1.35rem);
       font-weight: 800;
       font-variant-numeric: tabular-nums;
       letter-spacing: -0.02em;
@@ -13800,8 +14192,8 @@ function renderDashboardHtml(): string {
       min-height: 0;
       display: flex;
       flex-direction: column;
-      gap: 12px;
-      padding: 18px 22px;
+      gap: 6px;
+      padding: 10px 14px;
       border-radius: var(--radius-lg, 12px);
       background: var(--surface, #fff);
       border: 1px solid var(--border, rgba(15,30,60,0.12));
@@ -13898,10 +14290,10 @@ function renderDashboardHtml(): string {
     .p-reason-section h3 { color: var(--accent, #003a8c); }
     .presenter-card-title {
       margin: 0;
-      font-size: clamp(1.75rem, 2.6vw, 2.75rem);
+      font-size: clamp(1.2rem, 1.85vw, 1.72rem);
       font-weight: 700;
       letter-spacing: -0.02em;
-      line-height: 1.12;
+      line-height: 1.15;
       color: var(--text, #0a1a3a);
     }
     .p-hero { flex: 0 0 auto; display: flex; flex-direction: column; gap: 6px; }
@@ -13925,12 +14317,12 @@ function renderDashboardHtml(): string {
       flex: 0 0 auto;
     }
     .p-shop-banner {
-      margin-top: 4px;
-      padding: 14px 18px;
-      border-radius: 12px;
-      background: linear-gradient(135deg, rgba(0, 58, 140, 0.07) 0%, rgba(0, 58, 140, 0.14) 100%);
-      border: 2px solid rgba(0, 58, 140, 0.38);
-      box-shadow: 0 2px 10px rgba(0, 58, 140, 0.08);
+      margin-top: 2px;
+      padding: 6px 12px;
+      border-radius: 8px;
+      background: linear-gradient(135deg, rgba(0, 58, 140, 0.06) 0%, rgba(0, 58, 140, 0.11) 100%);
+      border: 1px solid rgba(0, 58, 140, 0.32);
+      box-shadow: 0 1px 6px rgba(0, 58, 140, 0.06);
     }
     .p-shop-banner.hidden { display: none; }
     .p-shop-banner .p-shop-eyebrow {
@@ -13944,10 +14336,10 @@ function renderDashboardHtml(): string {
     }
     .p-shop-banner .p-shop-name {
       display: block;
-      font-size: clamp(1.45rem, 2.35vw, 2.15rem);
+      font-size: clamp(0.92rem, 1.1vw, 1.22rem);
       font-weight: 800;
       letter-spacing: -0.02em;
-      line-height: 1.12;
+      line-height: 1.2;
       color: var(--text, #0a1a3a);
       word-break: break-word;
     }
@@ -13992,12 +14384,45 @@ function renderDashboardHtml(): string {
       word-break: break-word;
     }
 
-    /* 2×2 tiles — keeps each cell wide enough for long parts / ETIC strings */
+    /* 4-up KPI row — compact strip (meeting room: recent changes live above this). */
     .p-dashboard {
       flex: 0 0 auto;
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 10px;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 6px;
+    }
+    .p-dashboard--compact .p-tile {
+      padding: 6px 8px;
+      border-radius: 8px;
+      gap: 2px;
+    }
+    .p-dashboard--compact .p-tile .lbl {
+      font-size: clamp(0.55rem, 0.62vw, 0.62rem);
+    }
+    .p-dashboard--compact .p-tile .val {
+      font-size: clamp(0.92rem, 1.05vw, 1.15rem) !important;
+      font-weight: 750;
+      line-height: 1.15;
+    }
+    .p-dashboard--compact .p-tile .sub {
+      font-size: clamp(0.68rem, 0.78vw, 0.8rem);
+      line-height: 1.2;
+    }
+    .p-dashboard--compact .p-tile[data-tile="parts"] .val {
+      font-size: clamp(0.82rem, 0.95vw, 1rem) !important;
+      line-height: 1.22;
+    }
+    .p-dashboard--compact .p-tile[data-tile="parts"] .sub {
+      font-size: clamp(0.62rem, 0.72vw, 0.76rem);
+    }
+    .p-dashboard--compact .p-tile[data-tile="daysdown"] .val,
+    .p-dashboard--compact .p-tile[data-tile="slipped"] .val {
+      font-size: clamp(0.88rem, 1vw, 1.05rem) !important;
+      line-height: 1.2;
+    }
+    .p-dashboard--compact .p-tile[data-tile="daysdown"] .sub,
+    .p-dashboard--compact .p-tile[data-tile="slipped"] .sub {
+      font-size: clamp(0.62rem, 0.72vw, 0.76rem);
     }
     .p-tile {
       display: flex;
@@ -14018,7 +14443,7 @@ function renderDashboardHtml(): string {
       font-weight: 600;
     }
     .p-tile .val {
-      font-size: clamp(1.35rem, 1.85vw, 2rem);
+      font-size: clamp(1.05rem, 1.25vw, 1.28rem);
       font-weight: 700;
       line-height: 1.12;
       letter-spacing: -0.01em;
@@ -14065,9 +14490,9 @@ function renderDashboardHtml(): string {
       background: var(--bg2, #f0f3f8);
       border: 1px solid var(--border, rgba(15,30,60,0.12));
     }
-    .p-section-compact { flex: 0 1 auto; max-height: min(16vh, 150px); display: flex; flex-direction: column; min-height: 0; }
+    .p-section-compact { flex: 0 1 auto; max-height: min(12vh, 120px); display: flex; flex-direction: column; min-height: 0; }
     .p-section-compact .presenter-text { overflow-y: auto; flex: 1 1 auto; min-height: 0; }
-    .p-remark-block { max-height: min(22vh, 220px); }
+    .p-remark-block { max-height: min(12vh, 120px); flex: 0 0 auto; }
     .p-remark-meta {
       font-size: clamp(0.95rem, 1.2vw, 1.15rem);
       font-weight: 700;
@@ -14099,12 +14524,37 @@ function renderDashboardHtml(): string {
     }
     .p-section-grow {
       flex: 1 1 0;
-      min-height: 120px;
+      min-height: min(22vh, 200px);
       display: flex;
       flex-direction: column;
       min-width: 0;
     }
     .p-section-fill { flex: 1 1 0; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+    .p-presenter-focus {
+      background: linear-gradient(160deg, #fff 0%, rgba(0, 58, 140, 0.04) 100%);
+      border: 1px solid rgba(0, 58, 140, 0.22);
+      box-shadow: 0 1px 10px rgba(0, 58, 140, 0.06);
+    }
+    .presenter-card-section h3.p-focus-heading {
+      margin: 0 0 8px;
+      font-size: clamp(0.82rem, 1vw, 0.95rem);
+      font-weight: 800;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--accent-strong, #00276b);
+    }
+    .presenter-card-section h3.p-due-heading {
+      margin: 0 0 8px;
+      font-size: clamp(0.82rem, 1vw, 0.95rem);
+      font-weight: 800;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--danger);
+    }
+    .p-side-dueouts {
+      border-left: 3px solid rgba(176, 0, 32, 0.35);
+      background: linear-gradient(180deg, rgba(176, 0, 32, 0.04) 0%, var(--bg2, #f0f3f8) 28%);
+    }
     .presenter-card-section h3 {
       margin: 0 0 6px;
       font-size: clamp(0.68rem, 0.78vw, 0.78rem);
@@ -14203,29 +14653,38 @@ function renderDashboardHtml(): string {
       flex: 1 1 0;
       min-height: 0;
       display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(280px, 40%);
-      gap: 12px 18px;
+      grid-template-columns: minmax(0, 1fr) minmax(220px, 34%);
+      gap: 10px 14px;
       align-items: stretch;
     }
     .p-main-col {
       display: flex;
       flex-direction: column;
-      gap: 12px;
+      gap: 10px;
       min-width: 0;
       min-height: 0;
     }
     .p-side-col {
       display: flex;
       flex-direction: column;
-      gap: 12px;
+      gap: 10px;
       min-width: 0;
       min-height: 0;
     }
     .p-side-col .p-section-fill {
       flex: 1 1 0;
-      min-height: 120px;
+      min-height: 96px;
       display: flex;
       flex-direction: column;
+    }
+    .p-side-col .p-side-dueouts.p-section-fill {
+      flex: 1 1 55%;
+      min-height: min(24vh, 220px);
+    }
+    .p-side-col .p-side-notes.p-section-fill {
+      flex: 1 1 30%;
+      max-height: min(26vh, 240px);
+      min-height: 72px;
     }
     .p-side-col .presenter-text,
     .p-side-col .presenter-list {
@@ -15508,6 +15967,7 @@ function renderDashboardHtml(): string {
           <button type="button" id="date-jump-latest" class="date-pick-btn" title="Jump to the most recent snapshot">⤒ Latest</button>
           <button type="button" id="date-jump-prev" class="date-pick-btn date-pick-arrow" title="Previous snapshot" aria-label="Previous snapshot">◂</button>
           <select id="date-select" class="date-select" aria-label="Pick a snapshot date"></select>
+          <select id="date-prior-ingest" class="date-select date-prior-ingest hidden" aria-label="Earlier upload same report day" title="Multiple workbooks emailed this date: compare an earlier upload"></select>
           <button type="button" id="date-jump-next" class="date-pick-btn date-pick-arrow" title="Next snapshot" aria-label="Next snapshot">▸</button>
           <button type="button" id="date-delete-snapshot" class="date-pick-btn date-pick-delete" data-snapshot-delete title="Delete this snapshot from storage and history">Delete snapshot</button>
           <span class="date-picker-meta" id="date-picker-meta"></span>
@@ -16963,39 +17423,39 @@ function renderDashboardHtml(): string {
           <div class="p-opened hidden" id="p-opened"></div>
         </header>
 
-        <!-- 2. STATUS DASHBOARD: 4 big tiles for shop leads -->
-        <section class="p-dashboard" id="p-dashboard"></section>
-
-        <!-- 3. WO REASON (from workbook) -->
-        <section class="presenter-card-section p-section p-section-compact p-reason-section hidden" id="p-reason-section">
-          <h3>Reason</h3>
-          <p class="presenter-text" id="p-reason">—</p>
-        </section>
-
-        <!-- Main column + right rail: timeline + live meeting notes / due-outs -->
+        <!-- Primary readout for standup: deltas + commitments (fits on TV above big KPI tiles). -->
         <div class="p-main-split">
           <div class="p-main-col">
+            <section class="presenter-card-section p-section p-section-grow p-presenter-focus">
+              <h3 class="p-focus-heading">Recent changes</h3>
+              <div class="p-timeline" id="p-timeline"></div>
+            </section>
             <section class="presenter-card-section p-section p-section-compact p-remark-block">
               <h3>Latest workbook remark</h3>
               <div class="p-remark-meta" id="p-remark-meta"></div>
               <p class="presenter-text" id="p-remark">—</p>
             </section>
-            <section class="presenter-card-section p-section p-section-grow">
-              <h3>Change timeline</h3>
-              <div class="p-timeline" id="p-timeline"></div>
-            </section>
           </div>
           <aside class="p-side-col">
+            <section class="presenter-card-section p-section p-section-fill p-side-dueouts">
+              <h3 class="p-due-heading">Due-outs</h3>
+              <ul class="presenter-list" id="p-dueouts"></ul>
+            </section>
             <section class="presenter-card-section p-section p-section-fill p-side-notes">
               <h3>Meeting notes</h3>
               <p class="presenter-text" id="p-notes">—</p>
             </section>
-            <section class="presenter-card-section p-section p-section-fill p-side-dueouts">
-              <h3>Due-outs</h3>
-              <ul class="presenter-list" id="p-dueouts"></ul>
-            </section>
           </aside>
         </div>
+
+        <!-- KPI strip — scannable glance (compact; not the hero). -->
+        <section class="p-dashboard p-dashboard--compact" id="p-dashboard"></section>
+
+        <!-- WO REASON (from workbook) -->
+        <section class="presenter-card-section p-section p-section-compact p-reason-section hidden" id="p-reason-section">
+          <h3>Reason</h3>
+          <p class="presenter-text" id="p-reason">—</p>
+        </section>
       </article>
     </main>
     <footer class="presenter-foot">
@@ -17442,6 +17902,7 @@ function renderDashboardHtml(): string {
     let mcChartLastApiResponse = null;
     let mcChartDimensions = null;
     let selectedDate = null;
+    let selectedPriorReceivedAt = null;
     let snapshotRows = [];
     const watchCacheByDate = new Map();
     const changelogCache = new Map();
@@ -17455,12 +17916,20 @@ function renderDashboardHtml(): string {
     let woSort = "default";
     var woListInputDebounce = null;
     var WO_LIST_INPUT_DEBOUNCE_MS = 140;
+    function watchListCacheKey(forDateKey) {
+      if (!forDateKey) return forDateKey;
+      if (selectedPriorReceivedAt && forDateKey === selectedDate) {
+        return forDateKey + "|p=" + selectedPriorReceivedAt;
+      }
+      return forDateKey;
+    }
     function scheduleWoListRerender() {
       if (woListInputDebounce) clearTimeout(woListInputDebounce);
       woListInputDebounce = setTimeout(function () {
         woListInputDebounce = null;
         var asOf = woAsOfDate();
-        var rows = (asOf && watchCacheByDate.get(asOf)) || [];
+        var ckey = watchListCacheKey(asOf);
+        var rows = (asOf && watchCacheByDate.get(ckey)) || [];
         renderWoList(rows);
       }, WO_LIST_INPUT_DEBOUNCE_MS);
     }
@@ -17533,7 +18002,11 @@ function renderDashboardHtml(): string {
     }
 
     async function loadAnalysis(dateKey) {
-      const res = await fetch("/api/analysis/" + encodeURIComponent(dateKey));
+      var q = "";
+      if (selectedPriorReceivedAt && dateKey === selectedDate) {
+        q = "?priorReceivedAt=" + encodeURIComponent(selectedPriorReceivedAt);
+      }
+      const res = await fetch("/api/analysis/" + encodeURIComponent(dateKey) + q);
       if (!res.ok) throw new Error("No analysis for " + dateKey);
       return res.json();
     }
@@ -17541,18 +18014,19 @@ function renderDashboardHtml(): string {
     async function loadWatchForDate(dateKey, opts) {
       if (!dateKey) return [];
       const force = !!(opts && opts.force);
-      if (!force && watchCacheByDate.has(dateKey)) return watchCacheByDate.get(dateKey);
-      // Use scope=snapshot (default) so the list shows ONLY the work orders
-      // that were actually present in the .xlsx for this date. scope=all would
-      // return every WO we've ever ingested (work_order_state), which inflates
-      // the count well beyond what's in the latest workbook.
-      const url = "/api/watch?date=" + encodeURIComponent(dateKey) + "&summary=1" +
+      const ckey = watchListCacheKey(dateKey);
+      if (!force && watchCacheByDate.has(ckey)) return watchCacheByDate.get(ckey);
+      var pqs = "";
+      if (selectedPriorReceivedAt && dateKey === selectedDate) {
+        pqs = "&priorReceivedAt=" + encodeURIComponent(selectedPriorReceivedAt);
+      }
+      const url = "/api/watch?date=" + encodeURIComponent(dateKey) + "&summary=1" + pqs +
         (force ? "&_=" + Date.now() : "");
       const res = await fetch(url, force ? { cache: "no-store" } : undefined);
-      if (!res.ok) { watchCacheByDate.set(dateKey, []); return []; }
+      if (!res.ok) { watchCacheByDate.set(ckey, []); return []; }
       const data = await res.json();
       const rows = Array.isArray(data.rows) ? data.rows : [];
-      watchCacheByDate.set(dateKey, rows);
+      watchCacheByDate.set(ckey, rows);
       return rows;
     }
 
@@ -18883,7 +19357,8 @@ function renderDashboardHtml(): string {
     function getSelectedWatchRow() {
       const asOf = woAsOfDate();
       if (!asOf || !selectedWoId) return null;
-      const rows = watchCacheByDate.get(asOf) || [];
+      const ckey = watchListCacheKey(asOf);
+      const rows = watchCacheByDate.get(ckey) || [];
       for (let i = 0; i < rows.length; i++) {
         if (rows[i].workOrderId === selectedWoId) return rows[i];
       }
@@ -18983,7 +19458,7 @@ function renderDashboardHtml(): string {
       if (isWo) {
         const asOf = woAsOfDate();
         if (asOf) {
-          const cached = watchCacheByDate.get(asOf);
+          const cached = watchCacheByDate.get(watchListCacheKey(asOf));
           if (cached && cached.length) {
             renderWoList(cached, { preserveScroll: true });
             loadSightings(false);
@@ -21383,8 +21858,12 @@ function renderDashboardHtml(): string {
 
     /* --- WO Detail + inline timeline ------------------------------------- */
     async function fetchWoById(woId, asOfDate) {
+      var pq = "";
+      if (selectedPriorReceivedAt && asOfDate === selectedDate) {
+        pq = "&priorReceivedAt=" + encodeURIComponent(selectedPriorReceivedAt);
+      }
       const res = await fetch(
-        "/api/watch?workOrderId=" + encodeURIComponent(woId) + "&date=" + encodeURIComponent(asOfDate),
+        "/api/watch?workOrderId=" + encodeURIComponent(woId) + "&date=" + encodeURIComponent(asOfDate) + pq,
       );
       if (!res.ok) throw new Error("Lookup failed");
       return res.json();
@@ -21412,14 +21891,32 @@ function renderDashboardHtml(): string {
     }
     function parseSubWoPayload(s) {
       var t = (s == null ? "" : String(s)).trim();
-      if (!t) return { state: "", plan: "" };
+      if (!t) return { state: "", requestedService: "", workPlanTypeCd: "" };
       try {
         var o = JSON.parse(t);
         if (o && typeof o === "object") {
-          return { state: String(o.state || ""), plan: String(o.plan || "") };
+          var st = String(o.state || "").trim();
+          var rs = String(o.requestedService || "").trim();
+          var wpt = String(o.workPlanTypeCd || "").trim();
+          var leg = String(o.plan || "").trim();
+          if (!rs && !wpt && leg) {
+            var compact = leg.length <= 40 && leg.split(/\s+/).length <= 3;
+            if (compact) wpt = leg;
+            else rs = leg;
+          }
+          return { state: st, requestedService: rs, workPlanTypeCd: wpt };
         }
       } catch (_) {}
-      return { state: t, plan: "" };
+      return { state: t, requestedService: "", workPlanTypeCd: "" };
+    }
+    function subWoTimelineFields(p) {
+      if (!p) return "";
+      var rs = String(p.requestedService || "").trim();
+      var wpt = String(p.workPlanTypeCd || "").trim();
+      var out = "";
+      if (rs) out += "<div class='sub-wo-field'><strong>Requested service</strong> " + esc(rs) + "</div>";
+      if (wpt) out += "<div class='sub-wo-field'><strong>Work plan type</strong> " + esc(wpt) + "</div>";
+      return out;
     }
 
     const WO_MONTHS = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
@@ -21737,7 +22234,7 @@ function renderDashboardHtml(): string {
           if (k.indexOf("oswo.") !== 0) return false;
           const shortK = k.slice(5);
           if (/^sub work order state/.test(shortK)) return false;
-          if (/work ?plan|workplan|plan name|plan id|work plan type|item desc|work order desc|^plan$|^task$/i.test(shortK)) {
+          if (/work ?plan|workplan|plan name|plan id|work plan type|item desc|work order desc|requested service|work order reason|^plan$|^task$/i.test(shortK)) {
             return false;
           }
           return true;
@@ -21757,18 +22254,26 @@ function renderDashboardHtml(): string {
       }
       body.innerHTML =
         "<table class='wo-oswo-table' aria-label='Open sub work orders from extract'>" +
-        "<thead><tr><th scope='col'>Sub WO</th><th scope='col'>State</th><th scope='col'>Work plan / item</th><th scope='col'>Other columns</th></tr></thead><tbody>" +
+        "<thead><tr><th scope='col'>Sub WO</th><th scope='col'>State</th><th scope='col'>Requested service</th><th scope='col'>Work plan type</th><th scope='col'>Other columns</th></tr></thead><tbody>" +
         rows
           .map(function (row) {
             var sub = (row.subWorkOrderId && String(row.subWorkOrderId).trim()) ? String(row.subWorkOrderId).trim() : "—";
             var st = (row.subWorkOrderStateCd && String(row.subWorkOrderStateCd).trim()) ? String(row.subWorkOrderStateCd).trim() : "—";
-            var plan = (row.workPlanLabel && String(row.workPlanLabel).trim()) ? String(row.workPlanLabel).trim() : "—";
+            var rs =
+              row.requestedService && String(row.requestedService).trim()
+                ? String(row.requestedService).trim()
+                : row.workPlanLabel && String(row.workPlanLabel).trim()
+                  ? String(row.workPlanLabel).trim()
+                  : "—";
+            var wpt =
+              row.workPlanTypeCd && String(row.workPlanTypeCd).trim() ? String(row.workPlanTypeCd).trim() : "—";
             var extra = cellRawExtra(row.raw);
             return (
               "<tr>" +
               "<td class='mono'>" + esc(sub) + "</td>" +
               "<td class='mono'>" + esc(st) + "</td>" +
-              "<td>" + esc(plan) + "</td>" +
+              "<td>" + esc(rs) + "</td>" +
+              "<td class='mono'>" + esc(wpt) + "</td>" +
               "<td>" + (extra || "<span style='color:var(--muted)'>—</span>") + "</td>" +
               "</tr>"
             );
@@ -22004,21 +22509,21 @@ function renderDashboardHtml(): string {
             const subId = subSplit.id || "";
             const payloadOld = parseSubWoPayload(e.old_value);
             const payloadNew = parseSubWoPayload(e.new_value);
-            const planLbl = payloadNew.plan || payloadOld.plan || "";
             const headerBits = [];
             if (subId) headerBits.push("<span class='sub-wo-id'>" + esc(subId) + "</span>");
-            if (planLbl) headerBits.push("<span class='sub-wo-plan'>" + esc(planLbl) + "</span>");
             const head = headerBits.length ? ("<div class='sub-wo-head'>" + headerBits.join(" \u00B7 ") + "</div>") : "";
+            const metaAdded = subWoTimelineFields(payloadNew);
+            const metaRemoved = subWoTimelineFields(payloadOld);
             if (fld === "sub_wo_added") {
               const stateTxt = payloadNew.state ? "<span class='sub-wo-state'>" + esc(payloadNew.state) + "</span>" : "<span style='color:var(--subtle)'>(no state)</span>";
-              body = head + "<ins>added</ins> " + stateTxt;
+              body = head + metaAdded + "<div><ins>added</ins> " + stateTxt + "</div>";
             } else if (fld === "sub_wo_removed") {
               const stateTxt = payloadOld.state ? "<span class='sub-wo-state'>" + esc(payloadOld.state) + "</span>" : "";
-              body = head + "<del>removed</del>" + (stateTxt ? " " + stateTxt : "");
+              body = head + metaRemoved + "<div><del>removed</del>" + (stateTxt ? " " + stateTxt : "") + "</div>";
             } else {
               const oldS = payloadOld.state || "—";
               const newS = payloadNew.state || "—";
-              body = head + "<del>" + esc(oldS) + "</del><span class='arrow'>\u2192</span><ins>" + esc(newS) + "</ins>";
+              body = head + subWoTimelineFields(payloadNew) + "<div><del>" + esc(oldS) + "</del><span class='arrow'>\u2192</span><ins>" + esc(newS) + "</ins></div>";
             }
           } else if (fld === "initial") {
             body = "<span style='color:var(--muted)'>First snapshot we have for this WO</span>";
@@ -22248,7 +22753,36 @@ function renderDashboardHtml(): string {
       renderIngestFooter(analysis);
     }
 
+    async function refreshPriorIngestPicker(dk) {
+      const sel = document.getElementById("date-prior-ingest");
+      if (!sel) return;
+      sel.innerHTML = "";
+      sel.classList.add("hidden");
+      if (!dk) return;
+      try {
+        const res = await fetch("/api/snapshot-prior-ingests?dateKey=" + encodeURIComponent(dk));
+        if (!res.ok) return;
+        const data = await res.json();
+        const priors = Array.isArray(data.priors) ? data.priors : [];
+        if (!priors.length) return;
+        const opts = ['<option value="">Latest upload (current)</option>'];
+        for (let i = 0; i < priors.length; i++) {
+          const p = priors[i];
+          const t = p.superseded_received_at_iso || "";
+          var label = "Earlier upload · " + t;
+          try {
+            const d = new Date(t);
+            if (!isNaN(d.getTime())) label = "Earlier · " + d.toLocaleString();
+          } catch (_) {}
+          opts.push('<option value="' + esc(t) + '">' + esc(label) + "</option>");
+        }
+        sel.innerHTML = opts.join("");
+        sel.classList.remove("hidden");
+      } catch (_) {}
+    }
+
     async function selectDate(dateKey, pushHash) {
+      selectedPriorReceivedAt = null;
       selectedDate = dateKey;
       if (pushHash && dateKey) setHashSnapshot(dateKey);
       const ys = document.getElementById("yard-status"); if (ys) { ys.textContent = ""; ys.className = "status"; }
@@ -22262,6 +22796,9 @@ function renderDashboardHtml(): string {
       } catch (e) {
         console.warn("Could not load snapshot:", e);
       }
+      await refreshPriorIngestPicker(dateKey);
+      const priorSel = document.getElementById("date-prior-ingest");
+      if (priorSel) priorSel.value = "";
     }
 
     async function applyHashRoute() {
@@ -22339,7 +22876,10 @@ function renderDashboardHtml(): string {
       const prevLabel = btn ? btn.textContent : "";
       if (btn) { btn.disabled = true; btn.textContent = "…"; }
       try {
-        const url = "/api/workbook.xlsx?date=" + encodeURIComponent(dk);
+        const url = "/api/workbook.xlsx?date=" + encodeURIComponent(dk) +
+          (selectedPriorReceivedAt && dk === selectedDate
+            ? "&priorReceivedAt=" + encodeURIComponent(selectedPriorReceivedAt)
+            : "");
         const res = await fetch(url);
         if (!res.ok) {
           let msg = "Could not download.";
@@ -22876,6 +23416,21 @@ function renderDashboardHtml(): string {
         const dk = ev.target.value;
         if (dk && dk !== selectedDate) selectDate(dk, true);
       });
+      const priorIngSel = document.getElementById("date-prior-ingest");
+      if (priorIngSel) priorIngSel.addEventListener("change", async function (ev) {
+        selectedPriorReceivedAt = (ev.target.value || "").trim() || null;
+        watchCacheByDate.clear();
+        if (!selectedDate) return;
+        try {
+          const analysis = await loadAnalysis(selectedDate);
+          renderDetails(analysis);
+        } catch (e) { console.warn(e); }
+        const woBtn = document.getElementById("tab-work-orders");
+        if (woBtn && woBtn.classList.contains("active")) {
+          const asOf = woAsOfDate();
+          if (asOf) await loadAndRenderWoList(asOf, { force: true });
+        }
+      });
       document.getElementById("date-jump-latest").addEventListener("click", jumpDateLatest);
       document.getElementById("date-jump-prev").addEventListener("click", function () { jumpDateRel(1); });
       document.getElementById("date-jump-next").addEventListener("click", function () { jumpDateRel(-1); });
@@ -23272,7 +23827,7 @@ function renderDashboardHtml(): string {
           const q = (woInput.value || "").trim();
           if (!q) return;
           const asOf = woAsOfDate();
-          const rows = (asOf && watchCacheByDate.get(asOf)) || [];
+          const rows = (asOf && watchCacheByDate.get(watchListCacheKey(asOf))) || [];
           const exact = rows.find(function (r) { return (r.workOrderId || "").toLowerCase() === q.toLowerCase(); });
           if (exact) selectWo(exact.workOrderId, true);
           else {
@@ -23289,14 +23844,14 @@ function renderDashboardHtml(): string {
             b.classList.toggle("active", b === btn);
           });
           const asOf = woAsOfDate();
-          const rows = (asOf && watchCacheByDate.get(asOf)) || [];
+          const rows = (asOf && watchCacheByDate.get(watchListCacheKey(asOf))) || [];
           renderWoList(rows);
         });
       });
 
       function rerenderCurrentWoList() {
         const asOf = woAsOfDate();
-        const rows = (asOf && watchCacheByDate.get(asOf)) || [];
+        const rows = (asOf && watchCacheByDate.get(watchListCacheKey(asOf))) || [];
         renderWoList(rows);
       }
       document.getElementById("wo-unit").addEventListener("change", function (ev) {
@@ -29060,9 +29615,9 @@ function renderDashboardHtml(): string {
 
     function wirePresenterFullscreen() {
       var btn = document.getElementById("presenter-fullscreen");
-      var shell = document.getElementById("presenter");
-      if (!btn || !shell || btn._presenterFsWired) return;
+      if (!btn || btn._presenterFsWired) return;
       btn._presenterFsWired = true;
+      var fsTarget = document.documentElement;
       function isFs() {
         return !!(document.fullscreenElement || document.webkitFullscreenElement);
       }
@@ -29082,9 +29637,9 @@ function renderDashboardHtml(): string {
           var ex = document.exitFullscreen || document.webkitExitFullscreen;
           if (ex) ex.call(document);
         } else {
-          var req = shell.requestFullscreen || shell.webkitRequestFullscreen;
+          var req = fsTarget.requestFullscreen || fsTarget.webkitRequestFullscreen;
           if (req) {
-            req.call(shell).catch(function () {});
+            req.call(fsTarget).catch(function () {});
           }
         }
       });
@@ -29450,7 +30005,7 @@ function renderDashboardHtml(): string {
         if (shopTxt) {
           shopBanner.classList.remove("hidden");
           shopBanner.innerHTML =
-            '<span class="p-shop-eyebrow">Responding shop</span>' +
+            '<span class="p-shop-eyebrow">Shop assigned</span>' +
             '<span class="p-shop-name">' + esc(shopTxt) + "</span>";
         } else {
           shopBanner.classList.add("hidden");

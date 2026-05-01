@@ -76,6 +76,20 @@ const MONTH_TOKEN: Record<string, number> = {
   dec: 12,
 };
 
+/** Excel 1900 date system: whole-day serial to YYYY-MM-DD (UTC calendar). */
+function excelSerialToYyyyMmDd(serial: number): string | null {
+  const whole = Math.floor(serial);
+  if (!Number.isFinite(whole) || whole < 20000 || whole > 800000) return null;
+  const ms = Math.round((whole - 25569) * 86400 * 1000);
+  const d = new Date(ms);
+  if (Number.isNaN(d.getTime())) return null;
+  const y = d.getUTCFullYear();
+  if (y < 1970 || y > 2100) return null;
+  const m = d.getUTCMonth() + 1;
+  const day = d.getUTCDate();
+  return `${y}-${String(m).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
 /** Parse ETIC / due date from workbook cell text or Excel date serialization. */
 export function parseEticDate(raw: string): string | null {
   const t = raw.replace(/\s+/g, " ").trim();
@@ -101,6 +115,12 @@ export function parseEticDate(raw: string): string | null {
     if (!mon || !Number.isFinite(day) || !Number.isFinite(yr)) return null;
     if (yr < 100) yr = yr >= 70 ? 1900 + yr : 2000 + yr;
     return `${yr}-${String(mon).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  }
+  const serialPlain = t.replace(/,/g, "").trim();
+  if (/^\d+\.?\d*$/.test(serialPlain)) {
+    const serialNum = Number.parseFloat(serialPlain);
+    const fromSerial = excelSerialToYyyyMmDd(serialNum);
+    if (fromSerial) return fromSerial;
   }
   const tryDate = new Date(t);
   if (!Number.isNaN(tryDate.getTime())) {
@@ -339,11 +359,32 @@ export async function ingestWorkOrderSnapshot(
       rawRowJson: JSON.stringify(wo.rawColumns ?? {}),
     }))
     .filter((w) => w.wid.length > 0);
-  if (cleaned.length === 0) return;
 
   const dedup = new Map<string, (typeof cleaned)[number]>();
   for (const c of cleaned) dedup.set(c.wid, c);
   const workOrders = [...dedup.values()];
+  if (workOrders.length === 0) {
+    if (rows.length > 0) {
+      console.warn(
+        JSON.stringify({
+          level: "warn",
+          message: "ingestWorkOrderSnapshot_skipped_all_rows_missing_work_order_id",
+          dateKey,
+          extractedRows: rows.length,
+        }),
+      );
+    } else {
+      console.warn(
+        JSON.stringify({
+          level: "warn",
+          message: "ingestWorkOrderSnapshot_skipped_no_rows",
+          dateKey,
+          hint: "No WO sheet matched or zero data rows — fleet-only analysis may still succeed",
+        }),
+      );
+    }
+    return;
+  }
 
   const priorByWid = new Map<string, WoStateRow>();
   const selectBatchSize = 90;
@@ -540,6 +581,27 @@ export async function ingestWorkOrderSnapshot(
     await env.ETIC_SNAPSHOTS.batch(statements.slice(i, i + BATCH));
   }
 
+  // A second workbook email the same calendar day must fully replace the first
+  // for this `dateKey`. Upserts alone leave removed WOs / assets visible.
+  const keptWids = new Set(workOrders.map((w) => w.wid));
+  const existingSnap = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT work_order_id FROM work_order_snapshot WHERE snapshot_date_key = ?`,
+  )
+    .bind(dateKey)
+    .all<{ work_order_id: string }>();
+  const orphanWids = (existingSnap.results ?? [])
+    .map((r) => r.work_order_id)
+    .filter((id) => !keptWids.has(id));
+  if (orphanWids.length > 0) {
+    const delWoSnap = env.ETIC_SNAPSHOTS.prepare(
+      `DELETE FROM work_order_snapshot WHERE snapshot_date_key = ? AND work_order_id = ?`,
+    );
+    for (let i = 0; i < orphanWids.length; i += BATCH) {
+      const chunk = orphanWids.slice(i, i + BATCH);
+      await env.ETIC_SNAPSHOTS.batch(chunk.map((wid) => delWoSnap.bind(dateKey, wid)));
+    }
+  }
+
   // Rolling fleet roster: merge **entire** Fleet (P&A) sheet (all asset rows) with
   // WO-derived rows so FMC-only assets still appear in pickers (abuse tracker, etc.).
   // rawByAsset: full merged Fleet sheet cells per asset (for D1 `fleet_p_a_snapshot`).
@@ -645,6 +707,25 @@ export async function ingestWorkOrderSnapshot(
   }
   for (let i = 0; i < fleetPaStmts.length; i += BATCH) {
     await env.ETIC_SNAPSHOTS.batch(fleetPaStmts.slice(i, i + BATCH));
+  }
+
+  const keptAssetIds = new Set(fleetByAsset.keys());
+  const existingPa = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT asset_id FROM fleet_p_a_snapshot WHERE snapshot_date_key = ?`,
+  )
+    .bind(dateKey)
+    .all<{ asset_id: string }>();
+  const orphanAssets = (existingPa.results ?? [])
+    .map((r) => r.asset_id)
+    .filter((id) => !keptAssetIds.has(id));
+  if (orphanAssets.length > 0) {
+    const delPa = env.ETIC_SNAPSHOTS.prepare(
+      `DELETE FROM fleet_p_a_snapshot WHERE snapshot_date_key = ? AND asset_id = ?`,
+    );
+    for (let i = 0; i < orphanAssets.length; i += BATCH) {
+      const chunk = orphanAssets.slice(i, i + BATCH);
+      await env.ETIC_SNAPSHOTS.batch(chunk.map((aid) => delPa.bind(dateKey, aid)));
+    }
   }
 
   // Verify any pending FM&A actions against the changes we just wrote.
@@ -2808,7 +2889,11 @@ export type OpenSubWorkOrderRow = {
   subWorkOrderId: string;
   /** Sub work order state (e.g. from Sub Work Order State Cd). */
   subWorkOrderStateCd: string;
-  /** Best-effort label from work plan / item / type columns. */
+  /** Requested service / item desc / work order description (primary narrative). */
+  requestedService: string;
+  /** Work plan type code column when present. */
+  workPlanTypeCd: string;
+  /** Best-effort one-line label: requested service, else type cd, else other plan columns. */
   workPlanLabel: string;
   raw: Record<string, string>;
 };
@@ -2871,12 +2956,37 @@ function isOswoSubWorkOrderStateExcluded(stateText: string): boolean {
   return t === OSWO_EXCLUDED_STATE_NORMALIZED;
 }
 
-function pickOswoWorkPlanLabel(raw: Record<string, string>): string {
+/** Work plan / maintenance type code only (e.g. REPL-Replace, TYPE-A). */
+function pickOswoWorkPlanTypeCd(raw: Record<string, string>): string {
   return pickRawValue(raw, [
     "oswo.work plan type cd",
+    "work plan type cd",
+  ]);
+}
+
+/** Primary narrative line: requested service, item / WO description, etc. */
+function pickOswoRequestedService(raw: Record<string, string>): string {
+  return pickRawValue(raw, [
+    "oswo.requested service",
+    "requested service",
     "oswo.item desc",
+    "item desc",
     "oswo.work order desc",
+    "work order desc",
     "oswo.work order reason",
+    "work order reason",
+    "oswo.maintenance plan",
+    "maintenance plan",
+  ]);
+}
+
+/** One-line summary for legacy callers: requested service, else type cd, else other plan columns. */
+function pickOswoWorkPlanLabel(raw: Record<string, string>): string {
+  const svc = pickOswoRequestedService(raw);
+  if (svc) return svc;
+  const typeCd = pickOswoWorkPlanTypeCd(raw);
+  if (typeCd) return typeCd;
+  return pickRawValue(raw, [
     "oswo.work plan",
     "oswo.workplan",
     "oswo.plan",
@@ -2885,9 +2995,6 @@ function pickOswoWorkPlanLabel(raw: Record<string, string>): string {
     "workplan",
     "plan name",
     "plan id",
-    "work plan type cd",
-    "item desc",
-    "maintenance plan",
     "task",
     "description",
   ]);
@@ -3104,9 +3211,10 @@ export async function ingestOswoExtractFromAttachment(
  *   - `sub_wo_state:<id>`
  *
  * `<id>` is the Sub Work Order Id when present, otherwise the work-plan label,
- * otherwise the per-snapshot `row_key`. Old/new values carry a small JSON
- * payload `{state, plan}` so the renderer can show both pieces. Returns the
- * number of changelog rows written.
+ * otherwise the per-snapshot `row_key`. Old/new values carry JSON
+ * `{ state, requestedService, workPlanTypeCd }` (legacy ingests may still have
+ * `{ state, plan }` where `plan` was the merged label). Returns the number of
+ * changelog rows written.
  */
 async function writeOswoSubWorkOrderChangelogDiffs(
   env: { ETIC_SNAPSHOTS: D1Database },
@@ -3145,7 +3253,7 @@ async function writeOswoSubWorkOrderChangelogDiffs(
       .all<{ row_key: string; parent_work_order_id: string; sub_work_order_id: string; raw_row_json: string }>(),
   ]);
 
-  type SubInfo = { state: string; plan: string };
+  type SubInfo = { state: string; requestedService: string; workPlanTypeCd: string };
   type ParentMap = Map<string, Map<string, SubInfo>>;
   const parentCasing = new Map<string, string>();
   function group(
@@ -3164,12 +3272,13 @@ async function writeOswoSubWorkOrderChangelogDiffs(
         raw = {};
       }
       const state = pickOswoSubWorkOrderState(raw);
-      const plan = pickOswoWorkPlanLabel(raw);
+      const requestedService = pickOswoRequestedService(raw);
+      const workPlanTypeCd = pickOswoWorkPlanTypeCd(raw);
       const subId = (r.sub_work_order_id ?? "").trim();
-      const idKey = subId || plan || ("row:" + r.row_key);
+      const idKey = subId || requestedService || workPlanTypeCd || ("row:" + r.row_key);
       if (!m.has(lower)) m.set(lower, new Map());
       const inner = m.get(lower)!;
-      if (!inner.has(idKey)) inner.set(idKey, { state, plan });
+      if (!inner.has(idKey)) inner.set(idKey, { state, requestedService, workPlanTypeCd });
     }
     return m;
   }
@@ -3200,7 +3309,11 @@ async function writeOswoSubWorkOrderChangelogDiffs(
             receivedAtIso,
             "sub_wo_added:" + safeKey,
             "",
-            JSON.stringify({ state: c.state, plan: c.plan }),
+            JSON.stringify({
+              state: c.state,
+              requestedService: c.requestedService,
+              workPlanTypeCd: c.workPlanTypeCd,
+            }),
           ),
         );
       } else if (!c && p) {
@@ -3210,7 +3323,11 @@ async function writeOswoSubWorkOrderChangelogDiffs(
             currentDateKey,
             receivedAtIso,
             "sub_wo_removed:" + safeKey,
-            JSON.stringify({ state: p.state, plan: p.plan }),
+            JSON.stringify({
+              state: p.state,
+              requestedService: p.requestedService,
+              workPlanTypeCd: p.workPlanTypeCd,
+            }),
             "",
           ),
         );
@@ -3221,8 +3338,16 @@ async function writeOswoSubWorkOrderChangelogDiffs(
             currentDateKey,
             receivedAtIso,
             "sub_wo_state:" + safeKey,
-            JSON.stringify({ state: p.state, plan: p.plan }),
-            JSON.stringify({ state: c.state, plan: c.plan }),
+            JSON.stringify({
+              state: p.state,
+              requestedService: p.requestedService,
+              workPlanTypeCd: p.workPlanTypeCd,
+            }),
+            JSON.stringify({
+              state: c.state,
+              requestedService: c.requestedService,
+              workPlanTypeCd: c.workPlanTypeCd,
+            }),
           ),
         );
       }
@@ -3294,6 +3419,8 @@ export async function getOpenSubWorkOrdersForWorkOrder(
       parentWorkOrderId: row.parent_work_order_id,
       subWorkOrderId: (row.sub_work_order_id ?? "").trim(),
       subWorkOrderStateCd: pickOswoSubWorkOrderState(raw),
+      requestedService: pickOswoRequestedService(raw),
+      workPlanTypeCd: pickOswoWorkPlanTypeCd(raw),
       workPlanLabel: pickOswoWorkPlanLabel(raw),
       raw,
     });
@@ -3798,6 +3925,75 @@ export async function getWatchRowsForDate(
   return out;
 }
 
+function rawWorkOrderToEphemeralWatchReadRow(wo: RawWorkOrder, dateKey: string): WatchReadRow {
+  const wid = (wo.workOrderId ?? "").trim();
+  const eticDate = parseEticDate((wo.eticDue ?? "").trim());
+  const melTier = classifyMelTier(wo.currentMel ?? "");
+  const assetId = (wo.assetId ?? "").trim();
+  return {
+    work_order_id: wid,
+    asset_id: assetId,
+    mel_tier: melTier,
+    parts_status: (wo.partsStatus ?? "").trim(),
+    etic_raw: (wo.eticDue ?? "").trim(),
+    etic_date: eticDate,
+    remarks: (wo.remarks ?? "").trim(),
+    last_remark_change_date: dateKey,
+    etic_push_count: 0,
+    cumulative_etic_slip_days: 0,
+    first_etic_date: eticDate,
+    last_etic_date: eticDate,
+    last_snapshot_date: dateKey,
+    owning_unit: owningUnitForAssetId(assetId, (wo.owningUnit ?? "").trim()),
+    mel_key: (wo.melKey ?? "").trim() || null,
+    shop: (wo.shop ?? "").trim() || null,
+    mgmt_cd: (wo.mgmtCd ?? "").trim() || null,
+    make_model: (wo.makeModel ?? "").trim() || null,
+    veh_nomen: (wo.vehNomen ?? "").trim() || null,
+    raw_row_json: JSON.stringify(wo.rawColumns ?? {}),
+  };
+}
+
+/**
+ * Build WO list rows directly from workbook bytes (e.g. archived prior same-day ingest)
+ * without reading work_order_snapshot.
+ */
+export async function getWatchRowsFromWorkbookBytes(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  dateKey: string,
+  workbookBytes: ArrayBuffer,
+): Promise<WatchRow[]> {
+  const raw = await extractRawWorkOrdersFromBinary(workbookBytes);
+  const byWid = new Map<string, RawWorkOrder>();
+  for (const w of raw) {
+    const wid = (w.workOrderId ?? "").trim();
+    if (!wid) continue;
+    byWid.set(wid, w);
+  }
+  const cleaned = [...byWid.values()];
+  const readRows: WatchReadRow[] = cleaned.map((w) => rawWorkOrderToEphemeralWatchReadRow(w, dateKey));
+  const ids = readRows.map((r) => r.work_order_id);
+  const assetIds = [...new Set(readRows.map((r) => (r.asset_id ?? "").trim()).filter(Boolean))];
+  const [firstSeenMap, earliest, intervals, unitFallbacks] = await Promise.all([
+    getFirstSeenDates(env, ids),
+    getEarliestSnapshotDate(env),
+    getStalenessThresholds(env).then(resolveStaleness),
+    getHistoricalOwningUnitByAsset(env, assetIds),
+  ]);
+  const out: WatchRow[] = [];
+  for (const row of readRows) {
+    out.push(
+      rowToWatchRow(row, dateKey, {
+        firstSeenDate: firstSeenMap.get(row.work_order_id) ?? "",
+        earliestSnapshot: earliest,
+        intervals,
+        owningUnitFallback: unitFallbacks.get((row.asset_id ?? "").trim()) ?? "",
+      }),
+    );
+  }
+  return out;
+}
+
 /** Entire timeline of a single WO across every snapshot it appeared in. */
 export async function getWorkOrderTimeline(
   env: { ETIC_SNAPSHOTS: D1Database },
@@ -3893,25 +4089,10 @@ type SnapChangelogRow = {
 };
 
 /**
- * Reconstruct field changes by diffing consecutive work_order_snapshot rows (ingest
- * order). This is the correct timeline for "when did the workbook first show a
- * change" even when work_order_changelog is stale, rebuilt in one pass, or all rows
- * share one snapshot_date_key. Uses the same field rules as ingestWorkOrderSnapshot.
+ * Synthetic changelog from consecutive `work_order_snapshot` rows (full history, no tail cut).
+ * Used by {@link getChangelogFromSnapshots} and {@link getChangelogForDisplay}.
  */
-export async function getChangelogFromSnapshots(
-  env: { ETIC_SNAPSHOTS: D1Database },
-  workOrderId: string,
-  limit = 500,
-): Promise<WorkOrderChangelogEntry[]> {
-  const r = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT snapshot_date_key, remarks, parts_status, etic_raw, etic_date, mel_tier, shop
-     FROM work_order_snapshot
-     WHERE work_order_id = ?
-     ORDER BY snapshot_date_key ASC`,
-  )
-    .bind(workOrderId)
-    .all<SnapChangelogRow>();
-  const rows = r.results ?? [];
+export function snapshotRowsToChangelogEntries(rows: SnapChangelogRow[]): WorkOrderChangelogEntry[] {
   const out: WorkOrderChangelogEntry[] = [];
   let id = 0;
   const nowIso = new Date().toISOString();
@@ -3999,44 +4180,269 @@ export async function getChangelogFromSnapshots(
       });
     }
   }
+  return out;
+}
+
+/** Fields also written to persisted `work_order_changelog`; re-ingest can duplicate them on a wrong date. */
+const PERSISTED_SUPERSEDED_IF_IN_SNAPSHOT_DIFF = new Set<string>([
+  "remarks",
+  "parts_status",
+  "etic",
+  "etic_date_slip",
+  "mel_tier",
+  "shop",
+  "initial",
+]);
+
+function changelogTransitionKeyForMerge(field: string, oldV: string | null, newV: string | null): string {
+  return `${field}\t${String(oldV ?? "")}\t${String(newV ?? "")}`;
+}
+
+function transitionKeysFromSnapshotDerived(full: WorkOrderChangelogEntry[]): Set<string> {
+  const s = new Set<string>();
+  for (const e of full) {
+    if (PERSISTED_SUPERSEDED_IF_IN_SNAPSHOT_DIFF.has(e.field)) {
+      s.add(changelogTransitionKeyForMerge(e.field, e.old_value, e.new_value));
+    }
+  }
+  return s;
+}
+
+/**
+ * Drop persisted rows that repeat a transition already reconstructed from snapshot diffs
+ * (same field + old + new). Removes stale rows after re-ingest (e.g. everything tagged one day).
+ */
+export function filterPersistedChangelogSupersededBySnapshotDiff(
+  fullSnapshotDerived: WorkOrderChangelogEntry[],
+  persisted: WorkOrderChangelogEntry[],
+): WorkOrderChangelogEntry[] {
+  const keys = transitionKeysFromSnapshotDerived(fullSnapshotDerived);
+  return persisted.filter((p) => {
+    if (!PERSISTED_SUPERSEDED_IF_IN_SNAPSHOT_DIFF.has(p.field)) return true;
+    return !keys.has(changelogTransitionKeyForMerge(p.field, p.old_value, p.new_value));
+  });
+}
+
+function snapshotValueForField(row: SnapChangelogRow, field: string): string {
+  switch (field) {
+    case "remarks":
+      return String(row.remarks ?? "");
+    case "parts_status":
+      return String(row.parts_status ?? "");
+    case "etic":
+      return String(row.etic_raw ?? "");
+    case "etic_date_slip":
+      return String(row.etic_date ?? "");
+    case "mel_tier":
+      return String(row.mel_tier ?? "");
+    case "shop":
+      return String(row.shop ?? "");
+    default:
+      return "";
+  }
+}
+
+function normalizeChangelogValueForCompare(field: string, raw: unknown): string {
+  const t = String(raw ?? "").trim();
+  if (!t) return "";
+  if (field === "etic" || field === "etic_date_slip") {
+    const d = parseEticDate(t);
+    return d ?? t;
+  }
+  return t;
+}
+
+/**
+ * Validate persisted `work_order_changelog` rows against the snapshot chain: the
+ * `old_value` must equal the field's value in the most recent saved snapshot **strictly
+ * before** the persisted row's `snapshot_date_key`. Rows that contradict the chain are
+ * stale (typical after re-ingest where the prior baseline jumped) and dropped.
+ *
+ * Same-day re-ingest is preserved: if no snapshot exists strictly before the persisted
+ * row's date, the row is kept (no chain to validate against).
+ */
+export function filterPersistedChangelogStaleAgainstSnapshotChain(
+  snapshotRows: SnapChangelogRow[],
+  persisted: WorkOrderChangelogEntry[],
+): WorkOrderChangelogEntry[] {
+  if (!snapshotRows.length) return persisted;
+  const sortedSnapshots = [...snapshotRows].sort((a, b) =>
+    a.snapshot_date_key.localeCompare(b.snapshot_date_key),
+  );
+  return persisted.filter((p) => {
+    const fld = String(p.field);
+    if (!PERSISTED_SUPERSEDED_IF_IN_SNAPSHOT_DIFF.has(fld)) return true;
+    if (fld === "initial") return true;
+    let prior: SnapChangelogRow | undefined;
+    for (const row of sortedSnapshots) {
+      if (row.snapshot_date_key < p.snapshot_date_key) prior = row;
+      else break;
+    }
+    if (!prior) return true;
+    const expected = normalizeChangelogValueForCompare(fld, p.old_value);
+    const actual = normalizeChangelogValueForCompare(fld, snapshotValueForField(prior, fld));
+    return expected === actual;
+  });
+}
+
+/**
+ * Several `etic_date_slip` rows can end at the same `new_value` after merges/rebuilds; only one
+ * can match the snapshot chain. Keep the row whose `old_value` is the latest (largest date).
+ */
+export function dedupeEticDateSlipsSameDestination(entries: WorkOrderChangelogEntry[]): WorkOrderChangelogEntry[] {
+  const bestIdxByNew = new Map<string, number>();
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i]!;
+    if (e.field !== "etic_date_slip") continue;
+    const newV = String(e.new_value ?? "").trim();
+    const oldV = String(e.old_value ?? "").trim();
+    if (!newV) continue;
+    const j = bestIdxByNew.get(newV);
+    if (j === undefined) {
+      bestIdxByNew.set(newV, i);
+      continue;
+    }
+    if (!oldV) continue;
+    const oldPrev = String(entries[j]!.old_value ?? "").trim();
+    if (!oldPrev || oldV.localeCompare(oldPrev) > 0) {
+      bestIdxByNew.set(newV, i);
+    }
+  }
+  const keep = new Set(bestIdxByNew.values());
+  return entries.filter((e, i) => e.field !== "etic_date_slip" || keep.has(i));
+}
+
+/**
+ * Reconstruct field changes by diffing consecutive work_order_snapshot rows (ingest
+ * order). This is the correct timeline for "when did the workbook first show a
+ * change" even when work_order_changelog is stale, rebuilt in one pass, or all rows
+ * share one snapshot_date_key. Uses the same field rules as ingestWorkOrderSnapshot.
+ */
+export async function getChangelogFromSnapshots(
+  env: { ETIC_SNAPSHOTS: D1Database },
+  workOrderId: string,
+  limit = 500,
+): Promise<WorkOrderChangelogEntry[]> {
+  const r = await env.ETIC_SNAPSHOTS.prepare(
+    `SELECT snapshot_date_key, remarks, parts_status, etic_raw, etic_date, mel_tier, shop
+     FROM work_order_snapshot
+     WHERE work_order_id = ?
+     ORDER BY snapshot_date_key ASC`,
+  )
+    .bind(workOrderId)
+    .all<SnapChangelogRow>();
+  const rows = r.results ?? [];
+  const out = snapshotRowsToChangelogEntries(rows);
   if (out.length <= limit) return out;
   return out.slice(-limit);
 }
 
 /**
- * Work-order change timeline for display. Derive ETIC field changes from
- * consecutive snapshot rows so stale persisted changelog rows cannot invent a
- * later tracking start. Sub-WO events (`sub_wo_added` / `sub_wo_removed` /
- * `sub_wo_state`) are not derivable from snapshots, so they are always merged
- * in from the persisted changelog. Falls back to the persisted log entirely
- * when snapshot history is unavailable.
+ * Work-order change timeline for display. We **merge**:
+ * - **Snapshot diffs** — day-over-day field changes from `work_order_snapshot` (canonical
+ *   when changelog was rebuilt or persisted log is wrong).
+ * - **Persisted `work_order_changelog`** — captures **same-calendar-day** re-ingests
+ *   (second email): intra-day updates may not appear in snapshot diffs. Rows whose
+ *   (field, old, new) already appear in the full snapshot-derived chain are dropped so
+ *   a late re-ingest does not re-tag every transition under one date.
+ * - After merge, duplicate `etic_date_slip` rows that share the same `new_value` are reduced
+ *   to the single best step (largest `old_value` date) so the timeline does not show two
+ *   different “from” dates for the same ETIC destination.
+ * - **Sub-WO** events from the persisted log only (not derivable from snapshots).
+ *
+ * Stale duplicate `initial` rows in D1 are suppressed when snapshot-derived history
+ * already includes `initial` (see test).
  */
 export async function getChangelogForDisplay(
   env: { ETIC_SNAPSHOTS: D1Database },
   workOrderId: string,
   limit = 500,
 ): Promise<WorkOrderChangelogEntry[]> {
-  const fromSnapshots = await getChangelogFromSnapshots(env, workOrderId, limit);
-  const subWoR = await env.ETIC_SNAPSHOTS.prepare(
-    `SELECT id, snapshot_date_key, changed_at_iso, field, old_value, new_value
-     FROM work_order_changelog
-     WHERE work_order_id = ? AND field LIKE 'sub_wo_%'
-     ORDER BY id DESC LIMIT ?`,
-  )
-    .bind(workOrderId, limit)
-    .all<{
-      id: number;
-      snapshot_date_key: string;
-      changed_at_iso: string;
-      field: string;
-      old_value: string | null;
-      new_value: string | null;
-    }>();
-  const subWoEntries = subWoR.results ?? [];
-  if (fromSnapshots.length > 0 || subWoEntries.length > 0) {
-    return [...fromSnapshots, ...subWoEntries];
+  const [snapQ, subWoR, persistedR] = await Promise.all([
+    env.ETIC_SNAPSHOTS.prepare(
+      `SELECT snapshot_date_key, remarks, parts_status, etic_raw, etic_date, mel_tier, shop
+       FROM work_order_snapshot
+       WHERE work_order_id = ?
+       ORDER BY snapshot_date_key ASC`,
+    )
+      .bind(workOrderId)
+      .all<SnapChangelogRow>(),
+    env.ETIC_SNAPSHOTS.prepare(
+      `SELECT id, snapshot_date_key, changed_at_iso, field, old_value, new_value
+       FROM work_order_changelog
+       WHERE work_order_id = ? AND field LIKE 'sub_wo_%'
+       ORDER BY id DESC LIMIT ?`,
+    )
+      .bind(workOrderId, limit)
+      .all<{
+        id: number;
+        snapshot_date_key: string;
+        changed_at_iso: string;
+        field: string;
+        old_value: string | null;
+        new_value: string | null;
+      }>(),
+    env.ETIC_SNAPSHOTS.prepare(
+      `SELECT id, snapshot_date_key, changed_at_iso, field, old_value, new_value
+       FROM work_order_changelog
+       WHERE work_order_id = ? AND field NOT LIKE 'sub_wo_%'
+       ORDER BY id ASC LIMIT ?`,
+    )
+      .bind(workOrderId, Math.max(limit * 2, 500))
+      .all<{
+        id: number;
+        snapshot_date_key: string;
+        changed_at_iso: string;
+        field: string;
+        old_value: string | null;
+        new_value: string | null;
+      }>(),
+  ]);
+
+  const subWoEntries = (subWoR.results ?? []) as WorkOrderChangelogEntry[];
+  const persistedMain = (persistedR.results ?? []) as WorkOrderChangelogEntry[];
+  const fullFromSnapshots = snapshotRowsToChangelogEntries(snapQ.results ?? []);
+
+  if (fullFromSnapshots.length === 0) {
+    if (subWoEntries.length === 0) {
+      return getChangelog(env, workOrderId, limit);
+    }
+    return subWoEntries;
   }
-  return getChangelog(env, workOrderId, limit);
+
+  const snapshotHasInitial = fullFromSnapshots.some((e) => e.field === "initial");
+  let persistedFiltered = snapshotHasInitial
+    ? persistedMain.filter((e) => e.field !== "initial")
+    : persistedMain;
+  persistedFiltered = filterPersistedChangelogSupersededBySnapshotDiff(fullFromSnapshots, persistedFiltered);
+  persistedFiltered = filterPersistedChangelogStaleAgainstSnapshotChain(snapQ.results ?? [], persistedFiltered);
+
+  let merged: WorkOrderChangelogEntry[];
+  if (persistedFiltered.length === 0) {
+    merged = fullFromSnapshots;
+  } else {
+    const combined = [...fullFromSnapshots, ...persistedFiltered];
+    combined.sort((a, b) => {
+      const dk = a.snapshot_date_key.localeCompare(b.snapshot_date_key);
+      if (dk !== 0) return dk;
+      const ta = Date.parse(a.changed_at_iso);
+      const tb = Date.parse(b.changed_at_iso);
+      if (Number.isFinite(ta) && Number.isFinite(tb) && ta !== tb) return ta - tb;
+      return a.id - b.id;
+    });
+    const seen = new Set<string>();
+    merged = [];
+    for (const e of combined) {
+      const sig = `${e.snapshot_date_key}\t${e.field}\t${String(e.old_value ?? "")}\t${String(e.new_value ?? "")}`;
+      if (seen.has(sig)) continue;
+      seen.add(sig);
+      merged.push(e);
+    }
+  }
+
+  merged = dedupeEticDateSlipsSameDestination(merged);
+  const tail = merged.length > limit ? merged.slice(-limit) : merged;
+  return [...tail, ...subWoEntries];
 }
 
 /** ETIC meeting rows for this WO (notes / due-outs) for the work-order timeline. */

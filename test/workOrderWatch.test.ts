@@ -15,6 +15,9 @@ import {
   scheduleMxOwningUnitForAssetId,
   elmsPlanRowKeyFromRaw,
   getChangelogForDisplay,
+  filterPersistedChangelogSupersededBySnapshotDiff,
+  filterPersistedChangelogStaleAgainstSnapshotChain,
+  dedupeEticDateSlipsSameDestination,
   ingestWorkOrderSnapshot,
   melMgmtCodesMatch,
   parseCsvTextToRowArrays,
@@ -24,7 +27,7 @@ import {
   parseOswoCsvToRows,
   watchOwningUnitFromRawJson,
 } from "../src/workOrderWatch";
-import type { ScheduleMxFleetRow, WatchRow } from "../src/workOrderWatch";
+import type { ScheduleMxFleetRow, WatchRow, WorkOrderChangelogEntry } from "../src/workOrderWatch";
 
 describe("classifyMelTier", () => {
   it("detects below / at / above from phrases", () => {
@@ -48,6 +51,16 @@ describe("parseEticDate", () => {
   it("parses ISO prefix and US dates", () => {
     expect(parseEticDate("2026-04-20")).toBe("2026-04-20");
     expect(parseEticDate("4/20/2026")).toBe("2026-04-20");
+  });
+
+  it("parses Excel numeric date serials from typed cells", () => {
+    expect(parseEticDate("45776")).toBe("2025-04-29");
+    expect(parseEticDate("45776.0")).toBe("2025-04-29");
+    expect(parseEticDate("45,776")).toBe("2025-04-29");
+  });
+
+  it("does not treat work order ids as serials", () => {
+    expect(parseEticDate("2025081900033")).toBeNull();
   });
 });
 
@@ -81,6 +94,8 @@ describe("parseOswoCsvToRows", () => {
     expect(rows[0]!.parentWorkOrderId).toBe("WO123");
     expect(rows[0]!.subWorkOrderId).toBe("SW01");
     expect(rows[0]!.raw["oswo.sub work order state cd"]).toBe("INPR-In Progress");
+    expect(rows[0]!.raw["oswo.item desc"]).toBe("Replace filter");
+    expect(rows[0]!.raw["oswo.work plan type cd"]).toBe("TYPE-A");
     expect(rows[1]!.parentWorkOrderId).toBe("WO456");
   });
 
@@ -956,6 +971,15 @@ class MockD1Database {
   }
 
   all<T>(sql: string, params: unknown[]): T[] {
+    if (sql.includes("SELECT work_order_id FROM work_order_snapshot WHERE snapshot_date_key = ?")) {
+      const dateKey = String(params[0]);
+      const byWo = this.snapshots.get(dateKey);
+      if (!byWo) return [] as T[];
+      return [...byWo.keys()].map((work_order_id) => ({ work_order_id })) as T[];
+    }
+    if (sql.includes("SELECT asset_id FROM fleet_p_a_snapshot WHERE snapshot_date_key = ?")) {
+      return [] as T[];
+    }
     if (sql.includes("FROM work_order_snapshot") && sql.includes("WHERE work_order_id = ?")) {
       const workOrderId = String(params[0]);
       const rows: Record<string, unknown>[] = [];
@@ -984,6 +1008,23 @@ class MockD1Database {
       });
       return rows as T[];
     }
+    if (sql.includes("FROM work_order_changelog") && sql.includes("WHERE work_order_id = ?")) {
+      const wid = String(params[0]);
+      const lim = Number(params[params.length - 1]);
+      let rows = this.changelog.filter((r) => r.work_order_id === wid) as Record<string, unknown>[];
+      if (sql.includes("field LIKE 'sub_wo_%'")) {
+        rows = rows.filter((r) => String(r.field).startsWith("sub_wo_"));
+      } else if (sql.includes("field NOT LIKE 'sub_wo_%'")) {
+        rows = rows.filter((r) => !String(r.field).startsWith("sub_wo_"));
+      }
+      const asc = sql.includes("ORDER BY id ASC");
+      rows.sort((a, b) => {
+        const ida = Number(a.id ?? 0);
+        const idb = Number(b.id ?? 0);
+        return asc ? ida - idb : idb - ida;
+      });
+      return rows.slice(0, Number.isFinite(lim) ? lim : 500) as T[];
+    }
     if (sql.includes("FROM fleet_p_a_snapshot") && sql.includes("ROW_NUMBER() OVER")) {
       return [] as T[];
     }
@@ -991,6 +1032,16 @@ class MockD1Database {
   }
 
   run(sql: string, params: unknown[]): number {
+    if (sql.includes("DELETE FROM work_order_snapshot") && sql.includes("work_order_id = ?")) {
+      const dateKey = String(params[0]);
+      const wid = String(params[1]);
+      const byWo = this.snapshots.get(dateKey);
+      if (byWo?.has(wid)) {
+        byWo.delete(wid);
+        return 1;
+      }
+      return 0;
+    }
     if (sql.includes("INSERT OR REPLACE INTO work_order_changelog")) {
       const [work_order_id, snapshot_date_key, changed_at_iso, field, old_value, new_value] = params;
       const existing = this.changelog.findIndex(
@@ -999,7 +1050,26 @@ class MockD1Database {
           row.snapshot_date_key === snapshot_date_key &&
           row.field === field,
       );
-      const row = { work_order_id, snapshot_date_key, changed_at_iso, field, old_value, new_value };
+      const row =
+        existing >= 0
+          ? {
+              ...this.changelog[existing],
+              work_order_id,
+              snapshot_date_key,
+              changed_at_iso,
+              field,
+              old_value,
+              new_value,
+            }
+          : {
+              id: this.changelog.length + 1,
+              work_order_id,
+              snapshot_date_key,
+              changed_at_iso,
+              field,
+              old_value,
+              new_value,
+            };
       if (existing >= 0) this.changelog[existing] = row;
       else this.changelog.push(row);
       return 1;
@@ -1117,5 +1187,200 @@ describe("ingestWorkOrderSnapshot", () => {
     const display = await getChangelogForDisplay(env, "WO-1");
 
     expect(display.filter((row) => row.field === "initial").map((row) => row.snapshot_date_key)).toEqual(["2026-02-26"]);
+  });
+
+  it("same-day second ingest removes work orders dropped from the later workbook", async () => {
+    const db = new MockD1Database();
+    const env = { ETIC_SNAPSHOTS: db as unknown as D1Database };
+
+    await ingestWorkOrderSnapshot(env, "2026-04-30", [
+      wo({ workOrderId: "WO-1", assetId: "AF1", remarks: "A", currentMel: "Below MEL" }),
+      wo({ workOrderId: "WO-2", assetId: "AF2", remarks: "B", currentMel: "Below MEL" }),
+    ], "2026-04-30T10:00:00.000Z");
+
+    expect([...db.snapshots.get("2026-04-30")!.keys()].sort()).toEqual(["WO-1", "WO-2"]);
+
+    await ingestWorkOrderSnapshot(env, "2026-04-30", [
+      wo({ workOrderId: "WO-1", assetId: "AF1", remarks: "A2", currentMel: "Below MEL" }),
+    ], "2026-04-30T15:00:00.000Z");
+
+    expect([...db.snapshots.get("2026-04-30")!.keys()].sort()).toEqual(["WO-1"]);
+    expect(db.snapshots.get("2026-04-30")!.get("WO-1")?.remarks).toBe("A2");
+  });
+
+  it("getChangelogForDisplay includes persisted same-day ETIC rows (snapshot has only one row per day)", async () => {
+    const db = new MockD1Database();
+    const env = { ETIC_SNAPSHOTS: db as unknown as D1Database };
+
+    await ingestWorkOrderSnapshot(env, "2026-04-30", [
+      wo({ workOrderId: "WO-1", assetId: "AF1", eticDue: "27 APR 26", currentMel: "Below MEL" }),
+    ], "2026-04-30T10:00:00.000Z");
+    await ingestWorkOrderSnapshot(env, "2026-04-30", [
+      wo({ workOrderId: "WO-1", assetId: "AF1", eticDue: "22 MAY 26", currentMel: "Below MEL" }),
+    ], "2026-04-30T15:00:00.000Z");
+
+    const display = await getChangelogForDisplay(env, "WO-1");
+    const eticRows = display.filter((r) => r.field === "etic");
+    expect(eticRows.length).toBeGreaterThanOrEqual(1);
+    expect(eticRows.some((r) => String(r.new_value).includes("22 MAY") || String(r.new_value).includes("22"))).toBe(true);
+  });
+
+  it("getChangelogForDisplay drops persisted rows that duplicate snapshot-derived transitions (wrong re-ingest date)", async () => {
+    const db = new MockD1Database();
+    const env = { ETIC_SNAPSHOTS: db as unknown as D1Database };
+
+    await ingestWorkOrderSnapshot(env, "2026-02-26", [
+      wo({ workOrderId: "WO-1", assetId: "AF1", remarks: "R0", currentMel: "Below MEL" }),
+    ], "2026-02-26T18:00:00.000Z");
+    await ingestWorkOrderSnapshot(env, "2026-03-15", [
+      wo({ workOrderId: "WO-1", assetId: "AF1", remarks: "R1", currentMel: "Below MEL" }),
+    ], "2026-03-15T18:00:00.000Z");
+
+    db.changelog.push({
+      id: 999,
+      work_order_id: "WO-1",
+      snapshot_date_key: "2026-04-30",
+      changed_at_iso: "2026-04-30T18:00:00.000Z",
+      field: "remarks",
+      old_value: "R0",
+      new_value: "R1",
+    });
+
+    const display = await getChangelogForDisplay(env, "WO-1");
+    const remarksRows = display.filter((r) => r.field === "remarks");
+    expect(remarksRows.length).toBe(1);
+    expect(remarksRows[0]!.snapshot_date_key).toBe("2026-03-15");
+  });
+
+  it("filterPersistedChangelogSupersededBySnapshotDiff removes matching field transitions", () => {
+    const full = [
+      {
+        id: 1,
+        snapshot_date_key: "2026-03-01",
+        changed_at_iso: "2026-03-01T12:00:00.000Z",
+        field: "shop",
+        old_value: "A",
+        new_value: "B",
+      },
+    ];
+    const persisted = [
+      {
+        id: 2,
+        snapshot_date_key: "2026-04-30",
+        changed_at_iso: "2026-04-30T12:00:00.000Z",
+        field: "shop",
+        old_value: "A",
+        new_value: "B",
+      },
+      {
+        id: 3,
+        snapshot_date_key: "2026-04-30",
+        changed_at_iso: "2026-04-30T15:00:00.000Z",
+        field: "sub_wo_added:1",
+        old_value: "",
+        new_value: '{"state":"Open"}',
+      },
+    ];
+    const out = filterPersistedChangelogSupersededBySnapshotDiff(
+      full as WorkOrderChangelogEntry[],
+      persisted as WorkOrderChangelogEntry[],
+    );
+    expect(out.length).toBe(1);
+    expect(out[0]!.field).toContain("sub_wo");
+  });
+
+  it("dedupeEticDateSlipsSameDestination keeps the slip with the latest old date for each new_value", () => {
+    const rows: WorkOrderChangelogEntry[] = [
+      {
+        id: 1,
+        snapshot_date_key: "2026-04-30",
+        changed_at_iso: "2026-04-30T12:00:00.000Z",
+        field: "etic_date_slip",
+        old_value: "2026-04-30",
+        new_value: "2026-05-15",
+      },
+      {
+        id: 2,
+        snapshot_date_key: "2026-05-01",
+        changed_at_iso: "2026-05-01T12:00:00.000Z",
+        field: "etic_date_slip",
+        old_value: "2026-03-06",
+        new_value: "2026-05-15",
+      },
+    ];
+    const out = dedupeEticDateSlipsSameDestination(rows);
+    expect(out).toEqual([rows[0]]);
+  });
+
+  it("filterPersistedChangelogStaleAgainstSnapshotChain drops persisted etic rows whose old_value disagrees with the prior snapshot", () => {
+    const snapshotRows = [
+      {
+        snapshot_date_key: "2026-02-26",
+        remarks: "",
+        parts_status: "",
+        etic_raw: "27 FEB 26",
+        etic_date: "2026-02-27",
+        mel_tier: "below",
+        shop: null,
+      },
+      {
+        snapshot_date_key: "2026-03-23",
+        remarks: "",
+        parts_status: "",
+        etic_raw: "15 MAY 26",
+        etic_date: "2026-05-15",
+        mel_tier: "below",
+        shop: null,
+      },
+      {
+        snapshot_date_key: "2026-04-27",
+        remarks: "",
+        parts_status: "",
+        etic_raw: "15 MAY 26",
+        etic_date: "2026-05-15",
+        mel_tier: "below",
+        shop: null,
+      },
+      {
+        snapshot_date_key: "2026-05-01",
+        remarks: "",
+        parts_status: "",
+        etic_raw: "15 MAY 26",
+        etic_date: "2026-05-15",
+        mel_tier: "below",
+        shop: null,
+      },
+    ];
+    const persisted: WorkOrderChangelogEntry[] = [
+      {
+        id: 10,
+        snapshot_date_key: "2026-05-01",
+        changed_at_iso: "2026-05-01T18:00:00.000Z",
+        field: "etic",
+        old_value: "27 FEB 26",
+        new_value: "15 MAY 26",
+      },
+      {
+        id: 11,
+        snapshot_date_key: "2026-05-01",
+        changed_at_iso: "2026-05-01T18:00:00.000Z",
+        field: "etic_date_slip",
+        old_value: "2026-02-27",
+        new_value: "2026-05-15",
+      },
+      {
+        id: 12,
+        snapshot_date_key: "2026-05-01",
+        changed_at_iso: "2026-05-01T18:00:00.000Z",
+        field: "remarks",
+        old_value: "",
+        new_value: "Real same-day update",
+      },
+    ];
+    const out = filterPersistedChangelogStaleAgainstSnapshotChain(
+      snapshotRows as Parameters<typeof filterPersistedChangelogStaleAgainstSnapshotChain>[0],
+      persisted,
+    );
+    expect(out.map((r) => r.field)).toEqual(["remarks"]);
   });
 });

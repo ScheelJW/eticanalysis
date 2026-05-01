@@ -214,7 +214,12 @@ function readCellString(cell: ExcelJS.Cell): string {
   if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
     return String(value);
   }
-  if (value instanceof Date) return value.toISOString();
+  if (value instanceof Date) {
+    const y = value.getUTCFullYear();
+    const m = value.getUTCMonth() + 1;
+    const d = value.getUTCDate();
+    return `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+  }
   if (Array.isArray(value)) return value.map((part) => String(part ?? "")).join("");
   if (typeof value === "object") {
     const v = value as unknown as Record<string, unknown>;

@@ -97,6 +97,43 @@ describe("utility helpers", () => {
     const fallback = pickWorkbookAttachment(attachments, "does-not-exist.xlsx");
     expect(fallback?.filename).toBe("Vehicle ETIC.xlsx");
   });
+
+  it("with multiple xlsx and no exact name match, prefers Vehicle ETIC-like filename over a small stub", () => {
+    const attachments = [
+      {
+        filename: "Other.xlsx",
+        mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        disposition: "attachment" as const,
+        content: new Uint8Array(50),
+      },
+      {
+        filename: "Copy of Vehicle MC rate — ETIC.xlsx",
+        mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        disposition: "attachment" as const,
+        content: new Uint8Array(200),
+      },
+    ];
+    const picked = pickWorkbookAttachment(attachments, "Vehicle ETIC.xlsx");
+    expect(picked?.filename).toBe("Copy of Vehicle MC rate — ETIC.xlsx");
+  });
+
+  it("with multiple generic xlsx names, prefers the largest attachment", () => {
+    const attachments = [
+      {
+        filename: "a.xlsx",
+        mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        disposition: "attachment" as const,
+        content: new Uint8Array(100),
+      },
+      {
+        filename: "b.xlsx",
+        mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        disposition: "attachment" as const,
+        content: new Uint8Array(5000),
+      },
+    ];
+    expect(pickWorkbookAttachment(attachments, undefined)?.filename).toBe("b.xlsx");
+  });
 });
 
 async function makeAnalysis(
